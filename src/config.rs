@@ -397,6 +397,9 @@ pub struct Limits {
     pub max_total_sleep_secs: u64,
     /// How long `execute` and `wait` block before answering `pending`
     pub execute_wait_secs: u64,
+    /// How often a waiting `execute` or `wait` sends an MCP progress
+    /// notification, which keeps clients with an idle timeout connected
+    pub progress_interval_ms: u64,
     /// Concurrent Monty worker processes, each able to use up to
     /// `max_memory_bytes`
     pub max_workers: usize,
@@ -427,6 +430,7 @@ impl Default for Limits {
             max_suspensions: 1000,
             max_total_sleep_secs: 300,
             execute_wait_secs: 25,
+            progress_interval_ms: 15_000,
             max_workers: 16,
             max_queued_executions: 64,
             result_ttl_secs: 30 * 60,
@@ -442,6 +446,11 @@ impl Limits {
     /// Wait budget as a duration
     pub fn execute_wait(&self) -> Duration {
         Duration::from_secs(self.execute_wait_secs)
+    }
+
+    /// Progress notification interval as a duration
+    pub fn progress_interval(&self) -> Duration {
+        Duration::from_millis(self.progress_interval_ms)
     }
 
     /// Result retention as a duration
@@ -476,6 +485,7 @@ impl Limits {
                 self.max_retained_result_bytes as u64,
             ),
             ("execute_wait_secs", self.execute_wait_secs),
+            ("progress_interval_ms", self.progress_interval_ms),
         ];
         for (field, value) in positive {
             if value == 0 {

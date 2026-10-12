@@ -19,8 +19,8 @@ pub enum Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantMode {
-    /// An approval may cover every `session` tool of the server for the same
-    /// MCP session for a while
+    /// An approval may cover every `session` tool of the server for every
+    /// session of the same client for a while
     #[default]
     Session,
     /// Every call needs its own approval

@@ -158,6 +158,16 @@ fn caller(session: &str, client: &str) -> Caller {
         session: Some(session.to_owned()),
         client_name: Some(client.to_owned()),
         client_version: Some("1.0".to_owned()),
+        ..Caller::default()
+    }
+}
+
+/// A caller with no session, as every stateless client is
+fn sessionless(client: &str) -> Caller {
+    Caller {
+        client_name: Some(client.to_owned()),
+        client_version: Some("1.0".to_owned()),
+        ..Caller::default()
     }
 }
 
@@ -301,7 +311,7 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
         "{fingerprints}"
     );
 
-    let retries = section("## Sessions with the most failed executes");
+    let retries = section("## Runs with the most failed executes");
     let first = retries.find("1. **name_error**").ok_or(retries.clone())?;
     let third = retries.find("3. **ok**").ok_or(retries.clone())?;
     assert!(first < third, "{retries}");
@@ -337,47 +347,106 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
     Ok(())
 }
 
-/// Stateless 2026-07-28 clients carry no session id, which approval grants and
-/// the log key on, so they are turned away and fall back to `initialize`
+/// Session-less callers are grouped into runs by gaps between their calls
 #[tokio::test(flavor = "multi_thread")]
-async fn calls_are_logged_with_their_session_and_stateless_clients_are_refused() -> TestResult {
-    let Some(harness) = Harness::start("", "").await? else {
-        return Ok(());
+async fn review_groups_sessionless_calls_into_runs_by_time_gaps() -> TestResult {
+    let directory = temp_state_dir();
+    let log = UsageLog::start(&directory, Duration::from_secs(90 * 24 * 60 * 60))?;
+    let minute = 60 * 1000;
+    let base = store::now_ms() - 3 * 60 * minute;
+    let claude = || sessionless("claude-code");
+    let failing = |id: &str, at: i64, caller: Caller, outcome: Outcome| {
+        execution(
+            id,
+            at,
+            caller,
+            &format!("script {id}"),
+            Classification::new(outcome, "boom"),
+        )
     };
 
-    let discover = harness
-        .http
-        .post(format!("{}/mcp", harness.base()))
-        .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream")
-        .header("mcp-protocol-version", "2026-07-28")
-        .header("mcp-method", "server/discover")
-        .body(
-            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
-                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                "io.modelcontextprotocol/clientInfo":{"name":"x","version":"1"},
-                "io.modelcontextprotocol/clientCapabilities":{}}}}"#,
-        )
-        .send()
-        .await?;
-    assert_eq!(discover.status().as_u16(), 400);
+    // gaps of 4 and 5 minutes keep these three in one run
+    log.execution(failing("e1", base, claude(), Outcome::NameError));
+    log.execution(failing(
+        "e2",
+        base + 4 * minute,
+        claude(),
+        Outcome::TypeError,
+    ));
+    log.execution(execution(
+        "e3",
+        base + 9 * minute,
+        claude(),
+        "script e3",
+        Classification::ok(),
+    ));
+    // a 16 minute gap starts a second run
+    log.execution(failing(
+        "e4",
+        base + 25 * minute,
+        claude(),
+        Outcome::RuntimeError,
+    ));
+    // interleaved activity of another client does not extend the first
+    // client's runs and forms its own
+    log.execution(failing(
+        "e5",
+        base + 5 * minute,
+        sessionless("codex"),
+        Outcome::NameError,
+    ));
+    // a client with a session keeps grouping by it, whatever the gaps
+    log.execution(failing("e6", base, caller("s9", "zed"), Outcome::NameError));
+    log.execution(failing(
+        "e7",
+        base + 60 * minute,
+        caller("s9", "zed"),
+        Outcome::NameError,
+    ));
+    log.flush().await;
+
+    let connection = store::open(&directory)?;
+    let reporter = Reporter::new(&connection, Duration::from_secs(7 * 24 * 60 * 60));
+    let review = reporter.review(&[])?;
     assert!(
-        discover
-            .text()
-            .await?
-            .contains("Unsupported protocol version")
+        review.contains("Runs (approximate when session-less)"),
+        "{review}"
     );
 
-    execute(&harness.client, "1 + 1").await?;
-    harness.app.usage().flush().await;
-    let connection = store::open(harness.app.state_dir())?;
-    let (session, client): (Option<String>, Option<String>) = connection.query_row(
-        "select session, client_name from calls where tool = 'execute'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    assert!(session.is_some_and(|session| !session.is_empty()));
-    assert_eq!(client.as_deref(), Some("rmcp"));
+    let start = review
+        .find("## Runs with the most failed executes")
+        .ok_or("no retry section")?;
+    let retries = &review[start..];
+    let retries = &retries[..retries.find("\n## Hallucinated").unwrap_or(retries.len())];
+    assert!(
+        retries.contains("claude-code run `claude-code from "),
+        "{retries}"
+    );
+    // run one: two failures then success; run two: one failure, abandoned
+    assert!(retries.contains(": 2 failed, then succeeded"), "{retries}");
+    assert_eq!(retries.matches("claude-code run").count(), 2, "{retries}");
+    assert!(retries.contains(": 1 failed, abandoned"), "{retries}");
+    // the other session-less client has its own run, and the session-based
+    // one is a single run despite the hour between its executions
+    assert!(retries.contains("codex run `codex from "), "{retries}");
+    assert!(
+        retries.contains("zed run `s9`: 2 failed, abandoned"),
+        "{retries}"
+    );
 
-    harness.stop().await
+    let stats = reporter.stats()?;
+    let runs_of = |name: &str| {
+        stats
+            .clients
+            .iter()
+            .find(|client| client.client == name)
+            .map(|client| client.runs)
+    };
+    assert_eq!(runs_of("claude-code"), Some(2));
+    assert_eq!(runs_of("codex"), Some(1));
+    assert_eq!(runs_of("zed"), Some(1));
+
+    let _ = std::fs::remove_dir_all(&directory);
+
+    Ok(())
 }

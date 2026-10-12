@@ -1,7 +1,6 @@
 //! The agent-facing MCP server and its HTTP wiring
 
 use std::{
-    borrow::Cow,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,12 +10,15 @@ use axum::{Json, Router, extract::State, middleware, routing::get};
 use rmcp::{
     RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResult, ContentBlock, Implementation, ProgressNotificationParam,
+        ServerCapabilities, ServerConfig,
+    },
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
 };
 use serde::Deserialize;
@@ -44,10 +46,6 @@ const MAX_LABEL_CHARS: usize = 64;
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 50;
-/// Agents keep a session open across long idle stretches (a person reading,
-/// an approval pending), and an expired session surfaces as a 404 they
-/// cannot recover from, so sessions outlive any realistic idle time
-const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Arguments of `search_tools`
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -86,28 +84,72 @@ pub struct CodeModeServer {
     executions: Arc<Executions>,
     log: UsageLog,
     wait_budget: Duration,
+    progress_interval: Duration,
     max_response_bytes: usize,
 }
 
-/// Session id and client of the request being handled
+/// Session id (older clients that opened one) and client of the request
+/// being handled
+///
+/// Stateless clients carry no session, so the client is read from the
+/// request `_meta`, then from peer info when a handshake filled it in, then
+/// from the `user-agent` header
 fn caller_of(context: &RequestContext<RoleServer>) -> Caller {
-    let session = context
-        .extensions
-        .get::<http::request::Parts>()
+    let parts = context.extensions.get::<http::request::Parts>();
+    let session = parts
         .and_then(|parts| parts.headers.get(SESSION_HEADER))
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let client = context.peer.peer_info();
+        .map(clean_label);
+    let from_handshake = || {
+        // rmcp fills peer info with its own identity when it served the
+        // request without a handshake
+        let info = context.peer.peer_info()?;
+
+        (info.client_info != Implementation::default()).then(|| info.client_info.clone())
+    };
+    let client = context
+        .meta
+        .client_info()
+        .or_else(from_handshake)
+        .map(|info| Caller {
+            client_name: Some(clean_label(&info.name)),
+            client_version: Some(clean_label(&info.version)),
+            client_title: info.title.as_deref().map(clean_label),
+            ..Caller::default()
+        })
+        .or_else(|| {
+            let agent = parts?
+                .headers
+                .get(http::header::USER_AGENT)?
+                .to_str()
+                .ok()?;
+
+            caller_from_user_agent(agent)
+        });
 
     Caller {
-        session: session.map(|session| clean_label(&session)),
-        client_name: client
-            .as_ref()
-            .map(|info| clean_label(&info.client_info.name)),
-        client_version: client
-            .as_ref()
-            .map(|info| clean_label(&info.client_info.version)),
+        session,
+        ..client.unwrap_or_default()
     }
+}
+
+/// Client name and version from the first product of a `user-agent` header,
+/// e.g. `claude-code/2.1.296 (cli)`
+fn caller_from_user_agent(agent: &str) -> Option<Caller> {
+    let product = agent.split_whitespace().next()?;
+    let (name, version) = match product.split_once('/') {
+        Some((name, version)) => (name, Some(clean_label(version))),
+        None => (product, None),
+    };
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(Caller {
+        client_name: Some(clean_label(name)),
+        client_version: version,
+        ..Caller::default()
+    })
 }
 
 /// Client-supplied names end up in push titles, pages and every log row, so
@@ -171,12 +213,50 @@ impl CodeModeServer {
             executions: Arc::clone(app.executions()),
             log: app.usage().clone(),
             wait_budget: app.config().limits.execute_wait(),
+            progress_interval: app.config().limits.progress_interval(),
             max_response_bytes: app.config().limits.max_response_bytes(),
         }
     }
 
-    async fn await_outcome(&self, id: &str) -> (CallToolResult, Classification) {
-        match self.executions.wait(id, self.wait_budget).await {
+    /// Waits up to the wait budget, sending a progress notification every
+    /// `progress_interval` when the request carries a progress token
+    ///
+    /// Claude Code aborts an HTTP call that is idle for five minutes, and a
+    /// notification counts as activity
+    async fn await_outcome(
+        &self,
+        id: &str,
+        context: &RequestContext<RoleServer>,
+    ) -> (CallToolResult, Classification) {
+        let wait = self.executions.wait(id, self.wait_budget);
+        tokio::pin!(wait);
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.progress_interval,
+            self.progress_interval,
+        );
+        let mut ticks = 0.0;
+        let waited = loop {
+            tokio::select! {
+                waited = &mut wait => break waited,
+                _ = ticker.tick() => {
+                    let Some(token) = context.meta.get_progress_token() else {
+                        continue;
+                    };
+                    ticks += 1.0;
+                    // a client that went away makes this fail, and the
+                    // execution carries on regardless
+                    let _ = context
+                        .peer
+                        .notify_progress(
+                            ProgressNotificationParam::new(token, ticks)
+                                .with_message("script still running"),
+                        )
+                        .await;
+                }
+            }
+        };
+
+        match waited {
             WaitResult::Finished(outcome) => (
                 render_outcome(&outcome, self.max_response_bytes),
                 outcome.classification(),
@@ -365,7 +445,7 @@ impl CodeModeServer {
         let (result, classification, id) =
             match self.executions.start(params.code.clone(), caller.clone()) {
                 Ok(id) => {
-                    let (result, classification) = self.await_outcome(&id).await;
+                    let (result, classification) = self.await_outcome(&id, &context).await;
 
                     (result, classification, Some(id))
                 }
@@ -400,7 +480,7 @@ impl CodeModeServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let started = Instant::now();
-        let (result, classification) = self.await_outcome(&params.execution_id).await;
+        let (result, classification) = self.await_outcome(&params.execution_id, &context).await;
         self.record(
             Logged {
                 caller: caller_of(&context),
@@ -417,27 +497,11 @@ impl CodeModeServer {
     }
 }
 
-/// Protocol versions that open a session with `initialize`
-///
-/// The stateless 2026-07-28 protocol carries no session id, while approval
-/// grants and the usage log are keyed by MCP session; clients such as
-/// Claude Code fall back to `initialize` when the server does not offer it
-const SESSION_PROTOCOLS: &[ProtocolVersion] = &[
-    ProtocolVersion::V_2024_11_05,
-    ProtocolVersion::V_2025_03_26,
-    ProtocolVersion::V_2025_06_18,
-    ProtocolVersion::V_2025_11_25,
-];
-
 #[tool_handler]
 impl ServerHandler for CodeModeServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
-    }
-
-    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(SESSION_PROTOCOLS)
     }
 }
 
@@ -615,15 +679,16 @@ pub async fn serve(app: &App) -> std::io::Result<RunningServer> {
     let shutdown = CancellationToken::new();
 
     let mcp_app = app.clone();
-    let mut sessions = LocalSessionManager::default();
-    sessions.session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
     let mcp = StreamableHttpService::new(
         move || Ok(CodeModeServer::new(&mcp_app)),
-        Arc::new(sessions),
+        Arc::new(NeverSessionManager::default()),
         // rmcp only matches exact authorities; `host_guard` below applies
-        // the real rules, so its own check is switched off
+        // the real rules, so its own check is switched off; turning legacy
+        // session mode off serves every client statelessly, so older clients
+        // still `initialize` but are never given an `mcp-session-id`
         StreamableHttpServerConfig::default()
             .disable_allowed_hosts()
+            .with_legacy_session_mode(false)
             .with_cancellation_token(shutdown.child_token()),
     );
     let hosts = Arc::new(HostPolicy::new(&app.config().extra_allowed_hosts));

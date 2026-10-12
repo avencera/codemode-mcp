@@ -7,6 +7,7 @@ mod approvals;
 mod harness;
 mod oauth;
 mod service;
+mod session_less;
 mod usage;
 
 use std::{

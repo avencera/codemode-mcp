@@ -19,9 +19,7 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
     app::App,
-    approvals::{
-        ApprovalInfo, ApprovalKind, Approvals, Choice, DecideError, SESSION_GRANT_MINUTES,
-    },
+    approvals::{ApprovalInfo, ApprovalKind, Approvals, CLIENT_GRANT_MINUTES, Choice, DecideError},
     passkeys::{PasskeyError, Passkeys},
     policy::GrantMode,
     store,
@@ -100,7 +98,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 10px; ov
 .buttons {{ display: grid; gap: 12px; margin-top: 24px; }}
 button {{ font-size: 1.1rem; padding: 16px; border-radius: 14px; border: 0; font-weight: 600; min-height: 56px; }}
 button.approve {{ background: #1f7a3a; color: #fff; }}
-button.session {{ background: #2457a6; color: #fff; }}
+button.client {{ background: #2457a6; color: #fff; }}
 button.deny {{ background: #b3261e; color: #fff; }}
 button:disabled {{ opacity: .5; }}
 input {{ font-size: 1.1rem; padding: 12px; border-radius: 10px; border: 1px solid #999; width: 100%; box-sizing: border-box; }}
@@ -168,7 +166,7 @@ fn passkey_error(error: &PasskeyError) -> Response {
 fn decide_error(error: &DecideError) -> Response {
     let status = match error {
         DecideError::NotFound => StatusCode::GONE,
-        DecideError::SessionNotAllowed => StatusCode::BAD_REQUEST,
+        DecideError::GrantNotAllowed => StatusCode::BAD_REQUEST,
     };
 
     json_error(status, &error.to_string())
@@ -184,13 +182,16 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
 
     let arguments = serde_json::to_string_pretty(&Value::Object(info.arguments.clone()))
         .unwrap_or_else(|_| "{}".to_owned());
-    let session_buttons = if info.grant_mode == GrantMode::Session && info.caller.session.is_some()
+    let client_buttons = if info.grant_mode == GrantMode::Session
+        && info.caller.client_name.is_some()
     {
-        SESSION_GRANT_MINUTES
+        let client = escape(info.caller.client_display());
+
+        CLIENT_GRANT_MINUTES
             .iter()
             .map(|minutes| {
                 format!(
-                    r#"<button class="session" data-choice="session{minutes}">Approve for this session, {minutes} min</button>"#
+                    r#"<button class="client" data-choice="client{minutes}">Approve {client} for {minutes} min</button>"#
                 )
             })
             .collect::<String>()
@@ -199,7 +200,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     };
     let grant_note = match info.grant_mode {
         GrantMode::Session => {
-            "A session approval covers this server's read tools for the agent session."
+            "A client approval covers this server's read tools for every running session of that client, because the client does not identify its sessions."
         }
         GrantMode::PerCall => "This tool needs approval for every call.",
     };
@@ -211,7 +212,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     let body = format!(
         r#"<main data-kind="approve" data-base="/approve/{id}">
 <h1>{title}</h1>
-<p class="meta">Client {client} {version}<br>Session {session}<br>Execution {execution}</p>
+<p class="meta">Client {client} {version}<br>Execution {execution}</p>
 <p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>. {grant_note}</p>
 <h2>Arguments</h2>
 <pre>{arguments}</pre>
@@ -219,7 +220,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
 <pre>{script}</pre>
 <div class="buttons">
 <button class="approve" data-choice="once">Approve once</button>
-{session_buttons}
+{client_buttons}
 <button class="deny" data-choice="deny">Deny</button>
 </div>
 <p id="status" role="status"></p>
@@ -229,7 +230,6 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         title = escape(&title),
         client = escape(info.caller.client_label()),
         version = escape(info.caller.client_version.as_deref().unwrap_or("")),
-        session = escape(info.caller.session.as_deref().unwrap_or("none")),
         execution = escape(&info.execution_id),
         left = info.time_left().as_secs(),
         left_text = escape(&human_duration(info.time_left().as_millis() as i64)),
@@ -285,10 +285,10 @@ async fn approve_options(
         Some(Choice::Deny) | None => return json_error(StatusCode::BAD_REQUEST, "unknown choice"),
         Some(choice) => choice,
     };
-    if matches!(choice, Choice::Session(_))
-        && (info.grant_mode != GrantMode::Session || info.caller.session.is_none())
+    if matches!(choice, Choice::Client(_))
+        && (info.grant_mode != GrantMode::Session || info.caller.client_name.is_none())
     {
-        return decide_error(&DecideError::SessionNotAllowed);
+        return decide_error(&DecideError::GrantNotAllowed);
     }
 
     match state.passkeys.start_authentication(&id, choice) {
@@ -496,7 +496,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
         clients.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&client.client),
-            client.sessions,
+            client.runs,
             client.calls,
             client.executions,
             escape(&percent(client.success_rate())),
@@ -534,7 +534,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
         r#"<h1>codemode-mcp usage</h1>
 <p class="meta">Last {window}. Use <code>?since=1d</code> to change the window.</p>
 <h2>Clients</h2>
-<table><tr><th>Client</th><th>Sessions</th><th>Calls</th><th>Executions</th><th>Success</th><th>Attempts to success</th></tr>{clients}</table>
+<table><tr><th>Client</th><th>Runs (approximate when session-less)</th><th>Calls</th><th>Executions</th><th>Success</th><th>Attempts to success</th></tr>{clients}</table>
 <h2>Top error fingerprints</h2>
 <table><tr><th>Count</th><th>Fingerprint</th></tr>{fingerprints}</table>
 <h2>Slowest upstream tools</h2>

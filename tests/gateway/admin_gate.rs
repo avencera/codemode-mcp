@@ -102,11 +102,11 @@ async fn a_second_passkey_needs_approval_from_the_first() -> TestResult {
         .admin_json("/admin/enroll", &json!({ "label": "iPhone\" (you asked)" }))
         .await?;
     assert_eq!(status, 400);
-    assert!(!html.contains("for this session"), "{html}");
+    assert!(!html.contains("15 min"), "{html}");
     let (status, _) = harness
         .post_json(
             &format!("/approve/{id}/options"),
-            &json!({ "choice": "session15" }),
+            &json!({ "choice": "client15" }),
         )
         .await?;
     assert_eq!(status, 400);
@@ -218,7 +218,7 @@ async fn removing_a_passkey_needs_approval_and_never_the_last() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn assertions_approve_one_request_once_and_grants_stay_in_their_session() -> TestResult {
+async fn assertions_approve_one_request_once_and_grants_stay_with_their_client() -> TestResult {
     let Some(harness) = gated_harness().await? else {
         return Ok(());
     };
@@ -255,13 +255,19 @@ async fn assertions_approve_one_request_once_and_grants_stay_in_their_session() 
     assert!(harness.app.approvals().info(&a).is_some());
     assert!(harness.app.approvals().info(&b).is_some());
 
-    // a session grant in one MCP session does not cover another
+    // a grant covers a second connection of the same client but not another
+    // client
     harness
         .app
         .approvals()
-        .decide(&a, Choice::Session(Duration::from_secs(15 * 60)))?;
-    let other = harness.second_client().await?;
-    let pending = super::harness::execute(&other, "int(await fixture_add(a=2, b=2))").await?;
+        .decide(&a, Choice::Client(Duration::from_secs(15 * 60)))?;
+    let same = harness.second_client().await?;
+    let covered = super::harness::execute(&same, "int(await fixture_add(a=2, b=2))").await?;
+    let covered: Value = serde_json::from_str(&text_of(&covered))?;
+    assert_eq!(covered["result"], 4, "{covered}");
+    same.cancel().await?;
+    let other = harness.client_as("someone-else/2").await?;
+    let pending = super::harness::execute(&other, "int(await fixture_add(a=3, b=3))").await?;
     let pending: Value = serde_json::from_str(&text_of(&pending))?;
     assert_eq!(pending["status"], "pending", "{pending}");
     other.cancel().await?;

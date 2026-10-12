@@ -6,7 +6,7 @@
 # [notify.ntfy] section is added here
 
 # 1Password Environments: every call needs a phone passkey approval. Read
-# tools accept a 15 or 60 minute session grant; writes ask on every call
+# tools accept a 15 or 60 minute client grant; writes ask on every call
 [servers.onepassword]
 command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
 policy = "ask"
@@ -35,7 +35,7 @@ oauth = true
 
 # homebased through the built-in adapter. Submitting arbitrary commands,
 # cancelling tasks and messaging other sessions ask on the phone, with a
-# session grant. task_submit_agent stays `allow`, yet homebased runs workers
+# client grant. task_submit_agent stays `allow`, yet homebased runs workers
 # with their sandbox and approvals bypassed, so a submitted worker can run
 # anything its prompt asks for; add a policy = "ask" table for it to require
 # a phone approval

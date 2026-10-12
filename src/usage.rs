@@ -191,21 +191,35 @@ fn normalize_word(word: &str) -> String {
     word.to_owned()
 }
 
+/// Client name recorded for scripts run with `codemode-mcp exec`
+pub const EXEC_CLIENT: &str = "codemode-mcp exec";
+
 /// Who made an agent-facing call
 #[derive(Debug, Clone, Default)]
 pub struct Caller {
-    /// MCP session id (`Mcp-Session-Id`)
+    /// MCP session id (`Mcp-Session-Id`); `None` for session-less callers
     pub session: Option<String>,
-    /// Client name from the MCP `initialize` request
+    /// Client name from the request `_meta`, the `initialize` request or the
+    /// `user-agent` header
     pub client_name: Option<String>,
-    /// Client version from the MCP `initialize` request
+    /// Client version, from the same place as the name
     pub client_version: Option<String>,
+    /// Human-readable client name when the client sent one; shown on the
+    /// approval page and not logged
+    pub client_title: Option<String>,
 }
 
 impl Caller {
     /// Client name for display, `unknown` when the client sent none
     pub fn client_label(&self) -> &str {
         self.client_name.as_deref().unwrap_or("unknown")
+    }
+
+    /// Client title for display, falling back to the client name
+    pub fn client_display(&self) -> &str {
+        self.client_title
+            .as_deref()
+            .unwrap_or_else(|| self.client_label())
     }
 }
 

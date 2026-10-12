@@ -9,12 +9,14 @@ use std::{
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::store::now_ms;
+use crate::{store::now_ms, usage::EXEC_CLIENT};
 
 /// Error fingerprints listed at most
 const TOP_FINGERPRINTS: usize = 10;
-/// Sessions shown with their full attempt sequence
-const WORST_SESSIONS: usize = 5;
+/// Runs shown with their full attempt sequence
+const WORST_RUNS: usize = 5;
+/// Calls of one session-less client further apart than this start a new run
+const RUN_GAP_MS: i64 = 10 * 60 * 1000;
 /// Rows listed in the other review tables
 const TOP_ROWS: usize = 20;
 
@@ -47,20 +49,21 @@ pub fn parse_since(text: &str) -> Result<Duration, String> {
 /// Headline numbers for one client
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClientStats {
-    /// Client name from `initialize`
+    /// Client name from the request `_meta`, `initialize` or `user-agent`
     pub client: String,
     /// Agent-facing calls
     pub calls: i64,
-    /// Distinct MCP sessions
-    pub sessions: i64,
+    /// Distinct runs: MCP sessions, or for session-less callers stretches of
+    /// calls with gaps under 10 minutes (approximate)
+    pub runs: i64,
     /// Calls per agent-facing tool
     pub by_tool: BTreeMap<String, i64>,
     /// Finished executions
     pub executions: i64,
     /// Executions that ended `ok`
     pub succeeded: i64,
-    /// Mean executions per session up to and including the first success,
-    /// over sessions that succeeded
+    /// Mean executions per run up to and including the first success, over
+    /// runs that succeeded
     pub mean_attempts: Option<f64>,
 }
 
@@ -116,14 +119,58 @@ pub struct Stats {
     pub approvals: ApprovalStats,
 }
 
-/// One execution in a session's attempt sequence
+/// One execution in a run's attempt sequence
 #[derive(Debug, Clone)]
 struct Attempt {
-    session: String,
+    run: String,
     client: String,
     outcome: String,
     detail: Option<String>,
     script: String,
+}
+
+/// Splits session-less callers' activity into runs
+///
+/// A run is a session id when one exists. Otherwise it is one client's
+/// calls and executions with gaps under 10 minutes, so it is approximate:
+/// two sessions of one client that overlap or follow closely merge
+struct Runs {
+    /// Start of each run per client, ascending
+    starts: HashMap<String, Vec<i64>>,
+}
+
+impl Runs {
+    /// `events` are (client, time) pairs of session-less activity, ordered
+    /// by time
+    fn new(events: impl IntoIterator<Item = (String, i64)>) -> Self {
+        let mut starts: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut previous: HashMap<String, i64> = HashMap::new();
+        for (client, at_ms) in events {
+            let continues = previous
+                .insert(client.clone(), at_ms)
+                .is_some_and(|before| at_ms - before < RUN_GAP_MS);
+            if !continues {
+                starts.entry(client).or_default().push(at_ms);
+            }
+        }
+
+        Self { starts }
+    }
+
+    /// Identifier of the run an event belongs to; the event must have been
+    /// passed to [`Runs::new`] when it has no session
+    fn key(&self, session: Option<&str>, client: &str, at_ms: i64) -> String {
+        if let Some(session) = session {
+            return session.to_owned();
+        }
+        let start = self.starts.get(client).and_then(|starts| {
+            let after = starts.partition_point(|start| *start <= at_ms);
+
+            after.checked_sub(1).map(|index| starts[index])
+        });
+
+        format!("{client} from {}", central_time(start.unwrap_or(at_ms)))
+    }
 }
 
 /// Reads usage records from `since` until now
@@ -174,16 +221,32 @@ impl<'a> Reporter<'a> {
             entry.by_tool.insert(tool, count);
         }
 
+        let runs = self.runs()?;
         let mut statement = self.connection.prepare(
-            "SELECT COALESCE(client_name, 'unknown'), COUNT(DISTINCT session) FROM calls \
-             WHERE at_ms >= ?1 GROUP BY 1",
+            "SELECT session, COALESCE(client_name, 'unknown'), at_ms FROM calls \
+             WHERE at_ms >= ?1 \
+             UNION ALL \
+             SELECT session, COALESCE(client_name, 'unknown'), started_ms FROM executions \
+             WHERE started_ms >= ?1 AND client_name IS NOT ?2",
         )?;
-        let rows = statement.query_map(params![self.since_ms], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        let rows = statement.query_map(params![self.since_ms, EXEC_CLIENT], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
+        let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
         for row in rows {
-            let (client, sessions) = row?;
-            clients.entry(client).or_default().sessions = sessions;
+            let (session, client, at_ms) = row?;
+            seen.entry(client.clone()).or_default().insert(runs.key(
+                session.as_deref(),
+                &client,
+                at_ms,
+            ));
+        }
+        for (client, keys) in seen {
+            clients.entry(client).or_default().runs = keys.len() as i64;
         }
 
         let mut statement = self.connection.prepare(
@@ -206,7 +269,7 @@ impl<'a> Reporter<'a> {
         }
 
         let mut attempts_until: HashMap<String, Vec<usize>> = HashMap::new();
-        for sequence in self.sessions()?.values() {
+        for sequence in self.attempts()?.values() {
             if let Some(position) = sequence.iter().position(|attempt| attempt.outcome == "ok") {
                 attempts_until
                     .entry(sequence[0].client.clone())
@@ -225,34 +288,58 @@ impl<'a> Reporter<'a> {
         Ok(clients)
     }
 
-    /// Executions of each session in order; executions without a session
-    /// (the `exec` CLI) are left out
-    fn sessions(&self) -> Result<BTreeMap<String, Vec<Attempt>>, rusqlite::Error> {
+    /// Activity of session-less callers, which `Runs` splits by time gaps;
+    /// the `exec` CLI is left out because it is no agent
+    fn runs(&self) -> Result<Runs, rusqlite::Error> {
         let mut statement = self.connection.prepare(
-            "SELECT session, COALESCE(client_name, 'unknown'), outcome, detail, script \
-             FROM executions WHERE started_ms >= ?1 AND session IS NOT NULL \
-             ORDER BY session, started_ms",
+            "SELECT COALESCE(client_name, 'unknown'), at_ms FROM calls \
+             WHERE at_ms >= ?1 AND session IS NULL AND client_name IS NOT ?2 \
+             UNION ALL \
+             SELECT COALESCE(client_name, 'unknown'), started_ms FROM executions \
+             WHERE started_ms >= ?1 AND session IS NULL AND client_name IS NOT ?2 \
+             ORDER BY 2",
         )?;
-        let rows = statement.query_map(params![self.since_ms], |row| {
+        let events = statement
+            .query_map(params![self.since_ms, EXEC_CLIENT], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Runs::new(events))
+    }
+
+    /// Executions of each run in order; the `exec` CLI is left out
+    fn attempts(&self) -> Result<BTreeMap<String, Vec<Attempt>>, rusqlite::Error> {
+        let runs = self.runs()?;
+        let mut statement = self.connection.prepare(
+            "SELECT session, COALESCE(client_name, 'unknown'), started_ms, outcome, detail, script \
+             FROM executions WHERE started_ms >= ?1 AND client_name IS NOT ?2 \
+             ORDER BY started_ms",
+        )?;
+        let rows = statement.query_map(params![self.since_ms, EXEC_CLIENT], |row| {
+            let session: Option<String> = row.get(0)?;
+            let client: String = row.get(1)?;
+            let started_ms: i64 = row.get(2)?;
+
             Ok(Attempt {
-                session: row.get(0)?,
-                client: row.get(1)?,
-                outcome: row.get(2)?,
-                detail: row.get(3)?,
-                script: row.get(4)?,
+                run: runs.key(session.as_deref(), &client, started_ms),
+                client,
+                outcome: row.get(3)?,
+                detail: row.get(4)?,
+                script: row.get(5)?,
             })
         })?;
 
-        let mut sessions: BTreeMap<String, Vec<Attempt>> = BTreeMap::new();
+        let mut attempts: BTreeMap<String, Vec<Attempt>> = BTreeMap::new();
         for attempt in rows {
             let attempt = attempt?;
-            sessions
-                .entry(attempt.session.clone())
+            attempts
+                .entry(attempt.run.clone())
                 .or_default()
                 .push(attempt);
         }
 
-        Ok(sessions)
+        Ok(attempts)
     }
 
     fn fingerprints(&self) -> Result<Vec<(String, i64)>, rusqlite::Error> {
@@ -338,6 +425,11 @@ impl<'a> Reporter<'a> {
         let _ = writeln!(out, "# codemode-mcp usage review\n");
         let _ = writeln!(
             out,
+            "Runs (approximate when session-less): a run is an MCP session when the client has \
+             one, otherwise one client's calls with gaps under 10 minutes.\n"
+        );
+        let _ = writeln!(
+            out,
             "Window: last {} (since {})\n",
             human_duration(now_ms() - self.since_ms),
             central_time(self.since_ms)
@@ -362,7 +454,7 @@ impl<'a> Reporter<'a> {
         }
         let _ = writeln!(
             out,
-            "| Client | Sessions | Calls | search | describe | execute | wait | Executions | Success rate | Mean attempts to success |"
+            "| Client | Runs | Calls | search | describe | execute | wait | Executions | Success rate | Mean attempts to success |"
         );
         let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|");
         for client in &stats.clients {
@@ -371,7 +463,7 @@ impl<'a> Reporter<'a> {
                 out,
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 cell(&client.client),
-                client.sessions,
+                client.runs,
                 client.calls,
                 count("search_tools"),
                 count("describe_tools"),
@@ -435,10 +527,10 @@ impl<'a> Reporter<'a> {
     fn retry_section(&self, out: &mut String) -> Result<(), rusqlite::Error> {
         let _ = writeln!(
             out,
-            "## Sessions with the most failed executes before success\n"
+            "## Runs with the most failed executes before success\n"
         );
         let mut ranked: Vec<(usize, bool, Vec<Attempt>)> = self
-            .sessions()?
+            .attempts()?
             .into_values()
             .filter_map(|sequence| {
                 let success = sequence.iter().position(|attempt| attempt.outcome == "ok");
@@ -448,11 +540,11 @@ impl<'a> Reporter<'a> {
             .collect();
         ranked.sort_by_key(|ranked| std::cmp::Reverse(ranked.0));
         if ranked.is_empty() {
-            let _ = writeln!(out, "No session needed a retry.\n");
+            let _ = writeln!(out, "No run needed a retry.\n");
             return Ok(());
         }
 
-        for (failed, succeeded, sequence) in ranked.into_iter().take(WORST_SESSIONS) {
+        for (failed, succeeded, sequence) in ranked.into_iter().take(WORST_RUNS) {
             let first = &sequence[0];
             let ending = if succeeded {
                 "then succeeded"
@@ -461,9 +553,9 @@ impl<'a> Reporter<'a> {
             };
             let _ = writeln!(
                 out,
-                "### {} session `{}`: {failed} failed, {ending}\n",
+                "### {} run `{}`: {failed} failed, {ending}\n",
                 cell(&first.client),
-                inline(&first.session)
+                inline(&first.run)
             );
             for (index, attempt) in sequence.iter().enumerate() {
                 let _ = writeln!(
@@ -544,62 +636,75 @@ impl<'a> Reporter<'a> {
     fn undescribed_section(&self, out: &mut String) -> Result<(), rusqlite::Error> {
         let _ = writeln!(
             out,
-            "## Executes that called tools never described in the session\n"
+            "## Executes that called tools never described in that run\n"
         );
+        let runs = self.runs()?;
         let mut described: HashMap<String, HashSet<String>> = HashMap::new();
         let mut statement = self.connection.prepare(
-            "SELECT session, input FROM calls WHERE at_ms >= ?1 AND tool = 'describe_tools' \
-             AND session IS NOT NULL",
-        )?;
-        let rows = statement.query_map(params![self.since_ms], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
-        for row in rows {
-            let (session, input) = row?;
-            let names: Vec<String> = input
-                .and_then(|input| serde_json::from_str(&input).ok())
-                .unwrap_or_default();
-            described.entry(session).or_default().extend(names);
-        }
-
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT u.function, e.session, e.id FROM upstream_calls u \
-             JOIN executions e ON e.id = u.execution_id \
-             WHERE e.started_ms >= ?1 AND e.session IS NOT NULL",
+            "SELECT session, COALESCE(client_name, 'unknown'), at_ms, input FROM calls \
+             WHERE at_ms >= ?1 AND tool = 'describe_tools'",
         )?;
         let rows = statement.query_map(params![self.since_ms], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(0)?,
                 row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (session, client, at_ms, input) = row?;
+            let names: Vec<String> = input
+                .and_then(|input| serde_json::from_str(&input).ok())
+                .unwrap_or_default();
+            described
+                .entry(runs.key(session.as_deref(), &client, at_ms))
+                .or_default()
+                .extend(names);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT u.function, e.session, COALESCE(e.client_name, 'unknown'), \
+                    e.started_ms, e.id \
+             FROM upstream_calls u JOIN executions e ON e.id = u.execution_id \
+             WHERE e.started_ms >= ?1 AND e.client_name IS NOT ?2",
+        )?;
+        let rows = statement.query_map(params![self.since_ms, EXEC_CLIENT], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let mut unseen: BTreeMap<String, (HashSet<String>, HashSet<String>)> = BTreeMap::new();
         for row in rows {
-            let (function, session, execution) = row?;
+            let (function, session, client, started_ms, execution) = row?;
+            let run = runs.key(session.as_deref(), &client, started_ms);
             if described
-                .get(&session)
+                .get(&run)
                 .is_some_and(|names| names.contains(&function))
             {
                 continue;
             }
             let entry = unseen.entry(function).or_default();
             entry.0.insert(execution);
-            entry.1.insert(session);
+            entry.1.insert(run);
         }
         if unseen.is_empty() {
             let _ = writeln!(out, "None.\n");
             return Ok(());
         }
 
-        let _ = writeln!(out, "| Tool | Executions | Sessions |\n|---|---|---|");
-        for (function, (executions, sessions)) in unseen.into_iter().take(TOP_ROWS) {
+        let _ = writeln!(out, "| Tool | Executions | Runs |\n|---|---|---|");
+        for (function, (executions, runs)) in unseen.into_iter().take(TOP_ROWS) {
             let _ = writeln!(
                 out,
                 "| `{}` | {} | {} |",
                 inline(&function),
                 executions.len(),
-                sessions.len()
+                runs.len()
             );
         }
         out.push('\n');
@@ -621,19 +726,36 @@ impl<'a> Reporter<'a> {
             .collect::<Result<_, _>>()?;
         query_table(out, &empty, "Times");
 
-        let _ = writeln!(out, "## Repeated searches (same query, same session)\n");
+        let _ = writeln!(out, "## Repeated searches (same query, same run)\n");
+        let runs = self.runs()?;
         let mut statement = self.connection.prepare(
-            "SELECT input, SUM(times) FROM ( \
-                 SELECT session, COALESCE(input, '') AS input, COUNT(*) AS times FROM calls \
-                 WHERE at_ms >= ?1 AND tool = 'search_tools' AND session IS NOT NULL \
-                 GROUP BY session, input HAVING COUNT(*) > 1 \
-             ) GROUP BY input ORDER BY 2 DESC, 1 LIMIT ?2",
+            "SELECT session, COALESCE(client_name, 'unknown'), at_ms, COALESCE(input, '') \
+             FROM calls WHERE at_ms >= ?1 AND tool = 'search_tools'",
         )?;
-        let repeated: Vec<(String, i64)> = statement
-            .query_map(params![self.since_ms, TOP_ROWS as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<Result<_, _>>()?;
+        let rows = statement.query_map(params![self.since_ms], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut per_run: HashMap<(String, String), i64> = HashMap::new();
+        for row in rows {
+            let (session, client, at_ms, query) = row?;
+            *per_run
+                .entry((runs.key(session.as_deref(), &client, at_ms), query))
+                .or_default() += 1;
+        }
+        let mut totals: HashMap<String, i64> = HashMap::new();
+        for ((_, query), times) in per_run {
+            if times > 1 {
+                *totals.entry(query).or_default() += times;
+            }
+        }
+        let mut repeated: Vec<(String, i64)> = totals.into_iter().collect();
+        repeated.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        repeated.truncate(TOP_ROWS);
         query_table(out, &repeated, "Times");
 
         Ok(())
@@ -673,7 +795,7 @@ pub fn render_stats(stats: &Stats) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Since {} ago\n",
+        "Since {} ago (runs are approximate when session-less)\n",
         human_duration(now_ms() - stats.since_ms)
     );
     if stats.clients.is_empty() {
@@ -687,10 +809,10 @@ pub fn render_stats(stats: &Stats) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "{}: {} calls in {} sessions ({})\n  executions {}, success rate {}, mean attempts to success {}",
+            "{}: {} calls in {} runs ({})\n  executions {}, success rate {}, mean attempts to success {}",
             client.client,
             client.calls,
-            client.sessions,
+            client.runs,
             tools.join(", "),
             client.executions,
             percent(client.success_rate()),

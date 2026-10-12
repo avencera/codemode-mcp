@@ -18,7 +18,9 @@ use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, CallToolResult},
     service::{RoleClient, RunningService},
-    transport::StreamableHttpClientTransport,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde_json::{Value, json};
 use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
@@ -52,6 +54,26 @@ pub fn monty_worker() -> Result<Option<PathBuf>, Box<dyn Error>> {
         path.display()
     )
     .into())
+}
+
+/// Client name the default harness client identifies itself as, through its
+/// `user-agent` header since a stateless server never sees its `initialize`
+pub const DEFAULT_CLIENT: &str = "harness-client";
+
+/// An MCP client whose requests carry `user_agent`; it still sends
+/// `initialize` and tolerates a server that issues no session id
+pub async fn connect_as(base: &str, user_agent: &str) -> Result<Client, Box<dyn Error>> {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp"));
+    config.allow_stateless = true;
+    config.custom_headers.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_str(user_agent)?,
+    );
+
+    Ok(
+        ().serve(StreamableHttpClientTransport::from_config(config))
+            .await?,
+    )
 }
 
 /// A fresh state directory under the system temp dir
@@ -182,8 +204,8 @@ impl Harness {
         let app = App::start_with(config, installed).await?;
         app.gateway().wait_ready(Duration::from_secs(30)).await;
         let server = serve(&app).await?;
-        let url = format!("http://127.0.0.1:{}/mcp", server.local_addr().port());
-        let client: Client = ().serve(StreamableHttpClientTransport::from_uri(url)).await?;
+        let base = format!("http://127.0.0.1:{}", server.local_addr().port());
+        let client = connect_as(&base, &format!("{DEFAULT_CLIENT}/1.0")).await?;
 
         Ok(Some(Self {
             app,
@@ -195,14 +217,14 @@ impl Harness {
         }))
     }
 
-    /// Another MCP client, so another MCP session, on the same server
+    /// Another connection from the same client as the harness client
     pub async fn second_client(&self) -> Result<Client, Box<dyn Error>> {
-        let url = format!("{}/mcp", self.base());
+        self.client_as(&format!("{DEFAULT_CLIENT}/1.0")).await
+    }
 
-        Ok(
-            ().serve(StreamableHttpClientTransport::from_uri(url))
-                .await?,
-        )
+    /// A connection whose `user-agent` names another client
+    pub async fn client_as(&self, user_agent: &str) -> Result<Client, Box<dyn Error>> {
+        connect_as(&self.base(), user_agent).await
     }
 
     /// Runs a script that must succeed and returns the parsed response

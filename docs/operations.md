@@ -86,7 +86,8 @@ policy = "deny"
 ```
 
 - `oauth = true` on a `url` server enables `oauth login` (optional `scopes`, `client_name`).
-- Per tool: `policy` (`allow`, `ask`, `deny`) and, for `ask`, `grant` (`session` or `per_call`).
+- Per tool: `policy` (`allow`, `ask`, `deny`) and, for `ask`, `grant` (`session` or `per_call`). A `session` grant is given to the calling client, not to one MCP session: it covers every running session of that client name for 15 or 60 minutes.
+- The server is session-less: it issues no `mcp-session-id`, for any protocol version. Clients are told apart by the client name in the request `_meta`, the `initialize` handshake or the `user-agent` header. While `execute` or `wait` is waiting, it sends progress notifications every `limits.progress_interval_ms` (15000) to clients that sent a `progressToken`.
 - Check the result with `codemode-mcp tools` (connects, lists every tool with its status).
 
 ## Read the usage review
@@ -96,7 +97,7 @@ codemode-mcp stats --since 7d
 codemode-mcp review --since 7d --out review.md
 ```
 
-The review lists the most common error fingerprints with an example, the sessions that struggled most,
+The review lists the most common error fingerprints with an example, the runs that struggled most (a run is an MCP session, or for session-less clients one client's calls with gaps under 10 minutes, so approximate),
 hallucinated tool names, scripts that called tools they never described, and approval timings. Use it to fix
 the agent directions or the stubs. `/stats` on the main listener shows the same numbers as `stats`.
 

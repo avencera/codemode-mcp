@@ -1,4 +1,4 @@
-//! Approval requests for `ask` tools: pending requests, session grants,
+//! Approval requests for `ask` tools: pending requests, client grants,
 //! notifications and expiry
 //!
 //! The web page (after a passkey assertion) and tests both answer requests
@@ -30,31 +30,32 @@ pub const NO_NOTIFIER: &str = "approvals are not configured: add a [notify.ntfy]
 /// Reason given by `codemode-mcp exec`, which serves no approval page
 pub const NO_APPROVAL_PAGE: &str = "`codemode-mcp exec` cannot ask for approval; run the script \
      through the daemon's execute tool instead";
-/// Session grant lengths offered on the approval page, in minutes
-pub const SESSION_GRANT_MINUTES: [u64; 2] = [15, 60];
+/// Client grant lengths offered on the approval page, in minutes
+pub const CLIENT_GRANT_MINUTES: [u64; 2] = [15, 60];
 
 /// What the owner chose on the approval page
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choice {
     /// Run this call only
     Once,
-    /// Run this call and cover the session for the given time
-    Session(Duration),
+    /// Run this call and cover every session of the same client for the
+    /// given time
+    Client(Duration),
     /// Refuse the call
     Deny,
 }
 
 impl Choice {
-    /// Parses the page's button values: `once`, `session15`, `session60`, `deny`
+    /// Parses the page's button values: `once`, `client15`, `client60`, `deny`
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "once" => Some(Self::Once),
             "deny" => Some(Self::Deny),
             other => {
-                let minutes: u64 = other.strip_prefix("session")?.parse().ok()?;
-                SESSION_GRANT_MINUTES
+                let minutes: u64 = other.strip_prefix("client")?.parse().ok()?;
+                CLIENT_GRANT_MINUTES
                     .contains(&minutes)
-                    .then(|| Self::Session(Duration::from_secs(minutes * 60)))
+                    .then(|| Self::Client(Duration::from_secs(minutes * 60)))
             }
         }
     }
@@ -124,7 +125,7 @@ pub struct ApprovalInfo {
     pub arguments: Map<String, Value>,
     /// The script making the call
     pub script: Arc<str>,
-    /// Whether a session grant may be given
+    /// Whether a client grant may be given
     pub grant_mode: GrantMode,
     /// When the request is denied automatically
     pub expires_at: Instant,
@@ -162,7 +163,7 @@ pub struct GateRequest<'a> {
 
 /// Whether a call may run now
 pub enum Gate {
-    /// A session grant covers the call
+    /// A client grant covers the call
     Open {
         /// Approval that created the grant
         approval_id: String,
@@ -231,10 +232,10 @@ pub enum DecideError {
     /// including one past its expiry whose timer has not fired yet)
     #[error("no pending approval with this id")]
     NotFound,
-    /// A session grant was chosen for a per-call tool, or for a caller
-    /// without an MCP session
+    /// A client grant was chosen for a per-call tool, or for a caller that
+    /// did not identify its client
     #[error("this request can only be approved once")]
-    SessionNotAllowed,
+    GrantNotAllowed,
 }
 
 struct Pending {
@@ -250,7 +251,7 @@ struct Grant {
 #[derive(Default)]
 struct State {
     pending: HashMap<String, Pending>,
-    /// Keyed by (MCP session, server)
+    /// Keyed by (client name, server)
     grants: HashMap<(String, String), Grant>,
     /// Pending requests whose notification could not be delivered
     unnotified: HashSet<String>,
@@ -373,9 +374,9 @@ impl Approvals {
                 title: request.title.clone(),
             },
             caller: Caller {
-                session: None,
                 client_name: Some(ADMIN_CLIENT.to_owned()),
                 client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                ..Caller::default()
             },
             execution_id: String::new(),
             server: ADMIN_SERVER.to_owned(),
@@ -492,15 +493,15 @@ impl Approvals {
         if request.grant_mode != GrantMode::Session {
             return None;
         }
-        let session = request.caller.session.as_ref()?;
+        let client = request.caller.client_name.as_ref()?;
         let mut state = self.state();
-        // sessions end without telling us, so expired grants are swept here
+        // clients end without telling us, so expired grants are swept here
         let now = Instant::now();
         state.grants.retain(|_, grant| grant.expires_at > now);
 
         state
             .grants
-            .get(&(session.clone(), request.server.to_owned()))
+            .get(&(client.clone(), request.server.to_owned()))
             .map(|grant| grant.approval_id.clone())
     }
 
@@ -534,8 +535,8 @@ impl Approvals {
 
     /// Applies the owner's choice to a pending request
     ///
-    /// A session grant also answers the session's other pending requests for
-    /// session-grant tools of the same server
+    /// A client grant also answers the client's other pending requests for
+    /// grantable tools of the same server
     pub fn decide(&self, id: &str, choice: Choice) -> Result<(), DecideError> {
         let info = self.info(id).ok_or(DecideError::NotFound)?;
 
@@ -556,12 +557,12 @@ impl Approvals {
                     return Err(DecideError::NotFound);
                 }
             }
-            Choice::Session(length) => {
-                let Some(session) = &info.caller.session else {
-                    return Err(DecideError::SessionNotAllowed);
+            Choice::Client(length) => {
+                let Some(client) = &info.caller.client_name else {
+                    return Err(DecideError::GrantNotAllowed);
                 };
                 if info.grant_mode != GrantMode::Session || info.kind != ApprovalKind::ToolCall {
-                    return Err(DecideError::SessionNotAllowed);
+                    return Err(DecideError::GrantNotAllowed);
                 }
                 let minutes = Some((length.as_secs() / 60) as i64);
                 let verdict = Verdict::Approved {
@@ -570,18 +571,18 @@ impl Approvals {
                 if !self.settle(id, Some(verdict), "approved", minutes) {
                     return Err(DecideError::NotFound);
                 }
-                self.grant(session, &info.server, id, length);
+                self.grant(client, &info.server, id, length);
             }
         }
 
         Ok(())
     }
 
-    fn grant(&self, session: &str, server: &str, approval_id: &str, length: Duration) {
+    fn grant(&self, client: &str, server: &str, approval_id: &str, length: Duration) {
         let covered: Vec<String> = {
             let mut state = self.state();
             state.grants.insert(
-                (session.to_owned(), server.to_owned()),
+                (client.to_owned(), server.to_owned()),
                 Grant {
                     approval_id: approval_id.to_owned(),
                     expires_at: Instant::now() + length,
@@ -593,7 +594,7 @@ impl Approvals {
                 .values()
                 .filter(|pending| {
                     pending.info.kind == ApprovalKind::ToolCall
-                        && pending.info.caller.session.as_deref() == Some(session)
+                        && pending.info.caller.client_name.as_deref() == Some(client)
                         && pending.info.server == server
                         && pending.info.grant_mode == GrantMode::Session
                 })

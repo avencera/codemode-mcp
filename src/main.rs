@@ -24,7 +24,7 @@ use codemode_mcp::{
     service::{self, Action, ServicePaths},
     store::{self, Store},
     usage::{
-        Caller,
+        Caller, EXEC_CLIENT,
         report::{Reporter, human_duration, parse_since, render_stats},
     },
 };
@@ -575,9 +575,9 @@ async fn exec_command(config: Config, script: &str) -> Result<()> {
 
     let run_started = Instant::now();
     let caller = Caller {
-        session: None,
-        client_name: Some("codemode-mcp exec".to_owned()),
+        client_name: Some(EXEC_CLIENT.to_owned()),
         client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        ..Caller::default()
     };
     let id = app.executions().start(code, caller)?;
     let outcome = loop {

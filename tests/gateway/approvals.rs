@@ -15,7 +15,9 @@ use codemode_mcp::{
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::harness::{Harness, ORIGIN, Setup, TestResult, approval_id, execute, text_of};
+use super::harness::{
+    DEFAULT_CLIENT, Harness, ORIGIN, Setup, TestResult, approval_id, execute, text_of,
+};
 
 /// `add` asks with session grants; `json_text` asks on every call
 const ASK_TOOLS: &str = "tools.add.policy = \"ask\"\n\
@@ -82,7 +84,10 @@ async fn approve_once_through_the_passkey_page() -> TestResult {
     assert_eq!(page.status().as_u16(), 200);
     let html = page.text().await?;
     assert!(html.contains("Approve once"), "{html}");
-    assert!(html.contains("Approve for this session, 15 min"), "{html}");
+    assert!(
+        html.contains(&format!("Approve {DEFAULT_CLIENT} for 15 min")),
+        "{html}"
+    );
     assert!(html.contains("&quot;a&quot;: 1"), "{html}");
     assert!(html.contains("&lt;script&gt;alert(1)"), "{html}");
     assert!(!html.contains("<script>alert"), "{html}");
@@ -112,7 +117,7 @@ async fn approve_once_through_the_passkey_page() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn session_grants_cover_the_session_and_per_call_tools_ask_again() -> TestResult {
+async fn client_grants_cover_the_client_and_per_call_tools_ask_again() -> TestResult {
     let Some(harness) = approval_harness("", "").await? else {
         return Ok(());
     };
@@ -124,28 +129,28 @@ async fn session_grants_cover_the_session_and_per_call_tools_ask_again() -> Test
         .await?;
     approvals.decide(
         &approval_id(&first)?,
-        Choice::Session(Duration::from_secs(15 * 60)),
+        Choice::Client(Duration::from_secs(15 * 60)),
     )?;
     let done: Value =
         serde_json::from_str(&text_of(&harness.wait_done(&execution_id(&first)).await?))?;
     assert_eq!(done["result"], 3, "{done}");
 
-    // the grant covers the next call of the same session without asking
+    // the grant covers the next call of the same client without asking
     let second = harness
         .execute_json("int(await fixture_add(a=2, b=2))")
         .await?;
     assert_eq!(second["result"], 4, "{second}");
     assert_eq!(harness.notifier.tool_requests().len(), 1);
 
-    // a per-call tool asks even inside a granted session, and refuses a
-    // session grant
+    // a per-call tool asks even inside a granted client, and refuses a
+    // client grant
     let per_call = harness.execute_body("await fixture_json_text()").await?;
     assert_eq!(per_call["waiting_for"], "fixture.json_text", "{per_call}");
     let id = approval_id(&per_call)?;
     let (status, _) = harness
         .post_json(
             &format!("/approve/{id}/options"),
-            &json!({ "choice": "session15" }),
+            &json!({ "choice": "client15" }),
         )
         .await?;
     assert_eq!(status, 400);

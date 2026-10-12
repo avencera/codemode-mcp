@@ -72,17 +72,19 @@ idempotent. `tools/list_changed` refreshes the catalog
 ### Approvals
 
 - Policy per tool: `allow`, `ask`, or `deny`, with server-level defaults (1Password: `ask`)
-- Grant mode per `ask` tool: `session` (default) or `per_call`. A session grant (15 or 60 min) covers every
-  `session`-grant tool of that server for the same MCP session (`Mcp-Session-Id`), and also answers that
-  session's other pending requests for such tools. `per_call` tools ask on every call and refuse session grants
+- Grant mode per `ask` tool: `session` (default, name kept for existing configs) or `per_call`. A client grant
+  (15 or 60 min) covers every `session`-grant tool of that server for every connection of the same client name
+  (see Protocol versions), and also answers that client's other pending requests for such tools. `per_call`
+  tools ask on every call and refuse client grants. A caller that sent no client name cannot be granted anything
 - An `ask` call needs a notifier and at least one enrolled passkey; otherwise it is refused at once
   (`no passkey enrolled; run \`codemode-mcp passkey enroll\``)
 - On an `ask` call the gateway creates a pending request (random 128-bit id) and sends an ntfy notification:
   title `codemode: <client> wants <server>.<tool>`, high priority, click URL `<public_origin>/approve/<id>`.
   Arguments never go into the notification
 - `GET /approve/{id}` (server-rendered, mobile layout, all agent-supplied text escaped, strict CSP) shows the
-  client, session, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
-  Approve for this session 15 / 60 min (only for `session` tools in a session); Deny
+  client, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
+  "Approve <client title or name> for 15 / 60 min" (only for `session` tools from a named client), with a line
+  saying the grant covers every running session of that client; Deny
 - Approving takes a passkey assertion (webauthn-rs 0.5): `POST /approve/{id}/options` binds the choice to a
   server-side ceremony (random id, 5 min TTL, in memory, never serialized), then `POST /approve/{id}/confirm`
   verifies the assertion and applies that choice. Deny (`POST /approve/{id}/deny`) needs no passkey. All POSTs
@@ -119,7 +121,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   prints and the page and notification repeat, labels may not contain quotes, and a removal is pinned to the
   passkey's enrollment time so a reused row id cannot be hit. The CLI warns when no notifier is configured.
   Agent `notify` titles are prefixed `agent:` so they cannot pass for these The first-passkey notification carries no link, because the
-  enrollment link is a capability. Admin approvals offer only Approve and Deny, never session grants
+  enrollment link is a capability. Admin approvals offer only Approve and Deny, never client grants
 - An ntfy token configured for a plain `http://` server logs a warning at startup
 
 ### 1Password warm-up
@@ -139,12 +141,35 @@ phone passkey approval. Unconfirmed: whether a 1Password lock ends the MCP sessi
 
 ### Protocol versions
 
-The server offers only MCP versions that open a session with `initialize`
-(2024-11-05 through 2025-11-25). The stateless 2026-07-28 protocol carries no
-session id, and approval grants and the usage log are keyed by MCP session.
-Claude Code 2.1 tries `server/discover` first and falls back to `initialize`
-when the server answers "Unsupported protocol version", so each Claude Code
-process gets its own session (verified 2026-10-12 with `claude -p`)
+The server is session-less for every client. It offers every protocol version rmcp knows (2024-11-05 through
+2026-07-28) and serves them with `StreamableHttpServerConfig::with_legacy_session_mode(false)` (rmcp
+`transport/streamable_http_server/tower.rs`, `legacy_session_mode`) over a `NeverSessionManager`. The 2026-07-28
+protocol is stateless by design and is where clients are heading. Older clients still send `initialize` and get
+a normal answer, but the server never issues an `mcp-session-id`, keeps no per-connection state, and has no
+server-to-client stream (`GET /mcp` answers 405). Nothing is lost on restart or expiry: a client cannot hit a
+dead session
+
+Callers are identified per request, in this order:
+
+1. `_meta["io.modelcontextprotocol/clientInfo"]` of the request (2026-07-28 clients send it on every call)
+2. the `initialize` handshake's client info, only when rmcp has one that is not its own default identity (a
+   session-less server rarely does, because later requests do not carry the handshake)
+3. the `user-agent` header, parsed as `name/version` from its first product (`claude-code/2.1.296 (...)`)
+
+`Mcp-Session-Id` is still logged when a client sends one, so `calls.session` is nullable and is `None` for
+session-less callers. Claude Code 2.1.296 sends `_meta` with clientInfo, the protocol version, a different
+`claudecode/toolUseId` on every call and a `progressToken`, and no session or conversation id anywhere
+(verified 2026-10-12 against a stateless build)
+
+Tradeoff: approval grants are keyed by (client name, server) instead of (MCP session, server). One approval
+covers every running session of that client for 15 or 60 minutes, so two Claude Code windows share it. The
+client name is also self-asserted (`_meta` or `user-agent`), so any program that can reach `/mcp` and claims the
+name of a client with a live grant rides on it. Reach is limited by the host guard and the network the daemon
+listens on, and per-call tools and admin actions never accept a grant
+
+Waiting `execute` and `wait` calls send MCP progress notifications about every 15 s (`limits.progress_interval_ms`)
+when the request carries a `progressToken`. Claude Code aborts an HTTP call that is idle for 5 minutes, and a
+notification counts as activity
 
 ### Agent-facing tools
 
@@ -166,7 +191,7 @@ response or progress notification aborts after 5 minutes of idle time
 Goal: see whether agents use Code Mode well or get confused, and feed that back into the directions and stubs
 
 - SQLite at `<state_dir>/codemode.sqlite` (WAL, numbered migrations in `PRAGMA user_version`, mode 0600).
-  Tables: `calls` (every agent-facing call: time, MCP session, client name/version from `initialize`, tool,
+  Tables: `calls` (every agent-facing call: time, MCP session (usually null), client name/version, tool,
   input — query, described names or script —, outcome, detail, fingerprint, duration, result bytes, execution id),
   `executions` (one row per finished execution with its script and final outcome), `upstream_calls` (server,
   tool, Python name, arguments, outcome, duration, approval id), `approvals`, `passkeys`
@@ -182,12 +207,15 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - Sensitive servers (`sensitive = true`, default when the server policy is `ask`): upstream rows keep tool name and
   outcome only; a failure from such a tool is logged as the tool name; once an execution has read a sensitive
   tool's result, its exception detail keeps only the exception type
-- `codemode-mcp stats [--since 7d]`: per client calls, sessions, execute success rate, mean attempts until success
-  per session; top 10 fingerprints; slowest upstream tools; approval counts. `GET /stats` shows the same
+- A "run" is the unit behind every per-session number: the MCP session id when one exists, otherwise one client
+  name's calls and executions with gaps under 10 minutes, computed in Rust from rows ordered by time. Session-less
+  runs are approximate: two sessions of one client that overlap or follow within 10 minutes merge
+- `codemode-mcp stats [--since 7d]`: per client calls, runs (approximate when session-less), execute success rate,
+  mean attempts until success per run; top 10 fingerprints; slowest upstream tools; approval counts. `GET /stats` shows the same
 - `codemode-mcp review [--since 7d] [--out FILE]`: Markdown with a per-client summary, top fingerprints with one
-  example script and error each, the 5 sessions with the most failed executes before success or abandonment as their
+  example script and error each, the 5 runs with the most failed executes before success or abandonment as their
   ordered attempt sequence, hallucinated tool names (`name_error` names that start with a configured `<server>_`),
-  executes that called tools never described in the session, empty and repeated searches, and approval stats
+  executes that called tools never described in that run, empty and repeated searches, and approval stats
   (count, median wait, denied, expired)
 - Retention `log_retention_days` (90); purged on startup and daily. Passkeys are kept
 
@@ -241,8 +269,8 @@ device, PR linking) are scoped to that thread and already present in every T3 se
 gateway would mean forwarding each caller's own token, which needs one upstream connection per caller session
 instead of the one long-lived connection per server everything else uses. The gain is small because T3
 sessions already have the tools. Seam for later: an upstream kind `caller_auth` whose `Upstream` is created
-lazily per MCP session (keyed by `Mcp-Session-Id`, token taken from a header the agent's entry sets), dropped
-with the session, and excluded from the shared catalog build
+lazily per caller (the server is session-less, so keyed by token header rather than a session id; the token comes
+from a header the agent's entry sets), dropped when idle, and excluded from the shared catalog build
 
 ### Our own MCPs: homebased adapter
 
