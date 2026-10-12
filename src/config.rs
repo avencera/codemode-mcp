@@ -9,7 +9,13 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::policy::Policy;
+use crate::policy::{GrantMode, Policy};
+
+/// Origin the approval and enrollment pages are reached through; its host is
+/// the WebAuthn relying party id
+const DEFAULT_PUBLIC_ORIGIN: &str = "https://mac.tailnet-name.ts.net:8443";
+/// ntfy server used when a notify section names none
+const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 
 /// Reasons a configuration file could not be loaded
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +63,27 @@ pub struct Config {
     /// How long one upstream tool call may run before it is cancelled
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
+    /// Address of the admin listener the CLI talks to; must be loopback
+    /// because the main listener is reachable through `tailscale serve`,
+    /// whose proxied requests also arrive from a loopback peer
+    #[serde(default = "default_admin_listen")]
+    pub admin_listen: SocketAddr,
+    /// Directory for the database and the snapshot key; defaults to
+    /// `$XDG_STATE_HOME/codemode-mcp` or `~/.local/state/codemode-mcp`
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// HTTPS origin phones use to reach the approval pages
+    #[serde(default = "default_public_origin")]
+    pub public_origin: String,
+    /// Days of usage records kept before they are purged
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u64,
+    /// Approval behaviour
+    #[serde(default)]
+    pub approvals: ApprovalsConfig,
+    /// Where approval notifications go
+    #[serde(default)]
+    pub notify: NotifyConfig,
     /// Sandbox and execution limits
     #[serde(default)]
     pub limits: Limits,
@@ -72,6 +99,12 @@ impl Default for Config {
             extra_allowed_hosts: Vec::new(),
             worker_path: None,
             tool_timeout_secs: default_tool_timeout_secs(),
+            admin_listen: default_admin_listen(),
+            state_dir: None,
+            public_origin: default_public_origin(),
+            log_retention_days: default_log_retention_days(),
+            approvals: ApprovalsConfig::default(),
+            notify: NotifyConfig::default(),
             limits: Limits::default(),
             servers: BTreeMap::new(),
         }
@@ -112,11 +145,59 @@ impl Config {
         Duration::from_secs(self.tool_timeout_secs)
     }
 
+    /// Directory holding the database and snapshot key
+    pub fn state_dir(&self) -> Result<PathBuf, ConfigError> {
+        if let Some(directory) = &self.state_dir {
+            return Ok(expand_home(directory));
+        }
+        if let Some(state) = std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(state).join("codemode-mcp"));
+        }
+        let home = std::env::var_os("HOME").ok_or(ConfigError::NoHome)?;
+
+        Ok(PathBuf::from(home).join(".local/state/codemode-mcp"))
+    }
+
+    /// Public origin without a trailing slash, for building page links
+    pub fn public_base(&self) -> &str {
+        self.public_origin.trim_end_matches('/')
+    }
+
+    /// How long usage records are kept
+    pub fn log_retention(&self) -> Duration {
+        Duration::from_secs(self.log_retention_days.saturating_mul(24 * 60 * 60))
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.tool_timeout_secs == 0 {
             return Err(ConfigError::Invalid(
                 "tool_timeout_secs must be positive".into(),
             ));
+        }
+        if !self.admin_listen.ip().is_loopback() {
+            return Err(ConfigError::Invalid(
+                "admin_listen must be a loopback address".into(),
+            ));
+        }
+        if !(self.public_origin.starts_with("https://")
+            || self.public_origin.starts_with("http://"))
+        {
+            return Err(ConfigError::Invalid(
+                "public_origin must be an http(s) origin".into(),
+            ));
+        }
+        if self.log_retention_days == 0 {
+            return Err(ConfigError::Invalid(
+                "log_retention_days must be positive".into(),
+            ));
+        }
+        if self.approvals.timeout_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "approvals.timeout_secs must be positive".into(),
+            ));
+        }
+        if let Some(ntfy) = &self.notify.ntfy {
+            ntfy.validate()?;
         }
         self.limits.validate()?;
 
@@ -139,6 +220,162 @@ fn default_listen() -> SocketAddr {
 
 fn default_tool_timeout_secs() -> u64 {
     120
+}
+
+fn default_admin_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 7682))
+}
+
+fn default_public_origin() -> String {
+    DEFAULT_PUBLIC_ORIGIN.to_owned()
+}
+
+fn default_log_retention_days() -> u64 {
+    90
+}
+
+/// Expands a leading `~/` to `$HOME`
+pub fn expand_home(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path.to_owned(),
+    }
+}
+
+/// Approval settings
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ApprovalsConfig {
+    /// Seconds a pending approval waits before it is denied automatically
+    pub timeout_secs: u64,
+}
+
+impl Default for ApprovalsConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 10 * 60,
+        }
+    }
+}
+
+impl ApprovalsConfig {
+    /// Pending-approval lifetime as a duration
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+}
+
+/// Notification settings
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NotifyConfig {
+    /// ntfy target; when absent the `[notify.ntfy]` section of homebased's
+    /// config is used
+    pub ntfy: Option<NtfyConfig>,
+    /// homebased config read for the fallback ntfy section
+    pub homebased_config: Option<PathBuf>,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            ntfy: None,
+            homebased_config: std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".config/homebased/config.toml")),
+        }
+    }
+}
+
+impl NotifyConfig {
+    /// The ntfy target: this config's own section, else homebased's
+    ///
+    /// A missing or unreadable homebased config means no notifier; its other
+    /// sections are ignored
+    pub fn resolve_ntfy(&self) -> Result<Option<NtfyConfig>, ConfigError> {
+        if let Some(ntfy) = &self.ntfy {
+            return Ok(Some(ntfy.clone()));
+        }
+        let Some(path) = &self.homebased_config else {
+            return Ok(None);
+        };
+        let path = expand_home(path);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(ConfigError::Read { path, source }),
+        };
+
+        #[derive(Deserialize)]
+        struct Homebased {
+            #[serde(default)]
+            notify: Option<HomebasedNotify>,
+        }
+        #[derive(Deserialize)]
+        struct HomebasedNotify {
+            #[serde(default)]
+            ntfy: Option<NtfyConfig>,
+        }
+
+        let parsed: Homebased =
+            toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?;
+        let ntfy = parsed.notify.and_then(|notify| notify.ntfy);
+        if let Some(ntfy) = &ntfy {
+            ntfy.validate()?;
+        }
+
+        Ok(ntfy)
+    }
+}
+
+/// An ntfy topic, in the same shape homebased uses
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NtfyConfig {
+    /// Server base URL
+    #[serde(default = "default_ntfy_server")]
+    pub server: String,
+    /// Topic name; a secret, so never logged
+    pub topic: String,
+    /// File holding a bearer token
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+}
+
+// hand-written so the topic and token path never reach logs through `{:?}`
+impl std::fmt::Debug for NtfyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NtfyConfig")
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+fn default_ntfy_server() -> String {
+    DEFAULT_NTFY_SERVER.to_owned()
+}
+
+impl NtfyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let topic_ok = !self.topic.is_empty()
+            && self.topic.len() <= 64
+            && self
+                .topic
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-".contains(character));
+        if !topic_ok {
+            return Err(ConfigError::Invalid(
+                "notify.ntfy.topic must be 1-64 ASCII letters, digits, `_` or `-`".into(),
+            ));
+        }
+        if !(self.server.starts_with("https://") || self.server.starts_with("http://")) {
+            return Err(ConfigError::Invalid(
+                "notify.ntfy.server must be an http(s) URL".into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Sandbox and scheduling limits for script executions
@@ -172,6 +409,9 @@ pub struct Limits {
     /// Cap on the JSON result of one execution, in bytes; the rest is cut
     /// off and marked truncated
     pub max_result_bytes: usize,
+    /// Cap on one upstream tool result handed to a script; larger results
+    /// raise an exception at the call site
+    pub max_tool_result_bytes: usize,
     /// Total size of finished results kept for `wait`; the oldest are
     /// dropped first
     pub max_retained_result_bytes: usize,
@@ -191,6 +431,7 @@ impl Default for Limits {
             result_ttl_secs: 30 * 60,
             max_output_bytes: 64 * 1024,
             max_result_bytes: 256 * 1024,
+            max_tool_result_bytes: 4 * 1024 * 1024,
             max_retained_result_bytes: 32 * 1024 * 1024,
         }
     }
@@ -228,6 +469,7 @@ impl Limits {
             ("max_suspensions", self.max_suspensions as u64),
             ("max_workers", self.max_workers as u64),
             ("max_result_bytes", self.max_result_bytes as u64),
+            ("max_tool_result_bytes", self.max_tool_result_bytes as u64),
             (
                 "max_retained_result_bytes",
                 self.max_retained_result_bytes as u64,
@@ -271,17 +513,47 @@ pub struct ServerConfig {
     /// Default policy for every tool of this server
     #[serde(default)]
     pub policy: Policy,
+    /// Whether usage logs keep only tool names and outcomes for this server;
+    /// defaults to true when `policy` is `ask`
+    #[serde(default)]
+    pub sensitive: Option<bool>,
     /// Per-tool overrides keyed by the upstream tool name
     #[serde(default)]
     pub tools: BTreeMap<String, ToolOverride>,
+    /// Calls `codemode-mcp op warm` runs to front-load prompts on the Mac
+    #[serde(default)]
+    pub warm: Option<WarmConfig>,
 }
 
 /// Per-tool settings that override the server defaults
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolOverride {
-    /// Policy for this tool
-    pub policy: Policy,
+    /// Policy for this tool; the server policy when unset
+    #[serde(default)]
+    pub policy: Option<Policy>,
+    /// How far one approval of this tool reaches; `session` when unset
+    #[serde(default)]
+    pub grant: Option<GrantMode>,
+}
+
+/// Warm-up calls for one server
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmConfig {
+    /// Calls made in order
+    pub calls: Vec<WarmCall>,
+}
+
+/// One warm-up call
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarmCall {
+    /// Upstream tool name
+    pub tool: String,
+    /// Arguments passed as-is
+    #[serde(default)]
+    pub arguments: serde_json::Map<String, serde_json::Value>,
 }
 
 /// How to reach a server, derived from [`ServerConfig`]
@@ -311,7 +583,31 @@ impl ServerConfig {
 
     /// Policy for a tool, preferring a per-tool override
     pub fn policy_for(&self, tool: &str) -> Policy {
-        self.tools.get(tool).map_or(self.policy, |tool| tool.policy)
+        self.tools
+            .get(tool)
+            .and_then(|tool| tool.policy)
+            .unwrap_or(self.policy)
+    }
+
+    /// Grant mode for a tool whose policy is `ask`
+    pub fn grant_for(&self, tool: &str) -> GrantMode {
+        self.tools
+            .get(tool)
+            .and_then(|tool| tool.grant)
+            .unwrap_or_default()
+    }
+
+    /// Whether logs must leave out this server's arguments, results and
+    /// error text; unless set explicitly, true when the server or any of its
+    /// tools asks for approval
+    pub fn is_sensitive(&self) -> bool {
+        self.sensitive.unwrap_or_else(|| {
+            self.policy == Policy::Ask
+                || self
+                    .tools
+                    .values()
+                    .any(|tool| tool.policy == Some(Policy::Ask))
+        })
     }
 
     fn validate(&self, name: &str) -> Result<(), ConfigError> {
@@ -362,6 +658,9 @@ mod tests {
 
             [servers.op.tools.delete_item]
             policy = "deny"
+
+            [servers.op.tools.create_environment]
+            grant = "per_call"
             "#,
         )?;
 
@@ -374,6 +673,17 @@ mod tests {
         );
         assert_eq!(config.servers["op"].policy_for("list"), Policy::Ask);
         assert_eq!(config.servers["op"].policy_for("delete_item"), Policy::Deny);
+        assert_eq!(
+            config.servers["op"].policy_for("create_environment"),
+            Policy::Ask
+        );
+        assert_eq!(
+            config.servers["op"].grant_for("create_environment"),
+            GrantMode::PerCall
+        );
+        assert_eq!(config.servers["op"].grant_for("list"), GrantMode::Session);
+        assert!(config.servers["op"].is_sensitive());
+        assert!(!config.servers["docs"].is_sensitive());
 
         Ok(())
     }
@@ -383,5 +693,6 @@ mod tests {
         assert!(parse("surprise = 1").is_err());
         assert!(parse("[servers.a]\ncommand = \"x\"\nurl = \"http://y\"").is_err());
         assert!(parse("[servers.a]\npolicy = \"allow\"").is_err());
+        assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
     }
 }

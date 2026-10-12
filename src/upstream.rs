@@ -48,12 +48,12 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
     /// The server is not connected; the call was not sent
-    #[error("server `{server}` is unavailable ({reason}); the call was not sent")]
+    #[error("server `{server}` is unavailable ({}); the call was not sent", .category.as_str())]
     Unavailable {
         /// Server name
         server: String,
-        /// Last known failure
-        reason: String,
+        /// Coarse reason, safe to show to scripts
+        category: ErrorCategory,
     },
     /// The child process could not be started
     #[error("failed to start `{command}`: {source}")]
@@ -95,9 +95,96 @@ pub enum UpstreamError {
         /// Timeout that elapsed
         timeout: Duration,
     },
-    /// The server answered with something other than a tool result
+    /// The server asked for something other than a tool result
     #[error("server asked for interactive input, which is not supported")]
     InputRequired,
+}
+
+impl UpstreamError {
+    /// Coarse kind of failure, safe to show anywhere
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::Unavailable { category, .. } => *category,
+            Self::Spawn { .. } => ErrorCategory::Spawn,
+            Self::Header(_) => ErrorCategory::Configuration,
+            Self::Initialize(_) => ErrorCategory::Initialize,
+            Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
+            Self::Service(_) | Self::InputRequired => ErrorCategory::Protocol,
+            Self::Interrupted { .. } => ErrorCategory::ConnectionClosed,
+        }
+    }
+
+    /// Message for scripts and agents: transport errors can embed URLs with
+    /// query strings, commands, paths or header values, so only the coarse
+    /// category and the server name are kept. MCP errors are the upstream's
+    /// own answer to the call and keep their message
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Unavailable { .. } | Self::TimedOut { .. } | Self::InputRequired => {
+                self.to_string()
+            }
+            Self::Service(ServiceError::McpError(error)) => {
+                format!("the server returned an error: {}", error.message)
+            }
+            Self::Service(_) => "the server answered with an unexpected response".to_owned(),
+            Self::Interrupted { server, .. } => format!(
+                "connection to `{server}` failed while the call was running; \
+                 outcome unknown, the tool may or may not have run"
+            ),
+            Self::Spawn { .. }
+            | Self::Header(_)
+            | Self::Initialize(_)
+            | Self::ConnectTimeout(_) => {
+                format!(
+                    "the server could not be reached ({})",
+                    self.category().as_str()
+                )
+            }
+        }
+    }
+}
+
+/// Coarse failure kinds reported on `/healthz` and to scripts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCategory {
+    /// The child process could not be started
+    Spawn,
+    /// The configuration is unusable (e.g. a bad header)
+    Configuration,
+    /// The MCP handshake failed
+    Initialize,
+    /// Connecting or a call took too long
+    Timeout,
+    /// The connection dropped
+    ConnectionClosed,
+    /// Sending failed before the server saw the request
+    Transport,
+    /// The server spoke the protocol wrongly
+    Protocol,
+    /// Still connecting
+    Connecting,
+}
+
+impl Serialize for ErrorCategory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl ErrorCategory {
+    /// Stable name
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn_failed",
+            Self::Configuration => "configuration",
+            Self::Initialize => "initialize_failed",
+            Self::Timeout => "timeout",
+            Self::ConnectionClosed => "connection_closed",
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+            Self::Connecting => "connecting",
+        }
+    }
 }
 
 /// Connection state of one upstream
@@ -110,9 +197,31 @@ pub enum UpstreamStatus {
     Connected,
     /// Not connected; a retry is scheduled
     Unavailable {
-        /// Why the last attempt or connection failed
+        /// Why the last attempt or connection failed; may hold URLs, paths
+        /// or commands, so it is for local logs and the CLI only
         error: String,
+        /// Coarse reason, safe to publish
+        category: ErrorCategory,
     },
+}
+
+impl UpstreamStatus {
+    /// `connecting`, `connected` or `unavailable`
+    pub fn state(&self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    /// Coarse reason when unavailable
+    pub fn category(&self) -> Option<ErrorCategory> {
+        match self {
+            Self::Unavailable { category, .. } => Some(*category),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -177,10 +286,10 @@ impl Upstream {
             .clone()
             .ok_or_else(|| UpstreamError::Unavailable {
                 server: self.name.clone(),
-                reason: match self.status() {
-                    UpstreamStatus::Unavailable { error } => error,
-                    _ => "still connecting".to_owned(),
-                },
+                category: self
+                    .status()
+                    .category()
+                    .unwrap_or(ErrorCategory::Connecting),
             })
     }
 
@@ -200,9 +309,13 @@ impl Upstream {
         let handle = peer
             .send_request_with_option(request, PeerRequestOptions::with_timeout(self.call_timeout))
             .await
-            .map_err(|error| UpstreamError::Unavailable {
-                server: self.name.clone(),
-                reason: error.to_string(),
+            .map_err(|error| {
+                tracing::debug!(server = %self.name, %error, "sending the call failed");
+
+                UpstreamError::Unavailable {
+                    server: self.name.clone(),
+                    category: ErrorCategory::Transport,
+                }
             })?;
 
         // from here on the server may be running the tool
@@ -237,13 +350,13 @@ impl Upstream {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn mark_unavailable(&self, error: String) {
+    fn mark_unavailable(&self, error: String, category: ErrorCategory) {
         // only a connected server turning unavailable changes what the
         // catalog shows; repeated failed reconnects do not
         let was_connected = self.status() == UpstreamStatus::Connected;
         self.write().peer = None;
         self.status
-            .send_replace(UpstreamStatus::Unavailable { error });
+            .send_replace(UpstreamStatus::Unavailable { error, category });
         if was_connected {
             self.changed.notify_one();
         }
@@ -289,7 +402,7 @@ impl Upstream {
                     let reason = service.waiting().await;
                     let error = format!("connection closed ({reason:?})");
                     tracing::warn!(server = %self.name, %error, "upstream disconnected");
-                    self.mark_unavailable(error);
+                    self.mark_unavailable(error, ErrorCategory::ConnectionClosed);
 
                     // only a connection that stayed up counts as recovery, so
                     // a server that accepts and immediately drops us still backs off
@@ -299,7 +412,7 @@ impl Upstream {
                 }
                 Err(error) => {
                     tracing::warn!(server = %self.name, %error, "upstream connection failed");
-                    self.mark_unavailable(error.to_string());
+                    self.mark_unavailable(error.to_string(), error.category());
                 }
             }
 

@@ -19,6 +19,11 @@ const RESULT_MAX_NODES: usize = 200_000;
 const ARGUMENT_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Node ceiling for the arguments of a single tool call
 const ARGUMENT_MAX_NODES: usize = 1_000_000;
+/// Node ceiling for one upstream tool result handed to a script
+const TOOL_RESULT_MAX_NODES: usize = 1_000_000;
+/// Longest text a non-string dict key may expand to; tuple keys can share
+/// substructure, so their repr is measured before it is built
+const MAX_KEY_REPR_BYTES: usize = 4096;
 
 /// Why a script value could not be turned into JSON
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +40,12 @@ pub enum ConvertError {
     /// The value nests deeper than [`MAX_DEPTH`]
     #[error("value is nested more than {MAX_DEPTH} levels deep")]
     TooDeep,
+    /// The value has more elements than allowed
+    #[error("value has more than {0} elements")]
+    TooManyNodes(usize),
+    /// A non-string dict key would expand to an enormous string
+    #[error("a dict key is too large to use as a JSON key (limit {MAX_KEY_REPR_BYTES} bytes)")]
+    KeyTooLarge,
 }
 
 /// How much a conversion may emit
@@ -76,18 +87,100 @@ pub struct Converted {
 }
 
 /// Converts a JSON value into the Python value a script receives
-pub fn json_to_monty(value: &Value) -> MontyObject {
+///
+/// The value is measured first, so an upstream answering with something huge
+/// or absurdly nested costs a bounded walk instead of a sandbox-sized copy
+/// or a stack overflow
+pub fn json_to_monty(value: &Value, max_bytes: usize) -> Result<MontyObject, ConvertError> {
+    measure_json(value, max_bytes, TOOL_RESULT_MAX_NODES)?;
+
+    Ok(json_to_monty_unchecked(value))
+}
+
+/// Checks depth, element count and approximate size without recursion
+fn measure_json(value: &Value, max_bytes: usize, max_nodes: usize) -> Result<(), ConvertError> {
+    let mut stack = vec![(value, 0usize)];
+    let mut nodes = 0usize;
+    let mut bytes = 0usize;
+    while let Some((value, depth)) = stack.pop() {
+        if depth >= MAX_DEPTH {
+            return Err(ConvertError::TooDeep);
+        }
+        nodes += 1;
+        if nodes > max_nodes {
+            return Err(ConvertError::TooManyNodes(max_nodes));
+        }
+        bytes = bytes.saturating_add(match value {
+            Value::Null | Value::Bool(_) => 4,
+            Value::Number(number) => number.to_string().len(),
+            Value::String(text) => text.len() + 2,
+            Value::Array(items) => {
+                stack.extend(items.iter().map(|item| (item, depth + 1)));
+
+                2 + items.len()
+            }
+            Value::Object(map) => {
+                stack.extend(map.values().map(|item| (item, depth + 1)));
+
+                2 + map.keys().map(|key| key.len() + 4).sum::<usize>()
+            }
+        });
+        if bytes > max_bytes {
+            return Err(ConvertError::TooLarge(max_bytes));
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursive conversion; only called on values [`measure_json`] accepted,
+/// so the depth is bounded
+fn json_to_monty_unchecked(value: &Value) -> MontyObject {
     match value {
         Value::Null => MontyObject::none(),
         Value::Bool(flag) => MontyObject::bool(*flag),
         Value::Number(number) => number_to_monty(number),
         Value::String(text) => MontyObject::string(text.clone()),
-        Value::Array(items) => MontyObject::list(items.iter().map(json_to_monty)),
-        Value::Object(map) => MontyObject::dict(
-            map.iter()
-                .map(|(key, value)| (MontyObject::string(key.clone()), json_to_monty(value))),
-        ),
+        Value::Array(items) => MontyObject::list(items.iter().map(json_to_monty_unchecked)),
+        Value::Object(map) => MontyObject::dict(map.iter().map(|(key, value)| {
+            (
+                MontyObject::string(key.clone()),
+                json_to_monty_unchecked(value),
+            )
+        })),
     }
+}
+
+/// Whether the repr of `value` stays within `budget` bytes, without ever
+/// building a repr of a container; shared substructure is walked once per
+/// expansion, so the walk stops as soon as the budget runs out
+fn repr_fits(value: ObjectRef<'_>, budget: &mut usize, depth: usize) -> bool {
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    let cost = match value.items() {
+        Some(items) => {
+            let overhead = 2 + 2 * items.len();
+            if overhead > *budget {
+                return false;
+            }
+            *budget -= overhead;
+
+            return items
+                .into_iter()
+                .all(|item| repr_fits(item, budget, depth + 1));
+        }
+        None => match value.as_str() {
+            Some(text) => text.len() + 2,
+            None => value.py_repr().len(),
+        },
+    };
+    if cost > *budget {
+        return false;
+    }
+    *budget -= cost;
+
+    true
 }
 
 fn number_to_monty(number: &Number) -> MontyObject {
@@ -332,7 +425,17 @@ impl Walker {
             }
             // str(key) of a non-string key matches its repr for every type
             // JSON-ish scripts use as keys (int, float, bool, None, tuple)
-            let key = key.as_str().map_or_else(|| key.py_repr(), str::to_owned);
+            let key = match key.as_str() {
+                Some(text) => text.to_owned(),
+                None => {
+                    let mut budget = MAX_KEY_REPR_BYTES;
+                    if !repr_fits(key, &mut budget, 0) {
+                        return Err(ConvertError::KeyTooLarge);
+                    }
+
+                    key.py_repr()
+                }
+            };
             if !seen.insert(key.clone()) {
                 return Err(ConvertError::KeyCollision(key));
             }
@@ -369,12 +472,43 @@ mod tests {
         )
         .map_err(|_| ConvertError::TooDeep)?;
 
-        let back = convert(&json_to_monty(&original))?;
+        let back = convert(&json_to_monty(&original, 1 << 20)?)?;
 
         assert_eq!(back.value, original);
         assert!(!back.truncated);
 
         Ok(())
+    }
+
+    #[test]
+    fn oversized_or_deep_tool_results_are_refused_before_conversion() {
+        let wide = Value::Array(vec![Value::String("x".repeat(1000)); 100]);
+        let mut deep = json!(1);
+        for _ in 0..200 {
+            deep = json!([deep]);
+        }
+
+        assert!(matches!(
+            json_to_monty(&wide, 10_000),
+            Err(ConvertError::TooLarge(10_000))
+        ));
+        assert!(json_to_monty(&wide, 1_000_000).is_ok());
+        assert!(matches!(
+            json_to_monty(&deep, 1_000_000),
+            Err(ConvertError::TooDeep)
+        ));
+    }
+
+    #[test]
+    fn shared_tuple_keys_are_refused_instead_of_expanded() {
+        let mut key = MontyObject::tuple([MontyObject::int(1)]);
+        // in the sandbox these levels share one object; here they are copies
+        for _ in 0..16 {
+            key = MontyObject::tuple([key.clone(), key]);
+        }
+        let value = MontyObject::dict([(key, MontyObject::int(1))]);
+
+        assert!(matches!(convert(&value), Err(ConvertError::KeyTooLarge)));
     }
 
     #[test]

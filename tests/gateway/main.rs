@@ -1,154 +1,21 @@
 //! End-to-end checks: a real HTTP server, a real Monty worker and a stdio
 //! MCP fixture as the only upstream
 
+mod approvals;
+mod harness;
+mod usage;
+
 use std::{
     error::Error,
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
-use codemode_mcp::{
-    app::App,
-    config::Config,
-    server::{RunningServer, serve},
-};
-use rmcp::{
-    ServiceExt,
-    model::{CallToolRequestParams, CallToolResult},
-    service::{RoleClient, RunningService},
-    transport::StreamableHttpClientTransport,
-};
+use harness::{Harness, Setup, TestResult, call, execute, text_of};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
-
-type TestResult = Result<(), Box<dyn Error>>;
-type Client = RunningService<RoleClient, ()>;
-
-/// The Monty worker the tests run scripts in
-///
-/// A missing worker fails the test instead of skipping it, so a broken setup
-/// cannot pass silently; `CODEMODE_SKIP_MONTY=1` opts out on purpose
-fn monty_worker() -> Result<Option<PathBuf>, Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tools/bin/monty");
-    if path.exists() {
-        return Ok(Some(path));
-    }
-    if std::env::var("CODEMODE_SKIP_MONTY").as_deref() == Ok("1") {
-        eprintln!("skipping: {} is missing", path.display());
-
-        return Ok(None);
-    }
-
-    Err(format!(
-        "{} is missing (see docs/design.md for how to fetch the Monty worker); \
-         set CODEMODE_SKIP_MONTY=1 to skip these tests",
-        path.display()
-    )
-    .into())
-}
-
-/// Config for one fixture upstream; `limits` and `server` add lines to the
-/// `[limits]` and `[servers.fixture]` tables
-fn config_for_fixture(
-    worker: &std::path::Path,
-    limits: &str,
-    server: &str,
-) -> Result<Config, Box<dyn Error>> {
-    let text = format!(
-        r#"
-        listen = "127.0.0.1:0"
-        worker_path = "{worker}"
-
-        [limits]
-        execute_wait_secs = 2
-        {limits}
-
-        [servers.fixture]
-        command = "{fixture}"
-        {server}
-        "#,
-        worker = worker.display(),
-        fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
-    );
-
-    Ok(Config::parse(
-        &text,
-        std::path::Path::new("test-config.toml"),
-    )?)
-}
-
-/// A running app, HTTP server and MCP client wired to the fixture upstream
-struct Harness {
-    app: App,
-    server: RunningServer,
-    client: Client,
-}
-
-impl Harness {
-    /// `None` when the Monty worker is missing and skipping was requested
-    async fn start(limits: &str, server: &str) -> Result<Option<Self>, Box<dyn Error>> {
-        let Some(worker) = monty_worker()? else {
-            return Ok(None);
-        };
-
-        let app = App::start(config_for_fixture(&worker, limits, server)?).await?;
-        app.gateway().wait_ready(Duration::from_secs(30)).await;
-        let server = serve(&app).await?;
-        let url = format!("http://127.0.0.1:{}/mcp", server.local_addr().port());
-        let client: Client = ().serve(StreamableHttpClientTransport::from_uri(url)).await?;
-
-        Ok(Some(Self {
-            app,
-            server,
-            client,
-        }))
-    }
-
-    async fn execute_json(&self, code: &str) -> Result<Value, Box<dyn Error>> {
-        let result = execute(&self.client, code).await?;
-        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
-
-        Ok(serde_json::from_str(&text_of(&result))?)
-    }
-
-    async fn stop(self) -> TestResult {
-        self.client.cancel().await?;
-        self.server.shutdown().await?;
-
-        Ok(())
-    }
-}
-
-fn text_of(result: &CallToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(|block| block.as_text())
-        .map(|block| block.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-async fn call(
-    client: &Client,
-    tool: &'static str,
-    arguments: Value,
-) -> Result<CallToolResult, Box<dyn Error>> {
-    let Value::Object(arguments) = arguments else {
-        return Err("arguments must be an object".into());
-    };
-
-    Ok(client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
-        .await?)
-}
-
-async fn execute(client: &Client, code: &str) -> Result<CallToolResult, Box<dyn Error>> {
-    call(client, "execute", json!({ "code": code })).await
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_run_against_the_fixture_upstream() -> TestResult {
@@ -312,7 +179,7 @@ async fn huge_shared_results_are_truncated_not_expanded() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ask_policy_fails_closed_without_an_approver() -> TestResult {
+async fn ask_policy_fails_closed_without_a_notifier() -> TestResult {
     let Some(harness) = Harness::start("", "[servers.fixture.tools.add]\npolicy = \"ask\"").await?
     else {
         return Ok(());
@@ -321,10 +188,7 @@ async fn ask_policy_fails_closed_without_an_approver() -> TestResult {
     let denied = execute(&harness.client, "int(await fixture_add(a=1, b=2))").await?;
     let text = text_of(&denied);
     assert_eq!(denied.is_error, Some(true), "{text}");
-    assert!(
-        text.contains("requires approval; approvals are not configured"),
-        "{text}"
-    );
+    assert!(text.contains("approvals are not configured"), "{text}");
     assert!(text.contains("PermissionError"), "{text}");
 
     // other tools of the server are unaffected
@@ -451,10 +315,10 @@ async fn full_queue_answers_busy_immediately() -> TestResult {
         return Ok(());
     };
 
-    let running = harness
-        .app
-        .executions()
-        .start("await fixture_slow_echo(text=\"x\", delay_ms=1500)".to_owned())?;
+    let running = harness.app.executions().start(
+        "await fixture_slow_echo(text=\"x\", delay_ms=1500)".to_owned(),
+        Default::default(),
+    )?;
 
     let busy = execute(&harness.client, "1").await?;
     assert_eq!(busy.is_error, Some(true));
@@ -496,6 +360,68 @@ async fn unexpected_host_headers_are_forbidden() -> TestResult {
             .await?
             .contains("200")
     );
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_tool_results_raise_at_the_call_site() -> TestResult {
+    let Some(harness) = Harness::start("max_tool_result_bytes = 200", "").await? else {
+        return Ok(());
+    };
+
+    let body = harness
+        .execute_json(
+            "message = \"\"\n\
+             try:\n    await fixture_slow_echo(text=\"x\" * 1000, delay_ms=0)\n\
+             except ValueError as error:\n    message = str(error)\n\
+             small = await fixture_slow_echo(text=\"ok\", delay_ms=0)\n\
+             [message, small[\"echoed\"]]",
+        )
+        .await?;
+    let message = body["result"][0].as_str().unwrap_or_default();
+
+    assert!(message.contains("fixture_slow_echo"), "{body}");
+    assert!(message.contains("200-byte limit"), "{body}");
+    assert_eq!(body["result"][1], "ok", "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn healthz_reports_categories_not_raw_errors() -> TestResult {
+    let Some(harness) = Harness::with(Setup {
+        extra: "[servers.broken]\n\
+                command = \"/nonexistent/secret-dir/server\"\n\
+                env = { API_TOKEN = \"s3cr3t-value\" }",
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let body = harness
+        .http
+        .get(format!("{}/healthz", harness.base()))
+        .send()
+        .await?
+        .text()
+        .await?;
+    let health: Value = serde_json::from_str(&body)?;
+    let broken = health["upstreams"]
+        .as_array()
+        .and_then(|upstreams| {
+            upstreams
+                .iter()
+                .find(|upstream| upstream["name"] == "broken")
+        })
+        .ok_or("broken server missing from /healthz")?;
+
+    assert_eq!(broken["state"], "unavailable", "{body}");
+    assert_eq!(broken["error"], "spawn_failed", "{body}");
+    assert!(!body.contains("secret-dir"), "{body}");
+    assert!(!body.contains("s3cr3t"), "{body}");
 
     harness.stop().await
 }

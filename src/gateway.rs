@@ -16,16 +16,23 @@ use serde_json::{Map, Value};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
+    approvals::{Approvals, Gate, GateRequest, Waiting},
     budget::Budget,
     catalog::{Catalog, ServerSnapshot, ToolEntry},
     config::Config,
+    convert::json_to_monty,
     executor::Executor,
-    policy::{ApprovalDecision, ApprovalRequest, Approver, Policy},
-    upstream::{UpstreamError, UpstreamStatus, Upstreams},
+    policy::Policy,
+    upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
+    usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
 };
 
 /// Wait before retrying a catalog rebuild whose stub validation could not run
 const REBUILD_RETRY: Duration = Duration::from_secs(5);
+/// Longest upstream error text handed to a script
+const MAX_ERROR_TEXT: usize = 2000;
+/// Replacement for configured secrets found in upstream text
+const REDACTED: &str = "[redacted]";
 
 /// What a tool call needs to know about the execution making it
 #[derive(Clone)]
@@ -38,6 +45,10 @@ pub struct CallContext {
     pub catalog: Arc<Catalog>,
     /// The execution's wall-clock allowance, paused while an approval is pending
     pub budget: Budget,
+    /// Who started the execution
+    pub caller: Caller,
+    /// The script, shown on the approval page
+    pub script: Arc<str>,
 }
 
 /// Why a tool call from a script failed
@@ -58,7 +69,7 @@ pub enum ToolCallError {
         reason: String,
     },
     /// The upstream could not run the call
-    #[error("{0}")]
+    #[error("{}", .0.public_message())]
     Upstream(#[from] UpstreamError),
     /// The upstream ran the tool and it reported an error
     #[error("{0}")]
@@ -68,6 +79,14 @@ pub enum ToolCallError {
         "tool `{0}` declares an output schema but returned neither structured content nor JSON text"
     )]
     MissingOutput(String),
+    /// The result is too large or deep to hand to a script
+    #[error("tool `{tool}` returned a result the sandbox will not accept: {reason}")]
+    ResultTooLarge {
+        /// Python name of the tool
+        tool: String,
+        /// Which limit it broke
+        reason: String,
+    },
 }
 
 impl ToolCallError {
@@ -77,14 +96,141 @@ impl ToolCallError {
             Self::Unknown(_) => ExcType::NameError,
             Self::Denied(_) | Self::NotApproved { .. } => ExcType::PermissionError,
             Self::Upstream(UpstreamError::TimedOut { .. }) => ExcType::TimeoutError,
+            Self::ResultTooLarge { .. } => ExcType::ValueError,
             Self::Upstream(_) | Self::ToolFailed(_) | Self::MissingOutput(_) => {
                 ExcType::RuntimeError
             }
         }
     }
+
+    /// Usage-log bucket for this failure
+    pub fn outcome(&self) -> Outcome {
+        match self {
+            Self::Unknown(_) => Outcome::NameError,
+            Self::Denied(_) | Self::NotApproved { .. } => Outcome::Denied,
+            Self::Upstream(UpstreamError::TimedOut { .. }) => Outcome::Timeout,
+            Self::Upstream(_)
+            | Self::ToolFailed(_)
+            | Self::MissingOutput(_)
+            | Self::ResultTooLarge { .. } => Outcome::ToolError,
+        }
+    }
+}
+
+/// A resolved tool call that has passed policy checks
+pub struct PreparedCall {
+    /// Python name of the tool
+    pub function: String,
+    /// Server name
+    pub server: String,
+    /// Upstream tool name
+    pub tool: String,
+    /// Whether logs must omit this call's arguments and error text
+    pub sensitive: bool,
+    arguments: Map<String, Value>,
+    has_output_schema: bool,
+}
+
+/// How a call proceeds after [`Gateway::prepare`]
+pub enum Plan {
+    /// Run it now
+    Run {
+        /// The call
+        call: PreparedCall,
+        /// Approval or grant that allowed it, for `ask` tools
+        approval_id: Option<String>,
+    },
+    /// Wait for a person first
+    Gated {
+        /// The call
+        call: PreparedCall,
+        /// The pending request
+        waiting: Waiting,
+    },
 }
 
 /// Per-server entry of the health report
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicUpstreamReport {
+    /// Server name
+    pub name: String,
+    /// `connecting`, `connected` or `unavailable`
+    pub state: &'static str,
+    /// Number of tools currently known
+    pub tools: usize,
+    /// Coarse failure reason when unavailable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorCategory>,
+}
+
+/// Outcome of one warm-up call, safe to print
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct WarmResult {
+    /// Server name
+    pub server: String,
+    /// Upstream tool name
+    pub tool: String,
+    /// Whether the call succeeded
+    pub ok: bool,
+    /// Result size or failure category; never result content
+    pub detail: String,
+}
+
+/// Replaces configured secrets (header values, env values, URL query
+/// strings) in text that came from an upstream
+#[derive(Debug, Default)]
+struct Redactor(Vec<String>);
+
+impl Redactor {
+    fn new(config: &Config) -> Self {
+        let mut secrets = Vec::new();
+        for server in config.servers.values() {
+            for value in server.headers.values().chain(server.env.values()) {
+                secrets.push(value.clone());
+                if let Some(token) = value.strip_prefix("Bearer ") {
+                    secrets.push(token.to_owned());
+                }
+            }
+            if let Some(url) = server.url.as_deref() {
+                if let Some((_, query)) = url.split_once('?') {
+                    secrets.push(query.to_owned());
+                }
+                // `https://user:password@host/...`
+                if let Some((userinfo, _)) = url
+                    .split_once("://")
+                    .and_then(|(_, rest)| rest.split_once('@'))
+                    .filter(|(userinfo, _)| !userinfo.contains('/'))
+                {
+                    secrets.push(userinfo.to_owned());
+                }
+            }
+        }
+        // short values would redact ordinary words
+        secrets.retain(|secret| secret.len() >= 6);
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+
+        Self(secrets)
+    }
+
+    fn apply(&self, text: &str) -> String {
+        let mut text = self.0.iter().fold(text.to_owned(), |text, secret| {
+            text.replace(secret.as_str(), REDACTED)
+        });
+        if text.len() > MAX_ERROR_TEXT {
+            let mut end = MAX_ERROR_TEXT;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str("...[truncated]");
+        }
+
+        text
+    }
+}
+
+/// Per-server entry of the local status report
 #[derive(Debug, Clone, Serialize)]
 pub struct UpstreamReport {
     /// Server name
@@ -107,7 +253,10 @@ pub struct Gateway {
     /// cannot finish after a newer one
     rebuild_turn: Mutex<()>,
     executor: Arc<Executor>,
-    approver: Arc<dyn Approver>,
+    approvals: Arc<Approvals>,
+    log: UsageLog,
+    redactor: Redactor,
+    max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
 }
 
@@ -122,11 +271,14 @@ impl Gateway {
     pub fn start(
         config: Arc<Config>,
         executor: Arc<Executor>,
-        approver: Arc<dyn Approver>,
+        approvals: Arc<Approvals>,
+        log: UsageLog,
     ) -> Arc<Self> {
         let upstreams = Upstreams::start(&config.servers, config.tool_timeout());
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {
+            redactor: Redactor::new(&config),
+            max_tool_result_bytes: config.limits.max_tool_result_bytes,
             config,
             upstreams,
             catalog: RwLock::new(Published {
@@ -136,7 +288,8 @@ impl Gateway {
             generation: AtomicU64::new(0),
             rebuild_turn: Mutex::new(()),
             executor,
-            approver,
+            approvals,
+            log,
             rebuild_task: RwLock::new(None),
         });
 
@@ -200,22 +353,50 @@ impl Gateway {
             .collect()
     }
 
-    /// Runs one tool call on behalf of a script
+    /// The same report with only names, states, counts and coarse error
+    /// categories, for unauthenticated endpoints
+    pub fn public_report(&self) -> Vec<PublicUpstreamReport> {
+        self.report()
+            .into_iter()
+            .map(|report| PublicUpstreamReport {
+                state: report.status.state(),
+                error: report.status.category(),
+                name: report.name,
+                tools: report.tools,
+            })
+            .collect()
+    }
+
+    /// The approval service
+    pub fn approvals(&self) -> &Arc<Approvals> {
+        &self.approvals
+    }
+
+    /// Resolves a script's tool call and applies policy, without running it
     ///
     /// Tools are resolved in the execution's own catalog snapshot, not the
-    /// live one
-    pub async fn call(
+    /// live one. A refused call is logged here
+    pub fn prepare(
         &self,
         context: &CallContext,
         function: &str,
         arguments: Map<String, Value>,
-    ) -> Result<Value, ToolCallError> {
+    ) -> Result<Plan, ToolCallError> {
         let entry = context
             .catalog
             .get(function)
             .ok_or_else(|| ToolCallError::Unknown(function.to_owned()))?;
+        let server_config = self.config.servers.get(&entry.server);
+        let call = PreparedCall {
+            function: function.to_owned(),
+            server: entry.server.clone(),
+            tool: entry.tool.clone(),
+            sensitive: server_config.is_some_and(|server| server.is_sensitive()),
+            arguments: omit_none_arguments(entry, arguments),
+            has_output_schema: entry.has_output_schema,
+        };
         if entry.policy == Policy::Deny {
-            return Err(ToolCallError::Denied(function.to_owned()));
+            return Err(self.refuse(context, &call, ToolCallError::Denied(function.to_owned())));
         }
 
         let upstream = self
@@ -224,34 +405,185 @@ impl Gateway {
             .ok_or_else(|| ToolCallError::Unknown(function.to_owned()))?;
         // before asking anyone for approval: a call that cannot run should
         // not wake a phone
-        upstream.ensure_available()?;
+        if let Err(error) = upstream.ensure_available() {
+            return Err(self.refuse(context, &call, error.into()));
+        }
+        if entry.policy != Policy::Ask {
+            return Ok(Plan::Run {
+                call,
+                approval_id: None,
+            });
+        }
 
-        if entry.policy == Policy::Ask {
-            let request = ApprovalRequest {
-                execution_id: context.execution_id.to_string(),
-                server: entry.server.clone(),
-                tool: entry.tool.clone(),
-                arguments: arguments.clone(),
-            };
-            // waiting for a human must not eat the script's wall-clock allowance
-            let decision = {
-                let _paused = context.budget.pause();
+        let grant_mode = server_config.map(|server| server.grant_for(&entry.tool));
+        let gate = self.approvals.gate(GateRequest {
+            caller: &context.caller,
+            execution_id: &context.execution_id,
+            server: &call.server,
+            tool: &call.tool,
+            arguments: &call.arguments,
+            script: &context.script,
+            grant_mode: grant_mode.unwrap_or_default(),
+        });
 
-                self.approver.approve(&request).await
-            };
-            if let ApprovalDecision::Denied { reason } = decision {
-                return Err(ToolCallError::NotApproved {
+        match gate {
+            Gate::Open { approval_id } => Ok(Plan::Run {
+                call,
+                approval_id: Some(approval_id),
+            }),
+            Gate::Wait(waiting) => Ok(Plan::Gated { call, waiting }),
+            Gate::Closed { reason } => {
+                let error = ToolCallError::NotApproved {
                     tool: function.to_owned(),
                     reason,
+                };
+
+                Err(self.refuse(context, &call, error))
+            }
+        }
+    }
+
+    /// Logs a call refused before it reached the upstream and returns the error
+    pub fn refuse(
+        &self,
+        context: &CallContext,
+        call: &PreparedCall,
+        error: ToolCallError,
+    ) -> ToolCallError {
+        self.record(context, call, &Err(&error), Duration::ZERO, None);
+
+        error
+    }
+
+    /// Runs a prepared call on its upstream, converting the result to a
+    /// script value and logging the call
+    pub async fn invoke(
+        &self,
+        context: &CallContext,
+        call: PreparedCall,
+        approval_id: Option<String>,
+    ) -> Result<monty_types::MontyObject, ToolCallError> {
+        let started = std::time::Instant::now();
+        let result = self.invoke_unlogged(&call).await;
+        let logged = result.as_ref().map(|_| ());
+        self.record(context, &call, &logged, started.elapsed(), approval_id);
+
+        result
+    }
+
+    async fn invoke_unlogged(
+        &self,
+        call: &PreparedCall,
+    ) -> Result<monty_types::MontyObject, ToolCallError> {
+        let upstream = self
+            .upstreams
+            .get(&call.server)
+            .ok_or_else(|| ToolCallError::Unknown(call.function.clone()))?;
+        let result = upstream
+            .call_tool(&call.tool, call.arguments.clone())
+            .await
+            .map_err(|error| match error {
+                // the upstream's own error message can echo configured secrets
+                UpstreamError::Service(rmcp::service::ServiceError::McpError(_)) => {
+                    ToolCallError::ToolFailed(self.redactor.apply(&error.public_message()))
+                }
+                error => ToolCallError::Upstream(error),
+            })?;
+        let value = self.tool_result_value(call, result)?;
+
+        json_to_monty(&value, self.max_tool_result_bytes).map_err(|error| {
+            ToolCallError::ResultTooLarge {
+                tool: call.function.clone(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    fn record(
+        &self,
+        context: &CallContext,
+        call: &PreparedCall,
+        result: &Result<(), &ToolCallError>,
+        duration: Duration,
+        approval_id: Option<String>,
+    ) {
+        let classification = match result {
+            Ok(()) => Classification::ok(),
+            Err(error) => Classification {
+                outcome: error.outcome(),
+                detail: (!call.sensitive).then(|| error.to_string()),
+            },
+        };
+
+        self.log.upstream(UpstreamRecord {
+            execution_id: Some(context.execution_id.to_string()),
+            server: call.server.clone(),
+            tool: call.tool.clone(),
+            function: call.function.clone(),
+            arguments: (!call.sensitive).then(|| Value::Object(call.arguments.clone()).to_string()),
+            classification,
+            duration,
+            approval_id,
+        });
+    }
+
+    /// Runs the configured warm-up calls of one server, or of every server
+    /// that has them, directly on the upstream and without approvals
+    ///
+    /// Only the admin listener calls this, which only accepts loopback
+    /// peers, so it runs from the Mac itself
+    pub async fn warm(&self, only: Option<&str>) -> Result<Vec<WarmResult>, String> {
+        if let Some(name) = only
+            && !self.config.servers.contains_key(name)
+        {
+            return Err(format!("no server named `{name}`"));
+        }
+
+        let mut results = Vec::new();
+        for (name, server) in &self.config.servers {
+            if only.is_some_and(|only| only != name) {
+                continue;
+            }
+            let Some(warm) = &server.warm else {
+                if only.is_some() {
+                    return Err(format!(
+                        "server `{name}` has no [servers.{name}.warm] calls"
+                    ));
+                }
+                continue;
+            };
+            let Some(upstream) = self.upstreams.get(name) else {
+                continue;
+            };
+
+            for call in &warm.calls {
+                let outcome = upstream.call_tool(&call.tool, call.arguments.clone()).await;
+                let (ok, detail) = match outcome {
+                    Ok(result) if result.is_error == Some(true) => {
+                        (false, "the tool reported an error".to_owned())
+                    }
+                    Ok(result) => {
+                        let bytes: usize = result
+                            .content
+                            .iter()
+                            .filter_map(ContentBlock::as_text)
+                            .map(|block| block.text.len())
+                            .sum();
+
+                        (true, format!("ok ({bytes} bytes of output, not shown)"))
+                    }
+                    Err(error) => (false, error.category().as_str().to_owned()),
+                };
+                results.push(WarmResult {
+                    server: name.clone(),
+                    tool: call.tool.clone(),
+                    ok,
+                    detail,
                 });
             }
         }
 
-        let result = upstream
-            .call_tool(&entry.tool, omit_none_arguments(entry, arguments))
-            .await?;
-
-        tool_result_value(function, entry, result)
+        Ok(results)
     }
 
     /// Rebuilds the catalog from the current upstream state, returning false
@@ -333,43 +665,56 @@ fn omit_none_arguments(entry: &ToolEntry, mut arguments: Map<String, Value>) -> 
     arguments
 }
 
-/// Converts an MCP tool result to the value a script receives
-///
-/// Structured content wins. Without it, text that is a JSON object or array
-/// is parsed, and anything else is the text itself. Tool-reported errors
-/// become exceptions so scripts cannot mistake them for data
-fn tool_result_value(
-    function: &str,
-    entry: &ToolEntry,
-    result: CallToolResult,
-) -> Result<Value, ToolCallError> {
-    let text: Vec<String> = result
-        .content
-        .iter()
-        .filter_map(ContentBlock::as_text)
-        .map(|block| block.text.clone())
-        .collect();
+impl Gateway {
+    /// Converts an MCP tool result to the value a script receives
+    ///
+    /// Structured content wins. Without it, text that is a JSON object or
+    /// array is parsed, and anything else is the text itself. Tool-reported
+    /// errors become exceptions so scripts cannot mistake them for data
+    fn tool_result_value(
+        &self,
+        call: &PreparedCall,
+        result: CallToolResult,
+    ) -> Result<Value, ToolCallError> {
+        let text: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(ContentBlock::as_text)
+            .map(|block| block.text.clone())
+            .collect();
+        // before parsing: a huge text answer must not become a huge value
+        let text_bytes: usize = text.iter().map(String::len).sum();
+        if text_bytes > self.max_tool_result_bytes {
+            return Err(ToolCallError::ResultTooLarge {
+                tool: call.function.clone(),
+                reason: format!(
+                    "{text_bytes} bytes of text exceed the {}-byte limit",
+                    self.max_tool_result_bytes
+                ),
+            });
+        }
 
-    if result.is_error == Some(true) {
-        let message = if text.is_empty() {
-            "tool reported an error without details".to_owned()
-        } else {
-            text.join("\n")
-        };
+        if result.is_error == Some(true) {
+            let message = if text.is_empty() {
+                "tool reported an error without details".to_owned()
+            } else {
+                self.redactor.apply(&text.join("\n"))
+            };
 
-        return Err(ToolCallError::ToolFailed(message));
-    }
-    if let Some(structured) = result.structured_content {
-        return Ok(structured);
-    }
-    if let Some(parsed) = json_from_text(&text) {
-        return Ok(parsed);
-    }
-    if entry.has_output_schema {
-        return Err(ToolCallError::MissingOutput(function.to_owned()));
-    }
+            return Err(ToolCallError::ToolFailed(message));
+        }
+        if let Some(structured) = result.structured_content {
+            return Ok(structured);
+        }
+        if let Some(parsed) = json_from_text(&text) {
+            return Ok(parsed);
+        }
+        if call.has_output_schema {
+            return Err(ToolCallError::MissingOutput(call.function.clone()));
+        }
 
-    Ok(Value::String(text.join("\n")))
+        Ok(Value::String(text.join("\n")))
+    }
 }
 
 /// Parses text blocks as one JSON object or array; scalars stay text because

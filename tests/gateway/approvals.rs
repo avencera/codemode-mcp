@@ -1,0 +1,317 @@
+//! Approval flow end to end: notification, passkey page, grants, denial,
+//! expiry, budget pause and the worker release while waiting
+
+use std::time::Duration;
+
+use axum::{
+    body::Body,
+    extract::connect_info::MockConnectInfo,
+    http::{Request, StatusCode},
+};
+use codemode_mcp::{
+    admin,
+    approvals::{Choice, NO_PASSKEY},
+};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+use super::harness::{Harness, ORIGIN, Setup, TestResult, approval_id, execute, text_of};
+
+/// `add` asks with session grants; `json_text` asks on every call
+const ASK_TOOLS: &str = "tools.add.policy = \"ask\"\n\
+                         tools.json_text.policy = \"ask\"\n\
+                         tools.json_text.grant = \"per_call\"";
+
+async fn approval_harness(
+    limits: &str,
+    extra: &str,
+) -> Result<Option<Harness>, Box<dyn std::error::Error>> {
+    Harness::with(Setup {
+        limits,
+        server: ASK_TOOLS,
+        extra,
+        notify: true,
+        ..Setup::default()
+    })
+    .await
+}
+
+fn execution_id(pending: &Value) -> String {
+    pending["execution_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_once_through_the_passkey_page() -> TestResult {
+    let Some(harness) = approval_harness("", "").await? else {
+        return Ok(());
+    };
+    let mut passkey = harness.enroll_passkey().await?;
+
+    let pending = harness
+        .execute_body("# <script>alert(1)</script>\nint(await fixture_add(a=1, b=2))")
+        .await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    assert_eq!(pending["waiting_for"], "fixture.add", "{pending}");
+    let id = approval_id(&pending)?;
+    assert_eq!(
+        pending["approval_url"],
+        format!("{ORIGIN}/approve/{id}"),
+        "{pending}"
+    );
+
+    // the notification names the client and tool, and nothing else
+    let sent = harness.notifier.sent();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].title.starts_with("codemode: "), "{}", sent[0].title);
+    assert!(
+        sent[0].title.ends_with(" wants fixture.add"),
+        "{}",
+        sent[0].title
+    );
+    assert_eq!(sent[0].click, format!("{ORIGIN}/approve/{id}"));
+    assert!(!sent[0].message.contains("\"a\""), "{}", sent[0].message);
+
+    let page = harness
+        .http
+        .get(format!("{}/approve/{id}", harness.base()))
+        .send()
+        .await?;
+    assert_eq!(page.status().as_u16(), 200);
+    let html = page.text().await?;
+    assert!(html.contains("Approve once"), "{html}");
+    assert!(html.contains("Approve for this session, 15 min"), "{html}");
+    assert!(html.contains("&quot;a&quot;: 1"), "{html}");
+    assert!(html.contains("&lt;script&gt;alert(1)"), "{html}");
+    assert!(!html.contains("<script>alert"), "{html}");
+
+    let missing = harness
+        .http
+        .get(format!("{}/approve/0123456789abcdef", harness.base()))
+        .send()
+        .await?;
+    assert_eq!(missing.status().as_u16(), 404);
+
+    let (status, body) = harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let done = harness.wait_done(&execution_id(&pending)).await?;
+    let done: Value = serde_json::from_str(&text_of(&done))?;
+    assert_eq!(done["result"], 3, "{done}");
+
+    // an answered request cannot be answered again
+    let (status, _) = harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 410);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_grants_cover_the_session_and_per_call_tools_ask_again() -> TestResult {
+    let Some(harness) = approval_harness("", "").await? else {
+        return Ok(());
+    };
+    harness.enroll_passkey().await?;
+    let approvals = harness.app.approvals();
+
+    let first = harness
+        .execute_body("int(await fixture_add(a=1, b=2))")
+        .await?;
+    approvals.decide(
+        &approval_id(&first)?,
+        Choice::Session(Duration::from_secs(15 * 60)),
+    )?;
+    let done: Value =
+        serde_json::from_str(&text_of(&harness.wait_done(&execution_id(&first)).await?))?;
+    assert_eq!(done["result"], 3, "{done}");
+
+    // the grant covers the next call of the same session without asking
+    let second = harness
+        .execute_json("int(await fixture_add(a=2, b=2))")
+        .await?;
+    assert_eq!(second["result"], 4, "{second}");
+    assert_eq!(harness.notifier.sent().len(), 1);
+
+    // a per-call tool asks even inside a granted session, and refuses a
+    // session grant
+    let per_call = harness.execute_body("await fixture_json_text()").await?;
+    assert_eq!(per_call["waiting_for"], "fixture.json_text", "{per_call}");
+    let id = approval_id(&per_call)?;
+    let (status, _) = harness
+        .post_json(
+            &format!("/approve/{id}/options"),
+            &json!({ "choice": "session15" }),
+        )
+        .await?;
+    assert_eq!(status, 400);
+    approvals.decide(&id, Choice::Once)?;
+    let done: Value = serde_json::from_str(&text_of(
+        &harness.wait_done(&execution_id(&per_call)).await?,
+    ))?;
+    assert_eq!(done["result"], json!([1, 2, {"k": "v"}]), "{done}");
+
+    // and asks again on the next call; deny needs no passkey
+    let again = harness.execute_body("await fixture_json_text()").await?;
+    let id = approval_id(&again)?;
+    let (status, body) = harness
+        .post_json(&format!("/approve/{id}/deny"), &json!({}))
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let denied = harness.wait_done(&execution_id(&again)).await?;
+    let text = text_of(&denied);
+    assert_eq!(denied.is_error, Some(true), "{text}");
+    assert!(text.contains("PermissionError"), "{text}");
+    assert!(text.contains("denied on the approval page"), "{text}");
+    assert_eq!(harness.notifier.sent().len(), 3);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denial_and_expiry_raise_python_exceptions() -> TestResult {
+    let Some(harness) = approval_harness("", "[approvals]\ntimeout_secs = 3").await? else {
+        return Ok(());
+    };
+    harness.enroll_passkey().await?;
+    let script = "try:\n    await fixture_add(a=1, b=1)\n    outcome = \"ran\"\n\
+                  except OSError as error:\n    outcome = f\"{type(error).__name__}: {error}\"\noutcome";
+
+    let pending = harness.execute_body(script).await?;
+    harness
+        .app
+        .approvals()
+        .decide(&approval_id(&pending)?, Choice::Deny)?;
+    let denied: Value =
+        serde_json::from_str(&text_of(&harness.wait_done(&execution_id(&pending)).await?))?;
+    assert!(
+        denied["result"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("PermissionError: ")
+                && message.contains("denied on the approval page")),
+        "{denied}"
+    );
+
+    // nobody answers this one
+    let pending = harness.execute_body(script).await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let expired: Value =
+        serde_json::from_str(&text_of(&harness.wait_done(&execution_id(&pending)).await?))?;
+    assert!(
+        expired["result"]
+            .as_str()
+            .is_some_and(|message| message.contains("expired after 1 min")),
+        "{expired}"
+    );
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_waits_release_the_worker_and_pause_the_budget() -> TestResult {
+    // one worker, and a wall-clock budget shorter than the approval wait
+    let Some(harness) = approval_harness("max_workers = 1\nexecution_timeout_secs = 3", "").await?
+    else {
+        return Ok(());
+    };
+    harness.enroll_passkey().await?;
+
+    let pending = harness
+        .execute_body(
+            "import asyncio\n\
+             x = 41\n\
+             approved, echoed = await asyncio.gather(\n\
+                 fixture_add(a=x, b=1),\n\
+                 fixture_slow_echo(text=\"side\", delay_ms=200),\n\
+             )\n\
+             [x, int(approved), echoed[\"echoed\"]]",
+        )
+        .await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+
+    // the only worker was handed back while the script waits for a person
+    let other = harness.execute_json("1 + 1").await?;
+    assert_eq!(other["result"], 2, "{other}");
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    harness
+        .app
+        .approvals()
+        .decide(&approval_id(&pending)?, Choice::Once)?;
+    let done = harness.wait_done(&execution_id(&pending)).await?;
+    let text = text_of(&done);
+    assert_eq!(done.is_error, Some(false), "{text}");
+    let done: Value = serde_json::from_str(&text)?;
+    assert_eq!(done["result"], json!([41, 42, "side"]), "{done}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_without_a_passkey_is_denied_with_the_enroll_hint() -> TestResult {
+    let Some(harness) = approval_harness("", "").await? else {
+        return Ok(());
+    };
+
+    let result = execute(&harness.client, "int(await fixture_add(a=1, b=2))").await?;
+    let text = text_of(&result);
+
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(text.contains(NO_PASSKEY), "{text}");
+    assert!(harness.notifier.sent().is_empty());
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_routes_refuse_non_loopback_and_proxied_peers() -> TestResult {
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+    let status_from = |peer: [u8; 4], header: Option<(&'static str, &'static str)>| {
+        let router = admin::router(&harness.app)
+            .layer(MockConnectInfo(std::net::SocketAddr::from((peer, 40000))));
+        let mut request = Request::post("/admin/enroll");
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+
+        async move {
+            let request = request.body(Body::empty())?;
+
+            Ok::<_, Box<dyn std::error::Error>>(router.oneshot(request).await?.status())
+        }
+    };
+
+    for (peer, header) in [
+        ([192, 168, 1, 20], None),
+        ([100, 64, 1, 2], None),
+        ([127, 0, 0, 1], Some(("x-forwarded-for", "100.64.1.2"))),
+        // DNS rebinding: a local browser on an attacker's name
+        ([127, 0, 0, 1], Some(("host", "evil.example.com:7682"))),
+    ] {
+        assert_eq!(
+            status_from(peer, header).await?,
+            StatusCode::FORBIDDEN,
+            "{peer:?} {header:?}"
+        );
+    }
+    assert_eq!(
+        status_from([127, 0, 0, 1], Some(("host", "127.0.0.1:7682"))).await?,
+        StatusCode::OK
+    );
+
+    // the main listener does not serve the admin routes at all
+    let response = harness
+        .http
+        .post(format!("{}/admin/enroll", harness.base()))
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 404);
+
+    harness.stop().await
+}

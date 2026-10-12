@@ -1,0 +1,367 @@
+//! Shared test harness: a real HTTP server, a real Monty worker and a stdio
+//! MCP fixture as the upstream, with a temporary state directory
+
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use codemode_mcp::{
+    app::App,
+    config::Config,
+    notify::{BoxFuture, Notification, Notifier, NotifyError},
+    server::{RunningServer, serve},
+};
+use rmcp::{
+    ServiceExt,
+    model::{CallToolRequestParams, CallToolResult},
+    service::{RoleClient, RunningService},
+    transport::StreamableHttpClientTransport,
+};
+use serde_json::{Value, json};
+use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
+
+pub type TestResult = Result<(), Box<dyn Error>>;
+pub type Client = RunningService<RoleClient, ()>;
+
+/// Origin the soft authenticator claims; the server is reached on loopback,
+/// but WebAuthn only checks the origin inside the signed client data
+pub const ORIGIN: &str = "https://localhost:8443";
+
+/// The Monty worker the tests run scripts in
+///
+/// A missing worker fails the test instead of skipping it, so a broken setup
+/// cannot pass silently; `CODEMODE_SKIP_MONTY=1` opts out on purpose
+pub fn monty_worker() -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tools/bin/monty");
+    if path.exists() {
+        return Ok(Some(path));
+    }
+    if std::env::var("CODEMODE_SKIP_MONTY").as_deref() == Ok("1") {
+        eprintln!("skipping: {} is missing", path.display());
+
+        return Ok(None);
+    }
+
+    Err(format!(
+        "{} is missing (see docs/design.md for how to fetch the Monty worker); \
+         set CODEMODE_SKIP_MONTY=1 to skip these tests",
+        path.display()
+    )
+    .into())
+}
+
+/// A fresh state directory under the system temp dir
+pub fn temp_state_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("codemode-test-{}", uuid::Uuid::new_v4().simple()))
+}
+
+/// What a harness is built from
+#[derive(Default)]
+pub struct Setup<'a> {
+    /// Lines for `[limits]`
+    pub limits: &'a str,
+    /// Lines for `[servers.fixture]`
+    pub server: &'a str,
+    /// Extra top-level lines and tables, after the fixture table
+    pub extra: &'a str,
+    /// Lines placed before any table
+    pub top: &'a str,
+    /// Install a recording notifier; without one every `ask` call is refused
+    pub notify: bool,
+}
+
+/// Config with one fixture upstream
+pub fn config_for(
+    worker: &Path,
+    state_dir: &Path,
+    setup: &Setup<'_>,
+) -> Result<Config, Box<dyn Error>> {
+    let text = format!(
+        r#"
+        listen = "127.0.0.1:0"
+        admin_listen = "127.0.0.1:0"
+        worker_path = "{worker}"
+        state_dir = "{state}"
+        public_origin = "{ORIGIN}"
+        {top}
+
+        [notify]
+        homebased_config = "/nonexistent/homebased.toml"
+
+        [limits]
+        execute_wait_secs = 2
+        {limits}
+
+        [servers.fixture]
+        command = "{fixture}"
+        {server}
+
+        {extra}
+        "#,
+        worker = worker.display(),
+        state = state_dir.display(),
+        fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
+        top = setup.top,
+        limits = setup.limits,
+        server = setup.server,
+        extra = setup.extra,
+    );
+
+    Ok(Config::parse(&text, Path::new("test-config.toml"))?)
+}
+
+/// Remembers every notification instead of sending it
+#[derive(Default)]
+pub struct RecordingNotifier(Mutex<Vec<Notification>>);
+
+impl RecordingNotifier {
+    pub fn sent(&self) -> Vec<Notification> {
+        self.0.lock().map(|sent| sent.clone()).unwrap_or_default()
+    }
+}
+
+impl Notifier for RecordingNotifier {
+    fn notify<'a>(
+        &'a self,
+        notification: &'a Notification,
+    ) -> BoxFuture<'a, Result<(), NotifyError>> {
+        if let Ok(mut sent) = self.0.lock() {
+            sent.push(notification.clone());
+        }
+
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// A running app, HTTP server and MCP client wired to the fixture upstream
+pub struct Harness {
+    pub app: App,
+    pub server: RunningServer,
+    pub client: Client,
+    pub notifier: Arc<RecordingNotifier>,
+    pub http: reqwest::Client,
+    state_dir: PathBuf,
+}
+
+impl Harness {
+    /// `None` when the Monty worker is missing and skipping was requested
+    pub async fn start(limits: &str, server: &str) -> Result<Option<Self>, Box<dyn Error>> {
+        Self::with(Setup {
+            limits,
+            server,
+            ..Setup::default()
+        })
+        .await
+    }
+
+    pub async fn with(setup: Setup<'_>) -> Result<Option<Self>, Box<dyn Error>> {
+        let Some(worker) = monty_worker()? else {
+            return Ok(None);
+        };
+        let state_dir = temp_state_dir();
+        let config = config_for(&worker, &state_dir, &setup)?;
+
+        let notifier = Arc::new(RecordingNotifier::default());
+        let installed: Option<Arc<dyn Notifier>> = if setup.notify {
+            Some(Arc::clone(&notifier) as Arc<dyn Notifier>)
+        } else {
+            None
+        };
+        let app = App::start_with(config, installed).await?;
+        app.gateway().wait_ready(Duration::from_secs(30)).await;
+        let server = serve(&app).await?;
+        let url = format!("http://127.0.0.1:{}/mcp", server.local_addr().port());
+        let client: Client = ().serve(StreamableHttpClientTransport::from_uri(url)).await?;
+
+        Ok(Some(Self {
+            app,
+            server,
+            client,
+            notifier,
+            http: reqwest::Client::new(),
+            state_dir,
+        }))
+    }
+
+    /// Runs a script that must succeed and returns the parsed response
+    pub async fn execute_json(&self, code: &str) -> Result<Value, Box<dyn Error>> {
+        let result = execute(&self.client, code).await?;
+        assert_eq!(result.is_error, Some(false), "{}", text_of(&result));
+
+        Ok(serde_json::from_str(&text_of(&result))?)
+    }
+
+    /// Calls `execute` and parses the response, which must be JSON
+    pub async fn execute_body(&self, code: &str) -> Result<Value, Box<dyn Error>> {
+        let result = execute(&self.client, code).await?;
+
+        Ok(serde_json::from_str(&text_of(&result))?)
+    }
+
+    /// Calls `wait` until the execution is no longer pending
+    pub async fn wait_done(&self, id: &str) -> Result<CallToolResult, Box<dyn Error>> {
+        for _ in 0..30 {
+            let result = call(&self.client, "wait", json!({ "execution_id": id })).await?;
+            let pending = serde_json::from_str::<Value>(&text_of(&result))
+                .is_ok_and(|body| body["status"] == "pending");
+            if !pending {
+                return Ok(result);
+            }
+        }
+
+        Err("execution never finished".into())
+    }
+
+    /// Base URL of the main listener
+    pub fn base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.server.local_addr().port())
+    }
+
+    /// Base URL of the admin listener
+    pub fn admin_base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.server.admin_addr().port())
+    }
+
+    pub async fn post_json(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<(u16, Value), Box<dyn Error>> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base()))
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.json::<Value>().await.unwrap_or(Value::Null);
+
+        Ok((status, body))
+    }
+
+    /// Enrolls a software passkey through the admin and enrollment routes
+    pub async fn enroll_passkey(
+        &self,
+    ) -> Result<WebauthnAuthenticator<SoftPasskey>, Box<dyn Error>> {
+        let enrolled: Value = self
+            .http
+            .post(format!("{}/admin/enroll", self.admin_base()))
+            .json(&json!(null))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let url = enrolled["url"].as_str().ok_or("no enrollment url")?;
+        assert!(url.starts_with(ORIGIN), "{url}");
+        let path = url.trim_start_matches(ORIGIN).to_owned();
+
+        let page = self
+            .http
+            .get(format!("{}{path}", self.base()))
+            .send()
+            .await?;
+        assert_eq!(page.status().as_u16(), 200);
+
+        let (status, started) = self
+            .post_json(
+                &format!("{path}/options"),
+                &json!({ "label": "test <phone>" }),
+            )
+            .await?;
+        assert_eq!(status, 200, "{started}");
+        let options: CreationChallengeResponse =
+            serde_json::from_value(started["options"].clone())?;
+
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let credential = authenticator
+            .do_registration(Url::parse(ORIGIN)?, options)
+            .map_err(|error| format!("registration failed: {error:?}"))?;
+        let (status, finished) = self
+            .post_json(
+                &format!("{path}/finish"),
+                &json!({ "ceremony": started["ceremony"], "credential": credential }),
+            )
+            .await?;
+        assert_eq!(status, 200, "{finished}");
+
+        Ok(authenticator)
+    }
+
+    /// Approves `approval_id` the way the page does: options, a passkey
+    /// assertion, then confirm
+    pub async fn approve_with_passkey(
+        &self,
+        authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+        approval_id: &str,
+        choice: &str,
+    ) -> Result<(u16, Value), Box<dyn Error>> {
+        let (status, started) = self
+            .post_json(
+                &format!("/approve/{approval_id}/options"),
+                &json!({ "choice": choice }),
+            )
+            .await?;
+        if status != 200 {
+            return Ok((status, started));
+        }
+        let options: RequestChallengeResponse = serde_json::from_value(started["options"].clone())?;
+        let credential = authenticator
+            .do_authentication(Url::parse(ORIGIN)?, options)
+            .map_err(|error| format!("assertion failed: {error:?}"))?;
+
+        self.post_json(
+            &format!("/approve/{approval_id}/confirm"),
+            &json!({ "ceremony": started["ceremony"], "credential": credential }),
+        )
+        .await
+    }
+
+    pub async fn stop(self) -> TestResult {
+        self.client.cancel().await?;
+        self.server.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&self.state_dir);
+
+        Ok(())
+    }
+}
+
+pub fn text_of(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .map(|block| block.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub async fn call(
+    client: &Client,
+    tool: &'static str,
+    arguments: Value,
+) -> Result<CallToolResult, Box<dyn Error>> {
+    let Value::Object(arguments) = arguments else {
+        return Err("arguments must be an object".into());
+    };
+
+    Ok(client
+        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
+        .await?)
+}
+
+pub async fn execute(client: &Client, code: &str) -> Result<CallToolResult, Box<dyn Error>> {
+    call(client, "execute", json!({ "code": code })).await
+}
+
+/// Approval id from a pending body's `approval_url`
+pub fn approval_id(pending: &Value) -> Result<String, Box<dyn Error>> {
+    let url = pending["approval_url"]
+        .as_str()
+        .ok_or_else(|| format!("no approval_url in {pending}"))?;
+
+    Ok(url.rsplit('/').next().unwrap_or_default().to_owned())
+}

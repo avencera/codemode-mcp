@@ -21,7 +21,8 @@ macro_rules! script_rules {
             "\n\
              - Allowed: top-level `await`; `async def` helpers; `await asyncio.gather(a(), b())` for concurrency \
              (no keyword args such as return_exceptions); if/for/while; list/dict/set comprehensions; f-strings; \
-             try/except/finally with built-in exceptions; dict, list, set, tuple, str, int, float, bool, None; \
+             try/except/finally with built-in exceptions (a refused or unapproved tool call raises \
+             PermissionError; catch it as `except OSError`); dict, list, set, tuple, str, int, float, bool, None; \
              `@dataclass` only if really needed (eq=/frozen= options only).\n\
              - Stdlib only: asyncio, json, re, datetime, math, itertools, functools, collections, base64, \
              hashlib, random, time, typing. No third-party packages; no file or network access except through tools.\n\
@@ -42,6 +43,8 @@ pub const TOOL_CALL_RULE: &str = tool_call_rule!();
 pub const INSTRUCTIONS: &str = concat!(
     "Many upstream tools are reachable through scripts. Workflow: search_tools to find tools by keyword, \
      describe_tools to get their typed Python signatures, then execute a script that calls them. \
-     execute returns status \"pending\" with an execution_id if the script is slow; call wait(execution_id).\n\n",
+     execute returns status \"pending\" with an execution_id if the script is slow; call wait(execution_id). \
+     Some tools need the user's approval on their phone: a pending answer with approval_url and waiting_for \
+     means tell the user to check their phone, then call wait.\n\n",
     script_rules!()
 );

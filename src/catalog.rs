@@ -341,6 +341,12 @@ fn stable_hash(server: &str, tool: &str) -> String {
     format!("{hash:016x}")[..HASH_HEX_DIGITS].to_owned()
 }
 
+/// Start of every Python tool name of `server` (`<server>_`), before any
+/// collision suffix
+pub fn function_prefix(server: &str) -> String {
+    sanitize_identifier(&format!("{server}_"))
+}
+
 /// Makes a valid Python identifier from arbitrary text
 fn sanitize_identifier(raw: &str) -> String {
     let mut base: String = raw

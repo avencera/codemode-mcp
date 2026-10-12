@@ -11,6 +11,8 @@ use tokio::sync::watch;
 use crate::{
     executor::{ExecutionOutcome, Executor, ExecutorBusy},
     gateway::Gateway,
+    store::now_ms,
+    usage::{Caller, Classification, ExecutionRecord, Outcome, UsageLog},
 };
 
 /// What a caller learns after waiting on an execution
@@ -40,6 +42,7 @@ pub struct Executions {
     entries: Arc<Registry>,
     ttl: Duration,
     max_retained_bytes: usize,
+    log: UsageLog,
 }
 
 impl Executions {
@@ -50,6 +53,7 @@ impl Executions {
         executor: Arc<Executor>,
         ttl: Duration,
         max_retained_bytes: usize,
+        log: UsageLog,
     ) -> Self {
         Self {
             gateway,
@@ -57,13 +61,14 @@ impl Executions {
             entries: Arc::new(Mutex::new(HashMap::new())),
             ttl,
             max_retained_bytes,
+            log,
         }
     }
 
-    /// Starts `code` in the background and returns its id
+    /// Starts `code` for `caller` in the background and returns its id
     ///
     /// Refused when every worker is busy and the wait queue is full
-    pub fn start(&self, code: String) -> Result<String, ExecutorBusy> {
+    pub fn start(&self, code: String, caller: Caller) -> Result<String, ExecutorBusy> {
         self.purge();
         let ticket = self.executor.admit()?;
 
@@ -87,8 +92,23 @@ impl Executions {
             max_retained_bytes: self.max_retained_bytes,
         };
         let task_id = id.clone();
+        let log = self.log.clone();
         tokio::spawn(async move {
-            let outcome = executor.run(ticket, &gateway, &task_id, code).await;
+            let started = std::time::Instant::now();
+            let started_ms = now_ms();
+            let script = code.clone();
+            let outcome = executor
+                .run(ticket, &gateway, &task_id, code, caller.clone())
+                .await;
+            log.execution(ExecutionRecord {
+                id: task_id,
+                started_ms,
+                caller,
+                script,
+                classification: outcome.classification(),
+                duration: started.elapsed(),
+                result_bytes: retained_bytes(&outcome),
+            });
 
             guard.finish(outcome);
         });
@@ -173,9 +193,11 @@ impl FinishGuard {
 
 impl Drop for FinishGuard {
     fn drop(&mut self) {
+        let message = "the execution task ended unexpectedly (internal error)";
         self.record(ExecutionOutcome::Failed {
-            message: "the execution task ended unexpectedly (internal error)".to_owned(),
+            message: message.to_owned(),
             output: String::new(),
+            class: Classification::new(Outcome::RuntimeError, message),
         });
     }
 }
@@ -212,8 +234,12 @@ fn retained_bytes(outcome: &ExecutionOutcome) -> usize {
             output,
             ..
         } => value.to_string().len() + output.len() + notes.iter().map(String::len).sum::<usize>(),
-        ExecutionOutcome::TypeError { diagnostics } => diagnostics.len(),
-        ExecutionOutcome::Exception { message, output }
-        | ExecutionOutcome::Failed { message, output } => message.len() + output.len(),
+        ExecutionOutcome::TypeError { diagnostics, .. } => diagnostics.len(),
+        ExecutionOutcome::Exception {
+            message, output, ..
+        }
+        | ExecutionOutcome::Failed {
+            message, output, ..
+        } => message.len() + output.len(),
     }
 }
