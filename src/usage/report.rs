@@ -338,9 +338,9 @@ impl<'a> Reporter<'a> {
         let _ = writeln!(out, "# codemode-mcp usage review\n");
         let _ = writeln!(
             out,
-            "Window: last {} (since {} ms epoch)\n",
+            "Window: last {} (since {})\n",
             human_duration(now_ms() - self.since_ms),
-            self.since_ms
+            central_time(self.since_ms)
         );
 
         self.client_section(&mut out, &stats);
@@ -739,6 +739,16 @@ pub fn render_stats(stats: &Stats) -> String {
 /// `0.75` as `75%`, `-` when unknown
 pub fn percent(value: Option<f64>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| format!("{:.0}%", value * 100.0))
+}
+
+/// Formats a millisecond timestamp in US Central time, the owner's zone
+pub fn central_time(ms: i64) -> String {
+    jiff::Timestamp::from_millisecond(ms)
+        .and_then(|at| at.in_tz("America/Chicago"))
+        .map_or_else(
+            |_| format!("{ms} ms epoch"),
+            |at| at.strftime("%Y-%m-%d %H:%M %Z").to_string(),
+        )
 }
 
 /// Milliseconds as a short human duration
