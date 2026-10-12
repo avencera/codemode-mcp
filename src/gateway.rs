@@ -22,6 +22,7 @@ use crate::{
     config::Config,
     convert::json_to_monty,
     executor::Executor,
+    oauth::OAuth,
     policy::Policy,
     upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
@@ -255,6 +256,7 @@ pub struct Gateway {
     executor: Arc<Executor>,
     approvals: Arc<Approvals>,
     log: UsageLog,
+    oauth: Arc<OAuth>,
     redactor: Redactor,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
@@ -273,8 +275,13 @@ impl Gateway {
         executor: Arc<Executor>,
         approvals: Arc<Approvals>,
         log: UsageLog,
+        oauth: Arc<OAuth>,
     ) -> Arc<Self> {
-        let upstreams = Upstreams::start(&config.servers, config.tool_timeout());
+        let upstreams = Upstreams::start(
+            &config.servers,
+            config.tool_timeout(),
+            Some(Arc::clone(&oauth)),
+        );
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {
             redactor: Redactor::new(&config),
@@ -290,6 +297,7 @@ impl Gateway {
             executor,
             approvals,
             log,
+            oauth,
             rebuild_task: RwLock::new(None),
         });
 
@@ -370,6 +378,22 @@ impl Gateway {
     /// The approval service
     pub fn approvals(&self) -> &Arc<Approvals> {
         &self.approvals
+    }
+
+    /// OAuth logins of remote upstreams
+    pub fn oauth(&self) -> &Arc<OAuth> {
+        &self.oauth
+    }
+
+    /// Reconnects one upstream, e.g. after its login changed; false when no
+    /// server has this name
+    pub fn reconnect(&self, server: &str) -> bool {
+        let Some(upstream) = self.upstreams.get(server) else {
+            return false;
+        };
+        upstream.request_reconnect();
+
+        true
     }
 
     /// Resolves a script's tool call and applies policy, without running it

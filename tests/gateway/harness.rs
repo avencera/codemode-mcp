@@ -122,6 +122,14 @@ impl RecordingNotifier {
     pub fn sent(&self) -> Vec<Notification> {
         self.0.lock().map(|sent| sent.clone()).unwrap_or_default()
     }
+
+    /// Notifications about tool calls, leaving out passkey admin requests
+    pub fn tool_requests(&self) -> Vec<Notification> {
+        self.sent()
+            .into_iter()
+            .filter(|notification| notification.title.contains(" wants "))
+            .collect()
+    }
 }
 
 impl Notifier for RecordingNotifier {
@@ -187,6 +195,16 @@ impl Harness {
         }))
     }
 
+    /// Another MCP client, so another MCP session, on the same server
+    pub async fn second_client(&self) -> Result<Client, Box<dyn Error>> {
+        let url = format!("{}/mcp", self.base());
+
+        Ok(
+            ().serve(StreamableHttpClientTransport::from_uri(url))
+                .await?,
+        )
+    }
+
     /// Runs a script that must succeed and returns the parsed response
     pub async fn execute_json(&self, code: &str) -> Result<Value, Box<dyn Error>> {
         let result = execute(&self.client, code).await?;
@@ -243,22 +261,51 @@ impl Harness {
         Ok((status, body))
     }
 
-    /// Enrolls a software passkey through the admin and enrollment routes
+    /// Posts JSON to the admin listener
+    pub async fn admin_json(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<(u16, Value), Box<dyn Error>> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.admin_base()))
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+
+        Ok((status, response.json().await.unwrap_or(Value::Null)))
+    }
+
+    /// Asks the admin listener for an enrollment link; returns the link's
+    /// path on the main listener and the admin response
+    pub async fn request_enrollment(&self, label: &str) -> Result<(String, Value), Box<dyn Error>> {
+        let (status, enrolled) = self
+            .admin_json("/admin/enroll", &json!({ "label": label }))
+            .await?;
+        assert_eq!(status, 200, "{enrolled}");
+        let url = enrolled["url"].as_str().ok_or("no enrollment url")?;
+        assert!(url.starts_with(ORIGIN), "{url}");
+
+        Ok((url.trim_start_matches(ORIGIN).to_owned(), enrolled))
+    }
+
+    /// Enrolls the first software passkey through the admin and enrollment routes
     pub async fn enroll_passkey(
         &self,
     ) -> Result<WebauthnAuthenticator<SoftPasskey>, Box<dyn Error>> {
-        let enrolled: Value = self
-            .http
-            .post(format!("{}/admin/enroll", self.admin_base()))
-            .json(&json!(null))
-            .send()
-            .await?
-            .json()
-            .await?;
-        let url = enrolled["url"].as_str().ok_or("no enrollment url")?;
-        assert!(url.starts_with(ORIGIN), "{url}");
-        let path = url.trim_start_matches(ORIGIN).to_owned();
+        let (path, enrolled) = self.request_enrollment("test <phone>").await?;
+        assert!(enrolled["approval_url"].is_null(), "{enrolled}");
 
+        self.register_at(&path).await
+    }
+
+    /// Registers a new software passkey on an enrollment page that is ready
+    pub async fn register_at(
+        &self,
+        path: &str,
+    ) -> Result<WebauthnAuthenticator<SoftPasskey>, Box<dyn Error>> {
         let page = self
             .http
             .get(format!("{}{path}", self.base()))
@@ -267,10 +314,7 @@ impl Harness {
         assert_eq!(page.status().as_u16(), 200);
 
         let (status, started) = self
-            .post_json(
-                &format!("{path}/options"),
-                &json!({ "label": "test <phone>" }),
-            )
+            .post_json(&format!("{path}/options"), &json!({}))
             .await?;
         assert_eq!(status, 200, "{started}");
         let options: CreationChallengeResponse =

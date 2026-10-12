@@ -1,4 +1,4 @@
-//! Push notifications for approval requests
+//! Push notifications for approval requests and adapter messages
 
 use std::{future::Future, io::Read, pin::Pin, time::Duration};
 
@@ -13,8 +13,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const NTFY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Largest token file accepted
 const TOKEN_FILE_LIMIT: u64 = 4096;
-/// ntfy's "high" priority
-const HIGH_PRIORITY: u8 = 4;
 
 /// Why a notification was not delivered; never carries the topic or token
 #[derive(Debug, thiserror::Error)]
@@ -30,7 +28,28 @@ pub enum NotifyError {
     Status(u16),
 }
 
-/// One approval notification
+/// ntfy priority levels used here
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// ntfy 3
+    Default,
+    /// ntfy 4
+    High,
+    /// ntfy 5
+    Urgent,
+}
+
+impl Priority {
+    fn ntfy_level(self) -> u8 {
+        match self {
+            Self::Default => 3,
+            Self::High => 4,
+            Self::Urgent => 5,
+        }
+    }
+}
+
+/// One push notification
 #[derive(Debug, Clone)]
 pub struct Notification {
     /// Headline
@@ -38,7 +57,11 @@ pub struct Notification {
     /// Body text
     pub message: String,
     /// Page opened when the notification is tapped
-    pub click: String,
+    pub click: Option<String>,
+    /// How loudly the phone announces it
+    pub priority: Priority,
+    /// ntfy tag (an emoji short code)
+    pub tag: &'static str,
 }
 
 /// Delivers notifications to the owner's phone
@@ -59,6 +82,14 @@ pub struct Ntfy {
 impl Ntfy {
     /// A notifier for `config`
     pub fn new(config: NtfyConfig) -> Self {
+        // a bearer token sent over plain HTTP can be read by anyone on the path
+        if config.token_file.is_some() && config.server.starts_with("http://") {
+            tracing::warn!(
+                server = %config.server,
+                "an ntfy token is configured for a plain http:// server; it is sent unencrypted"
+            );
+        }
+
         Self {
             client: reqwest::Client::new(),
             config,
@@ -70,14 +101,16 @@ impl Ntfy {
             Some(path) => Some(read_token(&expand_home(path))?),
             None => None,
         };
-        let body = json!({
+        let mut body = json!({
             "topic": self.config.topic,
             "title": notification.title,
             "message": notification.message,
-            "priority": HIGH_PRIORITY,
-            "click": notification.click,
-            "tags": ["lock"],
+            "priority": notification.priority.ntfy_level(),
+            "tags": [notification.tag],
         });
+        if let Some(click) = &notification.click {
+            body["click"] = json!(click);
+        }
 
         // the topic travels in the body, so URLs in errors never reveal it
         let mut request = self

@@ -1,4 +1,4 @@
-//! SQLite state: usage records, approvals and enrolled passkeys
+//! SQLite state: usage records, approvals, enrolled passkeys and OAuth logins
 
 pub mod schema;
 
@@ -118,15 +118,32 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Stores a newly registered passkey and returns its id
-    pub fn add_passkey(&self, label: &str, credential: &str) -> Result<i64, StoreError> {
-        let connection = self.connection();
-        connection.execute(
+    /// Stores a newly registered passkey and returns its id; with
+    /// `only_if_none`, stores nothing and returns `None` when any passkey
+    /// already exists
+    pub fn add_passkey(
+        &self,
+        label: &str,
+        credential: &str,
+        only_if_none: bool,
+    ) -> Result<Option<i64>, StoreError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if only_if_none {
+            let count: i64 =
+                transaction.query_row("SELECT COUNT(*) FROM passkeys", [], |row| row.get(0))?;
+            if count > 0 {
+                return Ok(None);
+            }
+        }
+        transaction.execute(
             "INSERT INTO passkeys (label, created_ms, credential) VALUES (?1, ?2, ?3)",
             params![label, now_ms(), credential],
         )?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
 
-        Ok(connection.last_insert_rowid())
+        Ok(Some(id))
     }
 
     /// Every enrolled passkey, oldest first
@@ -181,23 +198,168 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes a passkey, returning whether it existed
-    pub fn remove_passkey(&self, id: i64) -> Result<bool, StoreError> {
-        let removed = self
-            .connection()
-            .execute("DELETE FROM passkeys WHERE id = ?1", params![id])?;
+    /// Deletes the passkey with this id and enrollment time, returning
+    /// whether it existed; the time guards against a reused row id
+    pub fn remove_passkey(&self, id: i64, created_ms: i64) -> Result<bool, StoreError> {
+        let removed = self.connection().execute(
+            "DELETE FROM passkeys WHERE id = ?1 AND created_ms = ?2",
+            params![id, created_ms],
+        )?;
 
         Ok(removed > 0)
     }
 
-    /// Label of a passkey, if it exists
-    pub fn passkey_label(&self, id: i64) -> Result<Option<String>, StoreError> {
+    /// Client registration and credentials JSON of a server's OAuth login
+    pub fn oauth_login(&self, server: &str) -> Result<Option<(String, String)>, StoreError> {
         Ok(self
             .connection()
             .query_row(
-                "SELECT label FROM passkeys WHERE id = ?1",
+                "SELECT client, credentials FROM oauth_logins WHERE server = ?1",
+                params![server],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Stores a completed login and forgets the server's flows in progress
+    pub fn save_oauth_login(
+        &self,
+        server: &str,
+        client: &str,
+        credentials: &str,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO oauth_logins (server, client, credentials, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (server) DO UPDATE SET client = ?2, credentials = ?3, updated_ms = ?4",
+            params![server, client, credentials, now_ms()],
+        )?;
+        transaction.execute(
+            "DELETE FROM oauth_pending WHERE server = ?1",
+            params![server],
+        )?;
+        transaction.commit()?;
+
+        Ok(())
+    }
+
+    /// Replaces the credentials of an existing login (a refresh); does
+    /// nothing when the server was logged out meanwhile
+    pub fn update_oauth_credentials(
+        &self,
+        server: &str,
+        credentials: &str,
+    ) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE oauth_logins SET credentials = ?2, updated_ms = ?3 WHERE server = ?1",
+            params![server, credentials, now_ms()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Deletes a server's login and flows in progress, returning whether a
+    /// login existed
+    pub fn remove_oauth_login(&self, server: &str) -> Result<bool, StoreError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM oauth_logins WHERE server = ?1",
+            params![server],
+        )?;
+        transaction.execute(
+            "DELETE FROM oauth_pending WHERE server = ?1",
+            params![server],
+        )?;
+        transaction.commit()?;
+
+        Ok(removed > 0)
+    }
+
+    /// Stores the PKCE state of a flow in progress, dropping flows older
+    /// than `max_age_ms`
+    pub fn save_oauth_pending(
+        &self,
+        server: &str,
+        csrf: &str,
+        state: &str,
+        max_age_ms: i64,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection();
+        let now = now_ms();
+        connection.execute(
+            "DELETE FROM oauth_pending WHERE created_ms < ?1",
+            params![now - max_age_ms],
+        )?;
+        connection.execute(
+            "INSERT OR REPLACE INTO oauth_pending (csrf, server, state, client, created_ms) \
+             VALUES (?1, ?2, ?3, NULL, ?4)",
+            params![csrf, server, state, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Attaches the client registration to a flow in progress
+    pub fn set_oauth_pending_client(
+        &self,
+        server: &str,
+        csrf: &str,
+        client: &str,
+    ) -> Result<bool, StoreError> {
+        let updated = self.connection().execute(
+            "UPDATE oauth_pending SET client = ?3 WHERE server = ?1 AND csrf = ?2",
+            params![server, csrf, client],
+        )?;
+
+        Ok(updated > 0)
+    }
+
+    /// PKCE state and client registration of a flow younger than `max_age_ms`
+    pub fn oauth_pending(
+        &self,
+        server: &str,
+        csrf: &str,
+        max_age_ms: i64,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT state, client FROM oauth_pending \
+                 WHERE server = ?1 AND csrf = ?2 AND created_ms >= ?3",
+                params![server, csrf, now_ms() - max_age_ms],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Forgets one flow in progress
+    pub fn delete_oauth_pending(&self, server: &str, csrf: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "DELETE FROM oauth_pending WHERE server = ?1 AND csrf = ?2",
+            params![server, csrf],
+        )?;
+
+        Ok(())
+    }
+
+    /// One passkey, if it exists
+    pub fn passkey(&self, id: i64) -> Result<Option<PasskeyRecord>, StoreError> {
+        Ok(self
+            .connection()
+            .query_row(
+                "SELECT id, label, created_ms, last_used_ms FROM passkeys WHERE id = ?1",
                 params![id],
-                |row| row.get(0),
+                |row| {
+                    Ok(PasskeyRecord {
+                        id: row.get(0)?,
+                        label: row.get(1)?,
+                        created_ms: row.get(2)?,
+                        last_used_ms: row.get(3)?,
+                    })
+                },
             )
             .optional()?)
     }

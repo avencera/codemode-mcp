@@ -63,7 +63,7 @@ async fn approve_once_through_the_passkey_page() -> TestResult {
     );
 
     // the notification names the client and tool, and nothing else
-    let sent = harness.notifier.sent();
+    let sent = harness.notifier.tool_requests();
     assert_eq!(sent.len(), 1);
     assert!(sent[0].title.starts_with("codemode: "), "{}", sent[0].title);
     assert!(
@@ -71,7 +71,7 @@ async fn approve_once_through_the_passkey_page() -> TestResult {
         "{}",
         sent[0].title
     );
-    assert_eq!(sent[0].click, format!("{ORIGIN}/approve/{id}"));
+    assert_eq!(sent[0].click, Some(format!("{ORIGIN}/approve/{id}")));
     assert!(!sent[0].message.contains("\"a\""), "{}", sent[0].message);
 
     let page = harness
@@ -135,7 +135,7 @@ async fn session_grants_cover_the_session_and_per_call_tools_ask_again() -> Test
         .execute_json("int(await fixture_add(a=2, b=2))")
         .await?;
     assert_eq!(second["result"], 4, "{second}");
-    assert_eq!(harness.notifier.sent().len(), 1);
+    assert_eq!(harness.notifier.tool_requests().len(), 1);
 
     // a per-call tool asks even inside a granted session, and refuses a
     // session grant
@@ -167,7 +167,7 @@ async fn session_grants_cover_the_session_and_per_call_tools_ask_again() -> Test
     assert_eq!(denied.is_error, Some(true), "{text}");
     assert!(text.contains("PermissionError"), "{text}");
     assert!(text.contains("denied on the approval page"), "{text}");
-    assert_eq!(harness.notifier.sent().len(), 3);
+    assert_eq!(harness.notifier.tool_requests().len(), 3);
 
     harness.stop().await
 }
@@ -206,6 +206,14 @@ async fn denial_and_expiry_raise_python_exceptions() -> TestResult {
             .as_str()
             .is_some_and(|message| message.contains("expired after 1 min")),
         "{expired}"
+    );
+    // an expired request takes no decision
+    assert!(
+        harness
+            .app
+            .approvals()
+            .decide(&approval_id(&pending)?, Choice::Once)
+            .is_err()
     );
 
     harness.stop().await
@@ -275,13 +283,13 @@ async fn admin_routes_refuse_non_loopback_and_proxied_peers() -> TestResult {
     let status_from = |peer: [u8; 4], header: Option<(&'static str, &'static str)>| {
         let router = admin::router(&harness.app)
             .layer(MockConnectInfo(std::net::SocketAddr::from((peer, 40000))));
-        let mut request = Request::post("/admin/enroll");
+        let mut request = Request::post("/admin/enroll").header("content-type", "application/json");
         if let Some((name, value)) = header {
             request = request.header(name, value);
         }
 
         async move {
-            let request = request.body(Body::empty())?;
+            let request = request.body(Body::from(r#"{"label":"x"}"#))?;
 
             Ok::<_, Box<dyn std::error::Error>>(router.oneshot(request).await?.status())
         }

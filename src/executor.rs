@@ -56,7 +56,7 @@ pub enum ExecutorError {
     Snapshot(#[from] crate::snapshot::SnapshotError),
     /// The Monty worker binary could not be located
     #[error(
-        "monty worker binary not found; set `worker_path` in the config or put `monty` on PATH"
+        "monty worker binary not found; set `worker_path` in the config, run `codemode-mcp service install`, or put `monty` on PATH"
     )]
     WorkerNotFound,
     /// The worker pool could not start
@@ -662,7 +662,8 @@ fn tool_inputs(catalog: &Catalog) -> Vec<(String, MontyObject)> {
         .collect()
 }
 
-/// Locates the worker binary: the configured path, else `monty` on `PATH`
+/// Locates the worker binary: the configured path, else the copy `service
+/// install` makes, else `monty` on `PATH`
 fn resolve_worker(configured: Option<&Path>) -> Result<PathBuf, ExecutorError> {
     if let Some(path) = configured {
         return if path.is_file() {
@@ -670,6 +671,12 @@ fn resolve_worker(configured: Option<&Path>) -> Result<PathBuf, ExecutorError> {
         } else {
             Err(ExecutorError::WorkerNotFound)
         };
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let installed = crate::service::default_worker_path(Path::new(&home));
+        if installed.is_file() {
+            return Ok(installed);
+        }
     }
 
     std::env::var_os("PATH")

@@ -34,7 +34,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::config::{ServerConfig, Transport};
+use crate::{
+    config::{ServerConfig, Transport},
+    oauth::OAuth,
+};
 
 /// Time allowed for the initialize handshake plus the first tool listing
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,6 +46,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A connection that survived this long is considered healthy, so the next
 /// failure starts the backoff over
 const HEALTHY_AFTER: Duration = Duration::from_secs(30);
+/// How often a server waiting for an OAuth login is retried anyway, in case
+/// it starts accepting anonymous clients
+const NEEDS_LOGIN_RETRY: Duration = Duration::from_secs(30 * 60);
 
 /// Failures talking to an upstream server
 #[derive(Debug, thiserror::Error)]
@@ -98,6 +104,12 @@ pub enum UpstreamError {
     /// The server asked for something other than a tool result
     #[error("server asked for interactive input, which is not supported")]
     InputRequired,
+    /// The server refuses anonymous clients and has no usable OAuth login
+    #[error("server `{0}` needs an OAuth login: run `codemode-mcp oauth login {0}`")]
+    NeedsLogin(String),
+    /// The OAuth client could not be prepared (discovery or stored login)
+    #[error("oauth: {0}")]
+    OAuth(String),
 }
 
 impl UpstreamError {
@@ -111,6 +123,8 @@ impl UpstreamError {
             Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
             Self::Service(_) | Self::InputRequired => ErrorCategory::Protocol,
             Self::Interrupted { .. } => ErrorCategory::ConnectionClosed,
+            Self::NeedsLogin(_) => ErrorCategory::NeedsLogin,
+            Self::OAuth(_) => ErrorCategory::Transport,
         }
     }
 
@@ -120,9 +134,10 @@ impl UpstreamError {
     /// own answer to the call and keep their message
     pub fn public_message(&self) -> String {
         match self {
-            Self::Unavailable { .. } | Self::TimedOut { .. } | Self::InputRequired => {
-                self.to_string()
-            }
+            Self::Unavailable { .. }
+            | Self::TimedOut { .. }
+            | Self::InputRequired
+            | Self::NeedsLogin(_) => self.to_string(),
             Self::Service(ServiceError::McpError(error)) => {
                 format!("the server returned an error: {}", error.message)
             }
@@ -134,6 +149,7 @@ impl UpstreamError {
             Self::Spawn { .. }
             | Self::Header(_)
             | Self::Initialize(_)
+            | Self::OAuth(_)
             | Self::ConnectTimeout(_) => {
                 format!(
                     "the server could not be reached ({})",
@@ -163,6 +179,8 @@ pub enum ErrorCategory {
     Protocol,
     /// Still connecting
     Connecting,
+    /// The server needs an OAuth login
+    NeedsLogin,
 }
 
 impl Serialize for ErrorCategory {
@@ -183,6 +201,7 @@ impl ErrorCategory {
             Self::Transport => "transport",
             Self::Protocol => "protocol",
             Self::Connecting => "connecting",
+            Self::NeedsLogin => "needs_login",
         }
     }
 }
@@ -195,6 +214,8 @@ pub enum UpstreamStatus {
     Connecting,
     /// Connected and serving tools
     Connected,
+    /// Refused anonymous access; waits for `codemode-mcp oauth login`
+    NeedsLogin,
     /// Not connected; a retry is scheduled
     Unavailable {
         /// Why the last attempt or connection failed; may hold URLs, paths
@@ -206,19 +227,21 @@ pub enum UpstreamStatus {
 }
 
 impl UpstreamStatus {
-    /// `connecting`, `connected` or `unavailable`
+    /// `connecting`, `connected`, `needs_login` or `unavailable`
     pub fn state(&self) -> &'static str {
         match self {
             Self::Connecting => "connecting",
             Self::Connected => "connected",
+            Self::NeedsLogin => "needs_login",
             Self::Unavailable { .. } => "unavailable",
         }
     }
 
-    /// Coarse reason when unavailable
+    /// Coarse reason when not connected
     pub fn category(&self) -> Option<ErrorCategory> {
         match self {
             Self::Unavailable { category, .. } => Some(*category),
+            Self::NeedsLogin => Some(ErrorCategory::NeedsLogin),
             _ => None,
         }
     }
@@ -244,6 +267,12 @@ pub struct Upstream {
     refresh_seq: AtomicU64,
     /// Serializes tool-list refreshes so a stale response never overwrites a newer one
     refresh_turn: Mutex<()>,
+    /// Logins for `oauth = true` servers
+    oauth: Option<Arc<OAuth>>,
+    /// Wakes the supervisor to drop the connection and connect again
+    /// Counts reconnect requests; the supervisor compares against the
+    /// value it last saw
+    reconnect: watch::Sender<u64>,
 }
 
 impl Upstream {
@@ -350,6 +379,24 @@ impl Upstream {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Drops the current connection (if any) and connects again at once,
+    /// e.g. after an OAuth login or logout
+    pub fn request_reconnect(&self) {
+        self.reconnect.send_modify(|count| *count += 1);
+    }
+
+    /// Without a login the server's tools are not usable, so they leave the
+    /// catalog instead of lingering as unavailable
+    fn mark_needs_login(&self) {
+        {
+            let mut inner = self.write();
+            inner.peer = None;
+            inner.tools.clear();
+        }
+        self.status.send_replace(UpstreamStatus::NeedsLogin);
+        self.changed.notify_one();
+    }
+
     fn mark_unavailable(&self, error: String, category: ErrorCategory) {
         // only a connected server turning unavailable changes what the
         // catalog shows; repeated failed reconnects do not
@@ -393,13 +440,26 @@ impl Upstream {
 
     async fn supervise(self: Arc<Self>) {
         let mut backoff = BACKOFF_START;
+        let mut requests = self.reconnect.subscribe();
 
         loop {
+            // a request made before this attempt is answered by it; a
+            // counter, unlike a Notify permit, cannot fire twice for one
+            requests.borrow_and_update();
+            let mut delay = backoff;
             match self.connect().await {
                 Ok(service) => {
                     let connected_at = Instant::now();
                     tracing::info!(server = %self.name, "connected");
+                    let token = service.cancellation_token();
+                    let mut watched = requests.clone();
+                    let watcher = tokio::spawn(async move {
+                        if watched.changed().await.is_ok() {
+                            token.cancel();
+                        }
+                    });
                     let reason = service.waiting().await;
+                    watcher.abort();
                     let error = format!("connection closed ({reason:?})");
                     tracing::warn!(server = %self.name, %error, "upstream disconnected");
                     self.mark_unavailable(error, ErrorCategory::ConnectionClosed);
@@ -410,16 +470,37 @@ impl Upstream {
                         backoff = BACKOFF_START;
                     }
                 }
+                Err(UpstreamError::NeedsLogin(_)) => {
+                    tracing::warn!(server = %self.name, "upstream needs an OAuth login");
+                    self.mark_needs_login();
+                    delay = NEEDS_LOGIN_RETRY;
+                }
                 Err(error) => {
                     tracing::warn!(server = %self.name, %error, "upstream connection failed");
                     self.mark_unavailable(error.to_string(), error.category());
                 }
             }
 
-            tracing::info!(server = %self.name, delay = ?backoff, "reconnecting");
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(BACKOFF_MAX);
-            self.status.send_replace(UpstreamStatus::Connecting);
+            let requested = if requests.has_changed().unwrap_or(false) {
+                true
+            } else {
+                tracing::info!(server = %self.name, ?delay, "reconnecting");
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => false,
+                    changed = requests.changed() => changed.is_ok(),
+                }
+            };
+            backoff = if requested {
+                BACKOFF_START
+            } else {
+                (backoff * 2).min(BACKOFF_MAX)
+            };
+            // a timed retry of a server waiting for a login stays
+            // `needs_login`; a requested reconnect (after login or logout)
+            // shows that it is trying
+            if requested || self.status() != UpstreamStatus::NeedsLogin {
+                self.status.send_replace(UpstreamStatus::Connecting);
+            }
         }
     }
 
@@ -449,12 +530,37 @@ impl Upstream {
                     .map_err(|error| UpstreamError::Initialize(error.to_string()))?
             }
             Some(Transport::Http { url }) => {
-                let transport = StreamableHttpClientTransport::from_config(self.http_config(url)?);
+                let config = self.http_config(url)?;
+                let authorized =
+                    match &self.oauth {
+                        Some(oauth) if self.config.oauth => oauth
+                            .authorized_client(&self.name)
+                            .await
+                            .map_err(|error| UpstreamError::OAuth(error.to_string()))?,
+                        _ => None,
+                    };
+                // without a login an OAuth server is tried anonymously; a
+                // 401 then means it needs one
+                let served = match authorized {
+                    Some(client) => {
+                        handler
+                            .serve(StreamableHttpClientTransport::with_client(client, config))
+                            .await
+                    }
+                    None => {
+                        handler
+                            .serve(StreamableHttpClientTransport::from_config(config))
+                            .await
+                    }
+                };
 
-                handler
-                    .serve(transport)
-                    .await
-                    .map_err(|error| UpstreamError::Initialize(error.to_string()))?
+                served.map_err(|error| {
+                    if self.config.oauth && error.is_authorization_required() {
+                        UpstreamError::NeedsLogin(self.name.clone())
+                    } else {
+                        UpstreamError::Initialize(error.to_string())
+                    }
+                })?
             }
             None => {
                 return Err(UpstreamError::Initialize(
@@ -614,6 +720,7 @@ impl Upstreams {
     pub fn start(
         servers: &std::collections::BTreeMap<String, ServerConfig>,
         call_timeout: Duration,
+        oauth: Option<Arc<OAuth>>,
     ) -> Self {
         let changed = Arc::new(Notify::new());
         let mut upstreams = Vec::new();
@@ -631,6 +738,8 @@ impl Upstreams {
                 epoch: AtomicU64::new(0),
                 refresh_seq: AtomicU64::new(0),
                 refresh_turn: Mutex::new(()),
+                oauth: oauth.clone(),
+                reconnect: watch::channel(0).0,
             });
             tasks.push(tokio::spawn(Arc::clone(&upstream).supervise()));
             upstreams.push(upstream);

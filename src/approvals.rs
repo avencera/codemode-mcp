@@ -2,7 +2,9 @@
 //! notifications and expiry
 //!
 //! The web page (after a passkey assertion) and tests both answer requests
-//! through [`Approvals::decide`], so there is one decision path
+//! through [`Approvals::decide`], so there is one decision path. Admin
+//! actions (adding or removing a passkey) use the same requests and page,
+//! so only an existing passkey can authorize them
 
 use std::{
     collections::{HashMap, HashSet},
@@ -14,7 +16,7 @@ use serde_json::{Map, Value};
 use tokio::sync::oneshot;
 
 use crate::{
-    notify::{Notification, Notifier},
+    notify::{Notification, Notifier, Priority},
     policy::GrantMode,
     store::Store,
     usage::{ApprovalRecord, Caller, UsageLog},
@@ -73,11 +75,43 @@ pub enum Verdict {
     },
 }
 
+/// Client name recorded for admin requests made through the CLI
+pub const ADMIN_CLIENT: &str = "codemode-mcp cli";
+/// Server name recorded for admin requests
+pub const ADMIN_SERVER: &str = "codemode-mcp";
+
+/// What a request asks permission for
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// A script's call of an `ask` tool
+    ToolCall,
+    /// A change to codemode-mcp itself, such as enrolling a passkey
+    Admin {
+        /// Headline on the page, e.g. `Enroll a new passkey named "iPad"`
+        title: String,
+    },
+}
+
+/// An admin action that needs an existing passkey's approval
+pub struct AdminRequest {
+    /// Action name recorded as the tool, e.g. `passkey.enroll`
+    pub action: &'static str,
+    /// Headline on the approval page and in the notification
+    pub title: String,
+    /// Details shown on the page
+    pub details: Map<String, Value>,
+    /// Short code the CLI prints and the page and notification repeat, so
+    /// the owner can tell their own request from a look-alike
+    pub code: String,
+}
+
 /// Everything the approval page shows about one request
 #[derive(Debug, Clone)]
 pub struct ApprovalInfo {
     /// Approval id
     pub id: String,
+    /// Tool call or admin action
+    pub kind: ApprovalKind,
     /// Who asked
     pub caller: Caller,
     /// Execution waiting on the answer
@@ -193,7 +227,8 @@ impl Drop for Waiting {
 /// Why a decision could not be applied
 #[derive(Debug, thiserror::Error)]
 pub enum DecideError {
-    /// No pending request has this id (unknown, decided or expired)
+    /// No pending request has this id (unknown, decided or expired,
+    /// including one past its expiry whose timer has not fired yet)
     #[error("no pending approval with this id")]
     NotFound,
     /// A session grant was chosen for a per-call tool, or for a caller
@@ -293,9 +328,9 @@ impl Approvals {
             }
         }
 
-        let id = random_id();
-        let info = Arc::new(ApprovalInfo {
-            id: id.clone(),
+        let info = ApprovalInfo {
+            id: random_id(),
+            kind: ApprovalKind::ToolCall,
             caller: request.caller.clone(),
             execution_id: request.execution_id.to_owned(),
             server: request.server.to_owned(),
@@ -304,7 +339,97 @@ impl Approvals {
             script: Arc::clone(request.script),
             grant_mode: request.grant_mode,
             expires_at: Instant::now() + self.timeout,
+        };
+        // arguments stay on the passkey page; the notification names the
+        // client and tool only
+        let notification = Notification {
+            title: format!(
+                "codemode: {} wants {}",
+                info.caller.client_label(),
+                info.waiting_for()
+            ),
+            message: format!(
+                "Tap to review. Denied automatically in {} min.",
+                self.timeout.as_secs().div_ceil(60)
+            ),
+            click: Some(self.url_for(&info.id)),
+            priority: Priority::High,
+            tag: "lock",
+        };
+
+        Gate::Wait(self.open(info, Some((notifier, notification))))
+    }
+
+    /// Asks for approval of an admin action; the request is answered on the
+    /// same page as tool calls, and approving it takes a passkey assertion
+    ///
+    /// The notification goes out whenever a notifier exists, so an
+    /// unexpected request is visible on the phone. Without one the caller
+    /// must hand the link to the owner itself
+    pub fn request_admin(self: &Arc<Self>, request: AdminRequest) -> Waiting {
+        let info = ApprovalInfo {
+            id: random_id(),
+            kind: ApprovalKind::Admin {
+                title: request.title.clone(),
+            },
+            caller: Caller {
+                session: None,
+                client_name: Some(ADMIN_CLIENT.to_owned()),
+                client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            },
+            execution_id: String::new(),
+            server: ADMIN_SERVER.to_owned(),
+            tool: request.action.to_owned(),
+            arguments: request.details,
+            script: Arc::from(""),
+            grant_mode: GrantMode::PerCall,
+            expires_at: Instant::now() + self.timeout,
+        };
+        let notification = Notification {
+            title: format!("codemode: {}", request.title),
+            message: format!(
+                "Code {}. Requested on the Mac; approve only if you started this and the \
+                 code matches. Denied automatically in {} min.",
+                request.code,
+                self.timeout.as_secs().div_ceil(60)
+            ),
+            click: Some(self.url_for(&info.id)),
+            priority: Priority::Urgent,
+            tag: "warning",
+        };
+        let notifier = self.notifier.clone();
+
+        self.open(info, notifier.map(|notifier| (notifier, notification)))
+    }
+
+    /// Whether requests reach the phone
+    pub fn can_notify(&self) -> bool {
+        self.notifier.is_some()
+    }
+
+    /// Sends a notification that needs no answer, when a notifier exists
+    pub fn announce(&self, notification: Notification) {
+        let Some(notifier) = self.notifier.clone() else {
+            tracing::warn!(title = %notification.title, "no notifier; announcement not sent");
+
+            return;
+        };
+
+        tokio::spawn(async move {
+            if let Err(error) = notifier.notify(&notification).await {
+                tracing::warn!(%error, "announcement failed");
+            }
         });
+    }
+
+    /// Registers a pending request, announces it and schedules its expiry
+    fn open(
+        self: &Arc<Self>,
+        info: ApprovalInfo,
+        notify: Option<(Arc<dyn Notifier>, Notification)>,
+    ) -> Waiting {
+        let info = Arc::new(info);
+        let id = info.id.clone();
         let (sender, receiver) = oneshot::channel();
         self.state().pending.insert(
             id.clone(),
@@ -322,36 +447,23 @@ impl Approvals {
             grant_mode: info.grant_mode.as_str(),
         });
 
-        let url = self.url_for(&id);
-        // arguments stay on the passkey page; the notification names the
-        // client and tool only
-        let notification = Notification {
-            title: format!(
-                "codemode: {} wants {}",
-                info.caller.client_label(),
-                info.waiting_for()
-            ),
-            message: format!(
-                "Tap to review. Denied automatically in {} min.",
-                self.timeout.as_secs().div_ceil(60)
-            ),
-            click: url.clone(),
-        };
-        let weak = Arc::downgrade(self);
-        let notified = id.clone();
-        tokio::spawn(async move {
-            if let Err(error) = notifier.notify(&notification).await {
-                tracing::warn!(%error, "approval notification failed");
-                // the agent's pending answer then says so, so the user can be
-                // sent to the link directly
-                if let Some(approvals) = weak.upgrade() {
-                    let mut state = approvals.state();
-                    if state.pending.contains_key(&notified) {
-                        state.unnotified.insert(notified);
+        if let Some((notifier, notification)) = notify {
+            let weak = Arc::downgrade(self);
+            let notified = id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = notifier.notify(&notification).await {
+                    tracing::warn!(%error, "approval notification failed");
+                    // the agent's pending answer then says so, so the user can be
+                    // sent to the link directly
+                    if let Some(approvals) = weak.upgrade() {
+                        let mut state = approvals.state();
+                        if state.pending.contains_key(&notified) {
+                            state.unnotified.insert(notified);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         let weak = Arc::downgrade(self);
         let expiring = id.clone();
@@ -367,13 +479,13 @@ impl Approvals {
             }
         });
 
-        Gate::Wait(Waiting {
+        Waiting {
             waiting_for: info.waiting_for(),
+            url: self.url_for(&id),
             id,
-            url,
             receiver: Some(receiver),
             approvals: Arc::downgrade(self),
-        })
+        }
     }
 
     fn granted(&self, request: &GateRequest<'_>) -> Option<String> {
@@ -392,11 +504,13 @@ impl Approvals {
             .map(|grant| grant.approval_id.clone())
     }
 
-    /// A pending request, for the approval page
+    /// A pending request that has not expired, for the approval page
     pub fn info(&self, id: &str) -> Option<Arc<ApprovalInfo>> {
+        // the expiry timer may lag the deadline slightly; the deadline wins
         self.state()
             .pending
             .get(id)
+            .filter(|pending| !pending.info.time_left().is_zero())
             .map(|pending| Arc::clone(&pending.info))
     }
 
@@ -410,7 +524,10 @@ impl Approvals {
         self.state()
             .pending
             .values()
-            .filter(|pending| pending.info.execution_id == execution_id)
+            .filter(|pending| {
+                pending.info.kind == ApprovalKind::ToolCall
+                    && pending.info.execution_id == execution_id
+            })
             .min_by_key(|pending| pending.info.expires_at)
             .map(|pending| Arc::clone(&pending.info))
     }
@@ -443,7 +560,7 @@ impl Approvals {
                 let Some(session) = &info.caller.session else {
                     return Err(DecideError::SessionNotAllowed);
                 };
-                if info.grant_mode != GrantMode::Session {
+                if info.grant_mode != GrantMode::Session || info.kind != ApprovalKind::ToolCall {
                     return Err(DecideError::SessionNotAllowed);
                 }
                 let minutes = Some((length.as_secs() / 60) as i64);
@@ -475,7 +592,8 @@ impl Approvals {
                 .pending
                 .values()
                 .filter(|pending| {
-                    pending.info.caller.session.as_deref() == Some(session)
+                    pending.info.kind == ApprovalKind::ToolCall
+                        && pending.info.caller.session.as_deref() == Some(session)
                         && pending.info.server == server
                         && pending.info.grant_mode == GrantMode::Session
                 })
@@ -526,6 +644,11 @@ impl Approvals {
 /// the request, so they must not be guessable
 pub fn random_id() -> String {
     hex(&rand::random::<[u8; 16]>())
+}
+
+/// Six characters for a person to compare between the CLI and the phone
+pub fn confirmation_code() -> String {
+    random_id()[..6].to_uppercase()
 }
 
 /// 256 random bits as hex, for one-time tokens

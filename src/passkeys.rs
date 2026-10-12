@@ -2,6 +2,10 @@
 //!
 //! Ceremony state stays in memory, keyed by a random id with a short
 //! lifetime; it is never serialized to the client
+//!
+//! The first passkey can be enrolled with a bare one-time link. Once one
+//! exists, a new link only works after an existing passkey approves it, so
+//! an agent that can run the CLI cannot add its own authenticator
 
 use std::{
     collections::HashMap,
@@ -52,8 +56,11 @@ pub enum PasskeyError {
     #[error("no passkey enrolled; run `codemode-mcp passkey enroll`")]
     NoPasskeys,
     /// The label is empty or too long
-    #[error("enter a label of 1 to {MAX_LABEL_CHARS} characters")]
+    #[error("enter a label of 1 to {MAX_LABEL_CHARS} characters, without quotes")]
     Label,
+    /// The link waits for approval with an existing passkey
+    #[error("this enrollment link must first be approved with an existing passkey")]
+    AwaitingApproval,
     /// The browser's response did not verify
     #[error("the passkey response could not be verified")]
     Rejected,
@@ -65,7 +72,6 @@ pub enum PasskeyError {
 enum Ceremony {
     Register {
         token: String,
-        label: String,
         state: PasskeyRegistration,
         expires_at: Instant,
     },
@@ -87,12 +93,48 @@ impl Ceremony {
     }
 }
 
+/// What lets an enrollment link be used
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnrollmentGate {
+    /// Created while no passkey existed; valid only while that holds, so a
+    /// link minted before the owner enrolled cannot add a second passkey
+    FirstPasskey,
+    /// Waits for an existing passkey to approve it
+    AwaitingApproval,
+    /// Approved with an existing passkey
+    Approved,
+}
+
+struct Enrollment {
+    label: String,
+    gate: EnrollmentGate,
+    expires_at: Instant,
+}
+
+/// What the enrollment page needs to know about a link
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollmentView {
+    /// Label the passkey will get
+    pub label: String,
+    /// Whether registration can start now
+    pub ready: bool,
+}
+
+/// A created enrollment link
+#[derive(Debug, Clone)]
+pub struct NewEnrollment {
+    /// One-time token in the link
+    pub token: String,
+    /// Whether an existing passkey must approve it first
+    pub needs_approval: bool,
+}
+
 /// Enrolled passkeys and the ceremonies in progress
 pub struct Passkeys {
     webauthn: Webauthn,
     store: Store,
     ceremonies: Mutex<HashMap<String, Ceremony>>,
-    enrollments: Mutex<HashMap<String, Instant>>,
+    enrollments: Mutex<HashMap<String, Enrollment>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -127,36 +169,107 @@ impl Passkeys {
         &self.store
     }
 
-    /// Creates a one-time enrollment token
-    pub fn create_enrollment(&self) -> String {
+    /// Creates a one-time enrollment token for a passkey named `label`
+    ///
+    /// With no passkey enrolled the link works at once; otherwise it waits
+    /// for [`Passkeys::approve_enrollment`]
+    pub fn create_enrollment(&self, label: &str) -> Result<NewEnrollment, PasskeyError> {
+        let label = label.trim();
+        // quotes could make the approval title read as something else
+        if label.is_empty()
+            || label.chars().count() > MAX_LABEL_CHARS
+            || label
+                .chars()
+                .any(|character| character.is_control() || "\"'`".contains(character))
+        {
+            return Err(PasskeyError::Label);
+        }
+        let needs_approval = self.store.passkey_count()? > 0;
+
         let token = random_token();
         let mut enrollments = lock(&self.enrollments);
-        enrollments.retain(|_, expires_at| *expires_at > Instant::now());
-        enrollments.insert(token.clone(), Instant::now() + ENROLLMENT_TTL);
+        enrollments.retain(|_, enrollment| enrollment.expires_at > Instant::now());
+        enrollments.insert(
+            token.clone(),
+            Enrollment {
+                label: label.to_owned(),
+                gate: if needs_approval {
+                    EnrollmentGate::AwaitingApproval
+                } else {
+                    EnrollmentGate::FirstPasskey
+                },
+                expires_at: Instant::now() + ENROLLMENT_TTL,
+            },
+        );
 
-        token
+        Ok(NewEnrollment {
+            token,
+            needs_approval,
+        })
     }
 
-    /// Whether an enrollment token can still be used
-    pub fn enrollment_valid(&self, token: &str) -> bool {
+    /// Marks a link approved by an existing passkey; its lifetime restarts so
+    /// a late approval still leaves time to enroll
+    pub fn approve_enrollment(&self, token: &str) {
+        if let Some(enrollment) = lock(&self.enrollments).get_mut(token)
+            && enrollment.gate == EnrollmentGate::AwaitingApproval
+            && enrollment.expires_at > Instant::now()
+        {
+            enrollment.gate = EnrollmentGate::Approved;
+            enrollment.expires_at = Instant::now() + ENROLLMENT_TTL;
+        }
+    }
+
+    /// Invalidates a link, e.g. after its approval was denied
+    pub fn drop_enrollment(&self, token: &str) {
+        lock(&self.enrollments).remove(token);
+    }
+
+    /// The link's label and whether it can be used now; `None` when it is
+    /// unknown, used or expired
+    pub fn enrollment(&self, token: &str) -> Result<Option<EnrollmentView>, PasskeyError> {
+        let Some((label, gate)) = self.live_enrollment(token) else {
+            return Ok(None);
+        };
+        let ready = self.gate_open(gate)?;
+        // a first-passkey link is dead once any passkey exists
+        if gate == EnrollmentGate::FirstPasskey && !ready {
+            return Ok(None);
+        }
+
+        Ok(Some(EnrollmentView { label, ready }))
+    }
+
+    fn live_enrollment(&self, token: &str) -> Option<(String, EnrollmentGate)> {
         lock(&self.enrollments)
             .get(token)
-            .is_some_and(|expires_at| *expires_at > Instant::now())
+            .filter(|enrollment| enrollment.expires_at > Instant::now())
+            .map(|enrollment| (enrollment.label.clone(), enrollment.gate))
     }
 
-    /// Starts registering a passkey named `label`
+    fn gate_open(&self, gate: EnrollmentGate) -> Result<bool, PasskeyError> {
+        Ok(match gate {
+            EnrollmentGate::FirstPasskey => self.store.passkey_count()? == 0,
+            EnrollmentGate::AwaitingApproval => false,
+            EnrollmentGate::Approved => true,
+        })
+    }
+
+    /// Starts registering a passkey under the link's label
     pub fn start_registration(
         &self,
         token: &str,
-        label: &str,
     ) -> Result<(String, CreationChallengeResponse), PasskeyError> {
-        if !self.enrollment_valid(token) {
-            return Err(PasskeyError::UnknownToken);
+        let (label, gate) = self
+            .live_enrollment(token)
+            .ok_or(PasskeyError::UnknownToken)?;
+        if !self.gate_open(gate)? {
+            return Err(match gate {
+                EnrollmentGate::FirstPasskey => PasskeyError::UnknownToken,
+                _ => PasskeyError::AwaitingApproval,
+            });
         }
-        let label = label.trim();
-        if label.is_empty() || label.chars().count() > MAX_LABEL_CHARS {
-            return Err(PasskeyError::Label);
-        }
+        let label = label.as_str();
 
         let existing: Vec<CredentialID> = self
             .passkeys()?
@@ -175,7 +288,6 @@ impl Passkeys {
 
         let id = self.insert(Ceremony::Register {
             token: token.to_owned(),
-            label: label.to_owned(),
             state,
             expires_at: Instant::now() + CEREMONY_TTL,
         })?;
@@ -193,15 +305,21 @@ impl Passkeys {
     ) -> Result<i64, PasskeyError> {
         let Some(Ceremony::Register {
             token: expected,
-            label,
             state,
             ..
         }) = self.take(ceremony)
         else {
             return Err(PasskeyError::UnknownCeremony);
         };
-        if expected != token || lock(&self.enrollments).remove(token).is_none() {
+        if expected != token {
             return Err(PasskeyError::UnknownToken);
+        }
+        let enrollment = lock(&self.enrollments)
+            .remove(token)
+            .filter(|enrollment| enrollment.expires_at > Instant::now())
+            .ok_or(PasskeyError::UnknownToken)?;
+        if enrollment.gate == EnrollmentGate::AwaitingApproval {
+            return Err(PasskeyError::AwaitingApproval);
         }
 
         let passkey = self
@@ -211,7 +329,18 @@ impl Passkeys {
         let json = serde_json::to_string(&passkey)
             .map_err(|error| StoreError::Corrupt(error.to_string()))?;
 
-        Ok(self.store.add_passkey(&label, &json)?)
+        // a first-passkey link checks for an empty table in the same
+        // transaction as the insert, so two such links cannot both succeed
+        let only_if_none = enrollment.gate == EnrollmentGate::FirstPasskey;
+        let id = self
+            .store
+            .add_passkey(&enrollment.label, &json, only_if_none)?
+            .ok_or(PasskeyError::UnknownToken)?;
+        // other first-passkey links must not come back to life if every
+        // passkey is removed later
+        lock(&self.enrollments).retain(|_, other| other.gate != EnrollmentGate::FirstPasskey);
+
+        Ok(id)
     }
 
     /// Starts an assertion that will apply `choice` to approval `approval_id`

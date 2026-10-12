@@ -9,6 +9,7 @@ use crate::{
     executor::{Executor, ExecutorError},
     gateway::Gateway,
     notify::{Notifier, Ntfy},
+    oauth::OAuth,
     passkeys::{PasskeyError, Passkeys},
     snapshot::Sealer,
     store::{Store, StoreError},
@@ -88,6 +89,7 @@ impl App {
         let log = UsageLog::start(&state_dir, config.log_retention())?;
         let sealer = Sealer::load_or_create(&state_dir).map_err(ExecutorError::from)?;
         let passkeys = Arc::new(Passkeys::new(&config.public_origin, store.clone())?);
+        let oauth = OAuth::new(&config, store.clone());
         let approvals = Approvals::new(
             config.public_base(),
             config.approvals.timeout(),
@@ -103,6 +105,7 @@ impl App {
             Arc::clone(&executor),
             approvals,
             log.clone(),
+            oauth,
         );
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),

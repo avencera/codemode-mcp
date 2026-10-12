@@ -1,0 +1,478 @@
+//! OAuth sign-in for remote upstreams, on top of rmcp's authorization client
+//!
+//! A login runs discovery, dynamic client registration and an authorization
+//! code flow with PKCE. The browser is sent back to the loopback admin
+//! listener (`/oauth/callback/<server>`), so the flow completes on the Mac.
+//!
+//! rmcp keeps the client registration in memory and stores only the client
+//! id with the tokens. Here the registration and the tokens are written
+//! together, in one transaction, when the callback succeeds: a flow that is
+//! abandoned halfway leaves an existing login untouched. Flows in progress
+//! (PKCE verifier, CSRF state, registration) are kept in SQLite for
+//! [`FLOW_TTL`], so a daemon restart mid-login does not strand the browser
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use rmcp::transport::auth::{
+    AuthClient, AuthError, AuthorizationManager, AuthorizationMetadataSource, CredentialStore,
+    InMemoryCredentialStore, OAuthClientConfig, StateStore, StoredAuthorizationState,
+    StoredCredentials,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{
+    config::Config,
+    store::{Store, StoreError},
+};
+
+/// How long a started login may take before its state is discarded
+pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
+/// Client name used for registration when the config names none
+const DEFAULT_CLIENT_NAME: &str = "codemode-mcp";
+
+/// Why an OAuth operation failed; messages are safe to print locally
+#[derive(Debug, thiserror::Error)]
+pub enum OAuthError {
+    /// No server with this name is configured
+    #[error("no server named `{0}`")]
+    UnknownServer(String),
+    /// The server is configured without `oauth = true`
+    #[error("server `{0}` is not configured with `oauth = true`")]
+    NotOAuth(String),
+    /// The admin listener has not bound yet, so no redirect URI exists
+    #[error("the admin listener is not running")]
+    NoCallback,
+    /// The server publishes no OAuth metadata
+    #[error("server `{0}` publishes no OAuth metadata")]
+    NoMetadata(String),
+    /// The callback does not match a login in progress
+    #[error("this sign-in is unknown or expired; run `codemode-mcp oauth login` again")]
+    UnknownFlow,
+    /// The authorization server reported an error on the callback
+    #[error("the authorization server refused the sign-in: {0}")]
+    Refused(String),
+    /// The authorization server took too long
+    #[error("the authorization server did not answer in time")]
+    TimedOut,
+    /// rmcp's OAuth client failed
+    #[error("{0}")]
+    Auth(#[from] AuthError),
+    /// The database failed
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A stored value could not be decoded
+    #[error("corrupt stored OAuth value: {0}")]
+    Corrupt(String),
+}
+
+/// The registered client, persisted next to the tokens; rmcp itself keeps
+/// only the client id
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClientRegistration {
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    redirect_uri: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+impl ClientRegistration {
+    fn from_config(config: &OAuthClientConfig) -> Self {
+        Self {
+            client_id: config.client_id.clone(),
+            client_secret: config.client_secret.clone(),
+            redirect_uri: config.redirect_uri.clone(),
+            scopes: config.scopes.clone(),
+        }
+    }
+
+    fn to_config(&self) -> OAuthClientConfig {
+        let mut config = OAuthClientConfig::new(&self.client_id, &self.redirect_uri)
+            .with_scopes(self.scopes.clone());
+        if let Some(secret) = &self.client_secret {
+            config = config.with_client_secret(secret);
+        }
+
+        config
+    }
+}
+
+fn store_error(error: impl std::fmt::Display) -> AuthError {
+    AuthError::CredentialStoreError(error.to_string())
+}
+
+/// Tokens of one server's completed login, refreshed in place
+struct SqliteCredentialStore {
+    store: Store,
+    server: String,
+}
+
+#[async_trait]
+impl CredentialStore for SqliteCredentialStore {
+    async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        let Some((_, credentials)) = self.store.oauth_login(&self.server).map_err(store_error)?
+        else {
+            return Ok(None);
+        };
+
+        serde_json::from_str(&credentials)
+            .map(Some)
+            .map_err(store_error)
+    }
+
+    async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        let json = serde_json::to_string(&credentials).map_err(store_error)?;
+
+        self.store
+            .update_oauth_credentials(&self.server, &json)
+            .map_err(store_error)
+    }
+
+    async fn clear(&self) -> Result<(), AuthError> {
+        self.store
+            .remove_oauth_login(&self.server)
+            .map(|_| ())
+            .map_err(store_error)
+    }
+}
+
+/// PKCE and CSRF state of one server's flows in progress
+struct SqliteStateStore {
+    store: Store,
+    server: String,
+}
+
+fn flow_ttl_ms() -> i64 {
+    FLOW_TTL.as_millis() as i64
+}
+
+#[async_trait]
+impl StateStore for SqliteStateStore {
+    async fn save(
+        &self,
+        csrf_token: &str,
+        state: StoredAuthorizationState,
+    ) -> Result<(), AuthError> {
+        let json = serde_json::to_string(&state).map_err(store_error)?;
+
+        self.store
+            .save_oauth_pending(&self.server, csrf_token, &json, flow_ttl_ms())
+            .map_err(store_error)
+    }
+
+    async fn load(&self, csrf_token: &str) -> Result<Option<StoredAuthorizationState>, AuthError> {
+        let Some((state, _)) = self
+            .store
+            .oauth_pending(&self.server, csrf_token, flow_ttl_ms())
+            .map_err(store_error)?
+        else {
+            return Ok(None);
+        };
+
+        serde_json::from_str(&state).map(Some).map_err(store_error)
+    }
+
+    async fn delete(&self, csrf_token: &str) -> Result<(), AuthError> {
+        self.store
+            .delete_oauth_pending(&self.server, csrf_token)
+            .map_err(store_error)
+    }
+}
+
+/// OAuth settings of one configured server
+#[derive(Debug, Clone)]
+struct OAuthServer {
+    url: String,
+    scopes: Vec<String>,
+    client_name: String,
+}
+
+/// Login state of one server, safe to print
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginStatus {
+    /// Server name
+    pub server: String,
+    /// Whether tokens are stored
+    pub logged_in: bool,
+    /// Scopes the authorization server granted
+    pub scopes: Vec<String>,
+    /// When the access token expires, ms since the epoch, if known
+    pub expires_at_ms: Option<i64>,
+    /// Whether a refresh token is stored, so expiry renews automatically
+    pub refreshable: bool,
+}
+
+/// What a callback carries back from the authorization server
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Callback {
+    /// Authorization code
+    pub code: Option<String>,
+    /// CSRF state
+    pub state: Option<String>,
+    /// RFC 9207 issuer
+    pub iss: Option<String>,
+    /// Error code when the user or server refused
+    pub error: Option<String>,
+    /// Human-readable error
+    pub error_description: Option<String>,
+}
+
+/// Logins of every `oauth = true` server
+pub struct OAuth {
+    store: Store,
+    servers: BTreeMap<String, OAuthServer>,
+    /// Every configured server, to tell unknown names from non-OAuth ones
+    configured: BTreeSet<String>,
+    /// `http://127.0.0.1:<admin port>`, set once the admin listener binds
+    callback_base: RwLock<Option<String>>,
+}
+
+impl OAuth {
+    /// The OAuth servers of `config`, with logins kept in `store`
+    pub fn new(config: &Config, store: Store) -> Arc<Self> {
+        let servers = config
+            .servers
+            .iter()
+            .filter(|(_, server)| server.oauth)
+            .filter_map(|(name, server)| {
+                Some((
+                    name.clone(),
+                    OAuthServer {
+                        url: server.url.clone()?,
+                        scopes: server.scopes.clone(),
+                        client_name: server
+                            .client_name
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_CLIENT_NAME.to_owned()),
+                    },
+                ))
+            })
+            .collect();
+
+        Arc::new(Self {
+            store,
+            servers,
+            configured: config.servers.keys().cloned().collect(),
+            callback_base: RwLock::new(None),
+        })
+    }
+
+    /// Records the admin listener's address; redirect URIs point at it
+    pub fn set_callback_address(&self, admin: SocketAddr) {
+        let base = format!("http://127.0.0.1:{}", admin.port());
+        if let Ok(mut slot) = self.callback_base.write() {
+            *slot = Some(base);
+        }
+    }
+
+    /// Redirect URI for `server`
+    pub fn redirect_uri(&self, server: &str) -> Result<String, OAuthError> {
+        let base = self
+            .callback_base
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or(OAuthError::NoCallback)?;
+
+        Ok(format!("{base}/oauth/callback/{server}"))
+    }
+
+    /// Names of the OAuth servers
+    pub fn servers(&self) -> impl Iterator<Item = &str> {
+        self.servers.keys().map(String::as_str)
+    }
+
+    fn server(&self, name: &str) -> Result<&OAuthServer, OAuthError> {
+        self.servers.get(name).ok_or_else(|| {
+            if self.configured.contains(name) {
+                OAuthError::NotOAuth(name.to_owned())
+            } else {
+                OAuthError::UnknownServer(name.to_owned())
+            }
+        })
+    }
+
+    /// A manager with discovered metadata; refuses servers that publish none
+    async fn discovered(&self, name: &str) -> Result<AuthorizationManager, OAuthError> {
+        let server = self.server(name)?;
+        let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
+        let resolution = manager.resolve_metadata().await?;
+        if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+            return Err(OAuthError::NoMetadata(name.to_owned()));
+        }
+        manager.set_metadata(resolution.metadata);
+        manager.set_state_store(SqliteStateStore {
+            store: self.store.clone(),
+            server: name.to_owned(),
+        });
+
+        Ok(manager)
+    }
+
+    /// Starts a login: discovery, client registration and a PKCE
+    /// authorization URL for the browser
+    pub async fn start_login(&self, name: &str) -> Result<String, OAuthError> {
+        let server = self.server(name)?.clone();
+        let redirect_uri = self.redirect_uri(name)?;
+        let mut manager = self.discovered(name).await?;
+
+        let defaults: Vec<&str> = server.scopes.iter().map(String::as_str).collect();
+        let scopes = manager.select_scopes(None, &defaults);
+        let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+        let registered = manager
+            .register_client(&server.client_name, &redirect_uri, &scopes)
+            .await?;
+        let url = manager.get_authorization_url(&scopes).await?;
+
+        // the state store row exists now; attach the registration to it so
+        // the callback can rebuild the client
+        let csrf = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .ok_or_else(|| OAuthError::Corrupt("authorization URL has no state".into()))?;
+        let client = serde_json::to_string(&ClientRegistration::from_config(&registered))
+            .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+        if !self.store.set_oauth_pending_client(name, &csrf, &client)? {
+            return Err(OAuthError::Corrupt("the login state was not stored".into()));
+        }
+
+        Ok(url)
+    }
+
+    /// Completes a login from the browser's callback and stores the
+    /// registration with the tokens
+    pub async fn finish_login(&self, name: &str, callback: &Callback) -> Result<(), OAuthError> {
+        self.server(name)?;
+        if let Some(error) = &callback.error {
+            if let Some(csrf) = &callback.state {
+                self.store.delete_oauth_pending(name, csrf)?;
+            }
+            let detail = callback.error_description.as_deref().unwrap_or(error);
+
+            return Err(OAuthError::Refused(detail.to_owned()));
+        }
+        let (Some(code), Some(csrf)) = (&callback.code, &callback.state) else {
+            return Err(OAuthError::UnknownFlow);
+        };
+        let Some((_, Some(client))) = self.store.oauth_pending(name, csrf, flow_ttl_ms())? else {
+            return Err(OAuthError::UnknownFlow);
+        };
+        let registration: ClientRegistration = serde_json::from_str(&client)
+            .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+
+        let mut manager = self.discovered(name).await?;
+        // the tokens land here first and reach SQLite only together with
+        // the registration
+        let staging = InMemoryCredentialStore::new();
+        manager.set_credential_store(staging.clone());
+        manager.configure_client(registration.to_config())?;
+        manager
+            .exchange_code_for_token_with_issuer(code, csrf, callback.iss.as_deref())
+            .await?;
+
+        let credentials = staging
+            .load()
+            .await?
+            .ok_or_else(|| OAuthError::Corrupt("no tokens after the exchange".into()))?;
+        let credentials = serde_json::to_string(&credentials)
+            .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+        self.store.save_oauth_login(name, &client, &credentials)?;
+
+        Ok(())
+    }
+
+    /// An HTTP client that signs requests with the stored tokens and
+    /// refreshes them as they expire; `None` when the server has no login
+    pub async fn authorized_client(
+        &self,
+        name: &str,
+    ) -> Result<Option<AuthClient<reqwest::Client>>, OAuthError> {
+        let server = self.server(name)?;
+        let Some((client, _)) = self.store.oauth_login(name)? else {
+            return Ok(None);
+        };
+        let registration: ClientRegistration = serde_json::from_str(&client)
+            .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+
+        let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
+        manager.set_credential_store(SqliteCredentialStore {
+            store: self.store.clone(),
+            server: name.to_owned(),
+        });
+        // false when the tokens were dropped, e.g. after the issuer changed
+        if !manager.initialize_from_store().await? {
+            return Ok(None);
+        }
+        // restores the client secret, which rmcp does not persist
+        manager.configure_client(registration.to_config())?;
+
+        Ok(Some(AuthClient::new(reqwest::Client::new(), manager)))
+    }
+
+    /// Login state of every OAuth server
+    pub fn status(&self) -> Result<Vec<LoginStatus>, OAuthError> {
+        let mut statuses = Vec::new();
+        for name in self.servers.keys() {
+            let Some((_, credentials)) = self.store.oauth_login(name)? else {
+                statuses.push(LoginStatus {
+                    server: name.clone(),
+                    logged_in: false,
+                    scopes: Vec::new(),
+                    expires_at_ms: None,
+                    refreshable: false,
+                });
+                continue;
+            };
+            // read as plain JSON so token values never pass through a typed
+            // value that might be printed
+            let value: Value = serde_json::from_str(&credentials)
+                .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+            let token = &value["token_response"];
+            let expires_at_ms = match (
+                value["token_received_at"].as_i64(),
+                token["expires_in"].as_i64(),
+            ) {
+                (Some(received), Some(seconds)) => Some((received + seconds) * 1000),
+                _ => None,
+            };
+
+            statuses.push(LoginStatus {
+                server: name.clone(),
+                logged_in: token.is_object(),
+                scopes: value["granted_scopes"]
+                    .as_array()
+                    .map(|scopes| {
+                        scopes
+                            .iter()
+                            .filter_map(|scope| scope.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                expires_at_ms,
+                refreshable: token["refresh_token"].is_string(),
+            });
+        }
+
+        Ok(statuses)
+    }
+
+    /// Forgets a server's login, returning whether one existed
+    pub fn logout(&self, name: &str) -> Result<bool, OAuthError> {
+        self.server(name)?;
+
+        Ok(self.store.remove_oauth_login(name)?)
+    }
+}

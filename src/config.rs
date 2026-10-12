@@ -56,8 +56,9 @@ pub struct Config {
     /// single-label names)
     #[serde(default)]
     pub extra_allowed_hosts: Vec<String>,
-    /// Path of the Monty worker binary; resolved against `$PATH` and a few
-    /// well-known locations when unset
+    /// Path of the Monty worker binary; when unset, the copy `service
+    /// install` makes (`~/.local/share/codemode-mcp/monty`), else `monty`
+    /// on `$PATH`
     #[serde(default)]
     pub worker_path: Option<PathBuf>,
     /// How long one upstream tool call may run before it is cancelled
@@ -510,6 +511,17 @@ pub struct ServerConfig {
     /// Static headers sent with every HTTP request
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Whether a `url` server signs in with OAuth (`codemode-mcp oauth
+    /// login <server>`); until then it is used anonymously, or reported as
+    /// `needs_login` when it refuses anonymous clients
+    #[serde(default)]
+    pub oauth: bool,
+    /// OAuth scopes to request; the server's advertised scopes when empty
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Client name sent during dynamic client registration
+    #[serde(default)]
+    pub client_name: Option<String>,
     /// Default policy for every tool of this server
     #[serde(default)]
     pub policy: Policy,
@@ -628,6 +640,25 @@ impl ServerConfig {
                     "servers.{name}: `args`, `env` and `cwd` only apply to `command` servers"
                 )))
             }
+            (Some(_), None) if self.oauth => Err(ConfigError::Invalid(format!(
+                "servers.{name}: `oauth` only applies to `url` servers"
+            ))),
+            _ if !self.oauth && (!self.scopes.is_empty() || self.client_name.is_some()) => {
+                Err(ConfigError::Invalid(format!(
+                    "servers.{name}: `scopes` and `client_name` need `oauth = true`"
+                )))
+            }
+            // the OAuth client owns the authorization header
+            _ if self.oauth
+                && self
+                    .headers
+                    .keys()
+                    .any(|header| header.eq_ignore_ascii_case("authorization")) =>
+            {
+                Err(ConfigError::Invalid(format!(
+                    "servers.{name}: an `authorization` header cannot be combined with `oauth`"
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -694,5 +725,11 @@ mod tests {
         assert!(parse("[servers.a]\ncommand = \"x\"\nurl = \"http://y\"").is_err());
         assert!(parse("[servers.a]\npolicy = \"allow\"").is_err());
         assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
+        assert!(parse("[servers.a]\ncommand = \"x\"\noauth = true").is_err());
+        assert!(parse("[servers.a]\nurl = \"https://y\"\nscopes = [\"s\"]").is_err());
+        assert!(
+            parse("[servers.a]\nurl = \"https://y\"\noauth = true\nheaders = { Authorization = \"Bearer abcdef\" }")
+                .is_err()
+        );
     }
 }

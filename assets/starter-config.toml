@@ -1,0 +1,52 @@
+# codemode-mcp configuration
+#
+# Written by `codemode-mcp config init`. Every option and its default is
+# described in docs/design.md and docs/operations.md. Approval notifications
+# use the [notify.ntfy] section of ~/.config/homebased/config.toml unless a
+# [notify.ntfy] section is added here
+
+# 1Password Environments: every call needs a phone passkey approval. Read
+# tools accept a 15 or 60 minute session grant; writes ask on every call
+[servers.onepassword]
+command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
+policy = "ask"
+
+[servers.onepassword.tools.create_environment]
+grant = "per_call"
+[servers.onepassword.tools.rename_environment]
+grant = "per_call"
+[servers.onepassword.tools.append_variables]
+grant = "per_call"
+[servers.onepassword.tools.create_local_env_file]
+grant = "per_call"
+
+# `codemode-mcp op warm` runs these on the Mac so the 1Password app's own
+# prompts appear there first
+[servers.onepassword.warm]
+calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
+
+[servers.openai_docs]
+url = "https://developers.openai.com/mcp"
+
+# works anonymously; `codemode-mcp oauth login exa` signs in for higher limits
+[servers.exa]
+url = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa"
+oauth = true
+
+# homebased through the built-in adapter. Submitting arbitrary commands,
+# cancelling tasks and messaging other sessions ask on the phone, with a
+# session grant. task_submit_agent stays `allow`, yet homebased runs workers
+# with their sandbox and approvals bypassed, so a submitted worker can run
+# anything its prompt asks for; add a policy = "ask" table for it to require
+# a phone approval
+[servers.homebased]
+command = "{{HOME}}/.local/bin/codemode-mcp"
+args = ["adapter", "homebased"]
+sensitive = false
+
+[servers.homebased.tools.task_submit_command]
+policy = "ask"
+[servers.homebased.tools.task_cancel]
+policy = "ask"
+[servers.homebased.tools.message_send]
+policy = "ask"

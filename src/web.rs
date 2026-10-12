@@ -19,7 +19,9 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
     app::App,
-    approvals::{Approvals, Choice, DecideError, SESSION_GRANT_MINUTES},
+    approvals::{
+        ApprovalInfo, ApprovalKind, Approvals, Choice, DecideError, SESSION_GRANT_MINUTES,
+    },
     passkeys::{PasskeyError, Passkeys},
     policy::GrantMode,
     store,
@@ -151,7 +153,7 @@ fn passkey_error(error: &PasskeyError) -> Response {
         PasskeyError::UnknownToken | PasskeyError::UnknownCeremony => StatusCode::GONE,
         PasskeyError::Label => StatusCode::BAD_REQUEST,
         PasskeyError::Rejected => StatusCode::FORBIDDEN,
-        PasskeyError::NoPasskeys => StatusCode::CONFLICT,
+        PasskeyError::NoPasskeys | PasskeyError::AwaitingApproval => StatusCode::CONFLICT,
         PasskeyError::Busy => StatusCode::TOO_MANY_REQUESTS,
         PasskeyError::Config(_) | PasskeyError::Store(_) => {
             tracing::warn!(%error, "passkey operation failed");
@@ -176,6 +178,9 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     let Some(info) = state.approvals.info(&id) else {
         return not_found("approval request");
     };
+    if let ApprovalKind::Admin { title } = &info.kind {
+        return admin_page(&info, title);
+    }
 
     let arguments = serde_json::to_string_pretty(&Value::Object(info.arguments.clone()))
         .unwrap_or_else(|_| "{}".to_owned());
@@ -233,6 +238,34 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     );
 
     page(StatusCode::OK, &title, &body)
+}
+
+/// An admin action: approve once or deny, nothing that could widen it
+fn admin_page(info: &ApprovalInfo, title: &str) -> Response {
+    let details = serde_json::to_string_pretty(&Value::Object(info.arguments.clone()))
+        .unwrap_or_else(|_| "{}".to_owned());
+    let body = format!(
+        r#"<main data-kind="approve" data-base="/approve/{id}">
+<h1>{title}</h1>
+<p class="meta">Requested by the codemode-mcp command line on the Mac. Approve only if you started this; an unexpected request means something on the Mac is trying to change who can approve tool calls.</p>
+<p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
+<h2>Details</h2>
+<pre>{details}</pre>
+<div class="buttons">
+<button class="approve" data-choice="once">Approve</button>
+<button class="deny" data-choice="deny">Deny</button>
+</div>
+<p id="status" role="status"></p>
+</main>
+<script src="/assets/webauthn.js"></script>"#,
+        id = escape(&info.id),
+        title = escape(title),
+        left = info.time_left().as_secs(),
+        left_text = escape(&human_duration(info.time_left().as_millis() as i64)),
+        details = escape(&details),
+    );
+
+    page(StatusCode::OK, title, &body)
 }
 
 #[derive(Deserialize)]
@@ -315,8 +348,22 @@ async fn approve_deny(
 }
 
 async fn enroll_page(State(state): State<WebState>, Path(token): Path<String>) -> Response {
-    if !state.passkeys.enrollment_valid(&token) {
-        return not_found("enrollment link");
+    let passkeys = Arc::clone(&state.passkeys);
+    let lookup = token.clone();
+    let enrollment = match tokio::task::spawn_blocking(move || passkeys.enrollment(&lookup)).await {
+        Ok(Ok(Some(enrollment))) => enrollment,
+        Ok(Ok(None)) => return not_found("enrollment link"),
+        Ok(Err(error)) => return passkey_error(&error),
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"),
+    };
+    if !enrollment.ready {
+        return page(
+            StatusCode::CONFLICT,
+            "Approval needed",
+            "<h1>Approval needed</h1><p>This enrollment link works only after an existing \
+             passkey approves it. Approve the request on the device that holds that passkey, \
+             then reload this page.</p>",
+        );
     }
 
     let body = format!(
@@ -324,30 +371,27 @@ async fn enroll_page(State(state): State<WebState>, Path(token): Path<String>) -
 <h1>Add a passkey for codemode-mcp approvals</h1>
 <p class="meta">The passkey approves sensitive tool calls from this device. This link works once and expires in 10 minutes.</p>
 <label for="label">Label</label>
-<input id="label" maxlength="64" placeholder="e.g. iPhone" autocomplete="off">
+<input id="label" value="{label}" readonly>
 <div class="buttons"><button class="approve" id="enroll">Create passkey</button></div>
 <p id="status" role="status"></p>
 </main>
 <script src="/assets/webauthn.js"></script>"#,
         token = escape(&token),
+        label = escape(&enrollment.label),
     );
 
     page(StatusCode::OK, "Add a passkey", &body)
 }
 
-#[derive(Deserialize)]
-struct LabelBody {
-    label: String,
-}
-
 async fn enroll_options(
     State(state): State<WebState>,
     Path(token): Path<String>,
-    Json(body): Json<LabelBody>,
+    // the label was fixed when the link was created; a JSON body keeps
+    // cross-site form posts out
+    Json(_body): Json<Value>,
 ) -> Response {
     let passkeys = Arc::clone(&state.passkeys);
-    let started =
-        tokio::task::spawn_blocking(move || passkeys.start_registration(&token, &body.label)).await;
+    let started = tokio::task::spawn_blocking(move || passkeys.start_registration(&token)).await;
 
     match started {
         Ok(Ok((ceremony, options))) => {

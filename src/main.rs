@@ -4,17 +4,24 @@
 use std::{
     io::Read,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
 use codemode_mcp::{
-    admin::{EnrollResponse, WarmRequest, WarmResponse},
+    adapters::homebased::HomebasedAdapter,
+    admin::{
+        EnrollRequest, EnrollResponse, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
+        OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
+    },
     app::App,
     catalog::function_prefix,
-    config::Config,
+    config::{Config, ConfigError, expand_home},
     executions::WaitResult,
+    notify::{Notifier, Ntfy},
     server::{outcome_text, serve},
+    service::{self, Action, ServicePaths},
     store::{self, Store},
     usage::{
         Caller,
@@ -79,16 +86,111 @@ enum Command {
         #[command(subcommand)]
         command: OpCommand,
     },
+    /// Sign in to remote upstreams configured with `oauth = true`
+    #[command(name = "oauth")]
+    OAuth {
+        #[command(subcommand)]
+        command: OAuthCommand,
+    },
+    /// Manage the launchd service
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    /// Manage the configuration file
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Run a built-in MCP adapter on stdio, as an upstream of the gateway
+    Adapter {
+        #[command(subcommand)]
+        command: AdapterCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum OAuthCommand {
+    /// Start a browser sign-in on the running daemon
+    Login {
+        /// Server name from the config
+        server: String,
+        /// Print the link without opening a browser
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Show the login state of every OAuth server
+    Status,
+    /// Forget a server's tokens; it reconnects anonymously
+    Logout {
+        /// Server name from the config
+        server: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Copy the binary and Monty worker to stable paths, write the
+    /// LaunchAgent and load it
+    Install {
+        /// Print what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Unload and remove the LaunchAgent; state and installed files stay
+    Uninstall {
+        /// Print what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show whether the service is loaded and healthy
+    Status {
+        /// Print what would be checked
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restart the running service
+    Restart {
+        /// Print what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Write a starter config; refuses to replace an existing file
+    Init {
+        /// Print it instead of writing it
+        #[arg(long)]
+        print: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdapterCommand {
+    /// The homebased CLI as MCP tools
+    Homebased {
+        /// homebased executable; `$CODEMODE_HOMEBASED_BIN`, else `homebased` on PATH
+        #[arg(long)]
+        homebased_bin: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
 enum PasskeyCommand {
     /// Print a one-time link (valid 10 minutes) for adding a passkey; needs
-    /// the daemon running
-    Enroll,
+    /// the daemon running. Once a passkey exists, an existing passkey must
+    /// approve the new one before the link works
+    Enroll {
+        /// Name for the new passkey, e.g. the device holding it
+        #[arg(long)]
+        label: String,
+    },
     /// List enrolled passkeys
     List,
-    /// Remove a passkey by id
+    /// Ask an existing passkey to approve removing a passkey; needs the
+    /// daemon running
     Remove {
         /// Id from `passkey list`
         id: i64,
@@ -117,23 +219,277 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let explicit = cli.config.clone();
     let path = match cli.config {
         Some(path) => path,
         None => Config::default_path()?,
     };
-    let config = Config::load(&path)?;
 
     match cli.command {
-        Command::Serve => serve_command(config).await,
-        Command::Tools { stubs } => tools_command(config, stubs).await,
-        Command::Exec { script } => exec_command(config, &script).await,
-        Command::Stats { since } => stats_command(&config, &since),
-        Command::Review { since, out } => review_command(&config, &since, out),
-        Command::Passkey { command } => passkey_command(&config, command).await,
+        Command::Serve => serve_command(Config::load(&path)?).await,
+        Command::Tools { stubs } => tools_command(Config::load(&path)?, stubs).await,
+        Command::Exec { script } => exec_command(Config::load(&path)?, &script).await,
+        Command::Stats { since } => stats_command(&Config::load(&path)?, &since),
+        Command::Review { since, out } => review_command(&Config::load(&path)?, &since, out),
+        Command::Passkey { command } => passkey_command(&Config::load(&path)?, command).await,
         Command::Op {
             command: OpCommand::Warm { server },
-        } => warm_command(&config, server).await,
+        } => warm_command(&Config::load(&path)?, server).await,
+        Command::OAuth { command } => oauth_command(&Config::load(&path)?, command).await,
+        Command::Service { command } => {
+            service_command(&load_or_default(&path)?, explicit.as_deref(), command).await
+        }
+        Command::Config {
+            command: ConfigCommand::Init { print },
+        } => config_init_command(&path, print),
+        Command::Adapter {
+            command: AdapterCommand::Homebased { homebased_bin },
+        } => adapter_command(&load_or_default(&path)?, homebased_bin).await,
     }
+}
+
+/// The config at `path`, or the defaults when there is no file yet
+fn load_or_default(path: &std::path::Path) -> Result<Config> {
+    match Config::load(path) {
+        Ok(config) => Ok(config),
+        Err(ConfigError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Config::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn oauth_command(config: &Config, command: OAuthCommand) -> Result<()> {
+    match command {
+        OAuthCommand::Login { server, no_open } => {
+            let response: OAuthLoginResponse =
+                admin_post(config, "/admin/oauth/login", &OAuthServerRequest { server }).await?;
+            println!("Open this link in a browser on this Mac to sign in:");
+            println!("{}", response.authorization_url);
+            if !no_open && cfg!(target_os = "macos") {
+                let opened = std::process::Command::new("open")
+                    .arg(&response.authorization_url)
+                    .status();
+                if !opened.is_ok_and(|status| status.success()) {
+                    eprintln!("could not open a browser; open the link yourself");
+                }
+            }
+        }
+        OAuthCommand::Status => {
+            let response: OAuthStatusResponse =
+                admin_post(config, "/admin/oauth/status", &()).await?;
+            if response.servers.is_empty() {
+                println!("No server is configured with `oauth = true`.");
+            }
+            let now = store::now_ms();
+            for entry in response.servers {
+                let login = &entry.login;
+                let detail = if login.logged_in {
+                    let expiry = login.expires_at_ms.map_or_else(
+                        || "no expiry".to_owned(),
+                        |at| {
+                            if at > now {
+                                format!("token expires in {}", human_duration(at - now))
+                            } else {
+                                format!("token expired {} ago", human_duration(now - at))
+                            }
+                        },
+                    );
+                    let refresh = if login.refreshable {
+                        "refreshes automatically"
+                    } else {
+                        "no refresh token"
+                    };
+                    let scopes = if login.scopes.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        login.scopes.join(" ")
+                    };
+
+                    format!("logged in, {expiry}, {refresh}, scopes {scopes}")
+                } else {
+                    "not logged in".to_owned()
+                };
+                println!("{}\t{}\t{detail}", login.server, entry.state);
+            }
+        }
+        OAuthCommand::Logout { server } => {
+            let response: OAuthLogoutResponse = admin_post(
+                config,
+                "/admin/oauth/logout",
+                &OAuthServerRequest {
+                    server: server.clone(),
+                },
+            )
+            .await?;
+            if response.removed {
+                println!("Forgot the login for {server}; it reconnects without one.");
+            } else {
+                println!("{server} had no stored login.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn service_command(
+    config: &Config,
+    explicit_config: Option<&std::path::Path>,
+    command: ServiceCommand,
+) -> Result<()> {
+    let paths = ServicePaths::from_env(&config.state_dir()?)?;
+    let uid = service::current_uid()?;
+
+    let (plan, dry_run) = match command {
+        ServiceCommand::Install { dry_run } => {
+            let binary = std::env::current_exe().wrap_err("cannot locate this binary")?;
+            let worker = match &config.worker_path {
+                Some(path) => expand_home(path),
+                None => {
+                    let checkout = std::env::current_dir()?.join(".tools/bin/monty");
+                    if checkout.is_file() {
+                        checkout
+                    } else {
+                        paths.worker.clone()
+                    }
+                }
+            };
+            if !worker.is_file() {
+                return Err(service::ServiceError::NoWorker(worker).into());
+            }
+            if config.worker_path.is_some() {
+                eprintln!(
+                    "note: `worker_path` is set, so the service keeps using {} rather than the \
+                     installed copy; remove it from the config to use {}",
+                    worker.display(),
+                    paths.worker.display()
+                );
+            }
+            // an explicit config is pinned in the plist; the default path
+            // is found by the daemon itself
+            let pinned = match explicit_config {
+                Some(path) => Some(std::path::absolute(path)?),
+                None => None,
+            };
+
+            (
+                service::install_plan(&paths, uid, &binary, &worker, pinned.as_deref()),
+                dry_run,
+            )
+        }
+        ServiceCommand::Uninstall { dry_run } => (service::uninstall_plan(&paths, uid), dry_run),
+        ServiceCommand::Restart { dry_run } => (service::restart_plan(uid), dry_run),
+        ServiceCommand::Status { dry_run } => {
+            return service_status(config, &paths, uid, dry_run).await;
+        }
+    };
+
+    if dry_run {
+        print_plan(&plan);
+
+        return Ok(());
+    }
+    for action in &plan {
+        println!("{}", action.describe());
+        action.apply()?;
+    }
+
+    Ok(())
+}
+
+fn print_plan(plan: &[Action]) {
+    println!("Dry run; nothing is changed. Would run:");
+    for action in plan {
+        println!("  {}", action.describe());
+    }
+    for action in plan {
+        if let Action::Write { path, contents } = action {
+            println!("\n--- {} ---\n{contents}", path.display());
+        }
+    }
+}
+
+async fn service_status(
+    config: &Config,
+    paths: &ServicePaths,
+    uid: u32,
+    dry_run: bool,
+) -> Result<()> {
+    let launchctl = service::status_command(uid);
+    let health = format!("http://127.0.0.1:{}/healthz", config.listen.port());
+    if dry_run {
+        println!("Dry run; would check:");
+        println!("  test -f {}", paths.plist.display());
+        println!("  {}", launchctl.join(" "));
+        println!("  GET {health}");
+
+        return Ok(());
+    }
+
+    println!(
+        "plist: {} ({})",
+        paths.plist.display(),
+        if paths.plist.is_file() {
+            "installed"
+        } else {
+            "missing"
+        }
+    );
+    match service::run_command(&launchctl) {
+        Ok(output) => {
+            let summary: Vec<&str> = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("state =") || line.starts_with("pid ="))
+                .collect();
+            println!("launchd: loaded ({})", summary.join(", "));
+        }
+        Err(_) => println!("launchd: not loaded"),
+    }
+    let answer = reqwest::Client::new()
+        .get(&health)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    match answer {
+        Ok(response) => println!("health: {}", response.text().await?),
+        Err(_) => println!("health: no answer on {health}"),
+    }
+
+    Ok(())
+}
+
+fn config_init_command(path: &std::path::Path, print: bool) -> Result<()> {
+    let home = std::env::var_os("HOME").ok_or_else(|| eyre!("$HOME is not set"))?;
+    if print {
+        print!("{}", service::starter_config(std::path::Path::new(&home)));
+
+        return Ok(());
+    }
+
+    service::write_starter_config(path, std::path::Path::new(&home))?;
+    println!("Wrote {}", path.display());
+
+    Ok(())
+}
+
+async fn adapter_command(config: &Config, homebased_bin: Option<PathBuf>) -> Result<()> {
+    let notifier: Option<Arc<dyn Notifier>> = match config.notify.resolve_ntfy() {
+        Ok(Some(ntfy)) => Some(Arc::new(Ntfy::new(ntfy))),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, "notify tool unavailable");
+
+            None
+        }
+    };
+    let program = homebased_bin.unwrap_or_else(HomebasedAdapter::program_from_env);
+
+    HomebasedAdapter::new(program, notifier)
+        .serve_stdio()
+        .await
+        .map_err(|error| eyre!(error))
 }
 
 async fn serve_command(config: Config) -> Result<()> {
@@ -279,10 +635,34 @@ fn review_command(config: &Config, since: &str, out: Option<PathBuf>) -> Result<
 
 async fn passkey_command(config: &Config, command: PasskeyCommand) -> Result<()> {
     match command {
-        PasskeyCommand::Enroll => {
-            let response: EnrollResponse = admin_post(config, "/admin/enroll", &()).await?;
-            println!("Open this link on the device that will approve (valid 10 minutes, one use):");
-            println!("{}", response.url);
+        PasskeyCommand::Enroll { label } => {
+            let response: EnrollResponse =
+                admin_post(config, "/admin/enroll", &EnrollRequest { label }).await?;
+            if !response.notified {
+                eprintln!(
+                    "warning: no ntfy topic is configured, so the phone was not told about this request"
+                );
+            }
+            if let Some(approval_url) = &response.approval_url {
+                println!("A passkey is already enrolled, so this enrollment needs its approval.");
+                println!(
+                    "Confirmation code: {} (the approval page shows the same code)",
+                    response.code.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "1. Approve the request with an existing passkey (a notification was sent):"
+                );
+                println!("   {approval_url}");
+                println!(
+                    "2. Then open this link on the new device (one use, valid 10 minutes after approval):"
+                );
+                println!("   {}", response.url);
+            } else {
+                println!(
+                    "Open this link on the device that will approve (valid 10 minutes, one use):"
+                );
+                println!("{}", response.url);
+            }
         }
         PasskeyCommand::List => {
             let passkeys = Store::open(&config.state_dir()?)?.list_passkeys()?;
@@ -304,12 +684,23 @@ async fn passkey_command(config: &Config, command: PasskeyCommand) -> Result<()>
             }
         }
         PasskeyCommand::Remove { id } => {
-            let store = Store::open(&config.state_dir()?)?;
-            let label = store.passkey_label(id)?;
-            if !store.remove_passkey(id)? {
-                bail!("no passkey with id {id}");
+            let response: RemoveResponse =
+                admin_post(config, "/admin/passkey/remove", &RemoveRequest { id }).await?;
+            if !response.notified {
+                eprintln!(
+                    "warning: no ntfy topic is configured, so the phone was not told about this request"
+                );
             }
-            println!("removed passkey {id} ({})", label.unwrap_or_default());
+            println!(
+                "Confirmation code: {} (the approval page shows the same code)",
+                response.code
+            );
+            println!(
+                "Passkey {id} ({}) is removed once an existing passkey approves it \
+                 (a notification was sent):",
+                response.label
+            );
+            println!("{}", response.approval_url);
         }
     }
 

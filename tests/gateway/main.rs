@@ -1,8 +1,12 @@
 //! End-to-end checks: a real HTTP server, a real Monty worker and a stdio
 //! MCP fixture as the only upstream
 
+mod adapter;
+mod admin_gate;
 mod approvals;
 mod harness;
+mod oauth;
+mod service;
 mod usage;
 
 use std::{

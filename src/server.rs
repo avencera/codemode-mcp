@@ -561,6 +561,8 @@ pub async fn serve(app: &App) -> std::io::Result<RunningServer> {
     let address = listener.local_addr()?;
     let admin_listener = TcpListener::bind(app.config().admin_listen).await?;
     let admin_address = admin_listener.local_addr()?;
+    // OAuth redirect URIs point at the admin listener's real port
+    app.gateway().oauth().set_callback_address(admin_address);
     let shutdown = CancellationToken::new();
 
     let mcp_app = app.clone();
