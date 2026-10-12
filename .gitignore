@@ -1,0 +1,6 @@
+_scratch/
+node_modules/
+.env*
+*.local.json
+.tools/
+target/
