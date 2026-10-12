@@ -336,3 +336,48 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
 
     Ok(())
 }
+
+/// Stateless 2026-07-28 clients carry no session id, which approval grants and
+/// the log key on, so they are turned away and fall back to `initialize`
+#[tokio::test(flavor = "multi_thread")]
+async fn calls_are_logged_with_their_session_and_stateless_clients_are_refused() -> TestResult {
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+
+    let discover = harness
+        .http
+        .post(format!("{}/mcp", harness.base()))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "server/discover")
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientInfo":{"name":"x","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+        )
+        .send()
+        .await?;
+    assert_eq!(discover.status().as_u16(), 400);
+    assert!(
+        discover
+            .text()
+            .await?
+            .contains("Unsupported protocol version")
+    );
+
+    execute(&harness.client, "1 + 1").await?;
+    harness.app.usage().flush().await;
+    let connection = store::open(harness.app.state_dir())?;
+    let (session, client): (Option<String>, Option<String>) = connection.query_row(
+        "select session, client_name from calls where tool = 'execute'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert!(session.is_some_and(|session| !session.is_empty()));
+    assert_eq!(client.as_deref(), Some("rmcp"));
+
+    harness.stop().await
+}

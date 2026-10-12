@@ -137,6 +137,15 @@ Each call prints `ok (<n> bytes of output, not shown)` or a failure category; re
 The CLI warns that the 1Password app on the Mac may show prompts to accept. Agent calls then only need the
 phone passkey approval. Unconfirmed: whether a 1Password lock ends the MCP session
 
+### Protocol versions
+
+The server offers only MCP versions that open a session with `initialize`
+(2024-11-05 through 2025-11-25). The stateless 2026-07-28 protocol carries no
+session id, and approval grants and the usage log are keyed by MCP session.
+Claude Code 2.1 tries `server/discover` first and falls back to `initialize`
+when the server answers "Unsupported protocol version", so each Claude Code
+process gets its own session (verified 2026-10-12 with `claude -p`)
+
 ### Agent-facing tools
 
 | Tool | Purpose |

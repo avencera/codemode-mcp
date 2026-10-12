@@ -1,6 +1,7 @@
 //! The agent-facing MCP server and its HTTP wiring
 
 use std::{
+    borrow::Cow,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -10,7 +11,7 @@ use axum::{Json, Router, extract::State, middleware, routing::get};
 use rmcp::{
     RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerConfig},
     schemars,
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -411,11 +412,27 @@ impl CodeModeServer {
     }
 }
 
+/// Protocol versions that open a session with `initialize`
+///
+/// The stateless 2026-07-28 protocol carries no session id, while approval
+/// grants and the usage log are keyed by MCP session; clients such as
+/// Claude Code fall back to `initialize` when the server does not offer it
+const SESSION_PROTOCOLS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+];
+
 #[tool_handler]
 impl ServerHandler for CodeModeServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SESSION_PROTOCOLS)
     }
 }
 
