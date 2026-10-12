@@ -19,7 +19,7 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
     app::App,
-    approvals::{ApprovalInfo, ApprovalKind, Approvals, CLIENT_GRANT_MINUTES, Choice, DecideError},
+    approvals::{ApprovalInfo, ApprovalKind, Approvals, Choice, DecideError, GRANT_MINUTES},
     passkeys::{PasskeyError, Passkeys},
     policy::GrantMode,
     store,
@@ -182,29 +182,53 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
 
     let arguments = serde_json::to_string_pretty(&Value::Object(info.arguments.clone()))
         .unwrap_or_else(|_| "{}".to_owned());
-    let client_buttons = if info.client_grant_allowed() {
-        let client = escape(info.caller.client_display());
-
-        CLIENT_GRANT_MINUTES
+    let grant_buttons = |class: &str, prefix: &str, subject: &str| -> String {
+        GRANT_MINUTES
             .iter()
             .map(|minutes| {
                 format!(
-                    r#"<button class="client" data-choice="client{minutes}">Approve {client} for {minutes} min</button>"#
+                    r#"<button class="{class}" data-choice="{prefix}{minutes}">Approve {subject} for {minutes} min</button>"#
                 )
             })
-            .collect::<String>()
-    } else {
-        String::new()
+            .collect()
     };
-    let grant_note = match info.grant_mode {
-        GrantMode::Session if !info.caller.local => {
-            "This request did not come straight from this machine (it was proxied or arrived over the network), and the client name is self-asserted, so it can only be approved once."
-        }
+    let mut client_buttons = String::new();
+    if info.session_grant_allowed() {
+        client_buttons.push_str(&grant_buttons("client", "session", "this session"));
+    }
+    if info.client_grant_allowed() {
+        client_buttons.push_str(&grant_buttons(
+            "client",
+            "client",
+            &escape(info.caller.client_display()),
+        ));
+    }
+    let mut notes = Vec::new();
+    match info.grant_mode {
+        GrantMode::PerCall => notes.push("This tool needs approval for every call."),
         GrantMode::Session => {
-            "A client approval covers this server's read tools for every running session of that client, because the client does not identify its sessions."
+            if info.session_grant_allowed() {
+                notes.push(
+                    "A session approval covers this server's read tools for later calls that carry the same session, and for no other session or client.",
+                );
+            }
+            if info.client_grant_allowed() {
+                notes.push(
+                    "A client approval covers this server's read tools for every running session of that client, because this call passed no session.",
+                );
+            } else if !info.caller.local {
+                notes.push(
+                    "This request did not come straight from this machine (it was proxied or arrived over the network), and the client name is self-asserted, so a client approval is not offered.",
+                );
+            }
         }
-        GrantMode::PerCall => "This tool needs approval for every call.",
-    };
+    }
+    let grant_note = notes.join(" ");
+    let session = info
+        .caller
+        .session_label()
+        .map(|label| format!("<br>Session {}", escape(label)))
+        .unwrap_or_default();
     let title = format!(
         "{} wants {}",
         info.caller.client_label(),
@@ -213,7 +237,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     let body = format!(
         r#"<main data-kind="approve" data-base="/approve/{id}">
 <h1>{title}</h1>
-<p class="meta">Client {client} {version}<br>Execution {execution}</p>
+<p class="meta">Client {client} {version}{session}<br>Execution {execution}</p>
 <p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>. {grant_note}</p>
 <h2>Arguments</h2>
 <pre>{arguments}</pre>
@@ -286,7 +310,12 @@ async fn approve_options(
         Some(Choice::Deny) | None => return json_error(StatusCode::BAD_REQUEST, "unknown choice"),
         Some(choice) => choice,
     };
-    if matches!(choice, Choice::Client(_)) && !info.client_grant_allowed() {
+    let allowed = match choice {
+        Choice::Client(_) => info.client_grant_allowed(),
+        Choice::Session(_) => info.session_grant_allowed(),
+        Choice::Once | Choice::Deny => true,
+    };
+    if !allowed {
         return decide_error(&DecideError::GrantNotAllowed);
     }
 
@@ -493,7 +522,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
     let mut clients = String::new();
     for client in &stats.clients {
         clients.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} / {} / {}</td></tr>",
             escape(&client.client),
             client.runs,
             client.calls,
@@ -502,6 +531,9 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
             client
                 .mean_attempts
                 .map_or_else(|| "-".to_owned(), |mean| format!("{mean:.1}")),
+            client.sessions_minted,
+            client.session_calls,
+            client.sessions_used_once,
         ));
     }
     let fingerprints: String = stats
@@ -533,7 +565,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
         r#"<h1>codemode-mcp usage</h1>
 <p class="meta">Last {window}. Use <code>?since=1d</code> to change the window.</p>
 <h2>Clients</h2>
-<table><tr><th>Client</th><th>Runs (approximate when session-less)</th><th>Calls</th><th>Executions</th><th>Success</th><th>Attempts to success</th></tr>{clients}</table>
+<table><tr><th>Client</th><th>Runs (approximate when session-less)</th><th>Calls</th><th>Executions</th><th>Success</th><th>Attempts to success</th><th>Sessions minted / calls with a passed session / used once</th></tr>{clients}</table>
 <h2>Top error fingerprints</h2>
 <table><tr><th>Count</th><th>Fingerprint</th></tr>{fingerprints}</table>
 <h2>Slowest upstream tools</h2>

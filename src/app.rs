@@ -41,6 +41,7 @@ pub struct App {
     gateway: Arc<Gateway>,
     executions: Arc<Executions>,
     passkeys: Arc<Passkeys>,
+    store: Store,
     log: UsageLog,
 }
 
@@ -86,9 +87,10 @@ impl App {
         let config = Arc::new(config);
         let state_dir = config.state_dir()?;
         let store = Store::open(&state_dir)?;
-        let log = UsageLog::start(&state_dir, config.log_retention())?;
+        let log = UsageLog::start(&state_dir, config.log_retention(), config.session_idle())?;
         let sealer = Sealer::load_or_create(&state_dir).map_err(ExecutorError::from)?;
         let passkeys = Arc::new(Passkeys::new(&config.public_origin, store.clone())?);
+        let session_store = store.clone();
         let oauth = OAuth::new(&config, store.clone());
         let approvals = Approvals::new(
             config.public_base(),
@@ -121,6 +123,7 @@ impl App {
             gateway,
             executions,
             passkeys,
+            store: session_store,
             log,
         })
     }
@@ -148,6 +151,11 @@ impl App {
     /// Enrolled passkeys and WebAuthn ceremonies
     pub fn passkeys(&self) -> &Arc<Passkeys> {
         &self.passkeys
+    }
+
+    /// Shared database handle, which also holds the app sessions
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     /// Background execution registry

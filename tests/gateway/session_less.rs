@@ -124,11 +124,14 @@ fn tool_text(reply: &Reply) -> Result<String, Box<dyn std::error::Error>> {
 
 async fn logged_calls(
     harness: &Harness,
-) -> Result<Vec<(Option<String>, Option<String>, Option<String>)>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(bool, Option<String>, Option<String>)>, Box<dyn std::error::Error>> {
     harness.app.usage().flush().await;
     let connection = store::open(harness.app.state_dir())?;
     let mut statement = connection.prepare(
-        "SELECT session, client_name, client_version FROM calls WHERE tool = 'execute' ORDER BY id",
+        // the first column says whether the call logged an app session label
+        // (8 hex characters); the protocol itself carries no session
+        "SELECT COALESCE(length(session) = 8 AND session NOT GLOB '*[^0-9a-f]*', 0), \
+         client_name, client_version FROM calls WHERE tool = 'execute' ORDER BY id",
     )?;
     let rows = statement
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
@@ -165,11 +168,11 @@ async fn a_2026_07_28_request_flow_works_without_a_session() -> TestResult {
     let body: Value = serde_json::from_str(&tool_text(&reply)?)?;
     assert_eq!(body["result"], 2, "{body}");
 
-    // `_meta` clientInfo wins over the user-agent and there is no session
+    // `_meta` clientInfo wins over the user-agent; the app session is logged
     let calls = logged_calls(&harness).await?;
     assert_eq!(
         calls,
-        vec![(None, Some("claude-code".to_owned()), Some("9.9".to_owned()))]
+        vec![(true, Some("claude-code".to_owned()), Some("9.9".to_owned()))]
     );
 
     harness.stop().await
@@ -208,7 +211,7 @@ async fn the_rmcp_client_can_discover_and_call_without_a_session() -> TestResult
     assert_eq!(
         calls,
         vec![(
-            None,
+            true,
             Some("discover-client".to_owned()),
             Some("4.2".to_owned())
         )]
@@ -257,7 +260,7 @@ async fn an_initialize_client_works_and_gets_no_session_id() -> TestResult {
     assert_eq!(
         calls,
         vec![(
-            None,
+            true,
             Some("legacy-agent".to_owned()),
             Some("3.1".to_owned())
         )]

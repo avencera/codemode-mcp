@@ -38,15 +38,14 @@ use crate::{
     executions::{Executions, WaitResult},
     executor::ExecutionOutcome,
     gateway::Gateway,
-    guidance::{INSTRUCTIONS, TOOL_CALL_RULE, script_rules},
+    guidance::{INSTRUCTIONS, SESSION_RULE, TOOL_CALL_RULE, script_rules, session_rule},
     host::{HostPolicy, host_guard, is_direct_local},
+    store::Store,
     usage::{CallRecord, Caller, Classification, Outcome, UsageLog},
     web,
 };
 
-/// Header carrying the Streamable HTTP session id
-const SESSION_HEADER: &str = "mcp-session-id";
-/// Longest client name, version or session id kept
+/// Longest client name or version kept
 const MAX_LABEL_CHARS: usize = 64;
 
 const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -59,6 +58,8 @@ pub struct SearchParams {
     pub query: String,
     /// Maximum number of results (default 10, at most 50)
     pub limit: Option<usize>,
+    /// Session value from your previous codemode result; omit on the first call
+    pub session: Option<String>,
 }
 
 /// Arguments of `describe_tools`
@@ -66,6 +67,8 @@ pub struct SearchParams {
 pub struct DescribeParams {
     /// Tool names exactly as returned by search_tools
     pub names: Vec<String>,
+    /// Session value from your previous codemode result; omit on the first call
+    pub session: Option<String>,
 }
 
 /// Arguments of `execute`
@@ -73,6 +76,8 @@ pub struct DescribeParams {
 pub struct ExecuteParams {
     /// Python source to run; the last expression is the result
     pub code: String,
+    /// Session value from your previous codemode result; omit on the first call
+    pub session: Option<String>,
 }
 
 /// Arguments of `wait`
@@ -80,6 +85,8 @@ pub struct ExecuteParams {
 pub struct WaitParams {
     /// The execution_id returned by a pending execute call
     pub execution_id: String,
+    /// Session value from your previous codemode result; omit if you have none
+    pub session: Option<String>,
 }
 
 /// MCP handler exposing search, describe, execute and wait
@@ -88,23 +95,21 @@ pub struct CodeModeServer {
     gateway: Arc<Gateway>,
     executions: Arc<Executions>,
     log: UsageLog,
+    store: Store,
+    session_idle: Duration,
     wait_budget: Duration,
     progress_interval: Duration,
     max_response_bytes: usize,
 }
 
-/// Session id (older clients that opened one) and client of the request
-/// being handled
+/// Client of the request being handled; the app session is filled in later
+/// by [`CodeModeServer::open_session`]
 ///
-/// Stateless clients carry no session, so the client is read from the
-/// request `_meta`, then from peer info when a handshake filled it in, then
-/// from the `user-agent` header
+/// The server is session-less at the protocol level, so the client is read
+/// from the request `_meta`, then from peer info when a handshake filled it
+/// in, then from the `user-agent` header
 fn caller_of(context: &RequestContext<RoleServer>) -> Caller {
     let parts = context.extensions.get::<http::request::Parts>();
-    let session = parts
-        .and_then(|parts| parts.headers.get(SESSION_HEADER))
-        .and_then(|value| value.to_str().ok())
-        .map(clean_label);
     let from_handshake = || {
         // rmcp fills peer info with its own identity when it served the
         // request without a handshake
@@ -141,7 +146,6 @@ fn caller_of(context: &RequestContext<RoleServer>) -> Caller {
     let local = parts.is_some_and(|parts| is_direct_local(peer, &parts.headers));
 
     Caller {
-        session,
         local,
         ..client.unwrap_or_default()
     }
@@ -173,6 +177,44 @@ fn clean_label(text: &str) -> String {
         .filter(|character| !character.is_control())
         .take(MAX_LABEL_CHARS)
         .collect()
+}
+
+/// Shown to an agent whose `session` value was rejected and replaced
+const REPLACED_NOTE: &str = "the session you passed was not valid (unknown, expired or from another \
+                             client); use this new one from now on";
+
+/// The session a response hands back, so the agent passes it on its next call
+struct SessionNote {
+    token: String,
+    replaced: bool,
+}
+
+impl SessionNote {
+    /// Lines that lead a plain-text response
+    fn lines(&self) -> String {
+        let mut lines = format!("session: {}\n", self.token);
+        if self.replaced {
+            lines.push_str(&format!("note: {REPLACED_NOTE}\n"));
+        }
+
+        lines
+    }
+
+    /// Adds the session to a JSON object response
+    fn insert(&self, body: &mut Value) {
+        body["session"] = Value::String(self.token.clone());
+        if self.replaced {
+            body["session_note"] = Value::String(REPLACED_NOTE.to_owned());
+        }
+    }
+}
+
+/// `text` led by the session lines, when there is a session
+fn tagged(session: Option<&SessionNote>, text: &str) -> String {
+    match session {
+        Some(session) => format!("{}{text}", session.lines()),
+        None => text.to_owned(),
+    }
 }
 
 /// The parts of a usage record known before the call is answered
@@ -226,9 +268,36 @@ impl CodeModeServer {
             gateway: Arc::clone(app.gateway()),
             executions: Arc::clone(app.executions()),
             log: app.usage().clone(),
+            store: app.store().clone(),
+            session_idle: app.config().session_idle(),
             wait_budget: app.config().limits.execute_wait(),
             progress_interval: app.config().limits.progress_interval(),
             max_response_bytes: app.config().limits.max_response_bytes(),
+        }
+    }
+
+    /// Finds or issues the app session of a call and records it on `caller`
+    ///
+    /// A store failure leaves the call session-less rather than failing it
+    fn open_session(&self, provided: Option<&str>, caller: &mut Caller) -> Option<SessionNote> {
+        match self
+            .store
+            .resolve_session(provided, caller.client_name.as_deref(), self.session_idle)
+        {
+            Ok(resolved) => {
+                caller.session = Some(resolved.hash);
+                caller.session_state = resolved.state;
+
+                Some(SessionNote {
+                    token: resolved.token,
+                    replaced: resolved.replaced,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot resolve an app session; serving the call without one");
+
+                None
+            }
         }
     }
 
@@ -241,6 +310,7 @@ impl CodeModeServer {
         &self,
         id: &str,
         context: &RequestContext<RoleServer>,
+        session: Option<&SessionNote>,
     ) -> (CallToolResult, Classification) {
         let wait = self.executions.wait(id, self.wait_budget);
         tokio::pin!(wait);
@@ -272,11 +342,14 @@ impl CodeModeServer {
 
         match waited {
             WaitResult::Finished(outcome) => (
-                render_outcome(&outcome, self.max_response_bytes),
+                render_outcome(&outcome, self.max_response_bytes, session),
                 outcome.classification(),
             ),
             WaitResult::Pending => {
-                let body = pending_body(self.gateway.approvals(), id);
+                let mut body = pending_body(self.gateway.approvals(), id);
+                if let Some(session) = session {
+                    session.insert(&mut body);
+                }
                 let detail = body["waiting_for"]
                     .as_str()
                     .map(|tool| format!("waiting for approval of {tool}"));
@@ -290,7 +363,7 @@ impl CodeModeServer {
                 )
             }
             WaitResult::Unknown => (
-                text_result("Unknown or expired execution_id.", true),
+                text_result(&tagged(session, "Unknown or expired execution_id."), true),
                 Classification::new(Outcome::RuntimeError, "unknown or expired execution_id"),
             ),
         }
@@ -335,6 +408,8 @@ impl CodeModeServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let started = Instant::now();
+        let mut caller = caller_of(&context);
+        let session = self.open_session(params.session.as_deref(), &mut caller);
         let limit = params
             .limit
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
@@ -364,10 +439,13 @@ impl CodeModeServer {
             outcome: Outcome::Ok,
             detail: Some(format!("results: {}", hits.len())),
         };
-        let result = text_result(&Value::Array(hits).to_string(), false);
+        let result = text_result(
+            &tagged(session.as_ref(), &Value::Array(hits).to_string()),
+            false,
+        );
         self.record(
             Logged {
-                caller: caller_of(&context),
+                caller,
                 tool: "search_tools",
                 input: params.query,
                 started,
@@ -390,6 +468,8 @@ impl CodeModeServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let started = Instant::now();
+        let mut caller = caller_of(&context);
+        let session = self.open_session(params.session.as_deref(), &mut caller);
         let catalog = self.gateway.catalog();
         let (stubs, missing) = catalog.describe(&params.names);
         let classification = if missing.is_empty() {
@@ -400,7 +480,10 @@ impl CodeModeServer {
                 format!("unknown tools: {}", missing.join(", ")),
             )
         };
-        let mut text = format!("# {TOOL_CALL_RULE}\n{stubs}");
+        let mut text = format!(
+            "{}# {TOOL_CALL_RULE}\n# {SESSION_RULE}\n{stubs}",
+            session.as_ref().map(SessionNote::lines).unwrap_or_default()
+        );
         if !missing.is_empty() {
             text.push_str("\n# Unknown tools: ");
             text.push_str(&missing.join(", "));
@@ -428,7 +511,7 @@ impl CodeModeServer {
         let result = text_result(&text, false);
         self.record(
             Logged {
-                caller: caller_of(&context),
+                caller,
                 tool: "describe_tools",
                 input: Value::from(params.names.clone()).to_string(),
                 started,
@@ -445,7 +528,9 @@ impl CodeModeServer {
         description = concat!(
             "Run a Python script that calls tools found with search_tools and described with describe_tools. ",
             "Waits briefly; if the script is still running it returns {\"status\":\"pending\",\"execution_id\":...} \
-             and you call wait. Type errors and exceptions come back as text so you can fix the script.\n\n",
+             and you call wait. Type errors and exceptions come back as text so you can fix the script. ",
+            session_rule!(),
+            "\n\n",
             script_rules!()
         )
     )]
@@ -455,16 +540,18 @@ impl CodeModeServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let started = Instant::now();
-        let caller = caller_of(&context);
+        let mut caller = caller_of(&context);
+        let session = self.open_session(params.session.as_deref(), &mut caller);
         let (result, classification, id) =
             match self.executions.start(params.code.clone(), caller.clone()) {
                 Ok(id) => {
-                    let (result, classification) = self.await_outcome(&id, &context).await;
+                    let (result, classification) =
+                        self.await_outcome(&id, &context, session.as_ref()).await;
 
                     (result, classification, Some(id))
                 }
                 Err(busy) => (
-                    text_result(&busy.to_string(), true),
+                    text_result(&tagged(session.as_ref(), &busy.to_string()), true),
                     Classification::new(Outcome::Busy, "all sandbox workers busy"),
                     None,
                 ),
@@ -486,7 +573,7 @@ impl CodeModeServer {
 
     #[tool(
         description = "Keep waiting for a pending execution started by execute. Returns its result or \
-                          {\"status\":\"pending\"} again."
+                          {\"status\":\"pending\"} again. It works with or without the session."
     )]
     async fn wait(
         &self,
@@ -494,10 +581,14 @@ impl CodeModeServer {
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
         let started = Instant::now();
-        let (result, classification) = self.await_outcome(&params.execution_id, &context).await;
+        let mut caller = caller_of(&context);
+        let session = self.open_session(params.session.as_deref(), &mut caller);
+        let (result, classification) = self
+            .await_outcome(&params.execution_id, &context, session.as_ref())
+            .await;
         self.record(
             Logged {
-                caller: caller_of(&context),
+                caller,
                 tool: "wait",
                 input: params.execution_id.clone(),
                 started,
@@ -557,8 +648,12 @@ fn text_result(text: &str, is_error: bool) -> CallToolResult {
 
 /// Formats a finished execution for the agent; failures are tool results,
 /// never protocol errors, so the agent can read them and retry
-pub fn render_outcome(outcome: &ExecutionOutcome, max_bytes: usize) -> CallToolResult {
-    let (text, is_error) = outcome_text(outcome, max_bytes);
+fn render_outcome(
+    outcome: &ExecutionOutcome,
+    max_bytes: usize,
+    session: Option<&SessionNote>,
+) -> CallToolResult {
+    let (text, is_error) = outcome_text_for(outcome, max_bytes, session);
 
     text_result(&text, is_error)
 }
@@ -566,6 +661,17 @@ pub fn render_outcome(outcome: &ExecutionOutcome, max_bytes: usize) -> CallToolR
 /// Text of a finished execution, capped at `max_bytes`, and whether it counts
 /// as a failure
 pub fn outcome_text(outcome: &ExecutionOutcome, max_bytes: usize) -> (String, bool) {
+    outcome_text_for(outcome, max_bytes, None)
+}
+
+/// Like [`outcome_text`] for a call under a session: a completed result
+/// carries the session as a JSON field; failures are plain text and lead
+/// with the session lines
+fn outcome_text_for(
+    outcome: &ExecutionOutcome,
+    max_bytes: usize,
+    session: Option<&SessionNote>,
+) -> (String, bool) {
     let (text, is_error) = match outcome {
         ExecutionOutcome::Completed {
             value,
@@ -583,29 +689,41 @@ pub fn outcome_text(outcome: &ExecutionOutcome, max_bytes: usize) -> (String, bo
             if !output.is_empty() {
                 body["output"] = Value::String(output.clone());
             }
+            if let Some(session) = session {
+                session.insert(&mut body);
+            }
 
             (body.to_string(), false)
         }
         ExecutionOutcome::TypeError { diagnostics, .. } => (
-            format!(
-                "Type check failed; the script did not run. Fix these and call execute again.\n\n{diagnostics}{}",
-                type_error_hints(diagnostics)
+            tagged(
+                session,
+                &format!(
+                    "Type check failed; the script did not run. Fix these and call execute again.\n\n{diagnostics}{}",
+                    type_error_hints(diagnostics)
+                ),
             ),
             true,
         ),
         ExecutionOutcome::Exception {
             message, output, ..
         } => (
-            with_output(
-                &format!("The script raised an exception.\n\n{message}"),
-                output,
+            tagged(
+                session,
+                &with_output(
+                    &format!("The script raised an exception.\n\n{message}"),
+                    output,
+                ),
             ),
             true,
         ),
         ExecutionOutcome::Failed {
             message, output, ..
         } => (
-            with_output(&format!("Execution failed: {message}"), output),
+            tagged(
+                session,
+                &with_output(&format!("Execution failed: {message}"), output),
+            ),
             true,
         ),
     };

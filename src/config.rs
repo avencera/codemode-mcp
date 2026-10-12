@@ -79,6 +79,9 @@ pub struct Config {
     /// Days of usage records kept before they are purged
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u64,
+    /// Hours an app session may sit idle before it expires
+    #[serde(default = "default_session_idle_hours")]
+    pub session_idle_hours: u64,
     /// Approval behaviour
     #[serde(default)]
     pub approvals: ApprovalsConfig,
@@ -104,6 +107,7 @@ impl Default for Config {
             state_dir: None,
             public_origin: default_public_origin(),
             log_retention_days: default_log_retention_days(),
+            session_idle_hours: default_session_idle_hours(),
             approvals: ApprovalsConfig::default(),
             notify: NotifyConfig::default(),
             limits: Limits::default(),
@@ -169,6 +173,11 @@ impl Config {
         Duration::from_secs(self.log_retention_days.saturating_mul(24 * 60 * 60))
     }
 
+    /// How long an app session may sit idle before it expires
+    pub fn session_idle(&self) -> Duration {
+        Duration::from_secs(self.session_idle_hours.saturating_mul(60 * 60))
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.tool_timeout_secs == 0 {
             return Err(ConfigError::Invalid(
@@ -190,6 +199,11 @@ impl Config {
         if self.log_retention_days == 0 {
             return Err(ConfigError::Invalid(
                 "log_retention_days must be positive".into(),
+            ));
+        }
+        if self.session_idle_hours == 0 {
+            return Err(ConfigError::Invalid(
+                "session_idle_hours must be positive".into(),
             ));
         }
         if self.approvals.timeout_secs == 0 {
@@ -233,6 +247,10 @@ fn default_public_origin() -> String {
 
 fn default_log_retention_days() -> u64 {
     90
+}
+
+fn default_session_idle_hours() -> u64 {
+    24
 }
 
 /// Expands a leading `~/` to `$HOME`

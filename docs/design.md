@@ -72,12 +72,15 @@ idempotent. `tools/list_changed` refreshes the catalog
 ### Approvals
 
 - Policy per tool: `allow`, `ask`, or `deny`, with server-level defaults (1Password: `ask`)
-- Grant mode per `ask` tool: `session` (default, name kept for existing configs) or `per_call`. A client grant
-  (15 or 60 min) covers every `session`-grant tool of that server for every connection of the same client name
-  (see Protocol versions), and also answers that client's other pending requests for such tools. `per_call`
-  tools ask on every call and refuse client grants. A caller that sent no client name cannot be granted anything.
-  Client grants also need a direct local caller (see Protocol versions): a request from a non-loopback peer, or
-  carrying any proxy header, never matches a grant and cannot create one
+- Grant mode per `ask` tool: `session` (default, name kept for existing configs) or `per_call`. A session grant
+  (15 or 60 min) is keyed by (app session hash, server), see App sessions. It covers every `session`-grant tool
+  of that server for later calls that carry the same session, and also answers that session's other pending
+  requests for such tools. It is allowed for any caller, local or proxied, because the unguessable token is the
+  credential. A client grant (15 or 60 min, keyed by client name and server) is the fallback for calls that did
+  not pass a valid session: it covers every connection of the same client name (see Protocol versions) and needs
+  a direct local caller: a request from a non-loopback peer, or carrying any proxy header, never matches a client
+  grant and cannot create one. A caller that sent no client name cannot get a client grant. `per_call` tools ask
+  on every call and refuse both kinds of grant
 - An `ask` call needs a notifier and at least one enrolled passkey; otherwise it is refused at once
   (`no passkey enrolled; run \`codemode-mcp passkey enroll\``)
 - On an `ask` call the gateway creates a pending request (random 128-bit id) and sends an ntfy notification:
@@ -85,9 +88,11 @@ idempotent. `tools/list_changed` refreshes the catalog
   Arguments never go into the notification
 - `GET /approve/{id}` (server-rendered, mobile layout, all agent-supplied text escaped, strict CSP) shows the
   client, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
-  "Approve <client title or name> for 15 / 60 min" (only for `session` tools from a named, direct local client),
-  with a line saying the grant covers every running session of that client; for a proxied or remote request
-  the page offers Approve once and says why, and the server refuses the 15 / 60 min choice anyway; Deny
+  "Approve this session for 15 / 60 min" (only for `session` tools; every MCP call has a session) and, for a
+  call that did not pass a valid session from a named, direct local client, also "Approve <client title or name>
+  for 15 / 60 min" with a line saying the grant covers every running session of that client; a proxied or remote
+  request is never offered the client grant, and the page says why. The server refuses a choice the page did not
+  offer (`session15`, `session60`, `client15`, `client60`); Deny
 - Approving takes a passkey assertion (webauthn-rs 0.5): `POST /approve/{id}/options` binds the choice to a
   server-side ceremony (random id, 5 min TTL, in memory, never serialized), then `POST /approve/{id}/confirm`
   verifies the assertion and applies that choice. Deny (`POST /approve/{id}/deny`) needs no passkey. All POSTs
@@ -142,6 +147,30 @@ Each call prints `ok (<n> bytes of output, not shown)` or a failure category; re
 The CLI warns that the 1Password app on the Mac may show prompts to accept. Agent calls then only need the
 phone passkey approval. Unconfirmed: whether a 1Password lock ends the MCP session
 
+### App sessions
+
+The protocol has no session id, so the server issues its own: an app session, passed by the agent as the optional
+`session` parameter of `search_tools`, `describe_tools`, `execute` and `wait`
+
+- Token: 128 random bits as `cs_` plus 26 base32 characters. Only its SHA-256 is stored (in memory, SQLite, logs,
+  `/stats`, reports), because the token is a bearer secret for grants. People see the first 8 hex characters
+- A call with no `session`, or one that is unknown, idle past `session_idle_hours` (default 24), or minted for a
+  different client name, gets a new session. Every response carries the session to use next: a `session` field in
+  the JSON body of `execute` and `wait` (including the pending answer), and a first line `session: cs_…` in
+  `search_tools`, `describe_tools` and the plain-text failures of `execute` and `wait`. A rejected value is
+  replaced with a one-line note (`session_note` field or a `note:` line). `wait` works with or without the session
+  as long as the execution id is valid; an execution stays bound to the session that started it
+- Sessions live in the `sessions` table (hash, client, created, last seen), so they survive daemon restarts, and
+  are purged daily with the log retention purge
+- `calls.session` holds the 8-character hash prefix, and `calls.session_state` records `reused`, `minted` or
+  `reminted` (a new session although the same client had an active one within the last hour: an agent that
+  forgot to pass it back, a parallel first-turn call, or a second agent of that client starting). `stats` and
+  `review` show per client the sessions minted, calls with a passed session and sessions used once. A
+  "reminted" count is not shown: live trials on 2026-10-12 had Haiku and Sonnet mint extra sessions from
+  parallel first-turn calls while passing every later session back correctly
+- The guidance (server instructions, `execute` description, `describe_tools` header) tells agents to pass the
+  `session` value from their previous codemode result on every call
+
 ### Protocol versions
 
 The server is session-less for every client. It offers every protocol version rmcp knows (2024-11-05 through
@@ -159,14 +188,14 @@ Callers are identified per request, in this order:
    session-less server rarely does, because later requests do not carry the handshake)
 3. the `user-agent` header, parsed as `name/version` from its first product (`claude-code/2.1.296 (...)`)
 
-`Mcp-Session-Id` is still logged when a client sends one, so `calls.session` is nullable and is `None` for
-session-less callers. Claude Code 2.1.296 sends `_meta` with clientInfo, the protocol version, a different
+`Mcp-Session-Id` is no longer read; `calls.session` holds the app session instead (see App sessions) and is null
+only for calls outside the MCP tools. Claude Code 2.1.296 sends `_meta` with clientInfo, the protocol version, a different
 `claudecode/toolUseId` on every call and a `progressToken`, and no session or conversation id anywhere
 (verified 2026-10-12 against a stateless build)
 
-Tradeoff: approval grants are keyed by (client name, server) instead of (MCP session, server). One approval
-covers every running session of that client for 15 or 60 minutes, so two Claude Code windows share it. The
-client name is also self-asserted (`_meta` or `user-agent`), so grants apply only to direct local callers: the
+Tradeoff: calls that do not pass an app session fall back to approval grants keyed by (client name, server). One
+such approval covers every running session of that client for 15 or 60 minutes, so two Claude Code windows share
+it. The client name is also self-asserted (`_meta` or `user-agent`), so grants apply only to direct local callers: the
 TCP peer is loopback (`ConnectInfo<SocketAddr>`, enabled with `into_make_service_with_connect_info` on the main
 listener and read from rmcp's injected request parts) and the request has none of `forwarded`, `x-forwarded-for`,
 `x-forwarded-host`, `x-forwarded-proto`, `x-real-ip` or any `tailscale-*` header (`tailscale serve` connects from
@@ -198,7 +227,7 @@ response or progress notification aborts after 5 minutes of idle time
 Goal: see whether agents use Code Mode well or get confused, and feed that back into the directions and stubs
 
 - SQLite at `<state_dir>/codemode.sqlite` (WAL, numbered migrations in `PRAGMA user_version`, mode 0600).
-  Tables: `calls` (every agent-facing call: time, MCP session (usually null), client name/version, tool,
+  Tables: `sessions`, `calls` (every agent-facing call: time, app session label, session state, client name/version, tool,
   input — query, described names or script —, outcome, detail, fingerprint, duration, result bytes, execution id),
   `executions` (one row per finished execution with its script and final outcome), `upstream_calls` (server,
   tool, Python name, arguments, outcome, duration, approval id), `approvals`, `passkeys`
@@ -214,11 +243,12 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - Sensitive servers (`sensitive = true`, default when the server policy is `ask`): upstream rows keep tool name and
   outcome only; a failure from such a tool is logged as the tool name; once an execution has read a sensitive
   tool's result, its exception detail keeps only the exception type
-- A "run" is the unit behind every per-session number: the MCP session id when one exists, otherwise one client
-  name's calls and executions with gaps under 10 minutes, computed in Rust from rows ordered by time. Session-less
-  runs are approximate: two sessions of one client that overlap or follow within 10 minutes merge
+- A "run" is the unit behind every per-session number: the app session when the call carried one, otherwise one
+  client name's calls and executions with gaps under 10 minutes, computed in Rust from rows ordered by time. Runs
+  without a session are approximate: two sessions of one client that overlap or follow within 10 minutes merge.
+  An agent that forgets to pass its session splits into several runs, which the session-reuse numbers expose
 - `codemode-mcp stats [--since 7d]`: per client calls, runs (approximate when session-less), execute success rate,
-  mean attempts until success per run; top 10 fingerprints; slowest upstream tools; approval counts. `GET /stats` shows the same
+  mean attempts until success per run, session reuse (minted, calls with a passed session, used once); top 10 fingerprints; slowest upstream tools; approval counts. `GET /stats` shows the same
 - `codemode-mcp review [--since 7d] [--out FILE]`: Markdown with a per-client summary, top fingerprints with one
   example script and error each, the 5 runs with the most failed executes before success or abandonment as their
   ordered attempt sequence, hallucinated tool names (`name_error` names that start with a configured `<server>_`),
@@ -243,8 +273,11 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - LAN and tailnet peers can reach `/mcp` without authentication (non-goal above); they get the same rights as a
   local MCP-only agent, except that they can never use or create a client grant, so every `ask` call they make
   needs its own approval
-- Local same-user processes can still impersonate a client name and ride a live client grant, because the name is
-  self-asserted and loopback gives no identity. Per-client tokens would close this; they are not implemented
+- Local same-user processes can still impersonate a client name and ride a live client grant (the fallback for
+  calls without a valid session), because the name is self-asserted and loopback gives no identity. Session
+  grants close this for agents that pass their session: the token is unguessable, and a caller that presents a
+  valid session never matches a client grant. Whoever holds a token (it appears in the agent's own context and
+  transcript) can use its grants for as long as the session lives
 
 ### OAuth
 

@@ -36,10 +36,21 @@ macro_rules! script_rules {
     };
 }
 
-pub(crate) use {script_rules, tool_call_rule};
+macro_rules! session_rule {
+    () => {
+        "Pass the `session` value from your previous codemode result on every call; \
+         the first call gets one automatically."
+    };
+}
+
+pub(crate) use {script_rules, session_rule, tool_call_rule};
 
 /// Rule about calling tools, repeated at the top of `describe_tools` output
 pub const TOOL_CALL_RULE: &str = tool_call_rule!();
+
+/// Rule about passing the app session back, repeated at the top of
+/// `describe_tools` output
+pub const SESSION_RULE: &str = session_rule!();
 
 /// Server-level instructions sent when an agent connects
 pub const INSTRUCTIONS: &str = concat!(
@@ -47,6 +58,8 @@ pub const INSTRUCTIONS: &str = concat!(
      describe_tools to get their typed Python signatures, then execute a script that calls them. \
      execute returns status \"pending\" with an execution_id if the script is slow; call wait(execution_id). \
      Some tools need the user's approval on their phone: a pending answer with approval_url and waiting_for \
-     means tell the user to check their phone, then call wait.\n\n",
+     means tell the user to check their phone, then call wait. ",
+    session_rule!(),
+    "\n\n",
     script_rules!()
 );

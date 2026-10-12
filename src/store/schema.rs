@@ -5,13 +5,13 @@ use rusqlite::Connection;
 use super::StoreError;
 
 /// Version a fully migrated database reports
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
-const MIGRATIONS: [Migration; 2] = [create_tables, create_oauth_tables];
+const MIGRATIONS: [Migration; 3] = [create_tables, create_oauth_tables, create_sessions];
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 
@@ -29,6 +29,27 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
 
     Ok(())
+}
+
+/// App sessions issued by the server. Only the SHA-256 of a token is kept,
+/// because the token is a bearer secret for approval grants. `session_state`
+/// on `calls` records how each call got its session (`reused`, `minted`,
+/// or `reminted` when the client already had a recent one), for the
+/// session-reuse numbers
+fn create_sessions(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE sessions (
+            hash TEXT PRIMARY KEY,
+            client TEXT,
+            created_ms INTEGER NOT NULL,
+            last_seen_ms INTEGER NOT NULL
+        );
+        CREATE INDEX sessions_client ON sessions (client, last_seen_ms);
+
+        ALTER TABLE calls ADD COLUMN session_state TEXT;
+        "#,
+    )
 }
 
 /// OAuth logins of remote upstreams: the client registration and the

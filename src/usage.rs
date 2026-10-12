@@ -20,7 +20,10 @@ use rusqlite::{Connection, params};
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-use crate::store::{self, StoreError, now_ms};
+use crate::store::{
+    self, StoreError, now_ms,
+    sessions::{self, SessionState, short_hash},
+};
 
 /// Records buffered before new ones are dropped
 const CHANNEL_CAPACITY: usize = 4096;
@@ -197,8 +200,12 @@ pub const EXEC_CLIENT: &str = "codemode-mcp exec";
 /// Who made an agent-facing call
 #[derive(Debug, Clone, Default)]
 pub struct Caller {
-    /// MCP session id (`Mcp-Session-Id`); `None` for session-less callers
+    /// SHA-256 (hex) of the app session token the call runs under; `None`
+    /// for callers outside the MCP tools. It keys session grants, so it is
+    /// logged only as [`Caller::session_label`]
     pub session: Option<String>,
+    /// How the call got its session
+    pub session_state: SessionState,
     /// Client name from the request `_meta`, the `initialize` request or the
     /// `user-agent` header
     pub client_name: Option<String>,
@@ -214,6 +221,12 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// First eight hex characters of the session hash, the form logged and
+    /// shown to people
+    pub fn session_label(&self) -> Option<&str> {
+        self.session.as_deref().map(short_hash)
+    }
+
     /// Client name for display, `unknown` when the client sent none
     pub fn client_label(&self) -> &str {
         self.client_name.as_deref().unwrap_or("unknown")
@@ -334,13 +347,19 @@ pub struct UsageLog(Arc<Shared>);
 
 impl UsageLog {
     /// Opens the database in `directory`, purges records older than
-    /// `retention` and starts the writer thread
-    pub fn start(directory: &Path, retention: Duration) -> Result<Self, StoreError> {
+    /// `retention` and sessions idle for `session_idle`, and starts the
+    /// writer thread
+    pub fn start(
+        directory: &Path,
+        retention: Duration,
+        session_idle: Duration,
+    ) -> Result<Self, StoreError> {
         let connection = store::open(directory)?;
         let (sender, receiver) = sync_channel(CHANNEL_CAPACITY);
         let writer = Writer {
             connection,
             retention,
+            session_idle,
             last_purge: None,
         };
         std::thread::Builder::new()
@@ -410,6 +429,7 @@ impl UsageLog {
 struct Writer {
     connection: Connection,
     retention: Duration,
+    session_idle: Duration,
     last_purge: Option<Instant>,
 }
 
@@ -484,6 +504,10 @@ impl Writer {
         if let Err(error) = purge(&self.connection, cutoff) {
             tracing::warn!(%error, "failed to purge old usage records");
         }
+        let idle_cutoff = now_ms().saturating_sub(self.session_idle.as_millis() as i64);
+        if let Err(error) = sessions::purge(&self.connection, idle_cutoff) {
+            tracing::warn!(%error, "failed to purge expired sessions");
+        }
     }
 }
 
@@ -513,11 +537,11 @@ fn millis(duration: Duration) -> i64 {
 fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), rusqlite::Error> {
     connection.execute(
         "INSERT INTO calls (at_ms, session, client_name, client_version, tool, input, outcome, \
-         detail, fingerprint, duration_ms, result_bytes, execution_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         detail, fingerprint, duration_ms, result_bytes, execution_id, session_state) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             now_ms() - millis(record.duration),
-            record.caller.session,
+            record.caller.session_label(),
             record.caller.client_name,
             record.caller.client_version,
             record.tool,
@@ -528,6 +552,7 @@ fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), rusql
             millis(record.duration),
             record.result_bytes as i64,
             record.execution_id,
+            record.caller.session_state.as_str(),
         ],
     )?;
 
@@ -546,7 +571,7 @@ fn insert_execution(
             record.id,
             record.started_ms,
             record.started_ms + millis(record.duration),
-            record.caller.session,
+            record.caller.session_label(),
             record.caller.client_name,
             record.script,
             record.classification.outcome.as_str(),
@@ -600,7 +625,7 @@ fn write_approval(connection: &Connection, record: &ApprovalRecord) -> Result<()
             params![
                 id,
                 now_ms(),
-                caller.session,
+                caller.session_label(),
                 caller.client_name,
                 execution_id,
                 server,

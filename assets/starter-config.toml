@@ -6,7 +6,7 @@
 # [notify.ntfy] section is added here
 
 # 1Password Environments: every call needs a phone passkey approval. Read
-# tools accept a 15 or 60 minute client grant; writes ask on every call
+# tools accept a 15 or 60 minute session grant; writes ask on every call
 [servers.onepassword]
 command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
 policy = "ask"

@@ -1,6 +1,7 @@
 //! SQLite state: usage records, approvals, enrolled passkeys and OAuth logins
 
 pub mod schema;
+pub mod sessions;
 
 use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},

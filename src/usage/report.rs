@@ -15,7 +15,7 @@ use crate::{store::now_ms, usage::EXEC_CLIENT};
 const TOP_FINGERPRINTS: usize = 10;
 /// Runs shown with their full attempt sequence
 const WORST_RUNS: usize = 5;
-/// Calls of one session-less client further apart than this start a new run
+/// Calls of one client without a session further apart than this start a new run
 const RUN_GAP_MS: i64 = 10 * 60 * 1000;
 /// Rows listed in the other review tables
 const TOP_ROWS: usize = 20;
@@ -53,7 +53,7 @@ pub struct ClientStats {
     pub client: String,
     /// Agent-facing calls
     pub calls: i64,
-    /// Distinct runs: MCP sessions, or for session-less callers stretches of
+    /// Distinct runs: app sessions, or for calls without one stretches of
     /// calls with gaps under 10 minutes (approximate)
     pub runs: i64,
     /// Calls per agent-facing tool
@@ -65,6 +65,18 @@ pub struct ClientStats {
     /// Mean executions per run up to and including the first success, over
     /// runs that succeeded
     pub mean_attempts: Option<f64>,
+    /// Calls that were issued a new session
+    pub sessions_minted: i64,
+    /// Calls that passed a valid session
+    pub session_calls: i64,
+    /// Sessions with a single call in the window
+    ///
+    /// Agents often make parallel calls before their first answer, and each
+    /// mints a session, so a "minted while another was active" count would
+    /// mostly flag parallel lanes and concurrent agents; a lone call is the
+    /// clearer sign of a session nobody passed back, though a one-shot task
+    /// produces one too
+    pub sessions_used_once: i64,
 }
 
 impl ClientStats {
@@ -129,9 +141,9 @@ struct Attempt {
     script: String,
 }
 
-/// Splits session-less callers' activity into runs
+/// Splits activity without a session into runs
 ///
-/// A run is a session id when one exists. Otherwise it is one client's
+/// A run is an app session when the call carried one. Otherwise it is one client's
 /// calls and executions with gaps under 10 minutes, so it is approximate:
 /// two sessions of one client that overlap or follow closely merge
 struct Runs {
@@ -219,6 +231,45 @@ impl<'a> Reporter<'a> {
             entry.client = client;
             entry.calls += count;
             entry.by_tool.insert(tool, count);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT COALESCE(client_name, 'unknown'), session_state, COUNT(*) FROM calls \
+             WHERE at_ms >= ?1 AND session_state IS NOT NULL GROUP BY 1, 2",
+        )?;
+        let rows = statement.query_map(params![self.since_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (client, state, count) = row?;
+            let entry = clients.entry(client.clone()).or_default();
+            entry.client = client;
+            match state.as_str() {
+                "reused" => entry.session_calls += count,
+                "minted" | "reminted" => entry.sessions_minted += count,
+                _ => {}
+            }
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT client, COUNT(*) FROM ( \
+                 SELECT COALESCE(client_name, 'unknown') AS client, session FROM calls \
+                 WHERE at_ms >= ?1 AND session IS NOT NULL \
+                 GROUP BY 1, 2 HAVING COUNT(*) = 1 \
+             ) GROUP BY 1",
+        )?;
+        let rows = statement.query_map(params![self.since_ms], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (client, count) = row?;
+            let entry = clients.entry(client.clone()).or_default();
+            entry.client = client;
+            entry.sessions_used_once += count;
         }
 
         let runs = self.runs()?;
@@ -425,7 +476,7 @@ impl<'a> Reporter<'a> {
         let _ = writeln!(out, "# codemode-mcp usage review\n");
         let _ = writeln!(
             out,
-            "Runs (approximate when session-less): a run is an MCP session when the client has \
+            "Runs (approximate when session-less): a run is an app session when the call carried \
              one, otherwise one client's calls with gaps under 10 minutes.\n"
         );
         let _ = writeln!(
@@ -436,6 +487,7 @@ impl<'a> Reporter<'a> {
         );
 
         self.client_section(&mut out, &stats);
+        session_section(&mut out, &stats);
         self.fingerprint_section(&mut out, &stats)?;
         self.retry_section(&mut out)?;
         self.hallucination_section(&mut out, server_prefixes)?;
@@ -762,6 +814,38 @@ impl<'a> Reporter<'a> {
     }
 }
 
+fn session_section(out: &mut String, stats: &Stats) {
+    let _ = writeln!(out, "## Session reuse\n");
+    if stats
+        .clients
+        .iter()
+        .all(|client| client.sessions_minted == 0 && client.session_calls == 0)
+    {
+        let _ = writeln!(out, "No calls carried a session in this window.\n");
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "Forgotten: a new session was issued although the same client had an active one within \
+         the last hour (parallel agents of one client count too).\n"
+    );
+    let _ = writeln!(
+        out,
+        "| Client | Sessions minted | Calls with a passed session | Sessions used once |\n|---|---|---|---|"
+    );
+    for client in &stats.clients {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            cell(&client.client),
+            client.sessions_minted,
+            client.session_calls,
+            client.sessions_used_once
+        );
+    }
+    out.push('\n');
+}
+
 fn approval_section(out: &mut String, stats: &ApprovalStats) {
     let _ = writeln!(out, "## Approvals\n");
     let _ = writeln!(
@@ -809,7 +893,8 @@ pub fn render_stats(stats: &Stats) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "{}: {} calls in {} runs ({})\n  executions {}, success rate {}, mean attempts to success {}",
+            "{}: {} calls in {} runs ({})\n  executions {}, success rate {}, mean attempts to success {}\n  \
+             session reuse: {} minted, {} calls with a passed session, {} used once",
             client.client,
             client.calls,
             client.runs,
@@ -819,6 +904,9 @@ pub fn render_stats(stats: &Stats) -> String {
             client
                 .mean_attempts
                 .map_or_else(|| "-".to_owned(), |mean| format!("{mean:.1}")),
+            client.sessions_minted,
+            client.session_calls,
+            client.sessions_used_once,
         );
     }
 

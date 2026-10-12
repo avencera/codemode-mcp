@@ -207,7 +207,11 @@ fn execution(
 #[tokio::test(flavor = "multi_thread")]
 async fn review_renders_sections_from_a_seeded_database() -> TestResult {
     let directory = temp_state_dir();
-    let log = UsageLog::start(&directory, Duration::from_secs(90 * 24 * 60 * 60))?;
+    let log = UsageLog::start(
+        &directory,
+        Duration::from_secs(90 * 24 * 60 * 60),
+        Duration::from_secs(24 * 60 * 60),
+    )?;
     let now = store::now_ms();
     let claude = || caller("s1", "claude-code");
 
@@ -351,7 +355,11 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn review_groups_sessionless_calls_into_runs_by_time_gaps() -> TestResult {
     let directory = temp_state_dir();
-    let log = UsageLog::start(&directory, Duration::from_secs(90 * 24 * 60 * 60))?;
+    let log = UsageLog::start(
+        &directory,
+        Duration::from_secs(90 * 24 * 60 * 60),
+        Duration::from_secs(24 * 60 * 60),
+    )?;
     let minute = 60 * 1000;
     let base = store::now_ms() - 3 * 60 * minute;
     let claude = || sessionless("claude-code");
