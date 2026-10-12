@@ -132,6 +132,42 @@ async fn scripts_run_against_the_fixture_upstream() -> TestResult {
     harness.stop().await
 }
 
+/// Mistakes agents made in trials come back with the fix spelled out
+#[tokio::test(flavor = "multi_thread")]
+async fn common_agent_mistakes_get_hints() -> TestResult {
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+
+    let result = execute(
+        &harness.client,
+        "x = await asyncio.gather(fixture_add(a=1, b=2))\nreturn json.dumps(x)",
+    )
+    .await?;
+    let text = text_of(&result);
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(
+        text.contains("Hint: Scripts run at the top level"),
+        "{text}"
+    );
+    assert!(text.contains("Hint: Add `import asyncio`"), "{text}");
+    assert!(text.contains("Hint: Add `import json`"), "{text}");
+
+    let described = call(
+        &harness.client,
+        "describe_tools",
+        json!({ "names": ["mcp__codemode__execute"] }),
+    )
+    .await?;
+    assert!(
+        text_of(&described).contains("describe_tools takes names returned by search_tools"),
+        "{}",
+        text_of(&described)
+    );
+
+    harness.stop().await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn async_sleeps_run_concurrently() -> TestResult {
     let Some(harness) = Harness::start("", "").await? else {

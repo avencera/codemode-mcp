@@ -28,7 +28,9 @@ macro_rules! script_rules {
              hashlib, random, time, typing. No third-party packages; no file or network access except through tools.\n\
              - Avoid: classes with inheritance, @property/@classmethod/@staticmethod, generators/yield, match, del, \
              async with/async for, user-defined exception classes, eval/exec.\n\
-             - The last expression is the result; make it JSON-serializable (dict/list/str/int/float/bool/None). \
+             - Import what you use (`import asyncio`, `import json`); nothing is pre-imported.\n\
+             - The script runs at the top level, not inside a function: never `return`; the last expression is \
+             the result. Make it JSON-serializable (dict/list/str/int/float/bool/None). \
              Use print() for intermediate notes. Keep scripts short and focused."
         )
     };

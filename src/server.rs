@@ -310,6 +310,11 @@ impl CodeModeServer {
         if !missing.is_empty() {
             text.push_str("\n# Unknown tools: ");
             text.push_str(&missing.join(", "));
+            text.push_str(
+                "\n# describe_tools takes names returned by search_tools, such as \
+                 `server_tool`; search_tools, describe_tools, execute and wait are not \
+                 callable from scripts",
+            );
             for name in missing {
                 let suggestions: Vec<&str> = catalog
                     .search(name, 3)
@@ -436,6 +441,32 @@ impl ServerHandler for CodeModeServer {
     }
 }
 
+/// Mistakes agents make repeatedly, seen in the usage log, with the fix
+/// spelled out so one retry is enough
+const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
+    (
+        "`return` statement outside of a function",
+        "Scripts run at the top level: drop `return` and end the script with the value as a bare expression",
+    ),
+    (
+        "Name `asyncio` used when not defined",
+        "Add `import asyncio` at the top of the script",
+    ),
+    (
+        "Name `json` used when not defined",
+        "Add `import json` at the top of the script",
+    ),
+];
+
+/// Hints for known mistakes in type-check diagnostics, or an empty string
+fn type_error_hints(diagnostics: &str) -> String {
+    TYPE_ERROR_HINTS
+        .iter()
+        .filter(|(needle, _)| diagnostics.contains(needle))
+        .map(|(_, hint)| format!("\nHint: {hint}"))
+        .collect()
+}
+
 fn text_result(text: &str, is_error: bool) -> CallToolResult {
     let content = vec![ContentBlock::text(text)];
 
@@ -479,7 +510,8 @@ pub fn outcome_text(outcome: &ExecutionOutcome, max_bytes: usize) -> (String, bo
         }
         ExecutionOutcome::TypeError { diagnostics, .. } => (
             format!(
-                "Type check failed; the script did not run. Fix these and call execute again.\n\n{diagnostics}"
+                "Type check failed; the script did not run. Fix these and call execute again.\n\n{diagnostics}{}",
+                type_error_hints(diagnostics)
             ),
             true,
         ),
