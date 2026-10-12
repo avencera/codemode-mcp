@@ -63,12 +63,28 @@ pub const DEFAULT_CLIENT: &str = "harness-client";
 /// An MCP client whose requests carry `user_agent`; it still sends
 /// `initialize` and tolerates a server that issues no session id
 pub async fn connect_as(base: &str, user_agent: &str) -> Result<Client, Box<dyn Error>> {
+    connect_with_headers(base, user_agent, &[]).await
+}
+
+/// Like [`connect_as`], with extra headers on every request, e.g. what
+/// `tailscale serve` adds
+pub async fn connect_with_headers(
+    base: &str,
+    user_agent: &str,
+    headers: &[(&str, &str)],
+) -> Result<Client, Box<dyn Error>> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp"));
     config.allow_stateless = true;
     config.custom_headers.insert(
         http::header::USER_AGENT,
         http::HeaderValue::from_str(user_agent)?,
     );
+    for (name, value) in headers {
+        config.custom_headers.insert(
+            http::HeaderName::from_bytes(name.as_bytes())?,
+            http::HeaderValue::from_str(value)?,
+        );
+    }
 
     Ok(
         ().serve(StreamableHttpClientTransport::from_config(config))
@@ -225,6 +241,12 @@ impl Harness {
     /// A connection whose `user-agent` names another client
     pub async fn client_as(&self, user_agent: &str) -> Result<Client, Box<dyn Error>> {
         connect_as(&self.base(), user_agent).await
+    }
+
+    /// A connection from the harness client's name whose requests also carry
+    /// `headers`, as if a proxy had forwarded them
+    pub async fn proxied_client(&self, headers: &[(&str, &str)]) -> Result<Client, Box<dyn Error>> {
+        connect_with_headers(&self.base(), &format!("{DEFAULT_CLIENT}/1.0"), headers).await
     }
 
     /// Runs a script that must succeed and returns the parsed response

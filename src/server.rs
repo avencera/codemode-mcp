@@ -6,7 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{Json, Router, extract::State, middleware, routing::get};
+use axum::{
+    Json, Router,
+    extract::{ConnectInfo, State},
+    middleware,
+    routing::get,
+};
 use rmcp::{
     RoleServer, ServerHandler,
     handler::server::wrapper::Parameters,
@@ -34,7 +39,7 @@ use crate::{
     executor::ExecutionOutcome,
     gateway::Gateway,
     guidance::{INSTRUCTIONS, TOOL_CALL_RULE, script_rules},
-    host::{HostPolicy, host_guard},
+    host::{HostPolicy, host_guard, is_direct_local},
     usage::{CallRecord, Caller, Classification, Outcome, UsageLog},
     web,
 };
@@ -127,8 +132,17 @@ fn caller_of(context: &RequestContext<RoleServer>) -> Caller {
             caller_from_user_agent(agent)
         });
 
+    // the peer comes from axum's connect info, which `serve` enables
+    let peer = context
+        .extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<ConnectInfo<SocketAddr>>())
+        .map(|ConnectInfo(peer)| *peer);
+    let local = parts.is_some_and(|parts| is_direct_local(peer, &parts.headers));
+
     Caller {
         session,
+        local,
         ..client.unwrap_or_default()
     }
 }
@@ -701,9 +715,12 @@ pub async fn serve(app: &App) -> std::io::Result<RunningServer> {
 
     let token = shutdown.clone();
     let main = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move { token.cancelled().await })
-            .await
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { token.cancelled().await })
+        .await
     });
     let token = shutdown.clone();
     let admin_router = admin::router(app);

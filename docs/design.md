@@ -75,7 +75,9 @@ idempotent. `tools/list_changed` refreshes the catalog
 - Grant mode per `ask` tool: `session` (default, name kept for existing configs) or `per_call`. A client grant
   (15 or 60 min) covers every `session`-grant tool of that server for every connection of the same client name
   (see Protocol versions), and also answers that client's other pending requests for such tools. `per_call`
-  tools ask on every call and refuse client grants. A caller that sent no client name cannot be granted anything
+  tools ask on every call and refuse client grants. A caller that sent no client name cannot be granted anything.
+  Client grants also need a direct local caller (see Protocol versions): a request from a non-loopback peer, or
+  carrying any proxy header, never matches a grant and cannot create one
 - An `ask` call needs a notifier and at least one enrolled passkey; otherwise it is refused at once
   (`no passkey enrolled; run \`codemode-mcp passkey enroll\``)
 - On an `ask` call the gateway creates a pending request (random 128-bit id) and sends an ntfy notification:
@@ -83,8 +85,9 @@ idempotent. `tools/list_changed` refreshes the catalog
   Arguments never go into the notification
 - `GET /approve/{id}` (server-rendered, mobile layout, all agent-supplied text escaped, strict CSP) shows the
   client, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
-  "Approve <client title or name> for 15 / 60 min" (only for `session` tools from a named client), with a line
-  saying the grant covers every running session of that client; Deny
+  "Approve <client title or name> for 15 / 60 min" (only for `session` tools from a named, direct local client),
+  with a line saying the grant covers every running session of that client; for a proxied or remote request
+  the page offers Approve once and says why, and the server refuses the 15 / 60 min choice anyway; Deny
 - Approving takes a passkey assertion (webauthn-rs 0.5): `POST /approve/{id}/options` binds the choice to a
   server-side ceremony (random id, 5 min TTL, in memory, never serialized), then `POST /approve/{id}/confirm`
   verifies the assertion and applies that choice. Deny (`POST /approve/{id}/deny`) needs no passkey. All POSTs
@@ -163,9 +166,13 @@ session-less callers. Claude Code 2.1.296 sends `_meta` with clientInfo, the pro
 
 Tradeoff: approval grants are keyed by (client name, server) instead of (MCP session, server). One approval
 covers every running session of that client for 15 or 60 minutes, so two Claude Code windows share it. The
-client name is also self-asserted (`_meta` or `user-agent`), so any program that can reach `/mcp` and claims the
-name of a client with a live grant rides on it. Reach is limited by the host guard and the network the daemon
-listens on, and per-call tools and admin actions never accept a grant
+client name is also self-asserted (`_meta` or `user-agent`), so grants apply only to direct local callers: the
+TCP peer is loopback (`ConnectInfo<SocketAddr>`, enabled with `into_make_service_with_connect_info` on the main
+listener and read from rmcp's injected request parts) and the request has none of `forwarded`, `x-forwarded-for`,
+`x-forwarded-host`, `x-forwarded-proto`, `x-real-ip` or any `tailscale-*` header (`tailscale serve` connects from
+127.0.0.1 and adds `X-Forwarded-For` and `Tailscale-User-*`). LAN and tailnet callers therefore need their own
+approval for every call, and a grant can only be created from a local request; both rules are enforced on the
+server, not only on the page. Per-call tools and admin actions never accept a grant
 
 Waiting `execute` and `wait` calls send MCP progress notifications about every 15 s (`limits.progress_interval_ms`)
 when the request carries a `progressToken`. Claude Code aborts an HTTP call that is idle for 5 minutes, and a
@@ -234,7 +241,10 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - The admin listener is loopback-only and refuses proxied requests and non-loopback `Host` headers; its JSON
   bodies keep cross-site form posts out. `op warm` bypasses approvals by design, and only from the Mac
 - LAN and tailnet peers can reach `/mcp` without authentication (non-goal above); they get the same rights as a
-  local MCP-only agent
+  local MCP-only agent, except that they can never use or create a client grant, so every `ask` call they make
+  needs its own approval
+- Local same-user processes can still impersonate a client name and ride a live client grant, because the name is
+  self-asserted and loopback gives no identity. Per-client tokens would close this; they are not implemented
 
 ### OAuth
 

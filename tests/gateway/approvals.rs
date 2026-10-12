@@ -328,3 +328,111 @@ async fn admin_routes_refuse_non_loopback_and_proxied_peers() -> TestResult {
 
     harness.stop().await
 }
+
+/// Headers a proxy in front of the daemon adds, one request each
+const PROXY_HEADER_SETS: [(&str, &str); 3] = [
+    ("x-forwarded-for", "100.64.0.9"),
+    ("tailscale-user-login", "someone@example.com"),
+    ("x-real-ip", "100.64.0.9"),
+];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxied_callers_never_match_a_client_grant() -> TestResult {
+    let Some(harness) = approval_harness("", "").await? else {
+        return Ok(());
+    };
+    harness.enroll_passkey().await?;
+    let approvals = harness.app.approvals();
+
+    let first = harness
+        .execute_body("int(await fixture_add(a=1, b=2))")
+        .await?;
+    approvals.decide(
+        &approval_id(&first)?,
+        Choice::Client(Duration::from_secs(15 * 60)),
+    )?;
+    harness.wait_done(&execution_id(&first)).await?;
+
+    // the local caller rides the grant
+    harness
+        .execute_json("int(await fixture_add(a=2, b=2))")
+        .await?;
+    assert_eq!(harness.notifier.tool_requests().len(), 1);
+
+    // the same client name behind a proxy is asked every time
+    for (name, value) in PROXY_HEADER_SETS {
+        let proxied = harness.proxied_client(&[(name, value)]).await?;
+        let pending = execute(&proxied, "int(await fixture_add(a=3, b=3))").await?;
+        let pending: Value = serde_json::from_str(&text_of(&pending))?;
+        assert_eq!(pending["status"], "pending", "{name}: {pending}");
+        approvals.decide(&approval_id(&pending)?, Choice::Once)?;
+        proxied.cancel().await?;
+    }
+    assert_eq!(
+        harness.notifier.tool_requests().len(),
+        1 + PROXY_HEADER_SETS.len()
+    );
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxied_requests_cannot_create_client_grants() -> TestResult {
+    let Some(harness) = approval_harness("", "").await? else {
+        return Ok(());
+    };
+    let mut passkey = harness.enroll_passkey().await?;
+    let approvals = harness.app.approvals();
+    let proxied = harness
+        .proxied_client(&[("x-forwarded-for", "100.64.0.9")])
+        .await?;
+
+    let result = execute(&proxied, "int(await fixture_add(a=1, b=2))").await?;
+    let pending: Value = serde_json::from_str(&text_of(&result))?;
+    let id = approval_id(&pending)?;
+
+    // the page offers only a one-time approval and says why
+    let html = harness
+        .http
+        .get(format!("{}/approve/{id}", harness.base()))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(html.contains("Approve once"), "{html}");
+    assert!(!html.contains("data-choice=\"client"), "{html}");
+    assert!(
+        html.contains("did not come straight from this machine"),
+        "{html}"
+    );
+
+    // bypassing the page does not help, at either step
+    for choice in ["client15", "client60"] {
+        let (status, _) = harness
+            .post_json(
+                &format!("/approve/{id}/options"),
+                &json!({ "choice": choice }),
+            )
+            .await?;
+        assert_eq!(status, 400, "{choice}");
+    }
+    assert!(
+        approvals
+            .decide(&id, Choice::Client(Duration::from_secs(900)))
+            .is_err()
+    );
+
+    // once still works, and leaves no grant behind
+    let (status, body) = harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    harness.wait_done(&execution_id(&pending)).await?;
+    let next = harness
+        .execute_body("int(await fixture_add(a=2, b=2))")
+        .await?;
+    assert_eq!(next["status"], "pending", "{next}");
+
+    proxied.cancel().await?;
+    harness.stop().await
+}

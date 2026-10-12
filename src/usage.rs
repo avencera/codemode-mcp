@@ -207,6 +207,10 @@ pub struct Caller {
     /// Human-readable client name when the client sent one; shown on the
     /// approval page and not logged
     pub client_title: Option<String>,
+    /// Whether the request came straight from a process on this machine
+    /// (loopback peer, no proxy headers); only such callers may hold client
+    /// grants, because the client name is self-asserted
+    pub local: bool,
 }
 
 impl Caller {

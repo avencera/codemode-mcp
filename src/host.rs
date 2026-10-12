@@ -5,13 +5,13 @@
 //! these rules in front of every route instead. The rules mirror homebased's.
 
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
 use axum::{
     extract::{Request, State},
-    http::{StatusCode, header::HOST},
+    http::{HeaderMap, StatusCode, header::HOST},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -153,6 +153,36 @@ fn is_dns_labels(host: &str) -> bool {
         })
 }
 
+/// Headers proxies add; `tailscale serve` sends `X-Forwarded-For` and the
+/// `Tailscale-User-*` family, other proxies the rest
+const PROXY_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
+
+/// Whether a request carries a header that only a proxy adds
+pub fn proxied(headers: &HeaderMap) -> bool {
+    PROXY_HEADERS
+        .iter()
+        .any(|header| headers.contains_key(*header))
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("tailscale-"))
+}
+
+/// Whether a request came straight from a process on this machine: the TCP
+/// peer is loopback and no proxy header is present
+///
+/// `tailscale serve` connects from 127.0.0.1, so the peer alone would let
+/// the tailnet in. A missing peer (a router served without connect info) is
+/// never local
+pub fn is_direct_local(peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+    peer.is_some_and(|peer| peer.ip().to_canonical().is_loopback()) && !proxied(headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +215,51 @@ mod tests {
         ] {
             assert!(!policy.allows(host), "{host} should be rejected");
         }
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn headers(names: &[&str]) -> Result<HeaderMap, Box<dyn std::error::Error>> {
+        let mut map = HeaderMap::new();
+        for name in names {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes())?,
+                "x".parse()?,
+            );
+        }
+
+        Ok(map)
+    }
+
+    #[test]
+    fn direct_local_needs_a_loopback_peer_and_no_proxy_headers() -> TestResult {
+        let loopback: SocketAddr = "127.0.0.1:5000".parse()?;
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:5000".parse()?;
+        let lan: SocketAddr = "192.168.0.10:5000".parse()?;
+        let tailnet: SocketAddr = "100.101.102.103:5000".parse()?;
+
+        assert!(is_direct_local(Some(loopback), &headers(&[])?));
+        assert!(is_direct_local(Some(mapped), &headers(&[])?));
+        assert!(!is_direct_local(Some(lan), &headers(&[])?));
+        assert!(!is_direct_local(Some(tailnet), &headers(&[])?));
+        assert!(!is_direct_local(None, &headers(&[])?));
+        for name in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-real-ip",
+            "tailscale-user-login",
+            "tailscale-user-name",
+            "tailscale-user-profile-pic",
+            "tailscale-app-capabilities",
+        ] {
+            assert!(
+                !is_direct_local(Some(loopback), &headers(&[name])?),
+                "{name}"
+            );
+        }
+
+        Ok(())
     }
 }

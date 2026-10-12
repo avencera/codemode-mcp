@@ -141,6 +141,15 @@ impl ApprovalInfo {
     pub fn waiting_for(&self) -> String {
         format!("{}.{}", self.server, self.tool)
     }
+
+    /// Whether a client grant may answer this request: a `session` tool call
+    /// from a named client that reached the daemon directly from this machine
+    pub fn client_grant_allowed(&self) -> bool {
+        self.kind == ApprovalKind::ToolCall
+            && self.grant_mode == GrantMode::Session
+            && self.caller.client_name.is_some()
+            && self.caller.local
+    }
 }
 
 /// A call that needs a decision
@@ -232,8 +241,9 @@ pub enum DecideError {
     /// including one past its expiry whose timer has not fired yet)
     #[error("no pending approval with this id")]
     NotFound,
-    /// A client grant was chosen for a per-call tool, or for a caller that
-    /// did not identify its client
+    /// A client grant was chosen for a per-call tool, for a caller that
+    /// did not identify its client, or for a request that did not come
+    /// straight from this machine
     #[error("this request can only be approved once")]
     GrantNotAllowed,
 }
@@ -490,7 +500,9 @@ impl Approvals {
     }
 
     fn granted(&self, request: &GateRequest<'_>) -> Option<String> {
-        if request.grant_mode != GrantMode::Session {
+        // a non-local caller may be impersonating the client that holds the
+        // grant, so it never matches one
+        if request.grant_mode != GrantMode::Session || !request.caller.local {
             return None;
         }
         let client = request.caller.client_name.as_ref()?;
@@ -558,12 +570,14 @@ impl Approvals {
                 }
             }
             Choice::Client(length) => {
-                let Some(client) = &info.caller.client_name else {
+                let Some(client) = info
+                    .caller
+                    .client_name
+                    .as_ref()
+                    .filter(|_| info.client_grant_allowed())
+                else {
                     return Err(DecideError::GrantNotAllowed);
                 };
-                if info.grant_mode != GrantMode::Session || info.kind != ApprovalKind::ToolCall {
-                    return Err(DecideError::GrantNotAllowed);
-                }
                 let minutes = Some((length.as_secs() / 60) as i64);
                 let verdict = Verdict::Approved {
                     approval_id: id.to_owned(),
@@ -594,6 +608,7 @@ impl Approvals {
                 .values()
                 .filter(|pending| {
                     pending.info.kind == ApprovalKind::ToolCall
+                        && pending.info.caller.local
                         && pending.info.caller.client_name.as_deref() == Some(client)
                         && pending.info.server == server
                         && pending.info.grant_mode == GrantMode::Session

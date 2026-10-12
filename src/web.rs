@@ -182,9 +182,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
 
     let arguments = serde_json::to_string_pretty(&Value::Object(info.arguments.clone()))
         .unwrap_or_else(|_| "{}".to_owned());
-    let client_buttons = if info.grant_mode == GrantMode::Session
-        && info.caller.client_name.is_some()
-    {
+    let client_buttons = if info.client_grant_allowed() {
         let client = escape(info.caller.client_display());
 
         CLIENT_GRANT_MINUTES
@@ -199,6 +197,9 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         String::new()
     };
     let grant_note = match info.grant_mode {
+        GrantMode::Session if !info.caller.local => {
+            "This request did not come straight from this machine (it was proxied or arrived over the network), and the client name is self-asserted, so it can only be approved once."
+        }
         GrantMode::Session => {
             "A client approval covers this server's read tools for every running session of that client, because the client does not identify its sessions."
         }
@@ -285,9 +286,7 @@ async fn approve_options(
         Some(Choice::Deny) | None => return json_error(StatusCode::BAD_REQUEST, "unknown choice"),
         Some(choice) => choice,
     };
-    if matches!(choice, Choice::Client(_))
-        && (info.grant_mode != GrantMode::Session || info.caller.client_name.is_none())
-    {
+    if matches!(choice, Choice::Client(_)) && !info.client_grant_allowed() {
         return decide_error(&DecideError::GrantNotAllowed);
     }
 

@@ -11,7 +11,7 @@ use std::{net::SocketAddr, sync::Arc};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -23,21 +23,13 @@ use crate::{
     app::App,
     approvals::{AdminRequest, Approvals, Verdict, confirmation_code},
     gateway::{Gateway, WarmResult},
+    host::is_direct_local,
     notify::{Notification, Priority},
     oauth::{Callback, LoginStatus, OAuthError},
     passkeys::{PasskeyError, Passkeys},
     upstream::UpstreamStatus,
     web::escape,
 };
-
-/// Headers proxies add; a request carrying one did not come straight from
-/// a local process
-const PROXY_HEADERS: [&str; 4] = [
-    "forwarded",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "tailscale-user-login",
-];
 
 /// Discovery, registration and the code exchange each make a few HTTP
 /// calls that rmcp does not bound
@@ -180,7 +172,7 @@ async fn loopback_only(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .is_none_or(is_loopback_host);
-    if !peer.ip().to_canonical().is_loopback() || proxied(request.headers()) || !host_ok {
+    if !is_direct_local(Some(peer), request.headers()) || !host_ok {
         return (
             StatusCode::FORBIDDEN,
             "forbidden: admin API is loopback-only",
@@ -202,12 +194,6 @@ fn is_loopback_host(host: &str) -> bool {
         || name
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
-}
-
-fn proxied(headers: &HeaderMap) -> bool {
-    PROXY_HEADERS
-        .iter()
-        .any(|header| headers.contains_key(*header))
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
