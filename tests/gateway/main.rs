@@ -4,6 +4,7 @@
 mod adapter;
 mod admin_gate;
 mod approvals;
+mod durable;
 mod harness;
 mod oauth;
 mod service;

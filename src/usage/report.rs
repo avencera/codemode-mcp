@@ -69,8 +69,12 @@ pub struct ClientStats {
     pub runs: i64,
     /// Calls per agent-facing tool
     pub by_tool: BTreeMap<String, i64>,
-    /// Finished executions
+    /// Executions that ended on their own (not still running, not cut short
+    /// by a restart)
     pub executions: i64,
+    /// Executions a daemon restart cut short; they count neither as
+    /// successes nor as failures
+    pub interrupted: i64,
     /// Executions that ended `ok`
     pub succeeded: i64,
     /// Mean executions per run up to and including the first success, over
@@ -313,7 +317,9 @@ impl<'a> Reporter<'a> {
         }
 
         let rows = self.connection.query_map(
-            "SELECT COALESCE(client_name, 'unknown'), COUNT(*), SUM(outcome = 'ok') \
+            "SELECT COALESCE(client_name, 'unknown'), \
+                    SUM(outcome NOT IN ('running', 'interrupted')), \
+                    SUM(outcome = 'ok'), SUM(outcome = 'interrupted') \
              FROM executions WHERE started_ms >= ?1 GROUP BY 1",
             params![self.since_ms],
             |row| {
@@ -321,14 +327,16 @@ impl<'a> Reporter<'a> {
                     row.get::<String>(0)?,
                     row.get::<i64>(1)?,
                     row.get::<i64>(2)?,
+                    row.get::<i64>(3)?,
                 ))
             },
         )?;
-        for (client, executions, succeeded) in rows {
+        for (client, executions, succeeded, interrupted) in rows {
             let entry = clients.entry(client.clone()).or_default();
             entry.client = client;
             entry.executions = executions;
             entry.succeeded = succeeded;
+            entry.interrupted = interrupted;
         }
 
         let mut attempts_until: HashMap<String, Vec<usize>> = HashMap::new();
@@ -374,7 +382,7 @@ impl<'a> Reporter<'a> {
         let rows = self.connection.query_map(
             "SELECT session, COALESCE(client_name, 'unknown'), started_ms, outcome, detail, script \
              FROM executions WHERE started_ms >= ?1 AND client_name IS NOT ?2 \
-             ORDER BY started_ms",
+             AND outcome NOT IN ('running', 'interrupted') ORDER BY started_ms",
             params![self.since_ms, EXEC_CLIENT],
             |row| {
                 let session: Option<String> = row.get(0)?;
@@ -516,14 +524,14 @@ impl<'a> Reporter<'a> {
         }
         let _ = writeln!(
             out,
-            "| Client | Runs | Calls | search | describe | execute | wait | Executions | Success rate | Mean attempts to success |"
+            "| Client | Runs | Calls | search | describe | execute | wait | Executions | Interrupted | Success rate | Mean attempts to success |"
         );
-        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|");
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
         for client in &stats.clients {
             let count = |tool: &str| client.by_tool.get(tool).copied().unwrap_or(0);
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 cell(&client.client),
                 client.runs,
                 client.calls,
@@ -532,6 +540,7 @@ impl<'a> Reporter<'a> {
                 count("execute"),
                 count("wait"),
                 client.executions,
+                client.interrupted,
                 percent(client.success_rate()),
                 client
                     .mean_attempts
@@ -893,13 +902,14 @@ pub fn render_stats(stats: &Stats) -> String {
             .collect();
         let _ = writeln!(
             out,
-            "{}: {} calls in {} runs ({})\n  executions {}, success rate {}, mean attempts to success {}\n  \
+            "{}: {} calls in {} runs ({})\n  executions {} ({} interrupted by a restart), success rate {}, mean attempts to success {}\n  \
              session reuse: {} minted, {} calls with a passed session, {} used once",
             client.client,
             client.calls,
             client.runs,
             tools.join(", "),
             client.executions,
+            client.interrupted,
             percent(client.success_rate()),
             client
                 .mean_attempts

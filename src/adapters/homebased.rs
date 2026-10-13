@@ -10,7 +10,7 @@
 use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -237,13 +237,66 @@ enum AdapterError {
     Io(String),
 }
 
+/// Name prefix of the temp dirs [`PrivateDir`] makes; followed by 32 hex digits
+const PRIVATE_DIR_PREFIX: &str = "codemode-homebased-";
+
+/// Removes the temp dirs a crashed adapter left behind
+///
+/// Only a directory (not a link) in the temp dir that is owned by this user,
+/// has exactly the name [`PrivateDir`] gives and is older than `min_age` is
+/// removed, so another user's files, a live submit and anything that merely
+/// looks similar are left alone. Returns how many were removed
+pub fn remove_stale_private_dirs(min_age: Duration) -> usize {
+    remove_stale_private_dirs_in(&std::env::temp_dir(), min_age)
+}
+
+fn remove_stale_private_dirs_in(temp: &Path, min_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(temp) else {
+        return 0;
+    };
+    let owner = rustix::process::getuid().as_raw();
+    let mut removed = 0;
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(PRIVATE_DIR_PREFIX))
+        else {
+            continue;
+        };
+        if suffix.len() != 32 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        // symlink_metadata: a link named like ours is never followed
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if metadata.is_dir()
+            && std::os::unix::fs::MetadataExt::uid(&metadata) == owner
+            && old_enough
+            && std::fs::remove_dir_all(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+
+    removed
+}
+
 /// A directory only this user can read, removed when dropped
 struct PrivateDir(PathBuf);
 
 impl PrivateDir {
     fn create() -> Result<Self, AdapterError> {
         let path = std::env::temp_dir().join(format!(
-            "codemode-homebased-{}",
+            "{PRIVATE_DIR_PREFIX}{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::DirBuilder::new()
@@ -878,5 +931,44 @@ impl ServerHandler for HomebasedAdapter {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PRIVATE_DIR_PREFIX, remove_stale_private_dirs_in};
+    use std::{os::unix::fs::symlink, time::Duration};
+
+    #[test]
+    fn stale_cleanup_removes_only_matching_old_directories() -> std::io::Result<()> {
+        let temp = std::env::temp_dir().join(format!("cleanup-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temp)?;
+
+        let hex = "0123456789abcdef0123456789abcdef";
+        let stale = temp.join(format!("{PRIVATE_DIR_PREFIX}{hex}"));
+        let short = temp.join(format!("{PRIVATE_DIR_PREFIX}abc"));
+        let other = temp.join(format!("other-{hex}"));
+        let target = temp.join("target");
+        let link = temp.join(format!(
+            "{PRIVATE_DIR_PREFIX}fedcba9876543210fedcba9876543210"
+        ));
+        for dir in [&stale, &short, &other, &target] {
+            std::fs::create_dir(dir)?;
+        }
+        symlink(&target, &link)?;
+
+        // too young to be a crash leftover: a live submit may own it
+        assert_eq!(
+            remove_stale_private_dirs_in(&temp, Duration::from_secs(3600)),
+            0
+        );
+        assert!(stale.exists());
+
+        assert_eq!(remove_stale_private_dirs_in(&temp, Duration::ZERO), 1);
+        assert!(!stale.exists());
+        assert!(short.exists() && other.exists() && target.exists());
+        assert!(link.symlink_metadata().is_ok());
+
+        std::fs::remove_dir_all(&temp)
     }
 }

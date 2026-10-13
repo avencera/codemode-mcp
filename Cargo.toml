@@ -37,8 +37,13 @@ rmcp = { version = "=3.5.1", default-features = false, features = [
 ruff_python_ast = "=0.0.14"
 ruff_python_parser = "=0.0.14"
 ruff_text_size = "=0.0.14"
+# already in the tree through turso; flock gives each state dir one daemon,
+# kill(pid, 0) spares a live CLI exec's rows at boot, and the uid check keeps
+# the cleanup of stale temp dirs to this user's own
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 schemars = "1.2.2"
-serde = { version = "1.0.229", features = ["derive"] }
+# rc: Arc<str> and Arc<Map> inside parked executions and stored approvals
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 # arbitrary_precision keeps integers beyond i64/u64 exact in both directions
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.11.0"
@@ -51,7 +56,10 @@ turso = { version = "0.8.3", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }
-webauthn-rs = "0.5.5"
+# danger-allow-state-serialisation: ceremony state is kept in the database
+# (server side, 5 minutes, bound to its approval) so a page loaded before a
+# restart still completes; the state never goes to the browser
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }

@@ -8,7 +8,7 @@ use codemode_mcp::{
     output::validate,
     store,
     usage::{
-        CallRecord, Caller, Classification, ExecutionRecord, Outcome, UpstreamRecord, UsageLog,
+        CallRecord, Caller, Classification, ExecutionRecord, Outcome, UpstreamRecord,
         report::Reporter,
     },
 };
@@ -19,7 +19,7 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
-use super::harness::{Harness, Setup, TestResult, call, execute, temp_state_dir, text_of};
+use super::harness::{Harness, Seed, Setup, TestResult, call, execute, temp_state_dir, text_of};
 
 /// Whether `text` uses `Any` as a word, ignoring names that merely contain it
 fn mentions_any(text: &str) -> bool {
@@ -416,7 +416,7 @@ fn claude(session: &str) -> Caller {
 }
 
 fn run(
-    log: &UsageLog,
+    log: &Seed,
     id: &str,
     at_ms: i64,
     session: &str,
@@ -434,7 +434,7 @@ fn run(
     });
 }
 
-fn upstream(log: &UsageLog, execution: &str, tool: &str, outcome: Outcome, output: &'static str) {
+fn upstream(log: &Seed, execution: &str, tool: &str, outcome: Outcome, output: &'static str) {
     log.upstream(UpstreamRecord {
         execution_id: Some(execution.to_owned()),
         server: "fixture".to_owned(),
@@ -466,13 +466,9 @@ fn section(review: &str) -> &str {
 }
 
 /// Seeds a database, reads the review's strictness section and returns it
-async fn strictness_of(seed: impl FnOnce(&UsageLog, i64)) -> Result<String, Box<dyn Error>> {
+async fn strictness_of(seed: impl FnOnce(&Seed, i64)) -> Result<String, Box<dyn Error>> {
     let directory = temp_state_dir();
-    let log = UsageLog::start(
-        &directory,
-        Duration::from_secs(90 * 24 * 60 * 60),
-        Duration::from_secs(24 * 60 * 60),
-    )?;
+    let log = Seed::start(&directory)?;
     seed(&log, store::now_ms() - 60 * 60 * 1000);
     log.flush().await;
 

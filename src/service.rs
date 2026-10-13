@@ -15,6 +15,9 @@ use std::{
 
 /// launchd label and plist name
 pub const LABEL: &str = "dev.praveen.codemode-mcp";
+/// Time launchd gives the daemon beyond the drain before it sends SIGKILL:
+/// parking, flushing the usage log and tearing down the workers
+const EXIT_GRACE: Duration = Duration::from_secs(30);
 /// How long `launchctl bootstrap` is retried while a previous instance exits
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(10);
 /// Starter configuration; `{{HOME}}` is replaced with the home directory
@@ -298,6 +301,33 @@ pub fn current_uid() -> Result<u32, ServiceError> {
     })
 }
 
+/// launchd's own default when a plist has no `ExitTimeOut`
+const LAUNCHD_EXIT_TIMEOUT_SECS: u64 = 20;
+
+/// Time the daemon needs beyond the drain to park, flush and exit
+const EXIT_MARGIN: Duration = Duration::from_secs(10);
+
+/// Warning for an installed plist whose `ExitTimeOut` would cut a drain short
+///
+/// `None` when the plist is fine; `plist` is its text
+pub fn exit_timeout_warning(plist: &str, drain: Duration) -> Option<String> {
+    let configured = plist
+        .split_once("<key>ExitTimeOut</key>")
+        .and_then(|(_, rest)| rest.split_once("<integer>"))
+        .and_then(|(_, rest)| rest.split_once("</integer>"))
+        .and_then(|(number, _)| number.trim().parse::<u64>().ok())
+        .unwrap_or(LAUNCHD_EXIT_TIMEOUT_SECS);
+    let needed = (drain + EXIT_MARGIN).as_secs();
+
+    (configured < needed).then(|| {
+        format!(
+            "the installed launchd plist gives the daemon {configured}s to exit, less than the \
+             {needed}s its {}s drain needs; run `codemode-mcp service install` again",
+            drain.as_secs()
+        )
+    })
+}
+
 /// Escapes text for XML element content
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -308,7 +338,11 @@ fn xml_escape(text: &str) -> String {
 }
 
 /// The LaunchAgent plist; `config` is passed to `serve` when given
-pub fn render_plist(paths: &ServicePaths, config: Option<&Path>) -> String {
+///
+/// `ExitTimeOut` is the configured `drain` plus a grace period: launchd's
+/// default of 20 seconds would kill the daemon in the middle of its drain
+pub fn render_plist(paths: &ServicePaths, config: Option<&Path>, drain: Duration) -> String {
+    let exit_timeout = (drain + EXIT_GRACE).as_secs();
     let mut arguments = vec![paths.binary.display().to_string()];
     if let Some(config) = config {
         arguments.push("--config".to_owned());
@@ -342,6 +376,8 @@ pub fn render_plist(paths: &ServicePaths, config: Option<&Path>) -> String {
   <true/>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>{exit_timeout}</integer>
   <key>WorkingDirectory</key>
   <string>{home}</string>
   <key>EnvironmentVariables</key>
@@ -387,6 +423,7 @@ pub fn install_plan(
     binary: &Path,
     worker: &Path,
     config: Option<&Path>,
+    drain: Duration,
 ) -> Vec<Action> {
     let parent = |path: &Path| path.parent().map(Path::to_owned).unwrap_or_default();
     let plist = paths.plist.display().to_string();
@@ -409,7 +446,7 @@ pub fn install_plan(
         Action::CreateDir(parent(&paths.plist)),
         Action::Write {
             path: staged.clone(),
-            contents: render_plist(paths, config),
+            contents: render_plist(paths, config, drain),
         },
         Action::run(&["plutil", "-lint", &staged.display().to_string()]),
         Action::Rename {
@@ -498,13 +535,37 @@ mod tests {
     #[test]
     fn plist_escapes_paths_and_runs_serve() {
         let paths = ServicePaths::new(Path::new("/Users/a&b"), Path::new("/Users/a&b/state"));
-        let plist = render_plist(&paths, Some(Path::new("/tmp/<c>.toml")));
+        let plist = render_plist(
+            &paths,
+            Some(Path::new("/tmp/<c>.toml")),
+            Duration::from_secs(20),
+        );
 
         assert!(plist.contains("<string>/Users/a&amp;b/.local/bin/codemode-mcp</string>"));
         assert!(plist.contains("<string>--config</string>\n    <string>/tmp/&lt;c&gt;.toml</string>\n    <string>serve</string>"));
         assert!(plist.contains("/Users/a&amp;b/.local/bin:/opt/homebrew/bin:"));
         assert!(plist.contains("<string>/Users/a&amp;b/state/logs/codemode-mcp.err.log</string>"));
         assert!(!plist.contains("a&b"));
+        // drain 20s plus the grace period, so launchd waits out the drain
+        assert!(plist.contains("<key>ExitTimeOut</key>\n  <integer>50</integer>"));
+    }
+
+    #[test]
+    fn a_plist_that_cuts_the_drain_short_is_reported() {
+        let paths = ServicePaths::new(Path::new("/Users/a"), Path::new("/Users/a/state"));
+        let drain = Duration::from_secs(20);
+
+        let current = render_plist(&paths, None, drain);
+        assert_eq!(exit_timeout_warning(&current, drain), None);
+
+        // a plist from before the drain existed has no ExitTimeOut at all
+        let old = current.replace("<key>ExitTimeOut</key>\n  <integer>50</integer>\n  ", "");
+        let warning = exit_timeout_warning(&old, drain);
+        assert!(
+            warning.is_some_and(|text| text.contains("service install")),
+            "{old}"
+        );
+        assert!(exit_timeout_warning(&current, Duration::from_secs(60)).is_some());
     }
 
     #[test]

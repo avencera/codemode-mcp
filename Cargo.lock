@@ -809,6 +809,7 @@ dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
+ "rustix 1.1.5",
  "schemars",
  "serde",
  "serde_json",

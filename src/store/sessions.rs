@@ -22,7 +22,7 @@ const SHORT_CHARS: usize = 8;
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 /// How a call got its session, kept per call for the reuse numbers
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionState {
     /// The call has no session (`codemode-mcp exec`, tests)
     #[default]

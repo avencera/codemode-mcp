@@ -44,6 +44,17 @@ pub struct Sealed {
 }
 
 impl Sealed {
+    /// The dump and its tag, for storing
+    pub fn parts(&self) -> (&[u8], &[u8]) {
+        (&self.bytes, &self.tag)
+    }
+
+    /// Rebuilds a sealed dump from stored parts; [`Sealer::open`] still
+    /// checks the tag
+    pub fn from_parts(bytes: Vec<u8>, tag: Vec<u8>) -> Self {
+        Self { bytes, tag }
+    }
+
     /// Size of the dump
     pub fn len(&self) -> usize {
         self.bytes.len()

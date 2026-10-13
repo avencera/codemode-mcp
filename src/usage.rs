@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use turso::params;
 
@@ -36,7 +36,7 @@ const PURGE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 const FINGERPRINT_CHARS: usize = 200;
 
 /// How an agent-facing call, execution or upstream call ended
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Succeeded
@@ -64,6 +64,8 @@ pub enum Outcome {
     Pending,
     /// No sandbox capacity was available
     Busy,
+    /// The daemon restarted while the script ran, so its outcome is unknown
+    Interrupted,
 }
 
 impl Outcome {
@@ -82,6 +84,7 @@ impl Outcome {
             Self::Denied => "denied",
             Self::Pending => "pending",
             Self::Busy => "busy",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -94,7 +97,7 @@ impl std::fmt::Display for Outcome {
 
 /// An outcome with the detail worth keeping, already redacted for
 /// sensitive servers
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Classification {
     /// Taxonomy bucket
     pub outcome: Outcome,
@@ -120,9 +123,13 @@ impl Classification {
     }
 
     /// Groups identical mistakes: the outcome plus the detail with line
-    /// numbers, literals and ids stripped; none for successes and pending
+    /// numbers, literals and ids stripped; none for successes, pending and
+    /// interrupted executions (a restart is no mistake of the script)
     pub fn fingerprint(&self) -> Option<String> {
-        if matches!(self.outcome, Outcome::Ok | Outcome::Pending) {
+        if matches!(
+            self.outcome,
+            Outcome::Ok | Outcome::Pending | Outcome::Interrupted
+        ) {
             return None;
         }
 
@@ -203,7 +210,7 @@ fn normalize_word(word: &str) -> String {
 pub const EXEC_CLIENT: &str = "codemode-mcp exec";
 
 /// Who made an agent-facing call
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Caller {
     /// SHA-256 (hex) of the app session token the call runs under; `None`
     /// for callers outside the MCP tools. It keys session grants, so it is
@@ -306,40 +313,9 @@ pub struct UpstreamRecord {
     pub output: &'static str,
 }
 
-/// A change to an approval request
-#[derive(Debug, Clone)]
-pub enum ApprovalRecord {
-    /// A request was created and a notification sent
-    Created {
-        /// Approval id
-        id: String,
-        /// Who asked
-        caller: Caller,
-        /// Execution waiting on it
-        execution_id: String,
-        /// Server name
-        server: String,
-        /// Upstream tool name
-        tool: String,
-        /// `session` or `per_call`
-        grant_mode: &'static str,
-    },
-    /// A request was answered or ran out of time
-    Decided {
-        /// Approval id
-        id: String,
-        /// `approved`, `denied`, `expired` or `abandoned`
-        decision: &'static str,
-        /// Session grant length when one was given
-        grant_minutes: Option<i64>,
-    },
-}
-
 enum Event {
     Call(CallRecord),
-    Execution(ExecutionRecord),
     Upstream(UpstreamRecord),
-    Approval(ApprovalRecord),
     Flush(oneshot::Sender<()>),
 }
 
@@ -388,19 +364,9 @@ impl UsageLog {
         self.send(Event::Call(record));
     }
 
-    /// Records a finished execution
-    pub fn execution(&self, record: ExecutionRecord) {
-        self.send(Event::Execution(record));
-    }
-
     /// Records an upstream call
     pub fn upstream(&self, record: UpstreamRecord) {
         self.send(Event::Upstream(record));
-    }
-
-    /// Records an approval change
-    pub fn approval(&self, record: ApprovalRecord) {
-        self.send(Event::Approval(record));
     }
 
     /// Records dropped because the writer fell behind
@@ -482,9 +448,7 @@ impl Writer {
                 // bad record costs only itself
                 let written = match event {
                     Event::Call(record) => insert_call(transaction, &record),
-                    Event::Execution(record) => insert_execution(transaction, &record),
                     Event::Upstream(record) => insert_upstream(transaction, &record),
-                    Event::Approval(record) => write_approval(transaction, &record),
                     Event::Flush(done) => {
                         flushes.push(done);
 
@@ -567,29 +531,6 @@ fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), turso
     Ok(())
 }
 
-fn insert_execution(connection: &Connection, record: &ExecutionRecord) -> Result<(), turso::Error> {
-    connection.execute(
-        "INSERT OR REPLACE INTO executions (id, started_ms, finished_ms, session, client_name, \
-         script, outcome, detail, fingerprint, duration_ms, result_bytes) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            record.id.as_str(),
-            record.started_ms,
-            record.started_ms + millis(record.duration),
-            record.caller.session_label(),
-            record.caller.client_name.as_deref(),
-            record.script.as_str(),
-            record.classification.outcome.as_str(),
-            record.classification.detail.as_deref(),
-            record.classification.fingerprint(),
-            millis(record.duration),
-            record.result_bytes as i64,
-        ],
-    )?;
-
-    Ok(())
-}
-
 fn insert_upstream(connection: &Connection, record: &UpstreamRecord) -> Result<(), turso::Error> {
     connection.execute(
         "INSERT INTO upstream_calls (at_ms, execution_id, server, tool, function, arguments, \
@@ -609,43 +550,6 @@ fn insert_upstream(connection: &Connection, record: &UpstreamRecord) -> Result<(
             record.output,
         ],
     )?;
-
-    Ok(())
-}
-
-fn write_approval(connection: &Connection, record: &ApprovalRecord) -> Result<(), turso::Error> {
-    match record {
-        ApprovalRecord::Created {
-            id,
-            caller,
-            execution_id,
-            server,
-            tool,
-            grant_mode,
-        } => connection.execute(
-            "INSERT OR IGNORE INTO approvals (id, created_ms, session, client_name, \
-             execution_id, server, tool, grant_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                id.as_str(),
-                now_ms(),
-                caller.session_label(),
-                caller.client_name.as_deref(),
-                execution_id.as_str(),
-                server.as_str(),
-                tool.as_str(),
-                *grant_mode
-            ],
-        )?,
-        ApprovalRecord::Decided {
-            id,
-            decision,
-            grant_minutes,
-        } => connection.execute(
-            "UPDATE approvals SET decided_ms = ?1, decision = ?2, grant_minutes = ?3 \
-             WHERE id = ?4 AND decision IS NULL",
-            params![now_ms(), *decision, *grant_minutes, id.as_str()],
-        )?,
-    };
 
     Ok(())
 }

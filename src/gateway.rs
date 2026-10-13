@@ -11,7 +11,7 @@ use std::{
 
 use monty_types::ExcType;
 use rmcp::model::{CallToolResult, ContentBlock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -21,10 +21,12 @@ use crate::{
     catalog::{Catalog, ServerSnapshot, ToolEntry},
     config::Config,
     convert::json_to_monty,
+    durable::Sensitivity,
     executor::Executor,
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
     policy::Policy,
+    store::Store,
     upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
 };
@@ -130,6 +132,10 @@ impl ToolCallError {
 }
 
 /// A resolved tool call that has passed policy checks
+///
+/// Serializable so a call waiting for an approval survives a restart; the
+/// storage layer refuses it when `sensitive` is set
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PreparedCall {
     /// Python name of the tool
     pub function: String,
@@ -287,11 +293,13 @@ impl Gateway {
         approvals: Arc<Approvals>,
         log: UsageLog,
         oauth: Arc<OAuth>,
+        store: &Store,
     ) -> Arc<Self> {
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
             Some(Arc::clone(&oauth)),
+            store,
         );
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {
@@ -410,12 +418,16 @@ impl Gateway {
     /// Resolves a script's tool call and applies policy, without running it
     ///
     /// Tools are resolved in the execution's own catalog snapshot, not the
-    /// live one. A refused call is logged here
+    /// live one. A refused call is logged here. `prior` says whether the
+    /// execution already holds data from a sensitive server, which keeps the
+    /// approval request off the disk
+    ///
     pub fn prepare(
         &self,
         context: &CallContext,
         function: &str,
         arguments: Map<String, Value>,
+        prior: Sensitivity,
     ) -> Result<Plan, ToolCallError> {
         let entry = context
             .catalog
@@ -459,6 +471,7 @@ impl Gateway {
             arguments: &call.arguments,
             script: &context.script,
             grant_mode: grant_mode.unwrap_or_default(),
+            sensitivity: Sensitivity::of(call.sensitive).or(prior),
         });
 
         match gate {

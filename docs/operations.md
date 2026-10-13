@@ -91,6 +91,38 @@ policy = "deny"
 - Result types. A tool that declares no output schema returns a `JsonValue` that scripts narrow with `isinstance`. Give it a type in the tool's table: `output = "text"` for prose or markdown (the script gets a `str`, never parsed), or `output_schema` with an inline JSON Schema table for JSON, e.g. `output_schema = { type = "object", required = ["id"], properties = { id = { type = "string" } } }`. An upstream-declared schema wins over `output_schema` unless the table also sets `force_output_schema = true`. Every result is checked against the schema, so write only fields the tool really returns and mark optional ones with a `required` list or a `["string", "null"]` type. Probe it first: `codemode-mcp exec` a script that prints `json.dumps(await server_tool(...))`.
 - Check the result with `codemode-mcp tools` (connects, lists every tool with its status).
 
+## Restarts and in-flight work
+
+`service install`, `service restart`, a crash and a reboot all restart the daemon. State is in
+`<state_dir>/codemode.sqlite` (default `~/.local/state/codemode-mcp/`) and needs no import: the daemon opens the
+file the previous build wrote, in place, and adds its new tables on first start. There is no
+`codemode.sqlite.imported-*` file and the old file is not moved or copied, so back it up before installing if you
+want a way back (a build older than the schema refuses to open it).
+
+What a restart does:
+
+- Finished results stay available to `wait` for 30 minutes (`limits.result_ttl_secs`).
+- Pending approvals stay pending; the phone link keeps working and the timer continues from the original
+  deadline. An ntfy that had failed is sent again at boot.
+- Executions waiting only on an approval resume once it is approved, denied or expired. Calls they make after
+  that use the tools the restarted daemon has.
+- On a normal stop (SIGTERM, which `service restart` sends) the daemon stops taking new executions, waits up to
+  `limits.drain_secs` (default 20) for running scripts, parks the ones waiting on approval, and flushes the usage
+  log. The plist `ExitTimeOut` is set to the drain plus 30 seconds when you run `service install`, so rerun it
+  after changing `drain_secs`; `serve` logs a warning at start when the installed plist allows less than the
+  drain plus 10 seconds.
+- A script still running after the drain, or running when the daemon died, ends as `interrupted`. `wait` says so
+  and lists the upstream calls that finished. Writes may have happened: check before running it again.
+- Anything that touched a sensitive server (1Password) is not written to disk. After a restart `wait` reports it
+  as `interrupted`, its approval page shows the request as withdrawn, and the script has to be run again. Grants
+  survive.
+- Enrollment links and passkey removals waiting on approval survive too.
+- Only one daemon can run on a state directory: a second `codemode-mcp serve` exits at once with "another
+  daemon owns <dir>" and changes nothing. A CLI command (`exec`, `stats`, `review`, `passkey list`) works beside
+  the running daemon.
+- On start the daemon removes `codemode-homebased-*` temp dirs older than 10 minutes left by a crash.
+- A kill with SIGKILL, or a power loss, also drops the last usage-log lines that were not yet flushed.
+
 ## Read the usage review
 
 ```sh

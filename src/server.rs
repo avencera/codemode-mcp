@@ -35,8 +35,9 @@ use crate::{
     admin,
     app::App,
     approvals::Approvals,
-    executions::{Executions, WaitResult},
-    executor::ExecutionOutcome,
+    config::Config,
+    executions::{Executions, StartError, WaitResult},
+    executor::{CompletedCall, ExecutionOutcome, InterruptReason},
     gateway::Gateway,
     guidance::{INSTRUCTIONS, SESSION_RULE, TOOL_CALL_RULE, script_rules, session_rule},
     host::{HostPolicy, host_guard, is_direct_local},
@@ -550,9 +551,15 @@ impl CodeModeServer {
 
                     (result, classification, Some(id))
                 }
-                Err(busy) => (
-                    text_result(&tagged(session.as_ref(), &busy.to_string()), true),
-                    Classification::new(Outcome::Busy, "all sandbox workers busy"),
+                Err(refused) => (
+                    text_result(&tagged(session.as_ref(), &refused.to_string()), true),
+                    Classification::new(
+                        Outcome::Busy,
+                        match refused {
+                            StartError::Busy(_) => "all sandbox workers busy",
+                            StartError::Draining => "the daemon is draining for a restart",
+                        },
+                    ),
                     None,
                 ),
             };
@@ -738,9 +745,62 @@ fn outcome_text_for(
             ),
             true,
         ),
+        ExecutionOutcome::ResultNotKept { outcome } => (
+            tagged(
+                session,
+                &format!(
+                    "The script finished ({outcome}); its result is not kept across restarts \
+                     because it used a sensitive server. Do not re-run it to get the result."
+                ),
+            ),
+            outcome != "ok",
+        ),
+        ExecutionOutcome::Interrupted { reason, calls } => {
+            (tagged(session, &interrupted_text(*reason, calls)), true)
+        }
     };
 
     (cap_text(text, max_bytes), is_error)
+}
+
+/// What an agent reads when a restart cut its script short: what is known
+/// about the upstream calls that finished, and that writes may have happened
+fn interrupted_text(reason: InterruptReason, calls: &[CompletedCall]) -> String {
+    let mut text = match reason {
+        InterruptReason::Restarted => String::from(
+            "The daemon restarted while this script was running, so its outcome is unknown.",
+        ),
+        InterruptReason::SensitiveNotKept => String::from(
+            "The daemon restarted while this script was running. The script used a sensitive \
+             server, and sensitive state is not kept across restarts, so the script was not \
+             resumed and its result was not kept. Re-run the script.",
+        ),
+    };
+
+    // the list comes from the usage log, which is written in batches, so a
+    // kill can lose its last rows: an empty list proves nothing
+    if calls.is_empty() {
+        text.push_str(
+            "\n\nNo upstream call was recorded as completed (this list may be incomplete).",
+        );
+    } else {
+        text.push_str(
+            "\n\nRecorded upstream calls that completed before it stopped (this list may be \
+             incomplete):",
+        );
+        for call in calls {
+            text.push_str(&format!(
+                "\n- {}.{}: {}",
+                call.server, call.tool, call.status
+            ));
+        }
+    }
+    text.push_str(
+        "\n\nWrites may have happened: a call that was running when the daemon stopped may \
+         have reached its upstream. Check the current state before running the script again.",
+    );
+
+    text
 }
 
 /// Backstop for the size of one response: whatever the pieces added up to,
@@ -814,9 +874,40 @@ impl RunningServer {
 /// Binds the configured addresses: `/mcp`, `/healthz`, `/stats` and the
 /// approval pages on `listen`, the admin API on the loopback `admin_listen`
 pub async fn serve(app: &App) -> std::io::Result<RunningServer> {
-    let listener = TcpListener::bind(app.config().listen).await?;
+    Listeners::bind(app.config()).await?.serve(app)
+}
+
+/// The two sockets, bound but not yet answering
+///
+/// Binding first lets the daemon fail on a taken port before it touches any
+/// state, and start answering only once it has settled what the previous
+/// process left behind
+pub struct Listeners {
+    listener: TcpListener,
+    admin_listener: TcpListener,
+}
+
+impl Listeners {
+    /// Binds the main and the admin listener of `config`
+    pub async fn bind(config: &Config) -> std::io::Result<Self> {
+        Ok(Self {
+            listener: TcpListener::bind(config.listen).await?,
+            admin_listener: TcpListener::bind(config.admin_listen).await?,
+        })
+    }
+
+    /// Starts answering requests for `app`
+    pub fn serve(self, app: &App) -> std::io::Result<RunningServer> {
+        serve_on(app, self.listener, self.admin_listener)
+    }
+}
+
+fn serve_on(
+    app: &App,
+    listener: TcpListener,
+    admin_listener: TcpListener,
+) -> std::io::Result<RunningServer> {
     let address = listener.local_addr()?;
-    let admin_listener = TcpListener::bind(app.config().admin_listen).await?;
     let admin_address = admin_listener.local_addr()?;
     // OAuth redirect URIs point at the admin listener's real port
     app.gateway().oauth().set_callback_address(admin_address);

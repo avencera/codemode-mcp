@@ -10,6 +10,7 @@ pub mod budget;
 pub mod catalog;
 pub mod config;
 pub mod convert;
+pub mod durable;
 pub mod executions;
 pub mod executor;
 pub mod gateway;

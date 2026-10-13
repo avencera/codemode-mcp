@@ -426,6 +426,11 @@ pub struct Limits {
     pub max_queued_executions: usize,
     /// How long finished results stay available to `wait`
     pub result_ttl_secs: u64,
+    /// How long a stopping daemon lets running executions finish before it
+    /// interrupts them; ones waiting only on approvals are parked at once and
+    /// resume after the restart. Named like the other durations, not
+    /// `drain`; zero skips the wait
+    pub drain_secs: u64,
     /// Largest script `execute` accepts, in bytes; agent scripts are glue
     /// of a few hundred bytes, and the cap bounds how deeply a script can
     /// nest before the host parses it
@@ -456,6 +461,7 @@ impl Default for Limits {
             max_workers: 16,
             max_queued_executions: 64,
             result_ttl_secs: 30 * 60,
+            drain_secs: 20,
             max_output_bytes: 64 * 1024,
             max_result_bytes: 256 * 1024,
             max_script_bytes: 64 * 1024,
@@ -479,6 +485,11 @@ impl Limits {
     /// Result retention as a duration
     pub fn result_ttl(&self) -> Duration {
         Duration::from_secs(self.result_ttl_secs)
+    }
+
+    /// Drain period as a duration
+    pub fn drain(&self) -> Duration {
+        Duration::from_secs(self.drain_secs)
     }
 
     /// Wall-clock cap per execution as a duration

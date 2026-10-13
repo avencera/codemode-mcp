@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -37,6 +37,7 @@ use tokio::{
 use crate::{
     config::{ServerConfig, Transport},
     oauth::OAuth,
+    store::Store,
 };
 
 /// Time allowed for the initialize handshake plus the first tool listing
@@ -269,6 +270,11 @@ pub struct Upstream {
     refresh_turn: Mutex<()>,
     /// Logins for `oauth = true` servers
     oauth: Option<Arc<OAuth>>,
+    /// Where the last tool list is kept for the next start
+    store: Store,
+    /// Set while tools restored from the database have not yet reached the
+    /// catalog, which only a connection event would otherwise rebuild
+    cache_unshown: AtomicBool,
     /// Wakes the supervisor to drop the connection and connect again
     /// Counts reconnect requests; the supervisor compares against the
     /// value it last saw
@@ -393,6 +399,9 @@ impl Upstream {
             inner.peer = None;
             inner.tools.clear();
         }
+        if let Err(error) = self.store.forget_tool_cache(&self.name) {
+            tracing::warn!(server = %self.name, %error, "could not forget a cached tool list");
+        }
         self.status.send_replace(UpstreamStatus::NeedsLogin);
         self.changed.notify_one();
     }
@@ -404,7 +413,7 @@ impl Upstream {
         self.write().peer = None;
         self.status
             .send_replace(UpstreamStatus::Unavailable { error, category });
-        if was_connected {
+        if was_connected || self.cache_unshown.swap(false, Ordering::SeqCst) {
             self.changed.notify_one();
         }
     }
@@ -433,9 +442,47 @@ impl Upstream {
         if changed {
             tracing::info!(server = %self.name, count = tools.len(), "tool list changed");
             inner.tools = tools;
+            self.remember_tools(&inner.tools);
         }
 
         Ok(changed)
+    }
+
+    /// Keeps the tool list for the next start
+    fn remember_tools(&self, tools: &[Tool]) {
+        let written = serde_json::to_string(tools)
+            .map_err(|error| error.to_string())
+            .and_then(|json| {
+                self.store
+                    .put_tool_cache(&self.name, &json)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = written {
+            tracing::warn!(server = %self.name, %error, "could not cache the tool list");
+        }
+    }
+
+    /// The tool list the previous process saw, if it left one
+    fn cached_tools(store: &Store, name: &str) -> Vec<Tool> {
+        let cached = match store.tool_cache(name) {
+            Ok(cached) => cached,
+            Err(error) => {
+                tracing::warn!(server = name, %error, "could not read the cached tool list");
+
+                return Vec::new();
+            }
+        };
+
+        cached
+            .and_then(|json| match serde_json::from_str(&json) {
+                Ok(tools) => Some(tools),
+                Err(error) => {
+                    tracing::warn!(server = name, %error, "the cached tool list is unreadable");
+
+                    None
+                }
+            })
+            .unwrap_or_default()
     }
 
     async fn supervise(self: Arc<Self>) {
@@ -721,6 +768,7 @@ impl Upstreams {
         servers: &std::collections::BTreeMap<String, ServerConfig>,
         call_timeout: Duration,
         oauth: Option<Arc<OAuth>>,
+        store: &Store,
     ) -> Self {
         let changed = Arc::new(Notify::new());
         let mut upstreams = Vec::new();
@@ -728,17 +776,22 @@ impl Upstreams {
 
         for (name, config) in servers {
             let (status, _) = watch::channel(UpstreamStatus::Connecting);
+            // a server that stays down shows these, unavailable, until it
+            // connects and lists its tools again
+            let tools = Upstream::cached_tools(store, name);
             let upstream = Arc::new(Upstream {
                 name: name.clone(),
                 config: config.clone(),
                 call_timeout,
-                inner: RwLock::new(Inner::default()),
+                cache_unshown: AtomicBool::new(!tools.is_empty()),
+                inner: RwLock::new(Inner { peer: None, tools }),
                 status,
                 changed: Arc::clone(&changed),
                 epoch: AtomicU64::new(0),
                 refresh_seq: AtomicU64::new(0),
                 refresh_turn: Mutex::new(()),
                 oauth: oauth.clone(),
+                store: store.clone(),
                 reconnect: watch::channel(0).0,
             });
             tasks.push(tokio::spawn(Arc::clone(&upstream).supervise()));

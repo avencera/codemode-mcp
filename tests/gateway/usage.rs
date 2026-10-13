@@ -6,12 +6,12 @@ use std::{collections::HashMap, time::Duration};
 use codemode_mcp::{
     store,
     usage::{
-        ApprovalRecord, CallRecord, Caller, Classification, ExecutionRecord, Outcome,
-        UpstreamRecord, UsageLog, report::Reporter,
+        CallRecord, Caller, Classification, ExecutionRecord, Outcome, UpstreamRecord,
+        report::Reporter,
     },
 };
 
-use super::harness::{Harness, Setup, TestResult, execute, temp_state_dir};
+use super::harness::{Harness, Seed, Setup, TestResult, execute, temp_state_dir};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn outcomes_are_classified_and_sensitive_servers_redacted() -> TestResult {
@@ -218,11 +218,7 @@ fn execution(
 #[tokio::test(flavor = "multi_thread")]
 async fn review_renders_sections_from_a_seeded_database() -> TestResult {
     let directory = temp_state_dir();
-    let log = UsageLog::start(
-        &directory,
-        Duration::from_secs(90 * 24 * 60 * 60),
-        Duration::from_secs(24 * 60 * 60),
-    )?;
+    let log = Seed::start(&directory)?;
     let now = store::now_ms();
     let claude = || caller("s1", "claude-code");
 
@@ -284,19 +280,7 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
     ));
     for (index, decision) in ["approved", "denied", "expired"].into_iter().enumerate() {
         let id = format!("a{index}");
-        log.approval(ApprovalRecord::Created {
-            id: id.clone(),
-            caller: claude(),
-            execution_id: "e3".to_owned(),
-            server: "op".to_owned(),
-            tool: "list_environments".to_owned(),
-            grant_mode: "session",
-        });
-        log.approval(ApprovalRecord::Decided {
-            id,
-            decision,
-            grant_minutes: None,
-        });
+        log.approval(&id, &claude(), "e3", decision);
     }
     log.flush().await;
 
@@ -367,11 +351,7 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn review_groups_sessionless_calls_into_runs_by_time_gaps() -> TestResult {
     let directory = temp_state_dir();
-    let log = UsageLog::start(
-        &directory,
-        Duration::from_secs(90 * 24 * 60 * 60),
-        Duration::from_secs(24 * 60 * 60),
-    )?;
+    let log = Seed::start(&directory)?;
     let minute = 60 * 1000;
     let base = store::now_ms() - 3 * 60 * minute;
     let claude = || sessionless("claude-code");

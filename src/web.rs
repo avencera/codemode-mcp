@@ -142,6 +142,23 @@ fn not_found(what: &str) -> Response {
     )
 }
 
+/// Shown for a request that was taken back, e.g. because the daemon restarted
+/// while a script involving a sensitive server waited for it
+fn withdrawn_page(sensitive: bool) -> Response {
+    let reason = if sensitive {
+        "The script used a sensitive server, whose data is not kept across a restart, so the \
+         request is gone. Ask the agent to run the script again."
+    } else {
+        "The script that asked for it is no longer waiting."
+    };
+
+    page(
+        StatusCode::GONE,
+        "Withdrawn",
+        &format!("<h1>Request withdrawn</h1><p>{}</p>", escape(reason)),
+    )
+}
+
 fn json_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
@@ -174,7 +191,10 @@ fn decide_error(error: &DecideError) -> Response {
 
 async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> Response {
     let Some(info) = state.approvals.info(&id) else {
-        return not_found("approval request");
+        return match state.approvals.withdrawn(&id) {
+            Some(sensitive) => withdrawn_page(sensitive),
+            None => not_found("approval request"),
+        };
     };
     if let ApprovalKind::Admin { title } = &info.kind {
         return admin_page(&info, title);
@@ -522,11 +542,12 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
     let mut clients = String::new();
     for client in &stats.clients {
         clients.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} / {} / {}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} / {} / {}</td></tr>",
             escape(&client.client),
             client.runs,
             client.calls,
             client.executions,
+            client.interrupted,
             escape(&percent(client.success_rate())),
             client
                 .mean_attempts
@@ -605,7 +626,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
         r#"<h1>codemode-mcp usage</h1>
 <p class="meta">Last {window}. Use <code>?since=1d</code> to change the window.</p>
 <h2>Clients</h2>
-<table><tr><th>Client</th><th>Runs (approximate when session-less)</th><th>Calls</th><th>Executions</th><th>Success</th><th>Attempts to success</th><th>Sessions minted / calls with a passed session / used once</th></tr>{clients}</table>
+<table><tr><th>Client</th><th>Runs (approximate when session-less)</th><th>Calls</th><th>Executions</th><th>Interrupted by a restart</th><th>Success</th><th>Attempts to success</th><th>Sessions minted / calls with a passed session / used once</th></tr>{clients}</table>
 <h2>Top error fingerprints</h2>
 <table><tr><th>Count</th><th>Fingerprint</th></tr>{fingerprints}</table>
 <h2>Slowest upstream tools</h2>

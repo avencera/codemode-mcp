@@ -1,8 +1,10 @@
 //! Wires configuration, state, approvals, gateway and executions into one handle
 
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::{
+    adapters::homebased::remove_stale_private_dirs,
+    admin::attach_action,
     approvals::{Approvals, NO_APPROVAL_PAGE, NO_NOTIFIER},
     config::{Config, ConfigError},
     executions::Executions,
@@ -15,6 +17,9 @@ use crate::{
     store::{Store, StoreError},
     usage::UsageLog,
 };
+
+/// How old a homebased temp dir must be before boot treats it as a crash leftover
+const STALE_TEMP_DIR_AGE: Duration = Duration::from_secs(600);
 
 /// Failures starting the app
 #[derive(Debug, thiserror::Error)]
@@ -33,9 +38,38 @@ pub enum AppError {
     Passkey(#[from] PasskeyError),
 }
 
+/// Freezes durable state when the last handle to an [`App`] goes away
+///
+/// Tearing a process down drops the tasks that wait on approvals and on
+/// results, and a dropped waiter looks like an abandoned request. Freezing
+/// first makes every exit that skipped [`App::halt`] (an early return, a
+/// panic, a dropped runtime) leave the stored state for the next boot, and
+/// only an explicit outcome settles anything
+struct Teardown {
+    gateway: Arc<Gateway>,
+    executions: Arc<Executions>,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        self.gateway.approvals().freeze();
+        self.executions.halt();
+    }
+}
+
+/// Freezes the app's durable state when dropped; see [`App::freeze_on_drop`]
+pub struct FreezeOnDrop(App);
+
+impl Drop for FreezeOnDrop {
+    fn drop(&mut self) {
+        self.0.halt();
+    }
+}
+
 /// A running codemode instance; cheap to clone
 #[derive(Clone)]
 pub struct App {
+    _teardown: Arc<Teardown>,
     config: Arc<Config>,
     state_dir: PathBuf,
     gateway: Arc<Gateway>,
@@ -97,27 +131,33 @@ impl App {
             config.approvals.timeout(),
             notifier,
             unavailable,
-            store,
-            log.clone(),
+            store.clone(),
         );
 
-        let executor = Arc::new(Executor::new(&config, sealer).await?);
+        let executor = Arc::new(Executor::new(&config, sealer, store.clone()).await?);
         let gateway = Gateway::start(
             Arc::clone(&config),
             Arc::clone(&executor),
             approvals,
             log.clone(),
             oauth,
+            &session_store,
         );
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),
             executor,
             config.limits.result_ttl(),
             config.limits.max_retained_result_bytes,
-            log.clone(),
+            session_store.clone(),
         ));
 
+        let teardown = Arc::new(Teardown {
+            gateway: Arc::clone(&gateway),
+            executions: Arc::clone(&executions),
+        });
+
         Ok(Self {
+            _teardown: teardown,
             config,
             state_dir,
             gateway,
@@ -126,6 +166,69 @@ impl App {
             store: session_store,
             log,
         })
+    }
+
+    /// Picks up what the previous process left in the database: parked
+    /// executions resume, the others that were running become `interrupted`,
+    /// admin actions wait for their approval again, and notifications that
+    /// failed are sent again
+    ///
+    /// The daemon calls this once at boot, before it serves; one-off CLI
+    /// runs do not, because they share the database with a running daemon
+    pub fn recover(&self) {
+        let removed = remove_stale_private_dirs(STALE_TEMP_DIR_AGE);
+        if removed > 0 {
+            tracing::info!(removed, "removed temp dirs a crashed adapter left behind");
+        }
+
+        self.executions.recover();
+        self.executions.start_housekeeping();
+
+        let approvals = self.gateway.approvals();
+        for (waiting, action) in approvals.restore_admin_actions() {
+            attach_action(Arc::clone(&self.passkeys), waiting, action);
+        }
+        // after the restores above: a pending request nothing took up is
+        // one whose execution did not survive
+        approvals.abandon_orphans();
+        approvals.renotify();
+    }
+
+    /// Stops accepting executions and gives the running ones up to
+    /// `limits.drain_secs` to finish; the ones waiting only on approvals are
+    /// parked already and stay so for the next boot
+    pub async fn drain(&self) {
+        let interrupted = self.executions.drain(self.config.limits.drain()).await;
+        if !interrupted.is_empty() {
+            tracing::warn!(
+                count = interrupted.len(),
+                "executions still running after the drain were interrupted"
+            );
+        }
+    }
+
+    /// The last step of a stop: freezes durable state, so tearing the tasks
+    /// down cannot withdraw approvals that parked executions wait on, and
+    /// flushes the usage log
+    pub async fn shutdown(&self) {
+        self.halt();
+        self.log.flush().await;
+    }
+
+    /// Stops this app from writing durable state, as if the process had died
+    ///
+    /// Task teardown after a drain would otherwise withdraw the approvals of
+    /// parked executions; tests use it to replace a daemon inside one process
+    pub fn halt(&self) {
+        self.gateway.approvals().freeze();
+        self.executions.halt();
+    }
+
+    /// A guard that halts this app when it is dropped, however the owner
+    /// leaves its scope; the app also halts once its last handle is gone, but
+    /// tasks that still hold handles can keep that from happening in time
+    pub fn freeze_on_drop(&self) -> FreezeOnDrop {
+        FreezeOnDrop(self.clone())
     }
 
     /// The loaded configuration

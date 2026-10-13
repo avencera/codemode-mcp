@@ -101,7 +101,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   request is never offered the client grant, and the page says why. The server refuses a choice the page did not
   offer (`session15`, `session60`, `client15`, `client60`); Deny
 - Approving takes a passkey assertion (webauthn-rs 0.5): `POST /approve/{id}/options` binds the choice to a
-  server-side ceremony (random id, 5 min TTL, in memory, never serialized), then `POST /approve/{id}/confirm`
+  server-side ceremony (random id, 5 min TTL, stored in the database and bound to the approval id and the choice, never sent to the browser), then `POST /approve/{id}/confirm`
   verifies the assertion and applies that choice. Deny (`POST /approve/{id}/deny`) needs no passkey. All POSTs
   take JSON bodies, which keeps cross-site form posts out. `assets/webauthn.js` is the only script (no build step)
 - The relying party id is the host of `public_origin` (default `https://mac.tailnet-name.ts.net:8443`); `Passkey`
@@ -120,7 +120,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   `Checkout::dump` works at any suspension (monty-pool-1.1.0 `src/checkout.rs:1162-1176`), `restore` re-announces
   the suspension (`src/checkout.rs:779-812`), and the integration test
   `approval_waits_release_the_worker_and_pause_the_budget` runs a second script on the only worker while the first waits
-- Dumps live in memory only, so a daemon restart mid-approval loses the execution (the request is withdrawn)
+- Dumps are written to the database when a session parks, so a daemon restart mid-approval does not lose the execution (see Durability); only sensitive executions are withdrawn
 - `codemode-mcp passkey enroll --label NAME` asks the daemon's admin listener for a one-time enrollment link
   (`<public_origin>/enroll/<token>`, 10 min); the page registers a passkey under that label.
   With no passkey enrolled the link works at once (and stops working as soon as any passkey exists, so a
@@ -299,7 +299,7 @@ relax that rule (or drop its ban) instead of adding hints.
 Goal: see whether agents use Code Mode well or get confused, and feed that back into the directions and stubs
 
 - SQLite-format database at `<state_dir>/codemode.sqlite`, kept with turso (WAL, numbered migrations in
-  `PRAGMA user_version`, mode 0600). Every open uses turso's multiprocess WAL so the CLI can read and write while
+  `PRAGMA user_version`, mode 0600, created that way before turso opens them, so no process-wide umask is needed). Every open uses turso's multiprocess WAL so the CLI can read and write while
   the daemon runs; a SQLite build must not open the file at the same time, since the two coordinate WAL access
   differently.
   Tables: `sessions`, `calls` (every agent-facing call: time, app session label, session state, client name/version, tool,
@@ -427,6 +427,101 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   `-c model_reasoning_effort=LEVEL`) as a cheap extra layer, and the prompt is logged, so misuse shows up in
   `review`. Revisit if MCP-only agents (no shell) start using the adapter
 
+### Durability
+
+A daemon restart, whether a deploy, a crash or a reboot, must not lose what an agent or the owner is waiting on.
+State is written through to `codemode.sqlite` when it changes, never only at shutdown; every deadline is a
+wall-clock epoch in milliseconds, not an `Instant`. The file is the one the rusqlite build used: turso opens it in
+place, new tables arrive through the migration list (schema version 5), and a file written by a newer binary is
+refused (`SchemaTooNew`).
+
+**What persists**
+
+- Executions: a `running` row is inserted when a script starts. The finished outcome (result JSON, printed
+  output, outcome) is stored on the same row, and `wait` reads through to it when the id is not in memory, for
+  `result_ttl_secs` (30 min). The payload is purged after the TTL, and oldest first once the stored results pass
+  `max_retained_result_bytes`; the audit row stays. The row is written before waiters wake, so a result a client
+  was told about is never missing after a crash
+- Pending approvals: everything the page and the decision need (`ApprovalInfo`, deadline, grant choices, ntfy
+  state). The expiry timer is re-armed from the stored deadline, and a request whose ntfy send failed
+  (`unnotified`) is sent again at boot
+- Client and session grants, with a wall-clock expiry. A grant is only (key, server, approval id, expiry), so
+  1Password grants persist too
+- Parked executions: the sealed dump and its tag, the stubs, the caller and script, the budget spent and slept,
+  the output so far, the failures, the call ids and each gated call (`PreparedCall` and approval id). At boot each
+  parked row is registered as running again (so `wait` works), its approvals are re-attached, and when a verdict
+  or the expiry arrives the dump is verified and restored on a fresh worker exactly as in a live unpark
+  (ids compared with the recorded ones). The parked row is deleted right after a successful restore, before the
+  verdict is acted on: a crash from then on yields `interrupted` and never a call made twice. The delete is the
+  claim: a resumed execution that finds the row already gone (another process took it) stops without acting on
+  the verdict, and a process that has stopped writing never starts a call
+- Enrollment links, as the SHA-256 of the token only, with label, gate and expiry; a link stays valid across a
+  restart and a pending "approve the new passkey" step resumes
+- Admin actions waiting on approval (enroll approval, passkey removal): the kind and target (passkey id or
+  enrollment hash) are stored with the approval and re-attached at boot, so an approval decided after a restart
+  still performs it
+- WebAuthn ceremonies, 5 min TTL, serialized with webauthn-rs `danger-allow-state-serialisation` (the feature
+  exists for server-side storage); the state never reaches the browser and stays bound to its approval id and
+  choice
+- Each upstream's last tool list (`tool_cache`). A server that is down at boot shows as `unavailable` with its
+  cached tools, as when it drops mid-run
+
+**Derived and rebuilt**: the catalog and stubs (from live upstreams, with the cache standing in for a missing
+one), the worker pool, the in-flight upstream connections, OAuth access in memory, and the usage log buffer.
+
+**The sensitive exception.** Data from a `sensitive` server (1Password) stays off disk. Every durable write of a
+payload goes through `Durable<T>` (`src/durable.rs`): `Durable::gate` does not even run the closure that builds the
+payload when the data is sensitive, so a later caller cannot write one by accident. This covers the dump, result,
+arguments and approval details of an execution that has used sensitive data (`sensitive_used`) and of any gated
+call with `PreparedCall.sensitive`. What is kept is the row with a `sensitive` flag and no payload. After a
+restart `wait` answers `interrupted`, saying sensitive state is not kept and the script must be run again, and
+the approval page shows the request as withdrawn. Grants still persist. An integration test greps the database
+file bytes for the arguments and results of a sensitive execution. Sensitivity is known only once the script has
+touched a sensitive server or reached a sensitive gated call: an execution is flagged from then on, and an
+approval is withheld when it is created for a sensitive call. Because `ask` servers are sensitive by default,
+only an `ask` server with `sensitive = false` yields execution that can resume
+
+**One owner per state directory.** `serve` takes an exclusive `flock` on `<state_dir>/daemon.lock` before it
+touches any state and exits at once with "another daemon owns <dir>" when another process holds it; the kernel
+releases the lock however the process ends. The listeners are bound next, then the previous process's leftovers
+are settled, and only then do they answer. Without this a second daemon would resume the first one's parked
+executions, interrupt its running ones and call an upstream twice. A finish never replaces a row that already
+ended (the first terminal outcome wins). A one-off `exec` run of another process is recorded with its pid
+(`executions.owner_pid`) and is left alone at boot while that process is alive and within the execution time
+limit.
+
+**Teardown freezes.** An `App` freezes its durable state (approvals stop settling, execution tasks stop writing
+and are aborted) when its last handle goes away, and `serve` also holds a guard that freezes on any exit. A task
+dropped during teardown therefore never marks an approval abandoned or deletes a parked row; only an explicit
+outcome (a decision, an expiry, a finish, an interruption) does.
+
+**Drain and `interrupted`.** On SIGTERM the daemon stops admitting executions (`execute` answers that the daemon is restarting), gives the
+running ones `limits.drain_secs` (default 20) to finish, and parks those that wait only on approvals, which then
+resume at the next boot. It then freezes durable state (so tearing tasks down cannot withdraw the approvals that
+parked executions wait on) and flushes the usage log, which `serve` never did before. A script still running
+after the drain, and any row still `running` and not parked at boot (a crash), becomes `interrupted`, a terminal
+outcome counted in the review and in `/stats`. `wait` on it returns a restart message, the upstream calls that
+recorded as completed (server, tool, status) and a warning that writes may have happened, so check before
+re-running. The list comes from the usage log, so it may be incomplete: a SIGKILL loses the records still queued
+for the writer thread, and an empty list never means that nothing happened. A sensitive execution that had
+already finished is not called interrupted: `wait` says it finished (with its outcome), that its result is not
+kept across restarts because it used a sensitive server, and not to re-run it. `serve` also warns at start when
+the installed plist's `ExitTimeOut` is below the drain plus 10 s (run `service install` again).
+
+**After a resume, tool calls resolve against the live catalog.** The catalog snapshot the script started with is
+gone with the process, so a call made after the resume uses the tools and policies of the running daemon. The
+script was type-checked against the old stubs, and a tool that changed shape in between fails at the call. The
+stubs are stored only to restore the session. A restored dump is also run by whatever Monty worker is installed
+then, which may be a newer version than the one that wrote it.
+
+**Housekeeping.** Stored results past `result_ttl_secs`, and the oldest ones beyond the byte cap, lose their
+payload at boot and then every minute, whether or not anyone calls; the audit row stays. At boot, homebased `PrivateDir` temp dirs a crash left behind (`codemode-homebased-` plus 32 hex
+digits in the temp dir, a real directory owned by this user, older than 10 minutes) are removed.
+
+**The CLI** (`stats`, `review`, `exec`, `passkey list`) opens the same file beside the running daemon through
+turso's `experimental_multiprocess_wal`, which every open uses (turso refuses a mix of modes). Recovery of
+in-flight work runs only in the daemon, never in a CLI run, so `exec` does not touch another process's rows.
+
 ### Service
 
 - Rust 2024, tokio, axum 0.8, rmcp, monty-pool, webauthn-rs, turso; conventions match homebased (color-eyre, thiserror, no unwrap/expect)
@@ -435,7 +530,7 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   (`worker_path`, else `.tools/bin/monty` in the current directory) to `~/.local/share/codemode-mcp/monty`, both
   through a temp file and rename, writes `~/Library/LaunchAgents/dev.praveen.codemode-mcp.plist` (RunAtLoad,
   KeepAlive, ThrottleInterval 10, PATH with `~/.local/bin` and `/opt/homebrew/bin`, stdout and stderr under
-  `<state_dir>/logs/`), lints it with `plutil`, then `launchctl bootout` (failure ignored) and `bootstrap
+  `<state_dir>/logs/`, `ExitTimeOut` = `limits.drain_secs` + 30 s so launchd waits out the drain), lints it with `plutil`, then `launchctl bootout` (failure ignored) and `bootstrap
   gui/<uid>` (retried for 10 s), as homebased does. An explicit `--config` is pinned in the plist.
   `service uninstall` boots out and removes the plist, keeping state and installed files; `service status` and
   `service restart` (`kickstart -k`). Every one takes `--dry-run`
@@ -486,7 +581,7 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - Approvals served over `tailscale serve` on HTTPS port 8443; pending approvals auto-deny after 10 minutes
 - Admin endpoints get their own loopback listener rather than a peer check on the proxied main listener
 - Denied and expired approvals raise `PermissionError`, caught in scripts as `OSError`
-- Approval waits release the worker through sealed in-memory dumps; surviving a daemon restart mid-approval is not implemented
+- Approval waits release the worker through sealed dumps, which are also written to the database so a parked execution survives a daemon restart (sensitive ones excepted, see Durability)
 - With a passkey enrolled, adding or removing passkeys needs an existing passkey's approval and every request is
   announced; hostile same-user code is out of scope (see Threat model)
 - OAuth registrations and tokens are committed together at the end of a login, in SQLite
@@ -494,9 +589,18 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - The homebased adapter ships in the main binary; submit is split by workload (`agent` allowed, `task` asks)
 - No tool returns `Any`; `Any`, `cast` and `type: ignore` in scripts are refused; the review decides whether to tighten or relax (see Type strictness)
 
+## Known gaps
+
+- A sensitive execution cannot survive a restart (by design); the script has to be run again
+- The usage log is written by a background thread, so a SIGKILL or power loss drops the records not yet written
+- A parked dump restored after a Monty worker upgrade may be refused or behave differently; such an execution
+  ends as an error, not a silent wrong answer
+- Calls after a resume use the live catalog, not the one the script was checked against
+- `flock` is advisory and local: a state directory on a network file system is not protected from two daemons
+
 ## Open questions
 
-- Persisting sealed dumps so approvals survive a daemon restart (needs re-attaching pending upstream calls)
+- Whether a sensitive execution could be resumed after a restart without writing its dump to disk (it would need a key held outside the daemon)
 - 1Password session lifetime across app lock
 - OS-user separation for the daemon and its state, which would extend the threat model to same-user code
 - Whether Exa's authorization server accepts the loopback redirect at sign-in (discovery, registration and the

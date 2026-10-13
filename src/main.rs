@@ -20,7 +20,7 @@ use codemode_mcp::{
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
     notify::{Notifier, Ntfy},
-    server::{outcome_text, serve},
+    server::{Listeners, outcome_text},
     service::{self, Action, ServicePaths},
     store::{self, Store},
     usage::{
@@ -374,7 +374,14 @@ async fn service_command(
             };
 
             (
-                service::install_plan(&paths, uid, &binary, &worker, pinned.as_deref()),
+                service::install_plan(
+                    &paths,
+                    uid,
+                    &binary,
+                    &worker,
+                    pinned.as_deref(),
+                    config.limits.drain(),
+                ),
                 dry_run,
             )
         }
@@ -493,19 +500,61 @@ async fn adapter_command(config: &Config, homebased_bin: Option<PathBuf>) -> Res
 }
 
 async fn serve_command(config: Config) -> Result<()> {
+    // before anything touches state: a second daemon on one state directory
+    // would resume the first one's parked executions and interrupt its
+    // running ones
+    let _lock = store::DaemonLock::acquire(&config.state_dir()?)?;
+    warn_on_short_exit_timeout(&config);
+
+    // a taken port fails here, before any state is settled
+    let listeners = Listeners::bind(&config)
+        .await
+        .wrap_err("failed to bind the listeners")?;
     let app = App::start(config).await?;
+    // frozen however this function ends, so tearing tasks down cannot
+    // withdraw what the next boot resumes
+    let _freeze = app.freeze_on_drop();
+
+    // before anything is answered: nothing else may start while the previous
+    // process's leftovers are settled
+    app.recover();
     app.gateway().wait_ready(SETTLE_LIMIT).await;
-    let server = serve(&app).await.wrap_err("failed to start the server")?;
+    let server = listeners
+        .serve(&app)
+        .wrap_err("failed to start the server")?;
 
     let token = server.shutdown_token();
+    let stopping = app.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
+        // the server keeps answering `wait` and the approval pages meanwhile
+        stopping.drain().await;
         token.cancel();
     });
 
-    server.finished().await?;
+    let served = server.finished().await;
+    app.shutdown().await;
 
-    Ok(())
+    Ok(served?)
+}
+
+/// Logs when the installed launchd plist would kill the daemon mid-drain
+fn warn_on_short_exit_timeout(config: &Config) {
+    let Ok(paths) = config
+        .state_dir()
+        .map_err(|_| ())
+        .and_then(|state| ServicePaths::from_env(&state).map_err(|_| ()))
+    else {
+        return;
+    };
+    // no plist: the daemon was started by hand
+    let Ok(plist) = std::fs::read_to_string(&paths.plist) else {
+        return;
+    };
+
+    if let Some(warning) = service::exit_timeout_warning(&plist, config.limits.drain()) {
+        tracing::warn!("{warning}");
+    }
 }
 
 async fn shutdown_signal() {

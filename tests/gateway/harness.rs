@@ -11,8 +11,11 @@ use std::{
 use codemode_mcp::{
     app::App,
     config::Config,
+    durable::{Durable, Sensitivity},
     notify::{BoxFuture, Notification, Notifier, NotifyError},
     server::{RunningServer, serve},
+    store::{self, DaemonLock, Store, approvals::NewApproval},
+    usage::{Caller, ExecutionRecord, UsageLog},
 };
 use rmcp::{
     ServiceExt,
@@ -95,6 +98,70 @@ pub async fn connect_with_headers(
 /// A fresh state directory under the system temp dir
 pub fn temp_state_dir() -> PathBuf {
     std::env::temp_dir().join(format!("codemode-test-{}", uuid::Uuid::new_v4().simple()))
+}
+
+/// A usage log and the store beside it, for seeding the review's inputs
+///
+/// Executions and approvals are written by the store since they became
+/// durable; calls and upstream rows still go through the usage log, which
+/// this derefs to
+pub struct Seed {
+    log: UsageLog,
+    store: Store,
+}
+
+impl Seed {
+    /// Opens both on `directory`
+    pub fn start(directory: &Path) -> Result<Self, Box<dyn Error>> {
+        let log = UsageLog::start(
+            directory,
+            Duration::from_secs(90 * 24 * 60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )?;
+        let store = Store::open(directory)?;
+
+        Ok(Self { log, store })
+    }
+
+    /// Stores a finished execution
+    pub fn execution(&self, record: ExecutionRecord) {
+        let result = Durable::gate(Sensitivity::PLAIN, String::new);
+        if let Err(failure) = self.store.finish_execution(&record, &result) {
+            panic!("seeding an execution failed: {failure}");
+        }
+    }
+
+    /// Stores an approval that was created and then decided
+    pub fn approval(&self, id: &str, caller: &Caller, execution_id: &str, decision: &str) {
+        let now = store::now_ms();
+        let request = NewApproval {
+            id,
+            created_ms: now,
+            expires_ms: now + 60_000,
+            caller,
+            execution_id,
+            server: "op",
+            tool: "list_environments",
+            grant_mode: "session",
+            action: None,
+            notify: false,
+        };
+        let created = self
+            .store
+            .create_approval(&request, &Durable::gate(Sensitivity::PLAIN, String::new));
+        let decided = created.and_then(|()| self.store.decide_approval(id, decision, None, None));
+        if let Err(failure) = decided {
+            panic!("seeding an approval failed: {failure}");
+        }
+    }
+}
+
+impl std::ops::Deref for Seed {
+    type Target = UsageLog;
+
+    fn deref(&self) -> &UsageLog {
+        &self.log
+    }
 }
 
 /// What a harness is built from
@@ -193,6 +260,61 @@ pub struct Harness {
     pub notifier: Arc<RecordingNotifier>,
     pub http: reqwest::Client,
     state_dir: PathBuf,
+    config: Config,
+    notifying: bool,
+    /// Held as `serve` holds it, so a second daemon on the directory is refused
+    _lock: DaemonLock,
+}
+
+/// Takes the state directory's lock as `serve` does
+///
+/// A test that spawns a process while another test releases its lock can leave
+/// the lock held for a moment: the child has inherited the descriptor between
+/// fork and exec. A real daemon is refused at once; here a short wait keeps
+/// unrelated tests from failing each other
+async fn take_lock(state_dir: &Path) -> Result<DaemonLock, Box<dyn Error>> {
+    let mut attempts = 0;
+    loop {
+        match DaemonLock::acquire(state_dir) {
+            Err(store::StoreError::Owned(_)) if attempts < 50 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return Ok(other?),
+        }
+    }
+}
+
+/// What is left of a daemon that was dropped without a clean stop
+pub struct Left {
+    config: Config,
+    state_dir: PathBuf,
+    notifier: Arc<RecordingNotifier>,
+    notifying: bool,
+}
+
+impl Left {
+    /// Starts a daemon on what the dropped one left behind
+    pub async fn boot(self) -> Result<Harness, Box<dyn Error>> {
+        Harness::boot(
+            self.config,
+            self.state_dir,
+            self.notifier,
+            self.notifying,
+            true,
+        )
+        .await
+    }
+}
+
+/// How a restarted daemon was stopped
+#[derive(Clone, Copy)]
+pub enum Stop {
+    /// Killed: whatever was in flight leaves no trace beyond what was
+    /// already written
+    Crash,
+    /// SIGTERM: running executions get `limits.drain_secs` to finish
+    Drain,
 }
 
 impl Harness {
@@ -214,25 +336,113 @@ impl Harness {
         let config = config_for(&worker, &state_dir, &setup)?;
 
         let notifier = Arc::new(RecordingNotifier::default());
-        let installed: Option<Arc<dyn Notifier>> = if setup.notify {
+
+        Ok(Some(
+            Self::boot(config, state_dir, notifier, setup.notify, false).await?,
+        ))
+    }
+
+    async fn boot(
+        config: Config,
+        state_dir: PathBuf,
+        notifier: Arc<RecordingNotifier>,
+        notifying: bool,
+        recover: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        let lock = take_lock(&state_dir).await?;
+        let installed: Option<Arc<dyn Notifier>> = if notifying {
             Some(Arc::clone(&notifier) as Arc<dyn Notifier>)
         } else {
             None
         };
-        let app = App::start_with(config, installed).await?;
+        let app = App::start_with(config.clone(), installed).await?;
+        if recover {
+            app.recover();
+        }
         app.gateway().wait_ready(Duration::from_secs(30)).await;
         let server = serve(&app).await?;
         let base = format!("http://127.0.0.1:{}", server.local_addr().port());
         let client = connect_as(&base, &format!("{DEFAULT_CLIENT}/1.0")).await?;
 
-        Ok(Some(Self {
+        Ok(Self {
             app,
             server,
             client,
             notifier,
             http: reqwest::Client::new(),
             state_dir,
-        }))
+            config,
+            notifying,
+            _lock: lock,
+        })
+    }
+
+    /// Stops the listeners and lets go of the app without halting it, as a
+    /// process that returns early does; the tasks are still running, so the
+    /// caller decides how they end (dropping their runtime)
+    pub async fn forget(self) -> Result<Left, Box<dyn Error>> {
+        let Self {
+            app,
+            server,
+            client,
+            notifier,
+            state_dir,
+            config,
+            notifying,
+            ..
+        } = self;
+        let _ = client.cancel().await;
+        server.shutdown().await?;
+        drop(app);
+
+        Ok(Left {
+            config,
+            state_dir,
+            notifier,
+            notifying,
+        })
+    }
+
+    /// Stops the daemon and starts another on the same state directory, the
+    /// way a deploy, a crash or a reboot does; the new one recovers what the
+    /// old one left behind
+    pub async fn restart(self, how: Stop) -> Result<Self, Box<dyn Error>> {
+        self.restart_with(how, |_| {}).await
+    }
+
+    /// Like [`Harness::restart`], with the new daemon's config changed first
+    pub async fn restart_with(
+        self,
+        how: Stop,
+        change: impl FnOnce(&mut Config),
+    ) -> Result<Self, Box<dyn Error>> {
+        let Self {
+            app,
+            server,
+            client,
+            notifier,
+            state_dir,
+            mut config,
+            notifying,
+            _lock: lock,
+            ..
+        } = self;
+
+        match how {
+            Stop::Crash => app.halt(),
+            Stop::Drain => {
+                app.drain().await;
+                app.shutdown().await;
+            }
+        }
+        let _ = client.cancel().await;
+        server.shutdown().await?;
+        drop(app);
+        // a dead process holds no lock
+        drop(lock);
+        change(&mut config);
+
+        Self::boot(config, state_dir, notifier, notifying, true).await
     }
 
     /// Another connection from the same client as the harness client

@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     app::App,
-    approvals::{AdminRequest, Approvals, Verdict, confirmation_code},
+    approvals::{AdminAction, AdminRequest, Approvals, Verdict, Waiting, confirmation_code},
     gateway::{Gateway, WarmResult},
     host::is_direct_local,
     notify::{Notification, Priority},
@@ -245,22 +245,17 @@ async fn enroll(State(state): State<AdminState>, Json(request): Json<EnrollReque
     let code = confirmation_code();
     let mut details = Map::new();
     details.insert("label".to_owned(), Value::String(label.clone()));
-    details.insert("code".to_owned(), Value::String(code.clone()));
+    let action = AdminAction::EnrollPasskey {
+        enrollment_hash: created.hash,
+    };
     let waiting = state.approvals.request_admin(AdminRequest {
-        action: "passkey.enroll",
+        action: action.clone(),
         title: format!("Enroll a new passkey named \"{label}\""),
         details,
         code: code.clone(),
     });
     let approval_url = waiting.url().to_owned();
-    let passkeys = Arc::clone(&state.passkeys);
-    let token = created.token;
-    tokio::spawn(async move {
-        match waiting.decision().await {
-            Verdict::Approved { .. } => passkeys.approve_enrollment(&token),
-            Verdict::Denied { .. } => passkeys.drop_enrollment(&token),
-        }
-    });
+    attach_action(Arc::clone(&state.passkeys), waiting, action);
 
     Json(EnrollResponse {
         url,
@@ -304,33 +299,18 @@ async fn remove_passkey(
     let mut details = Map::new();
     details.insert("id".to_owned(), json!(request.id));
     details.insert("label".to_owned(), Value::String(label.clone()));
-    details.insert("code".to_owned(), Value::String(code.clone()));
+    let action = AdminAction::RemovePasskey {
+        id: request.id,
+        created_ms: passkey.created_ms,
+    };
     let waiting = state.approvals.request_admin(AdminRequest {
-        action: "passkey.remove",
+        action: action.clone(),
         title: format!("Remove the passkey named \"{label}\""),
         details,
         code: code.clone(),
     });
     let approval_url = waiting.url().to_owned();
-    let passkeys = Arc::clone(&state.passkeys);
-    let id = request.id;
-    let created_ms = passkey.created_ms;
-    tokio::spawn(async move {
-        if let Verdict::Approved { .. } = waiting.decision().await {
-            // another removal may have been approved while this one waited
-            if !matches!(passkeys.store().passkey_count(), Ok(count) if count > 1) {
-                tracing::warn!(id, "refused to remove the last passkey");
-                return;
-            }
-
-            // the enrollment time pins the row, in case its id was reused
-            match passkeys.store().remove_passkey(id, created_ms) {
-                Ok(true) => tracing::info!(id, "passkey removed after approval"),
-                Ok(false) => tracing::info!(id, "passkey was already gone"),
-                Err(failure) => tracing::warn!(id, error = %failure, "passkey removal failed"),
-            }
-        }
-    });
+    attach_action(Arc::clone(&state.passkeys), waiting, action);
 
     Json(RemoveResponse {
         label,
@@ -339,6 +319,47 @@ async fn remove_passkey(
         notified: state.approvals.can_notify(),
     })
     .into_response()
+}
+
+/// Carries out `action` once the request's wait ends, then records that it is
+/// done; used for new requests and for those restored after a restart
+pub fn attach_action(passkeys: Arc<Passkeys>, waiting: Waiting, action: AdminAction) {
+    tokio::spawn(async move {
+        let request = waiting.id().to_owned();
+        let verdict = waiting.decision().await;
+        perform(&passkeys, &action, &verdict);
+
+        if let Err(failure) = passkeys.store().complete_action(&request) {
+            tracing::warn!(error = %failure, "could not record a finished admin action");
+        }
+    });
+}
+
+fn perform(passkeys: &Passkeys, action: &AdminAction, verdict: &Verdict) {
+    match (action, verdict) {
+        (AdminAction::EnrollPasskey { enrollment_hash }, Verdict::Approved { .. }) => {
+            passkeys.approve_enrollment(enrollment_hash);
+        }
+        (AdminAction::EnrollPasskey { enrollment_hash }, Verdict::Denied { .. }) => {
+            passkeys.drop_enrollment(enrollment_hash);
+        }
+        (AdminAction::RemovePasskey { id, created_ms }, Verdict::Approved { .. }) => {
+            // another removal may have been approved while this one waited
+            if !matches!(passkeys.store().passkey_count(), Ok(count) if count > 1) {
+                tracing::warn!(id, "refused to remove the last passkey");
+
+                return;
+            }
+
+            // the enrollment time pins the row, in case its id was reused
+            match passkeys.store().remove_passkey(*id, *created_ms) {
+                Ok(true) => tracing::info!(id, "passkey removed after approval"),
+                Ok(false) => tracing::info!(id, "passkey was already gone"),
+                Err(failure) => tracing::warn!(id, error = %failure, "passkey removal failed"),
+            }
+        }
+        (AdminAction::RemovePasskey { .. }, Verdict::Denied { .. }) => {}
+    }
 }
 
 fn oauth_failure(failure: &OAuthError) -> Response {

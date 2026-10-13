@@ -1,12 +1,18 @@
 //! SQLite-format state, kept with turso: usage records, approvals,
 //! enrolled passkeys and OAuth logins
 
+pub mod approvals;
+pub mod enrollments;
+pub mod executions;
+pub mod parked;
 pub mod schema;
 pub mod sessions;
 pub mod sql;
+pub mod tools;
 
 use std::{
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    io::Write,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,6 +24,8 @@ use self::sql::Connection;
 
 /// File name of the database inside the state directory
 pub const DATABASE_FILE: &str = "codemode.sqlite";
+/// File name of the lock a daemon holds on its state directory
+pub const LOCK_FILE: &str = "daemon.lock";
 /// How long a writer waits on a locked database before failing
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -38,6 +46,9 @@ pub enum StoreError {
     /// A newer build created this database
     #[error("database schema version {0} is newer than this build supports")]
     SchemaTooNew(i64),
+    /// Another process holds the state directory's lock
+    #[error("another daemon owns {0}")]
+    Owned(PathBuf),
     /// A stored value could not be decoded
     #[error("corrupt stored value: {0}")]
     Corrupt(String),
@@ -50,36 +61,129 @@ pub fn now_ms() -> i64 {
         .map_or(0, |elapsed| elapsed.as_millis() as i64)
 }
 
-/// Creates the state directory, readable by the owner only
+/// Files turso keeps beside the database
+const DATABASE_SIDE_FILES: [&str; 3] = ["", "-wal", "-tshm"];
+
+/// Creates the database files that are missing, readable by their owner only,
+/// before turso opens them
+///
+/// turso creates its files under the process umask, so changing their mode
+/// afterwards would leave a window in which they are world-readable. A
+/// process-wide umask would close the window too, but it would also make every
+/// file the upstream servers and Monty workers create owner-only
+fn precreate_database_files(database: &Path) {
+    for suffix in DATABASE_SIDE_FILES {
+        let mut file = database.to_owned().into_os_string();
+        file.push(suffix);
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file);
+        match created {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // the chmod after the open still tightens the file
+            Err(error) => {
+                tracing::warn!(file = ?file, %error, "could not create a state file for its owner only");
+            }
+        }
+    }
+}
+
+/// A claim on a state directory: at most one daemon runs on it
+///
+/// The lock is an advisory `flock` on `daemon.lock`, released by the kernel
+/// when the process exits, however it exits
+#[derive(Debug)]
+pub struct DaemonLock {
+    _file: std::fs::File,
+}
+
+impl DaemonLock {
+    /// Takes the lock on `directory`, creating the directory when needed
+    ///
+    /// Fails at once, without waiting, when another process holds it
+    pub fn acquire(directory: &Path) -> Result<Self, StoreError> {
+        prepare_state_dir(directory)?;
+        let path = directory.join(LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|source| StoreError::Directory {
+                path: path.clone(),
+                source,
+            })?;
+
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                return Err(StoreError::Owned(directory.to_owned()));
+            }
+            Err(error) => {
+                return Err(StoreError::Directory {
+                    path,
+                    source: error.into(),
+                });
+            }
+        }
+        // informational only; the lock is what counts
+        let _ = file.set_len(0);
+        let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+
+        Ok(Self { _file: file })
+    }
+}
+
+/// Creates the state directory, or tightens an existing one, to owner access
+/// only
 pub fn prepare_state_dir(directory: &Path) -> Result<(), StoreError> {
+    let failed = |source| StoreError::Directory {
+        path: directory.to_owned(),
+        source,
+    };
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(directory)
-        .map_err(|source| StoreError::Directory {
-            path: directory.to_owned(),
-            source,
-        })
+        .map_err(failed)?;
+
+    // `create` leaves a directory that already exists as it was
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).map_err(failed)
 }
 
 /// Opens (creating and migrating if needed) the database in `directory`
 pub fn open(directory: &Path) -> Result<Connection, StoreError> {
     prepare_state_dir(directory)?;
     let path = directory.join(DATABASE_FILE);
+    precreate_database_files(&path);
     // turso always journals to a WAL, so there is no journal mode to set
     let connection = Connection::open(&path, false, BUSY_TIMEOUT)?;
-    // the database holds scripts and passkeys, so only the owner may read
-    // it; unlike SQLite, turso creates the WAL and its coordination file
-    // with the default mode rather than the database's
-    for suffix in ["", "-wal", "-tshm"] {
-        let mut file = path.clone().into_os_string();
-        file.push(suffix);
-        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
-    }
+    restrict_files(&path);
     connection.execute_batch("PRAGMA foreign_keys = ON")?;
     connection.transaction(schema::migrate)?;
 
     Ok(connection)
+}
+
+/// Tightens files that existed already or that turso made itself: the
+/// database holds scripts and passkeys, so only the owner may read it
+fn restrict_files(database: &Path) {
+    for suffix in DATABASE_SIDE_FILES {
+        let mut file = database.to_owned().into_os_string();
+        file.push(suffix);
+        match std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            // the coordination files exist only while a database is open
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(file = ?file, %error, "could not restrict a state file to its owner");
+            }
+        }
+    }
 }
 
 /// Opens an existing database without creating or migrating it; for
@@ -87,11 +191,11 @@ pub fn open(directory: &Path) -> Result<Connection, StoreError> {
 /// turso hands back that writable instance, so read-only is a promise of
 /// the callers rather than of the open
 pub fn open_read_only(directory: &Path) -> Result<Connection, StoreError> {
-    Ok(Connection::open(
-        &directory.join(DATABASE_FILE),
-        true,
-        BUSY_TIMEOUT,
-    )?)
+    let path = directory.join(DATABASE_FILE);
+    let connection = Connection::open(&path, true, BUSY_TIMEOUT)?;
+    restrict_files(&path);
+
+    Ok(connection)
 }
 
 /// One enrolled passkey as listed to the owner
@@ -352,4 +456,39 @@ fn passkey_record(row: &turso::Row) -> Result<PasskeyRecord, turso::Error> {
         created_ms: row.get(2)?,
         last_used_ms: row.get(3)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mode(path: &Path) -> std::io::Result<u32> {
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+
+    // the daemon keeps scripts, passkeys and sealed dumps here
+    #[test]
+    fn state_files_are_owner_only_even_in_a_loose_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("codemode-modes-{}", uuid::Uuid::new_v4()));
+
+        let fresh = root.join("fresh");
+        drop(open(&fresh)?);
+        assert_eq!(mode(&fresh)?, 0o700);
+        for entry in std::fs::read_dir(&fresh)? {
+            assert_eq!(mode(&entry?.path())?, 0o600);
+        }
+
+        let loose = root.join("loose");
+        std::fs::create_dir_all(&loose)?;
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755))?;
+        drop(open(&loose)?);
+        assert_eq!(mode(&loose)?, 0o700);
+        for entry in std::fs::read_dir(&loose)? {
+            assert_eq!(mode(&entry?.path())?, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        Ok(())
+    }
 }

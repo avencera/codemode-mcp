@@ -1,13 +1,13 @@
 //! Runs agent scripts in Monty workers, answering their tool calls
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,6 +19,7 @@ use monty_pool::{
 use monty_types::{
     ExcType, MontyException, MontyObject, NameLookupResult, OsFunctionCall, ResourceLimits,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
@@ -32,10 +33,16 @@ use crate::{
     catalog::Catalog,
     config::{Config, Limits},
     convert::{ConvertLimits, monty_to_argument, monty_to_json},
+    durable::Sensitivity,
     gateway::{CallContext, Gateway, Plan, PreparedCall, ToolCallError},
     snapshot::{Sealed, Sealer},
+    store::Store,
     usage::{Caller, Classification, Outcome},
 };
+
+mod parked;
+
+pub use parked::{ParkedState, Reattached};
 
 /// Grace added to the script budget before the pool kills a stuck worker
 const WORKER_KILL_MARGIN: Duration = Duration::from_secs(30);
@@ -121,8 +128,41 @@ impl Ticket {
     }
 }
 
+/// Why an execution has no outcome
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterruptReason {
+    /// The daemon restarted (or was killed) while the script ran
+    Restarted,
+    /// The execution had used a sensitive server, whose data is never
+    /// written to disk, so it could not be resumed or its result kept
+    SensitiveNotKept,
+}
+
+impl InterruptReason {
+    /// Detail stored with the `interrupted` outcome
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Restarted => "the daemon restarted while the script ran",
+            Self::SensitiveNotKept => {
+                "sensitive state is not kept across restarts; re-run the script"
+            }
+        }
+    }
+}
+
+/// An upstream call that finished before the daemon stopped
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletedCall {
+    /// Server name
+    pub server: String,
+    /// Upstream tool name
+    pub tool: String,
+    /// Outcome name from the usage log, e.g. `ok` or `tool_error`
+    pub status: String,
+}
+
 /// How a script run ended
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionOutcome {
     /// The script finished and produced a value
     Completed {
@@ -160,6 +200,20 @@ pub enum ExecutionOutcome {
         /// Usage-log classification
         class: Classification,
     },
+    /// The script finished, but it used a sensitive server, so its result was
+    /// never written to disk and is gone after a restart. Only a lookup in the
+    /// database produces this outcome
+    ResultNotKept {
+        /// How it ended, e.g. `ok`
+        outcome: String,
+    },
+    /// The daemon stopped before the script ended
+    Interrupted {
+        /// Why there is no outcome
+        reason: InterruptReason,
+        /// Upstream calls that finished before it stopped
+        calls: Vec<CompletedCall>,
+    },
 }
 
 impl ExecutionOutcome {
@@ -167,6 +221,11 @@ impl ExecutionOutcome {
     pub fn classification(&self) -> Classification {
         match self {
             Self::Completed { .. } => Classification::ok(),
+            Self::Interrupted { reason, .. } => {
+                Classification::new(Outcome::Interrupted, reason.detail())
+            }
+            // a lookup, not a run; nothing is recorded for it
+            Self::ResultNotKept { .. } => Classification::ok(),
             Self::TypeError { class, .. }
             | Self::Exception { class, .. }
             | Self::Failed { class, .. } => class.clone(),
@@ -180,6 +239,25 @@ impl ExecutionOutcome {
             class: Classification::new(outcome, message.clone()),
             message,
             output,
+        }
+    }
+}
+
+/// A finished run with what the database may keep of it
+#[derive(Debug)]
+pub struct Finished {
+    /// How the run ended
+    pub outcome: ExecutionOutcome,
+    /// Whether the run touched a sensitive server, so its result must stay
+    /// in memory
+    pub sensitivity: Sensitivity,
+}
+
+impl Finished {
+    fn plain(outcome: ExecutionOutcome) -> Self {
+        Self {
+            outcome,
+            sensitivity: Sensitivity::PLAIN,
         }
     }
 }
@@ -270,6 +348,22 @@ impl OutputSink {
         }
     }
 
+    /// Starts with output printed before a restart
+    fn resumed(cap: usize, printed: String) -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(printed)),
+            cap,
+        }
+    }
+
+    /// What was printed so far, leaving it in place
+    fn peek(&self) -> String {
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+
     fn take(&self) -> String {
         self.buffer
             .lock()
@@ -280,7 +374,7 @@ impl OutputSink {
 
 /// An error handed to the script by the host, remembered so the final
 /// exception can be traced back to it
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Failure {
     exc_type: ExcType,
     message: String,
@@ -341,12 +435,17 @@ pub struct Executor {
     slots: Arc<Semaphore>,
     queued: Arc<AtomicUsize>,
     sealer: Sealer,
+    store: Store,
+    /// Set when the process stops writing for its executions, so a driver
+    /// torn down afterwards leaves the database as a crash would
+    frozen: AtomicBool,
 }
 
 impl Executor {
     /// Starts the worker pools described by `config`; `sealer` protects
-    /// sessions dumped while they wait for an approval
-    pub async fn new(config: &Config, sealer: Sealer) -> Result<Self, ExecutorError> {
+    /// sessions dumped while they wait for an approval, and `store` keeps
+    /// them for a restart
+    pub async fn new(config: &Config, sealer: Sealer, store: Store) -> Result<Self, ExecutorError> {
         let worker = resolve_worker(config.worker_path.as_deref())?;
         let limits = config.limits.clone();
 
@@ -371,7 +470,20 @@ impl Executor {
             queued: Arc::new(AtomicUsize::new(0)),
             limits,
             sealer,
+            store,
+            frozen: AtomicBool::new(false),
         })
+    }
+
+    /// Stops parked executions from being written to the database; see
+    /// `Executions::halt`
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::SeqCst);
+    }
+
+    /// The wall-clock allowance of one execution
+    pub fn execution_timeout(&self) -> Duration {
+        self.limits.execution_timeout()
     }
 
     /// Reserves a place for one execution, or refuses it when every worker
@@ -417,10 +529,11 @@ impl Executor {
         execution_id: &str,
         code: String,
         caller: Caller,
-    ) -> ExecutionOutcome {
+        parked: Arc<AtomicBool>,
+    ) -> Finished {
         // before taking a worker: a refused script costs no sandbox time
         if code.len() > self.limits.max_script_bytes {
-            return ExecutionOutcome::failed(
+            return Finished::plain(ExecutionOutcome::failed(
                 format!(
                     "the script is {} bytes; scripts are limited to {} bytes",
                     code.len(),
@@ -428,21 +541,27 @@ impl Executor {
                 ),
                 String::new(),
                 Outcome::UnsupportedSyntax,
-            );
+            ));
         }
         let bans = bans::find(&code);
         if !bans.is_empty() {
             let diagnostics = bans::diagnostics(&bans);
 
-            return ExecutionOutcome::TypeError {
+            return Finished::plain(ExecutionOutcome::TypeError {
                 class: classify_typing(&diagnostics),
                 diagnostics,
-            };
+            });
         }
 
         let permit = match ticket.permit().await {
             Ok(permit) => permit,
-            Err(message) => return ExecutionOutcome::failed(message, String::new(), Outcome::Busy),
+            Err(message) => {
+                return Finished::plain(ExecutionOutcome::failed(
+                    message,
+                    String::new(),
+                    Outcome::Busy,
+                ));
+            }
         };
 
         // started after queueing, so waiting for a worker costs no budget
@@ -459,11 +578,11 @@ impl Executor {
             Err(error) => {
                 tracing::warn!(%error, "could not start a sandbox");
 
-                return ExecutionOutcome::failed(
+                return Finished::plain(ExecutionOutcome::failed(
                     "could not start a sandbox worker; retry shortly",
                     String::new(),
                     Outcome::Busy,
-                );
+                ));
             }
         };
 
@@ -482,40 +601,58 @@ impl Executor {
             session: Some(session),
             permit: Some(permit),
             parked: None,
+            parked_flag: parked,
             running: JoinSet::new(),
             deciding: JoinSet::new(),
-            gated: BTreeSet::new(),
+            gated: BTreeMap::new(),
             output: output.clone(),
             slept: Duration::ZERO,
             max_sleep: Duration::from_secs(self.limits.max_total_sleep_secs),
             failures: Vec::new(),
             sensitive_used: false,
+            resumed: false,
         };
         let finished = tokio::select! {
             result = driver.run(code, inputs) => Some(result),
             () = budget.expired() => None,
         };
+
+        self.conclude(driver, finished, &output).await
+    }
+
+    /// Turns how a driver ended into the run's outcome; `finished` is `None`
+    /// when the wall-clock budget ran out first
+    async fn conclude(
+        &self,
+        mut driver: Driver<'_>,
+        finished: Option<Result<MontyObject, PoolError>>,
+        output: &OutputSink,
+    ) -> Finished {
+        let sensitivity = Sensitivity::of(driver.sensitive_used);
         let Some(result) = finished else {
             // the worker is stuck mid-turn, so it is dropped rather than
             // reset; dropping the driver cancels the in-flight tool calls and
             // withdraws pending approvals
             drop(driver);
 
-            return ExecutionOutcome::failed(
-                format!(
-                    "the execution exceeded its {:?} wall-clock limit and was stopped",
-                    self.limits.execution_timeout()
+            return Finished {
+                outcome: ExecutionOutcome::failed(
+                    format!(
+                        "the execution exceeded its {:?} wall-clock limit and was stopped",
+                        self.limits.execution_timeout()
+                    ),
+                    output.take(),
+                    Outcome::Timeout,
                 ),
-                output.take(),
-                Outcome::Timeout,
-            );
+                sensitivity,
+            };
         };
 
         // typing and runtime errors leave the worker healthy; finish returns it
         // to the pool, and discards it when it was already lost
         driver.release().await;
 
-        match result {
+        let outcome = match result {
             Ok(value) => match monty_to_json(
                 value.as_ref(),
                 ConvertLimits::result(self.limits.max_result_bytes),
@@ -568,6 +705,11 @@ impl Executor {
                     Outcome::RuntimeError,
                 )
             }
+        };
+
+        Finished {
+            outcome,
+            sensitivity,
         }
     }
 
@@ -731,11 +873,13 @@ struct Driver<'a> {
     /// Worker slot; released while parked
     permit: Option<OwnedSemaphorePermit>,
     parked: Option<Parked>,
+    /// Tells the registry whether the session is parked, for the drain
+    parked_flag: Arc<AtomicBool>,
     running: JoinSet<(u32, Answer)>,
     /// Approval-gated calls waiting for a decision
     deciding: JoinSet<(u32, Verdict, PreparedCall)>,
-    /// Call ids in `deciding`
-    gated: BTreeSet<u32>,
+    /// The calls in `deciding`, by call id
+    gated: BTreeMap<u32, Gated>,
     output: OutputSink,
     slept: Duration,
     max_sleep: Duration,
@@ -743,12 +887,20 @@ struct Driver<'a> {
     failures: Vec<Failure>,
     /// A sensitive server answered a call, so exception text may hold its data
     sensitive_used: bool,
+    /// Rebuilt from a stored parked row after a restart
+    resumed: bool,
+}
+
+/// A call waiting for a decision, with what a restart needs to wait again
+struct Gated {
+    call: PreparedCall,
+    approval_id: String,
 }
 
 /// What to do with a tool call
 enum Step {
     Ready(ToolFuture),
-    Gated(PreparedCall, crate::approvals::Waiting),
+    Gated(Box<PreparedCall>, crate::approvals::Waiting),
 }
 
 impl Driver<'_> {
@@ -764,10 +916,20 @@ impl Driver<'_> {
         let sink = self.output.clone();
         let mut print = on_print_sync(move |_, text| sink.push(text));
 
-        let mut event = self
+        let event = self
             .session()?
             .feed(code, inputs, vec![], false, &mut print)
             .await?;
+
+        self.drive(event, &mut print).await
+    }
+
+    /// Answers the script's suspensions until it ends
+    async fn drive(
+        &mut self,
+        mut event: TurnEvent,
+        print: OnPrint<'_>,
+    ) -> Result<MontyObject, PoolError> {
         loop {
             event = match event {
                 TurnEvent::Complete(value) => return Ok(value),
@@ -779,14 +941,21 @@ impl Driver<'_> {
                     ..
                 } => match self.plan(function_name, &args) {
                     Step::Ready(call) => {
-                        self.dispatch(call_id, allow_eager_await, call, &mut print)
+                        self.dispatch(call_id, allow_eager_await, call, &mut *print)
                             .await?
                     }
                     Step::Gated(call, waiting) => {
+                        let call = *call;
                         // always a future, even when awaited directly, so the
                         // session can be dumped at ResolveFutures while a
                         // person decides
-                        self.gated.insert(call_id);
+                        self.gated.insert(
+                            call_id,
+                            Gated {
+                                call: call.clone(),
+                                approval_id: waiting.id().to_owned(),
+                            },
+                        );
                         self.deciding.spawn(async move {
                             let verdict = waiting.decision().await;
 
@@ -794,7 +963,7 @@ impl Driver<'_> {
                         });
 
                         self.session()?
-                            .resume(ResumeValue::Future, &mut print)
+                            .resume(ResumeValue::Future, &mut *print)
                             .await?
                     }
                 },
@@ -809,29 +978,31 @@ impl Driver<'_> {
                     // Monty names sleeps `system.async_sleep` / `system.sleep`;
                     // only the async form may be answered with a future
                     if OsFunctionCall::accepts_future(&function_name) {
-                        self.dispatch(call_id, allow_eager_await, call, &mut print)
+                        self.dispatch(call_id, allow_eager_await, call, &mut *print)
                             .await?
                     } else {
                         // `time.sleep` blocks the script, so answer it in place
                         let answer = call.await;
                         let value = self.deliver_one(answer);
-                        self.session()?.resume(value, &mut print).await?
+                        self.session()?.resume(value, &mut *print).await?
                     }
                 }
                 TurnEvent::OsCall { .. } => {
                     self.session()?
-                        .resume(ResumeValue::NotHandled, &mut print)
+                        .resume(ResumeValue::NotHandled, &mut *print)
                         .await?
                 }
                 TurnEvent::NameLookup { .. } => {
                     self.session()?
-                        .resume_name_lookup(NameLookupResult::Undefined, &mut print)
+                        .resume_name_lookup(NameLookupResult::Undefined, &mut *print)
                         .await?
                 }
                 TurnEvent::ResolveFutures { .. } => {
-                    let finished = self.next_finished(&mut print).await?;
+                    let finished = self.next_finished(&mut *print).await?;
 
-                    self.session()?.resume_futures(finished, &mut print).await?
+                    self.session()?
+                        .resume_futures(finished, &mut *print)
+                        .await?
                 }
             };
         }
@@ -934,11 +1105,16 @@ impl Driver<'_> {
         (call_id, verdict, call): (u32, Verdict, PreparedCall),
     ) -> Option<(u32, Answer)> {
         self.gated.remove(&call_id);
+        // a process that stopped writing must not start anything: the next
+        // boot resumes this execution from its parked row
+        if self.executor.frozen.load(Ordering::SeqCst) {
+            return None;
+        }
 
         match verdict {
             Verdict::Approved { approval_id } => {
                 if call.sensitive {
-                    self.sensitive_used = true;
+                    self.mark_sensitive();
                 }
                 let gateway = Arc::clone(&self.gateway);
                 let context = self.context.clone();
@@ -988,9 +1164,11 @@ impl Driver<'_> {
             "released the worker while waiting for approval"
         );
         self.release().await;
+        self.persist_parked(&sealed);
+        self.parked_flag.store(true, Ordering::SeqCst);
         self.parked = Some(Parked {
             sealed,
-            pending: self.gated.iter().copied().collect(),
+            pending: self.gated.keys().copied().collect(),
         });
     }
 
@@ -1032,6 +1210,13 @@ impl Driver<'_> {
 
         self.session = Some(session);
         self.permit = Some(permit);
+        // restored before the verdict is acted on, so a crash from here on
+        // leaves an interrupted execution, never a call made twice
+        if !self.forget_parked() {
+            return Err(PoolError::Protocol(
+                "the parked session is no longer this process's to resume".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -1114,16 +1299,21 @@ impl Driver<'_> {
             }
         }
 
-        match self.gateway.prepare(&self.context, &function, arguments) {
+        match self.gateway.prepare(
+            &self.context,
+            &function,
+            arguments,
+            Sensitivity::of(self.sensitive_used),
+        ) {
             Err(error) => {
                 let answer = Answer::tool_error(&error, &function, false);
 
                 Step::Ready(Box::pin(std::future::ready(answer)))
             }
-            Ok(Plan::Gated { call, waiting }) => Step::Gated(call, waiting),
+            Ok(Plan::Gated { call, waiting }) => Step::Gated(Box::new(call), waiting),
             Ok(Plan::Run { call, approval_id }) => {
                 if call.sensitive {
-                    self.sensitive_used = true;
+                    self.mark_sensitive();
                 }
                 let gateway = Arc::clone(&self.gateway);
                 let context = self.context.clone();

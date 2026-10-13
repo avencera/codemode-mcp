@@ -8,6 +8,7 @@
 
 use std::{cell::Cell, fmt, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Deepest `$ref` chain followed without consuming any data, so a schema
@@ -22,7 +23,7 @@ const MAX_STEPS: usize = 100_000;
 const MAX_QUOTED_CHARS: usize = 40;
 
 /// How a tool's result reaches the script
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum OutputSpec {
     /// Nothing is declared: a JSON object or array in the text is parsed,
     /// anything else stays text, and the script sees a `JsonValue`

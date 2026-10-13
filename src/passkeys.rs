@@ -1,17 +1,15 @@
 //! Passkey enrollment and assertions (WebAuthn)
 //!
-//! Ceremony state stays in memory, keyed by a random id with a short
-//! lifetime; it is never serialized to the client
+//! Enrollment links and ceremony state live in the database, keyed by a
+//! hash of the token or by a random id, with a short lifetime, so a link
+//! or a page opened before a restart still works; the ceremony state is
+//! never sent to the client
 //!
 //! The first passkey can be enrolled with a bare one-time link. Once one
 //! exists, a new link only works after an existing passkey approves it, so
 //! an agent that can run the CLI cannot add its own authenticator
 
-use std::{
-    collections::HashMap,
-    sync::{Mutex, MutexGuard},
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 use webauthn_rs::{
     Webauthn, WebauthnBuilder,
@@ -24,7 +22,7 @@ use webauthn_rs::{
 
 use crate::{
     approvals::{Choice, random_token},
-    store::{Store, StoreError},
+    store::{Store, StoreError, enrollments::StoredCeremony, now_ms, sessions::hash_token},
 };
 
 /// How long an enrollment link stays valid
@@ -36,6 +34,10 @@ const MAX_LABEL_CHARS: usize = 64;
 /// Ceremonies in progress at most; the approval routes are unauthenticated,
 /// so anyone holding an approval id could otherwise pile them up
 const MAX_CEREMONIES: usize = 64;
+/// Stored kind of a registration ceremony
+const REGISTER: &str = "register";
+/// Stored kind of an assertion ceremony
+const AUTHENTICATE: &str = "authenticate";
 
 /// Why a passkey operation failed; messages are safe to show on the page
 #[derive(Debug, thiserror::Error)]
@@ -69,30 +71,6 @@ pub enum PasskeyError {
     Store(#[from] StoreError),
 }
 
-enum Ceremony {
-    Register {
-        token: String,
-        state: PasskeyRegistration,
-        expires_at: Instant,
-    },
-    Authenticate {
-        approval_id: String,
-        choice: Choice,
-        state: PasskeyAuthentication,
-        expires_at: Instant,
-    },
-}
-
-impl Ceremony {
-    fn expires_at(&self) -> Instant {
-        match self {
-            Self::Register { expires_at, .. } | Self::Authenticate { expires_at, .. } => {
-                *expires_at
-            }
-        }
-    }
-}
-
 /// What lets an enrollment link be used
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnrollmentGate {
@@ -105,10 +83,30 @@ enum EnrollmentGate {
     Approved,
 }
 
+impl EnrollmentGate {
+    /// Name stored in the database
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPasskey => "first_passkey",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Approved => "approved",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "first_passkey" => Some(Self::FirstPasskey),
+            "awaiting_approval" => Some(Self::AwaitingApproval),
+            "approved" => Some(Self::Approved),
+            _ => None,
+        }
+    }
+}
+
+/// An enrollment link read back from the database
 struct Enrollment {
     label: String,
     gate: EnrollmentGate,
-    expires_at: Instant,
 }
 
 /// What the enrollment page needs to know about a link
@@ -125,22 +123,20 @@ pub struct EnrollmentView {
 pub struct NewEnrollment {
     /// One-time token in the link
     pub token: String,
+    /// SHA-256 of the token, the only form that is stored
+    pub hash: String,
     /// Whether an existing passkey must approve it first
     pub needs_approval: bool,
 }
 
-/// Enrolled passkeys and the ceremonies in progress
+/// Enrolled passkeys, enrollment links and the ceremonies in progress
 pub struct Passkeys {
     webauthn: Webauthn,
     store: Store,
-    ceremonies: Mutex<HashMap<String, Ceremony>>,
-    enrollments: Mutex<HashMap<String, Enrollment>>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn millis(duration: Duration) -> i64 {
+    duration.as_millis().min(i64::MAX as u128) as i64
 }
 
 impl Passkeys {
@@ -156,12 +152,7 @@ impl Passkeys {
             .and_then(|builder| builder.rp_name("codemode-mcp").build())
             .map_err(|error| PasskeyError::Config(error.to_string()))?;
 
-        Ok(Self {
-            webauthn,
-            store,
-            ceremonies: Mutex::new(HashMap::new()),
-            enrollments: Mutex::new(HashMap::new()),
-        })
+        Ok(Self { webauthn, store })
     }
 
     /// The database holding the passkeys
@@ -187,48 +178,51 @@ impl Passkeys {
         let needs_approval = self.store.passkey_count()? > 0;
 
         let token = random_token();
-        let mut enrollments = lock(&self.enrollments);
-        enrollments.retain(|_, enrollment| enrollment.expires_at > Instant::now());
-        enrollments.insert(
-            token.clone(),
-            Enrollment {
-                label: label.to_owned(),
-                gate: if needs_approval {
-                    EnrollmentGate::AwaitingApproval
-                } else {
-                    EnrollmentGate::FirstPasskey
-                },
-                expires_at: Instant::now() + ENROLLMENT_TTL,
-            },
-        );
+        let hash = hash_token(&token);
+        let gate = if needs_approval {
+            EnrollmentGate::AwaitingApproval
+        } else {
+            EnrollmentGate::FirstPasskey
+        };
+        self.store.put_enrollment(
+            &hash,
+            label,
+            gate.as_str(),
+            now_ms() + millis(ENROLLMENT_TTL),
+        )?;
 
         Ok(NewEnrollment {
             token,
+            hash,
             needs_approval,
         })
     }
 
     /// Marks a link approved by an existing passkey; its lifetime restarts so
     /// a late approval still leaves time to enroll
-    pub fn approve_enrollment(&self, token: &str) {
-        if let Some(enrollment) = lock(&self.enrollments).get_mut(token)
-            && enrollment.gate == EnrollmentGate::AwaitingApproval
-            && enrollment.expires_at > Instant::now()
-        {
-            enrollment.gate = EnrollmentGate::Approved;
-            enrollment.expires_at = Instant::now() + ENROLLMENT_TTL;
+    pub fn approve_enrollment(&self, hash: &str) {
+        let advanced = self.store.advance_enrollment(
+            hash,
+            EnrollmentGate::AwaitingApproval.as_str(),
+            EnrollmentGate::Approved.as_str(),
+            now_ms() + millis(ENROLLMENT_TTL),
+        );
+        if let Err(error) = advanced {
+            tracing::warn!(%error, "could not mark an enrollment link approved");
         }
     }
 
     /// Invalidates a link, e.g. after its approval was denied
-    pub fn drop_enrollment(&self, token: &str) {
-        lock(&self.enrollments).remove(token);
+    pub fn drop_enrollment(&self, hash: &str) {
+        if let Err(error) = self.store.take_enrollment(hash) {
+            tracing::warn!(%error, "could not drop an enrollment link");
+        }
     }
 
     /// The link's label and whether it can be used now; `None` when it is
     /// unknown, used or expired
     pub fn enrollment(&self, token: &str) -> Result<Option<EnrollmentView>, PasskeyError> {
-        let Some((label, gate)) = self.live_enrollment(token) else {
+        let Some(Enrollment { label, gate }) = self.live_enrollment(token)? else {
             return Ok(None);
         };
         let ready = self.gate_open(gate)?;
@@ -240,11 +234,16 @@ impl Passkeys {
         Ok(Some(EnrollmentView { label, ready }))
     }
 
-    fn live_enrollment(&self, token: &str) -> Option<(String, EnrollmentGate)> {
-        lock(&self.enrollments)
-            .get(token)
-            .filter(|enrollment| enrollment.expires_at > Instant::now())
-            .map(|enrollment| (enrollment.label.clone(), enrollment.gate))
+    fn live_enrollment(&self, token: &str) -> Result<Option<Enrollment>, PasskeyError> {
+        Ok(self
+            .store
+            .enrollment(&hash_token(token))?
+            .and_then(|stored| {
+                Some(Enrollment {
+                    gate: EnrollmentGate::parse(&stored.gate)?,
+                    label: stored.label,
+                })
+            }))
     }
 
     fn gate_open(&self, gate: EnrollmentGate) -> Result<bool, PasskeyError> {
@@ -260,8 +259,8 @@ impl Passkeys {
         &self,
         token: &str,
     ) -> Result<(String, CreationChallengeResponse), PasskeyError> {
-        let (label, gate) = self
-            .live_enrollment(token)
+        let Enrollment { label, gate } = self
+            .live_enrollment(token)?
             .ok_or(PasskeyError::UnknownToken)?;
         if !self.gate_open(gate)? {
             return Err(match gate {
@@ -286,10 +285,12 @@ impl Passkeys {
             )
             .map_err(|_| PasskeyError::Rejected)?;
 
-        let id = self.insert(Ceremony::Register {
-            token: token.to_owned(),
-            state,
-            expires_at: Instant::now() + CEREMONY_TTL,
+        let id = self.insert(StoredCeremony {
+            kind: REGISTER.to_owned(),
+            subject: hash_token(token),
+            choice: None,
+            state: serde_json::to_string(&state)
+                .map_err(|error| StoreError::Corrupt(error.to_string()))?,
         })?;
 
         Ok((id, challenge))
@@ -303,22 +304,22 @@ impl Passkeys {
         ceremony: &str,
         credential: &RegisterPublicKeyCredential,
     ) -> Result<i64, PasskeyError> {
-        let Some(Ceremony::Register {
-            token: expected,
-            state,
-            ..
-        }) = self.take(ceremony)
-        else {
-            return Err(PasskeyError::UnknownCeremony);
-        };
-        if expected != token {
+        let hash = hash_token(token);
+        let stored = self
+            .take(ceremony)?
+            .filter(|stored| stored.kind == REGISTER)
+            .ok_or(PasskeyError::UnknownCeremony)?;
+        if stored.subject != hash {
             return Err(PasskeyError::UnknownToken);
         }
-        let enrollment = lock(&self.enrollments)
-            .remove(token)
-            .filter(|enrollment| enrollment.expires_at > Instant::now())
+        let state: PasskeyRegistration =
+            serde_json::from_str(&stored.state).map_err(|_| PasskeyError::UnknownCeremony)?;
+        let enrollment = self
+            .store
+            .take_enrollment(&hash)?
             .ok_or(PasskeyError::UnknownToken)?;
-        if enrollment.gate == EnrollmentGate::AwaitingApproval {
+        let gate = EnrollmentGate::parse(&enrollment.gate).ok_or(PasskeyError::UnknownToken)?;
+        if gate == EnrollmentGate::AwaitingApproval {
             return Err(PasskeyError::AwaitingApproval);
         }
 
@@ -331,14 +332,15 @@ impl Passkeys {
 
         // a first-passkey link checks for an empty table in the same
         // transaction as the insert, so two such links cannot both succeed
-        let only_if_none = enrollment.gate == EnrollmentGate::FirstPasskey;
+        let only_if_none = gate == EnrollmentGate::FirstPasskey;
         let id = self
             .store
             .add_passkey(&enrollment.label, &json, only_if_none)?
             .ok_or(PasskeyError::UnknownToken)?;
         // other first-passkey links must not come back to life if every
         // passkey is removed later
-        lock(&self.enrollments).retain(|_, other| other.gate != EnrollmentGate::FirstPasskey);
+        self.store
+            .remove_enrollments_with_gate(EnrollmentGate::FirstPasskey.as_str())?;
 
         Ok(id)
     }
@@ -365,11 +367,12 @@ impl Passkeys {
             .start_passkey_authentication(&passkeys)
             .map_err(|_| PasskeyError::Rejected)?;
 
-        let id = self.insert(Ceremony::Authenticate {
-            approval_id: approval_id.to_owned(),
-            choice,
-            state,
-            expires_at: Instant::now() + CEREMONY_TTL,
+        let id = self.insert(StoredCeremony {
+            kind: AUTHENTICATE.to_owned(),
+            subject: approval_id.to_owned(),
+            choice: Some(choice.as_text()),
+            state: serde_json::to_string(&state)
+                .map_err(|error| StoreError::Corrupt(error.to_string()))?,
         })?;
 
         Ok((id, challenge))
@@ -382,15 +385,18 @@ impl Passkeys {
         ceremony: &str,
         credential: &PublicKeyCredential,
     ) -> Result<(String, Choice), PasskeyError> {
-        let Some(Ceremony::Authenticate {
-            approval_id,
-            choice,
-            state,
-            ..
-        }) = self.take(ceremony)
-        else {
-            return Err(PasskeyError::UnknownCeremony);
-        };
+        let stored = self
+            .take(ceremony)?
+            .filter(|stored| stored.kind == AUTHENTICATE)
+            .ok_or(PasskeyError::UnknownCeremony)?;
+        let approval_id = stored.subject;
+        let choice = stored
+            .choice
+            .as_deref()
+            .and_then(Choice::parse)
+            .ok_or(PasskeyError::UnknownCeremony)?;
+        let state: PasskeyAuthentication =
+            serde_json::from_str(&stored.state).map_err(|_| PasskeyError::UnknownCeremony)?;
 
         let result = self
             .webauthn
@@ -426,21 +432,20 @@ impl Passkeys {
         Ok(passkeys)
     }
 
-    fn insert(&self, ceremony: Ceremony) -> Result<String, PasskeyError> {
+    /// Stores a ceremony under a new random id
+    fn insert(&self, ceremony: StoredCeremony) -> Result<String, PasskeyError> {
         let id = random_token();
-        let mut ceremonies = lock(&self.ceremonies);
-        ceremonies.retain(|_, ceremony| ceremony.expires_at() > Instant::now());
-        if ceremonies.len() >= MAX_CEREMONIES {
-            return Err(PasskeyError::Busy);
-        }
-        ceremonies.insert(id.clone(), ceremony);
+        let stored = self.store.put_ceremony(
+            &id,
+            &ceremony,
+            now_ms() + millis(CEREMONY_TTL),
+            MAX_CEREMONIES,
+        )?;
 
-        Ok(id)
+        stored.then_some(id).ok_or(PasskeyError::Busy)
     }
 
-    fn take(&self, id: &str) -> Option<Ceremony> {
-        lock(&self.ceremonies)
-            .remove(id)
-            .filter(|ceremony| ceremony.expires_at() > Instant::now())
+    fn take(&self, id: &str) -> Result<Option<StoredCeremony>, PasskeyError> {
+        Ok(self.store.take_ceremony(id)?)
     }
 }

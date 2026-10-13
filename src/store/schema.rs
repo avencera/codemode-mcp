@@ -3,17 +3,18 @@
 use super::{StoreError, sql::Connection};
 
 /// Version a fully migrated database reports
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 type Migration = fn(&Connection) -> Result<(), turso::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     create_tables,
     create_oauth_tables,
     create_sessions,
     add_call_output,
+    create_durable_state,
 ];
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
@@ -32,6 +33,75 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
 
     Ok(())
+}
+
+/// State a daemon restart must not lose: execution results, approvals with
+/// everything the page needs, grants, parked executions, enrollment links,
+/// WebAuthn ceremonies and each upstream's last tool list
+///
+/// Deadlines are epoch milliseconds, because an `Instant` means nothing to
+/// the next process. Rows of sensitive servers carry a `sensitive` flag and
+/// no payload (see `durable`). Enrollment tokens are stored as SHA-256 only
+fn create_durable_state(connection: &Connection) -> Result<(), turso::Error> {
+    connection.execute_batch(
+        r#"
+        -- outcome is `running` until the execution finishes; `result` is the
+        -- serialized outcome, cleared once the result TTL passes
+        ALTER TABLE executions ADD COLUMN result TEXT;
+        ALTER TABLE executions ADD COLUMN sensitive INTEGER;
+        -- process that started the row, so boot leaves a live one-off `exec`
+        -- of another process alone
+        ALTER TABLE executions ADD COLUMN owner_pid INTEGER;
+
+        ALTER TABLE approvals ADD COLUMN expires_ms INTEGER;
+        ALTER TABLE approvals ADD COLUMN sensitive INTEGER;
+        ALTER TABLE approvals ADD COLUMN payload TEXT;
+        ALTER TABLE approvals ADD COLUMN action TEXT;
+        ALTER TABLE approvals ADD COLUMN action_done INTEGER;
+        ALTER TABLE approvals ADD COLUMN unnotified INTEGER;
+        ALTER TABLE approvals ADD COLUMN approved_by TEXT;
+
+        CREATE TABLE grants (
+            kind TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            server TEXT NOT NULL,
+            approval_id TEXT NOT NULL,
+            expires_ms INTEGER NOT NULL,
+            PRIMARY KEY (kind, subject, server)
+        );
+
+        CREATE TABLE parked (
+            execution_id TEXT PRIMARY KEY,
+            parked_ms INTEGER NOT NULL,
+            sensitive INTEGER NOT NULL,
+            state TEXT,
+            dump BLOB,
+            tag BLOB
+        );
+
+        CREATE TABLE enrollments (
+            hash TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            gate TEXT NOT NULL,
+            expires_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE ceremonies (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            choice TEXT,
+            state TEXT NOT NULL,
+            expires_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE tool_cache (
+            server TEXT PRIMARY KEY,
+            tools TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );
+        "#,
+    )
 }
 
 /// How each upstream call's result was typed for the script (`schema`,

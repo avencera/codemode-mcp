@@ -50,6 +50,22 @@ impl Budget {
         }
     }
 
+    /// Starts a budget of `limit` that has already used `spent`, for an
+    /// execution picked up again after a restart
+    pub fn resumed(limit: Duration, spent: Duration) -> Self {
+        let budget = Self::new(limit);
+        budget.state().spent = spent;
+
+        budget
+    }
+
+    /// Time used so far, whether or not the clock is running
+    pub fn spent(&self) -> Duration {
+        let state = self.state();
+
+        state.spent + state.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
     /// Stops the clock until the returned guard (and any other) is dropped
     pub fn pause(&self) -> PauseGuard {
         let mut state = self.state();
