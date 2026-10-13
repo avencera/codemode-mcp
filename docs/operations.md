@@ -88,6 +88,7 @@ policy = "deny"
 - `oauth = true` on a `url` server enables `oauth login` (optional `scopes`, `client_name`).
 - Per tool: `policy` (`allow`, `ask`, `deny`) and, for `ask`, `grant` (`session` or `per_call`). A `session` grant is given to the calling client, not to one MCP session: it covers every running session of that client name for 15 or 60 minutes.
 - The server is session-less: it issues no `mcp-session-id`, for any protocol version. Clients are told apart by the client name in the request `_meta`, the `initialize` handshake or the `user-agent` header. While `execute` or `wait` is waiting, it sends progress notifications every `limits.progress_interval_ms` (15000) to clients that sent a `progressToken`.
+- Result types. A tool that declares no output schema returns a `JsonValue` that scripts narrow with `isinstance`. Give it a type in the tool's table: `output = "text"` for prose or markdown (the script gets a `str`, never parsed), or `output_schema` with an inline JSON Schema table for JSON, e.g. `output_schema = { type = "object", required = ["id"], properties = { id = { type = "string" } } }`. An upstream-declared schema wins over `output_schema` unless the table also sets `force_output_schema = true`. Every result is checked against the schema, so write only fields the tool really returns and mark optional ones with a `required` list or a `["string", "null"]` type. Probe it first: `codemode-mcp exec` a script that prints `json.dumps(await server_tool(...))`.
 - Check the result with `codemode-mcp tools` (connects, lists every tool with its status).
 
 ## Read the usage review
@@ -98,8 +99,19 @@ codemode-mcp review --since 7d --out review.md
 ```
 
 The review lists the most common error fingerprints with an example, the runs that struggled most (a run is an MCP session, or for session-less clients one client's calls with gaps under 10 minutes, so approximate),
-hallucinated tool names, scripts that called tools they never described, and approval timings. Use it to fix
-the agent directions or the stubs. `/stats` on the main listener shows the same numbers as `stats`.
+hallucinated tool names, scripts that called tools they never described, type strictness, and approval timings.
+Use it to fix the agent directions or the stubs. `/stats` on the main listener shows the same numbers as `stats`.
+
+The "Type strictness" section ends with a verdict line:
+
+- `Looks too loose` names the signal: probe executes, runtime errors typing should have caught, or `json.loads`
+  scripts. Look at the untyped-tool ranking in the section and add `output` / `output_schema` overrides for the
+  top tools.
+- `Looks too strict` names a rule whose errors the next execute did not fix, runs abandoned after a type error, or
+  a tool whose results keep failing their schema (`output_mismatch`: loosen or fix that `output_schema`, or use
+  `output = "text"`).
+- `Mixed` means both; fix the schema mismatches first, since they hide the rest.
+- Act on a signal that holds across two reviews; the thresholds are in `docs/design.md`.
 
 ## Troubleshoot
 

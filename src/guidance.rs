@@ -19,6 +19,10 @@ macro_rules! script_rules {
              - ",
             $crate::guidance::tool_call_rule!(),
             "\n\
+             - Results are typed. A tool with no declared result type returns `JsonValue`; narrow it with isinstance:\n  \
+             `v = r.get(\"k\") if isinstance(r, dict) else None`\n  \
+             `name = v if isinstance(v, str) else \"\"`\n  \
+             `Any`, `cast` and `# type: ignore` are rejected.\n\
              - Allowed: top-level `await`; `async def` helpers; `await asyncio.gather(a(), b())` for concurrency \
              (no keyword args such as return_exceptions); if/for/while; list/dict/set comprehensions; f-strings; \
              try/except/finally with built-in exceptions (a refused or unapproved tool call raises \

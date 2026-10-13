@@ -11,6 +11,14 @@ use serde::Serialize;
 
 use crate::{store::now_ms, usage::EXEC_CLIENT};
 
+mod strictness;
+
+pub use strictness::{
+    ABANDONED_SHARE_LIMIT, ClientStrictness, JSON_LOADS_LIMIT, MIN_ERROR_RUNS, MIN_RULE_ERRORS,
+    MISMATCH_LIMIT, PROBE_LIMIT, RUNTIME_ERROR_LIMIT, RuleStats, Strictness,
+    UNRESOLVED_SHARE_LIMIT,
+};
+
 /// Error fingerprints listed at most
 const TOP_FINGERPRINTS: usize = 10;
 /// Runs shown with their full attempt sequence
@@ -129,6 +137,8 @@ pub struct Stats {
     pub slow_tools: Vec<SlowTool>,
     /// Approval counts
     pub approvals: ApprovalStats,
+    /// Whether the type rules are too strict or too loose
+    pub strictness: Strictness,
 }
 
 /// One execution in a run's attempt sequence
@@ -208,6 +218,7 @@ impl<'a> Reporter<'a> {
             fingerprints: self.fingerprints()?,
             slow_tools: self.slow_tools()?,
             approvals: self.approvals()?,
+            strictness: self.strictness()?,
         })
     }
 
@@ -493,6 +504,7 @@ impl<'a> Reporter<'a> {
         self.hallucination_section(&mut out, server_prefixes)?;
         self.undescribed_section(&mut out)?;
         self.search_section(&mut out)?;
+        strictness::render_section(&mut out, &stats.strictness);
         approval_section(&mut out, &stats.approvals);
 
         Ok(out)
@@ -942,6 +954,7 @@ pub fn render_stats(stats: &Stats) -> String {
             .median_wait_ms
             .map_or_else(|| "-".to_owned(), human_duration),
     );
+    strictness::render_text(&mut out, &stats.strictness);
 
     out
 }

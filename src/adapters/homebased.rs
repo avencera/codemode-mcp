@@ -18,15 +18,22 @@ use std::{
 
 use rmcp::{
     ServerHandler, ServiceExt,
-    handler::server::wrapper::Parameters,
+    handler::server::wrapper::{Json, Parameters},
     model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::notify::{Notification, Notifier, Priority};
+
+mod outputs;
+
+use outputs::{
+    Agent, CancelAck, DaemonStatus, FleetMachines, MessageAck, NotifyAck, SubmitAck, TaskDetail,
+    TaskList, TaskLog, TaskStatus, TaskUsage,
+};
 
 /// Environment variable naming the homebased executable
 pub const PROGRAM_ENV: &str = "CODEMODE_HOMEBASED_BIN";
@@ -53,57 +60,6 @@ const CALLER_ENV: [&str; 5] = [
 const INSTRUCTIONS: &str = "Supervise long-running agent workers and commands through homebased. \
      Submits take your own session id as `thread`; results arrive later as HOMEBASED_EVENT \
      messages in that session, so never poll task_show or task_list in a loop.";
-
-/// Status filter values of `task_list`
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskStatus {
-    /// Waiting on `after` dependencies
-    Held,
-    /// Waiting to start
-    Queued,
-    /// Running
-    Running,
-    /// Finished successfully
-    Succeeded,
-    /// Finished with an error
-    Failed,
-    /// Cancelled
-    Cancelled,
-    /// Lost track of
-    Lost,
-    /// Preempted by a priority job
-    Preempted,
-}
-
-impl TaskStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Held => "held",
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Lost => "lost",
-            Self::Preempted => "preempted",
-        }
-    }
-}
-
-/// Agent CLIs homebased can run
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Agent {
-    /// `codex exec`
-    Codex,
-    /// `claude -p`
-    Claude,
-    /// `grok`
-    Grok,
-    /// `opencode run`
-    Opencode,
-}
 
 /// How urgent a notification is
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -536,35 +492,44 @@ impl HomebasedAdapter {
             .run(&args, Some(spec.to_string()), SUBMIT_TIMEOUT)
             .await?;
 
-        Ok(with_field(answer, "request_id", &request_id))
+        Ok(submit_ack(answer, &request_id, dry_run))
     }
 }
 
-/// Adds `key` to an object answer unless homebased already set it
-fn with_field(answer: Value, key: &str, value: &str) -> Value {
-    match answer {
-        Value::Object(mut object) => {
-            object
-                .entry(key.to_owned())
-                .or_insert_with(|| Value::String(value.to_owned()));
-
-            Value::Object(object)
-        }
-        other => {
-            let mut object = Map::new();
-            object.insert("output".to_owned(), other);
-            object.insert(key.to_owned(), Value::String(value.to_owned()));
-
-            Value::Object(object)
+/// The ack of a submit or follow-up
+///
+/// A dry run prints the normalized spec instead of a task, so only its
+/// `argv` and the flag that says nothing started are kept
+fn submit_ack(answer: Value, request_id: &str, dry_run: bool) -> Value {
+    let mut ack = Map::new();
+    ack.insert("request_id".to_owned(), json!(request_id));
+    ack.insert("dry_run".to_owned(), json!(dry_run));
+    for key in ["id", "status", "argv"] {
+        if let Some(value) = answer.get(key) {
+            ack.insert(key.to_owned(), value.clone());
         }
     }
+    // homebased may echo its own request id
+    if let Some(echoed) = answer.get("request_id") {
+        ack.insert("request_id".to_owned(), echoed.clone());
+    }
+
+    Value::Object(ack)
 }
 
-fn result(outcome: Result<Value, AdapterError>) -> CallToolResult {
-    match outcome {
-        Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
-        Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
-    }
+/// The tool's structured result, or the failure as the tool's error text
+///
+/// The answer is read into `T`, which drops fields the agent does not need
+/// and fails loudly when homebased changes a shape the declared schema relies on
+fn typed<T: DeserializeOwned>(
+    outcome: Result<Value, AdapterError>,
+) -> Result<Json<T>, CallToolResult> {
+    let failed = |message: String| CallToolResult::error(vec![ContentBlock::text(message)]);
+    let value = outcome.map_err(|error| failed(error.to_string()))?;
+
+    serde_json::from_value(value)
+        .map(Json)
+        .map_err(|error| failed(format!("unexpected homebased output: {error}")))
 }
 
 fn strings(args: &[&str]) -> Vec<String> {
@@ -574,8 +539,8 @@ fn strings(args: &[&str]) -> Vec<String> {
 #[tool_router]
 impl HomebasedAdapter {
     #[tool(description = "Daemon socket state, web address and in-flight task count.")]
-    async fn daemon_status(&self) -> CallToolResult {
-        result(
+    async fn daemon_status(&self) -> Result<Json<DaemonStatus>, CallToolResult> {
+        typed(
             self.run(&strings(&["daemon", "status"]), None, READ_TIMEOUT)
                 .await,
         )
@@ -586,7 +551,10 @@ impl HomebasedAdapter {
                        session or thread the tasks report to. Do not call this in a loop to \
                        wait for a task; results arrive as HOMEBASED_EVENT messages."
     )]
-    async fn task_list(&self, Parameters(params): Parameters<TaskListParams>) -> CallToolResult {
+    async fn task_list(
+        &self,
+        Parameters(params): Parameters<TaskListParams>,
+    ) -> Result<Json<TaskList>, CallToolResult> {
         let outcome = async {
             let mut args = strings(&["task", "list"]);
             if let Some(statuses) = params.status.filter(|statuses| !statuses.is_empty()) {
@@ -600,11 +568,14 @@ impl HomebasedAdapter {
             self.run(&args, None, READ_TIMEOUT).await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(description = "One task's status, reports, dependencies and last event.")]
-    async fn task_show(&self, Parameters(params): Parameters<TaskIdParams>) -> CallToolResult {
+    async fn task_show(
+        &self,
+        Parameters(params): Parameters<TaskIdParams>,
+    ) -> Result<Json<TaskDetail>, CallToolResult> {
         let outcome = async {
             let args = vec![
                 "task".to_owned(),
@@ -615,11 +586,14 @@ impl HomebasedAdapter {
             self.run(&args, None, READ_TIMEOUT).await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(description = "The last lines of a task's output log (default 200).")]
-    async fn task_log(&self, Parameters(params): Parameters<TaskLogParams>) -> CallToolResult {
+    async fn task_log(
+        &self,
+        Parameters(params): Parameters<TaskLogParams>,
+    ) -> Result<Json<TaskLog>, CallToolResult> {
         let outcome = async {
             let args = vec![
                 "task".to_owned(),
@@ -631,11 +605,14 @@ impl HomebasedAdapter {
             self.run(&args, None, READ_TIMEOUT).await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(description = "Token usage of finished Claude workers, by model, day, thread and task.")]
-    async fn task_usage(&self, Parameters(params): Parameters<TaskUsageParams>) -> CallToolResult {
+    async fn task_usage(
+        &self,
+        Parameters(params): Parameters<TaskUsageParams>,
+    ) -> Result<Json<TaskUsage>, CallToolResult> {
         let outcome = async {
             let mut args = strings(&["task", "usage"]);
             args.push(format!(
@@ -649,12 +626,12 @@ impl HomebasedAdapter {
             self.run(&args, None, READ_TIMEOUT).await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(description = "This machine and the known fleet machines with their reachability.")]
-    async fn fleet_machines(&self) -> CallToolResult {
-        result(
+    async fn fleet_machines(&self) -> Result<Json<FleetMachines>, CallToolResult> {
+        typed(
             self.run(&strings(&["fleet", "machines"]), None, READ_TIMEOUT)
                 .await,
         )
@@ -673,7 +650,7 @@ impl HomebasedAdapter {
     async fn task_submit_agent(
         &self,
         Parameters(params): Parameters<SubmitAgentParams>,
-    ) -> CallToolResult {
+    ) -> Result<Json<SubmitAck>, CallToolResult> {
         let outcome = async {
             let request_id = request_id("request_id", params.request_id.as_deref())?;
             // homebased inlines the prompt file at submit, so the file only
@@ -706,7 +683,7 @@ impl HomebasedAdapter {
                 .await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(
@@ -719,7 +696,7 @@ impl HomebasedAdapter {
     async fn task_submit_command(
         &self,
         Parameters(params): Parameters<SubmitCommandParams>,
-    ) -> CallToolResult {
+    ) -> Result<Json<SubmitAck>, CallToolResult> {
         let outcome = async {
             if params.command.first().is_none_or(String::is_empty) {
                 return Err(AdapterError::Invalid(
@@ -741,7 +718,7 @@ impl HomebasedAdapter {
                 .await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(
@@ -751,7 +728,7 @@ impl HomebasedAdapter {
     async fn task_followup(
         &self,
         Parameters(params): Parameters<FollowupParams>,
-    ) -> CallToolResult {
+    ) -> Result<Json<SubmitAck>, CallToolResult> {
         let outcome = async {
             let request_id = request_id("request_id", params.request_id.as_deref())?;
             let directory = PrivateDir::create()?;
@@ -773,16 +750,20 @@ impl HomebasedAdapter {
             if params.dry_run.unwrap_or(false) {
                 args.push("--dry-run".to_owned());
             }
+            let dry_run = params.dry_run.unwrap_or(false);
             let answer = self.run(&args, None, SUBMIT_TIMEOUT).await?;
 
-            Ok(with_field(answer, "request_id", &request_id))
+            Ok(submit_ack(answer, &request_id, dry_run))
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(description = "Cancel a task. Idempotent when the task already finished.")]
-    async fn task_cancel(&self, Parameters(params): Parameters<TaskIdParams>) -> CallToolResult {
+    async fn task_cancel(
+        &self,
+        Parameters(params): Parameters<TaskIdParams>,
+    ) -> Result<Json<CancelAck>, CallToolResult> {
         let outcome = async {
             let args = vec![
                 "task".to_owned(),
@@ -793,7 +774,7 @@ impl HomebasedAdapter {
             self.run(&args, None, WRITE_TIMEOUT).await
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(
@@ -803,7 +784,10 @@ impl HomebasedAdapter {
                        worker). Returns a receipt with message_id; retry with the same \
                        message_id to avoid a duplicate."
     )]
-    async fn message_send(&self, Parameters(params): Parameters<MessageParams>) -> CallToolResult {
+    async fn message_send(
+        &self,
+        Parameters(params): Parameters<MessageParams>,
+    ) -> Result<Json<MessageAck>, CallToolResult> {
         let outcome = async {
             let destinations = [
                 ("thread", params.thread.as_deref()),
@@ -838,19 +822,30 @@ impl HomebasedAdapter {
             }
             let answer = self.run(&args, None, WRITE_TIMEOUT).await?;
 
-            Ok(with_field(answer, "message_id", &message_id))
+            // the CLI echoes the id; this keeps the ack usable if it ever stops
+            Ok(match answer {
+                Value::Object(mut ack) => {
+                    ack.entry("message_id").or_insert_with(|| json!(message_id));
+
+                    Value::Object(ack)
+                }
+                other => json!({ "message_id": message_id, "output": other }),
+            })
         };
 
-        result(outcome.await)
+        typed(outcome.await)
     }
 
     #[tool(
         description = "Push a notification to the owner's phone. Use `blocked` only when work \
                        cannot continue without them."
     )]
-    async fn notify(&self, Parameters(params): Parameters<NotifyParams>) -> CallToolResult {
+    async fn notify(
+        &self,
+        Parameters(params): Parameters<NotifyParams>,
+    ) -> Result<Json<NotifyAck>, CallToolResult> {
         let Some(notifier) = self.0.notifier.clone() else {
-            return result(Err(AdapterError::Invalid(
+            return typed(Err(AdapterError::Invalid(
                 "no ntfy topic is configured for codemode-mcp or homebased".into(),
             )));
         };
@@ -868,7 +863,7 @@ impl HomebasedAdapter {
             tag,
         };
 
-        result(
+        typed(
             notifier
                 .notify(&notification)
                 .await

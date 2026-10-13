@@ -103,12 +103,18 @@ log = await homebased_task_log(id="{AFTER}")
     else {
         return Err(format!("unexpected result {body}").into());
     };
-    assert_eq!(listed["tasks"], json!([]), "{body}");
+    assert_eq!(listed["tasks"].as_array().map(Vec::len), Some(3), "{body}");
+    assert_eq!(listed["tasks"][1]["status"], "failed", "{body}");
+    assert_eq!(listed["tasks"][1]["exit_reason"]["code"], 1, "{body}");
+    // fields outside the declared shape are dropped
+    assert!(listed["tasks"][0].get("callback").is_none(), "{body}");
     assert_eq!(status["socket"], "up", "{body}");
     let request_id = submitted["request_id"].as_str().ok_or("no request_id")?;
     assert!(uuid::Uuid::parse_str(request_id).is_ok(), "{submitted}");
     assert_eq!(submitted["status"], "queued", "{submitted}");
     assert_eq!(again["request_id"], request_id, "{again}");
+    assert_eq!(again["dry_run"], true, "{again}");
+    assert!(again.get("id").is_none(), "{again}");
     assert_ne!(command["request_id"], request_id, "{command}");
 
     let calls = fake.calls()?;
@@ -272,7 +278,7 @@ async fn real_homebased_answers_read_only_calls() -> TestResult {
             ]);
         });
     let client = ().serve(TokioChildProcess::new(command)?).await?;
-    for tool in ["daemon_status", "task_list"] {
+    for (tool, key) in [("daemon_status", "socket"), ("task_list", "tasks")] {
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             client.call_tool(CallToolRequestParams::new(tool)),
@@ -281,7 +287,7 @@ async fn real_homebased_answers_read_only_calls() -> TestResult {
         let text = text_of(&result);
         assert_eq!(result.is_error, Some(false), "{tool}: {text}");
         let value: Value = serde_json::from_str(&text)?;
-        assert_eq!(value["api_version"], 1, "{tool}: {text}");
+        assert!(value.get(key).is_some(), "{tool}: {text}");
     }
     client.cancel().await?;
 

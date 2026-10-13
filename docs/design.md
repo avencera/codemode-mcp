@@ -56,7 +56,9 @@ idempotent. `tools/list_changed` refreshes the catalog
 
 - Tools are namespaced by server: `exa.web_search`, `onepassword.list_environments`
 - Each server becomes a Python host module with a generated `.pyi` stub:
-  JSON Schema → `TypedDict` inputs, `async def` functions, docstrings from tool descriptions
+  JSON Schema → `TypedDict` inputs and results, `async def` functions, docstrings from tool descriptions. No
+  function returns `Any`: a tool with an output schema returns the generated type, any other returns `JsonValue`
+  (see Type strictness). `describe_tools` declares each shared `TypedDict` once
 - Search ranks over name, description and parameter names (BM25 is enough at this scale)
 
 ### Executor
@@ -66,6 +68,10 @@ idempotent. `tools/list_changed` refreshes the catalog
 - Type checking with the bundled `ty` against the generated stubs; type errors are returned to the agent as-is
 - Limits per execution: memory, wall-clock budget excluding time spent waiting for approval, max suspensions
 - Tool calls inside a script run concurrently through `asyncio.gather`
+- Scripts that use `Any`, `cast` or a `# type: ignore` / `# ty: ignore` comment are refused before `ty` runs (see Type strictness)
+- A tool result is validated against the tool's effective output schema before the script sees it; a mismatch
+  raises `RuntimeError` naming the tool, the JSON path and the expected and actual type, and the upstream call is
+  logged as `output_mismatch`
 - Upstream results are measured (depth, element count, bytes; `limits.max_tool_result_bytes`, default 4 MiB) before they are converted into Python values; an oversized result raises `ValueError` at the call site
 - While an execution waits only on approvals, its session is dumped (`Checkout::dump`), sealed with HMAC-SHA256 under a per-install key (`<state_dir>/snapshot.key`, mode 0600), the worker and its slot are released, and on the decision the dump is verified and restored on a fresh worker (see Approvals)
 
@@ -222,6 +228,71 @@ defaults `tool_timeout_sec` to 60 s per call. Claude Code's wall-clock
 response or progress notification aborts after 5 minutes of idle time
 (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`). A 25 s wait budget fits both
 
+### Type strictness
+
+**Goal.** A fast agent experience with few mistakes and few wasted tokens, not maximum strictness. Agents lose
+turns two ways: they do not know a tool's result shape, so they spend an `execute` printing it or guess a key and
+hit a runtime error; and they silence a type error that then fails at runtime. Hard rule: no tool function's
+return type is `Any`.
+
+**Enforced.**
+
+- Result types. A tool with an `outputSchema` returns the `TypedDict` (or type) generated from it. A tool without
+  one returns `JsonValue`, declared once in the stub header as
+  `type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]` (PEP 695; ty 0.0.14
+  narrows it with `isinstance`, the stubs are never executed, so Monty never sees the statement). Parameters of
+  unknown type accept `object`, results of unknown type are `JsonValue`; the header has no `Any`. The
+  `**kwargs` fallback for parameter names that are not identifiers is `**kwargs: Unpack[<TypedDict>]` using the
+  functional `TypedDict` syntax, which ty accepts
+- Per-tool overrides (`[servers.<s>.tools.<t>]`): `output_schema` is an inline TOML table holding a JSON Schema;
+  `output = "text"` returns the joined text as `str`, never parsed. Precedence: `output = "text"` wins over any
+  upstream schema; an upstream-declared schema wins over `output_schema`, so a schema written for a server that
+  later documents its own stops applying without an edit; `force_output_schema = true` makes the configured schema
+  win. `output` and `output_schema` cannot be combined. The starter config types the OpenAI docs search, list and
+  endpoint tools and marks Exa and `fetch_openai_doc` as text
+- Runtime check. Every result is validated against its effective schema (upstream, config or adapter) before the
+  script sees it, by a validator for the subset `stubs` turns into types (`type`, `nullable`, `enum`, `const`,
+  `required`, `properties`, `additionalProperties`, `items`/`prefixItems`, `allOf`/`anyOf`/`oneOf`, `$ref`); other
+  keywords such as `pattern`, `minimum` and `format` pass. A text result for a `str` tool always passes. Sensitive
+  servers log the path and expected type of a mismatch and never the value
+- Bans before `ty` runs (`src/bans.rs`, `ruff_python_parser` pinned to the version Monty uses): a use of `Any` or
+  `cast` imported under any alias, `<typing alias>.Any` and `<typing alias>.cast`, and `# type: ignore` /
+  `# ty: ignore` comment tokens (text inside a string is not a comment). An unused import is allowed: it switches
+  nothing off, and the first smoke run showed agents add one out of habit, which cost a retry for no gain. They come back as a `type_error` with rule ids
+  `ban:any`, `ban:cast`, `ban:type-ignore` and a one-line hint
+
+**Deliberately skipped.** A second checker (mypy, basedpyright), required annotations on `def`s, and bans on bare
+`list` or `dict`. They cost agents turns, and the review below says whether they would pay off.
+
+**How the weekly review judges it.** `review` and `/stats` carry a "Type strictness" section per client:
+
+- Too strict: `type_error` counts per rule (ty rule names and `ban:*`); for each rule the share resolved by the
+  next execute of the run (the next execute no longer reports the rule); the share of runs with a type error that
+  never had a successful execute afterwards; `output_mismatch` counts per tool
+- Not strict enough: runtime errors that typing should have caught (`KeyError`, `TypeError`, `AttributeError`, or
+  a message naming a tool result); probe executes (a script that is, ignoring imports, one awaited tool call or a
+  gather of bare tool calls returned as is, optionally through a variable); calls to tools still returning
+  `JsonValue`, ranked, which are the next schemas to write (`upstream_calls.output` records `schema`, `text` or
+  `untyped` per call); scripts using `json.loads`
+- One verdict line from named constants in `src/usage/report/strictness.rs`:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `MIN_RULE_ERRORS` | 5 | errors of a rule before its unresolved share counts |
+| `UNRESOLVED_SHARE_LIMIT` | 40% | unresolved share from which a rule looks too strict |
+| `MIN_ERROR_RUNS` | 5 | runs with a type error before the abandoned share counts |
+| `ABANDONED_SHARE_LIMIT` | 30% | abandoned share from which the rules look too strict |
+| `MISMATCH_LIMIT` | 3 | `output_mismatch` calls of one tool that mark its schema wrong |
+| `PROBE_LIMIT` | 5 | probe executes from which typing looks too loose |
+| `RUNTIME_ERROR_LIMIT` | 5 | typed-catchable runtime errors from which typing looks too loose |
+| `JSON_LOADS_LIMIT` | 5 | `json.loads` scripts from which typing looks too loose |
+
+The verdict is `Looks too strict`, `Looks too loose`, `Mixed` or `Looks balanced`, summed over clients.
+
+**Escalation.** If the not-strict-enough signals stay over their thresholds across two consecutive reviews after
+the untyped tools they name got schemas, add a strict checker for scripts. If a rule's unresolved share stays high,
+relax that rule (or drop its ban) instead of adding hints.
+
 ### Usage tracking
 
 Goal: see whether agents use Code Mode well or get confused, and feed that back into the directions and stubs
@@ -230,13 +301,13 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   Tables: `sessions`, `calls` (every agent-facing call: time, app session label, session state, client name/version, tool,
   input — query, described names or script —, outcome, detail, fingerprint, duration, result bytes, execution id),
   `executions` (one row per finished execution with its script and final outcome), `upstream_calls` (server,
-  tool, Python name, arguments, outcome, duration, approval id), `approvals`, `passkeys`
+  tool, Python name, arguments, outcome, duration, approval id, how the result was typed), `approvals`, `passkeys`
 - Records go through a bounded channel (4096) to a writer thread; when it is full the record is dropped and
   counted, so logging never blocks or fails an agent call
 - Outcome taxonomy, classified from structured executor results: `ok`, `type_error` (ty rule codes kept),
   `unsupported_syntax` (Monty `NotImplementedError`), `name_error` (only `unresolved-reference` diagnostics, unknown
   tools, unknown described names), `import_error` (only `unresolved-import`), `runtime_error` (exception type kept),
-  `tool_error`, `timeout`, `denied`, `pending`, `busy`. An exception is traced back to the tool failure the host
+  `tool_error`, `output_mismatch` (a result broke its output schema), `timeout`, `denied`, `pending`, `busy`. An exception is traced back to the tool failure the host
   injected when its type and message match, so an unhandled tool error is `tool_error`/`denied`/`timeout`, not
   `runtime_error`
 - Error fingerprint: outcome plus the detail with quoted literals, numbers, hex ids and whitespace normalized
@@ -252,8 +323,8 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - `codemode-mcp review [--since 7d] [--out FILE]`: Markdown with a per-client summary, top fingerprints with one
   example script and error each, the 5 runs with the most failed executes before success or abandonment as their
   ordered attempt sequence, hallucinated tool names (`name_error` names that start with a configured `<server>_`),
-  executes that called tools never described in that run, empty and repeated searches, and approval stats
-  (count, median wait, denied, expired)
+  executes that called tools never described in that run, empty and repeated searches, type strictness (see
+  Type strictness), and approval stats (count, median wait, denied, expired)
 - Retention `log_retention_days` (90); purged on startup and daily. Passkeys are kept
 
 ### Threat model
@@ -335,6 +406,11 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   from homebased's environment: it acts for many sessions and must not pass its own caller identity on
 - `notify` posts through the shared ntfy module (blocked = urgent, important = high, done = default), because
   `homebased notify` only sends a test message
+- Every tool declares an `outputSchema` and returns `structured_content` (serde structs with schemars in
+  `src/adapters/homebased/outputs.rs`), read from real `homebased --json` output and cut to the fields an agent
+  acts on: statuses are enums (stubs: `Literal`), fields homebased leaves out are `NotRequired`, and mutating tools
+  return small acks (`request_id`/`id`/`status`, `message_id`, `{ok}`). A dry run submit returns
+  `{request_id, dry_run: true, argv}`. `task_list` drops the CLI's extra fields, which shrinks a long history
 - homebased errors (`{"error": {code, message, retryable}}` on stderr) become tool errors:
   `homebased error <code> (exit <n>, retryable: <bool>): <message>`
 - Starter policies: `task_submit_command`, `task_cancel` and `message_send` are `ask` with session grants, the
@@ -412,6 +488,7 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - OAuth registrations and tokens are committed together at the end of a login, in SQLite
 - T3 Code stays outside the gateway for now
 - The homebased adapter ships in the main binary; submit is split by workload (`agent` allowed, `task` asks)
+- No tool returns `Any`; `Any`, `cast` and `type: ignore` in scripts are refused; the review decides whether to tighten or relax (see Type strictness)
 
 ## Open questions
 

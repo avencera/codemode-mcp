@@ -52,6 +52,9 @@ pub enum Outcome {
     RuntimeError,
     /// An upstream tool failed and the script did not handle it
     ToolError,
+    /// A tool's result broke its declared output schema, so the script never
+    /// saw it
+    OutputMismatch,
     /// A time limit ended the call or execution
     Timeout,
     /// Policy or a person refused a tool call
@@ -73,6 +76,7 @@ impl Outcome {
             Self::ImportError => "import_error",
             Self::RuntimeError => "runtime_error",
             Self::ToolError => "tool_error",
+            Self::OutputMismatch => "output_mismatch",
             Self::Timeout => "timeout",
             Self::Denied => "denied",
             Self::Pending => "pending",
@@ -297,6 +301,8 @@ pub struct UpstreamRecord {
     pub duration: Duration,
     /// Approval or grant that allowed the call
     pub approval_id: Option<String>,
+    /// How the result was typed for the script: `schema`, `text` or `untyped`
+    pub output: &'static str,
 }
 
 /// A change to an approval request
@@ -591,8 +597,8 @@ fn insert_upstream(
 ) -> Result<(), rusqlite::Error> {
     connection.execute(
         "INSERT INTO upstream_calls (at_ms, execution_id, server, tool, function, arguments, \
-         outcome, detail, duration_ms, approval_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         outcome, detail, duration_ms, approval_id, output) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             now_ms() - millis(record.duration),
             record.execution_id,
@@ -604,6 +610,7 @@ fn insert_upstream(
             record.classification.detail,
             millis(record.duration),
             record.approval_id,
+            record.output,
         ],
     )?;
 

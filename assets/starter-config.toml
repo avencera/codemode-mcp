@@ -25,13 +25,41 @@ grant = "per_call"
 [servers.onepassword.warm]
 calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 
+# Result types. A tool that declares no output schema returns a `JsonValue`
+# the script has to narrow, so the tools below say what they return. An
+# `output_schema` applies only while the upstream declares none (add
+# `force_output_schema = true` to override one), and results are checked
+# against it. `output = "text"` returns the text as a `str`, unparsed.
+# `codemode-mcp review` ranks the tools still returning `JsonValue`
 [servers.openai_docs]
 url = "https://developers.openai.com/mcp"
 
-# works anonymously; `codemode-mcp oauth login exa` signs in for higher limits
+[servers.openai_docs.tools.fetch_openai_doc]
+output = "text"
+
+# one hit of search_openai_docs and list_openai_docs; the Algolia
+# `_highlightResult` markup is left out on purpose
+[servers.openai_docs.tools.search_openai_docs]
+output_schema = { type = "object", required = ["hits", "nbHits", "page"], properties = { nbHits = { type = "integer" }, page = { type = "integer" }, nextCursor = { type = ["string", "null"] }, hits = { type = "array", items = { type = "object", required = ["url", "url_without_anchor", "type", "anchor", "content", "hierarchy", "objectID"], properties = { url = { type = "string" }, url_without_anchor = { type = "string" }, type = { type = "string" }, anchor = { type = "string" }, content = { type = ["string", "null"] }, objectID = { type = "string" }, hierarchy = { type = "object", required = ["lvl0", "lvl1"], properties = { lvl0 = { type = "string" }, lvl1 = { type = "string" }, lvl2 = { type = ["string", "null"] }, lvl3 = { type = ["string", "null"] }, lvl4 = { type = ["string", "null"] }, lvl5 = { type = ["string", "null"] }, lvl6 = { type = ["string", "null"] } } } } } } } }
+
+[servers.openai_docs.tools.list_openai_docs]
+output_schema = { type = "object", required = ["hits", "nbHits", "page"], properties = { nbHits = { type = "integer" }, page = { type = "integer" }, nextCursor = { type = ["string", "null"] }, hits = { type = "array", items = { type = "object", required = ["url", "url_without_anchor", "type", "anchor", "content", "hierarchy", "objectID"], properties = { url = { type = "string" }, url_without_anchor = { type = "string" }, type = { type = "string" }, anchor = { type = "string" }, content = { type = ["string", "null"] }, objectID = { type = "string" }, hierarchy = { type = "object", required = ["lvl0", "lvl1"], properties = { lvl0 = { type = "string" }, lvl1 = { type = "string" }, lvl2 = { type = ["string", "null"] }, lvl3 = { type = ["string", "null"] }, lvl4 = { type = ["string", "null"] }, lvl5 = { type = ["string", "null"] }, lvl6 = { type = ["string", "null"] } } } } } } } }
+
+[servers.openai_docs.tools.list_api_endpoints]
+output_schema = { type = "object", required = ["baseUrls", "paths", "total", "urls"], properties = { baseUrls = { type = "array", items = { type = "string" } }, paths = { type = "array", items = { type = "string" } }, urls = { type = "array", items = { type = "string" } }, total = { type = "integer" } } }
+
+# works anonymously; `codemode-mcp oauth login exa` signs in for higher limits.
+# Search and fetch answer with prose and markdown, not JSON
 [servers.exa]
 url = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa"
 oauth = true
+
+[servers.exa.tools.web_search_exa]
+output = "text"
+[servers.exa.tools.web_search_advanced_exa]
+output = "text"
+[servers.exa.tools.web_fetch_exa]
+output = "text"
 
 # homebased through the built-in adapter. Submitting arbitrary commands,
 # cancelling tasks and messaging other sessions ask on the phone, with a

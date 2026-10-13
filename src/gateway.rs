@@ -23,6 +23,7 @@ use crate::{
     convert::json_to_monty,
     executor::Executor,
     oauth::OAuth,
+    output::{Mismatch, OutputSpec, validate},
     policy::Policy,
     upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
@@ -75,11 +76,19 @@ pub enum ToolCallError {
     /// The upstream ran the tool and it reported an error
     #[error("{0}")]
     ToolFailed(String),
-    /// The tool declares an output schema but returned nothing structured
+    /// The tool has an output schema but returned nothing structured
     #[error(
-        "tool `{0}` declares an output schema but returned neither structured content nor JSON text"
+        "tool `{0}` has an output schema but returned neither structured content nor JSON text"
     )]
     MissingOutput(String),
+    /// The result does not match the tool's output schema
+    #[error("tool `{tool}` returned data that breaks its output schema {mismatch}")]
+    OutputMismatch {
+        /// Python name of the tool
+        tool: String,
+        /// Where and how it broke
+        mismatch: Mismatch,
+    },
     /// The result is too large or deep to hand to a script
     #[error("tool `{tool}` returned a result the sandbox will not accept: {reason}")]
     ResultTooLarge {
@@ -98,9 +107,10 @@ impl ToolCallError {
             Self::Denied(_) | Self::NotApproved { .. } => ExcType::PermissionError,
             Self::Upstream(UpstreamError::TimedOut { .. }) => ExcType::TimeoutError,
             Self::ResultTooLarge { .. } => ExcType::ValueError,
-            Self::Upstream(_) | Self::ToolFailed(_) | Self::MissingOutput(_) => {
-                ExcType::RuntimeError
-            }
+            Self::Upstream(_)
+            | Self::ToolFailed(_)
+            | Self::MissingOutput(_)
+            | Self::OutputMismatch { .. } => ExcType::RuntimeError,
         }
     }
 
@@ -110,6 +120,7 @@ impl ToolCallError {
             Self::Unknown(_) => Outcome::NameError,
             Self::Denied(_) | Self::NotApproved { .. } => Outcome::Denied,
             Self::Upstream(UpstreamError::TimedOut { .. }) => Outcome::Timeout,
+            Self::OutputMismatch { .. } => Outcome::OutputMismatch,
             Self::Upstream(_)
             | Self::ToolFailed(_)
             | Self::MissingOutput(_)
@@ -129,7 +140,7 @@ pub struct PreparedCall {
     /// Whether logs must omit this call's arguments and error text
     pub sensitive: bool,
     arguments: Map<String, Value>,
-    has_output_schema: bool,
+    output: OutputSpec,
 }
 
 /// How a call proceeds after [`Gateway::prepare`]
@@ -417,7 +428,7 @@ impl Gateway {
             tool: entry.tool.clone(),
             sensitive: server_config.is_some_and(|server| server.is_sensitive()),
             arguments: omit_none_arguments(entry, arguments),
-            has_output_schema: entry.has_output_schema,
+            output: entry.output.clone(),
         };
         if entry.policy == Policy::Deny {
             return Err(self.refuse(context, &call, ToolCallError::Denied(function.to_owned())));
@@ -514,6 +525,12 @@ impl Gateway {
                 error => ToolCallError::Upstream(error),
             })?;
         let value = self.tool_result_value(call, result)?;
+        if let OutputSpec::Schema(schema) = &call.output {
+            validate(schema, &value).map_err(|mismatch| ToolCallError::OutputMismatch {
+                tool: call.function.clone(),
+                mismatch,
+            })?;
+        }
 
         json_to_monty(&value, self.max_tool_result_bytes).map_err(|error| {
             ToolCallError::ResultTooLarge {
@@ -535,7 +552,16 @@ impl Gateway {
             Ok(()) => Classification::ok(),
             Err(error) => Classification {
                 outcome: error.outcome(),
-                detail: (!call.sensitive).then(|| error.to_string()),
+                detail: match error {
+                    _ if !call.sensitive => Some(error.to_string()),
+                    // the path and the expected type are schema facts; only
+                    // the offending value is withheld
+                    ToolCallError::OutputMismatch { mismatch, .. } => Some(format!(
+                        "at {}: expected {}",
+                        mismatch.path, mismatch.expected
+                    )),
+                    _ => None,
+                },
             },
         };
 
@@ -548,6 +574,7 @@ impl Gateway {
             classification,
             duration,
             approval_id,
+            output: call.output.kind(),
         });
     }
 
@@ -693,8 +720,10 @@ impl Gateway {
     /// Converts an MCP tool result to the value a script receives
     ///
     /// Structured content wins. Without it, text that is a JSON object or
-    /// array is parsed, and anything else is the text itself. Tool-reported
-    /// errors become exceptions so scripts cannot mistake them for data
+    /// array is parsed, and anything else is the text itself. A tool
+    /// configured as `output = "text"` always gives its joined text.
+    /// Tool-reported errors become exceptions so scripts cannot mistake them
+    /// for data
     fn tool_result_value(
         &self,
         call: &PreparedCall,
@@ -727,13 +756,23 @@ impl Gateway {
 
             return Err(ToolCallError::ToolFailed(message));
         }
+        if matches!(call.output, OutputSpec::Text) {
+            // a text tool that sends only structured content still gives the
+            // script something to read
+            return Ok(Value::String(
+                match (text.is_empty(), result.structured_content) {
+                    (true, Some(structured)) => structured.to_string(),
+                    _ => text.join("\n"),
+                },
+            ));
+        }
         if let Some(structured) = result.structured_content {
             return Ok(structured);
         }
         if let Some(parsed) = json_from_text(&text) {
             return Ok(parsed);
         }
-        if call.has_output_schema {
+        if matches!(call.output, OutputSpec::Schema(_)) {
             return Err(ToolCallError::MissingOutput(call.function.clone()));
         }
 

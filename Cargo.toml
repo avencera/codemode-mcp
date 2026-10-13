@@ -29,6 +29,11 @@ rmcp = { version = "=3.5.1", default-features = false, features = [
     "transport-streamable-http-client-reqwest",
     "transport-streamable-http-server",
 ] }
+# the parser behind the escape-hatch ban; pinned to the version Monty 1.1.0
+# uses, so the ban reads scripts the way the sandbox does
+ruff_python_ast = "=0.0.14"
+ruff_python_parser = "=0.0.14"
+ruff_text_size = "=0.0.14"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }

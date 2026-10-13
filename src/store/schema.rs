@@ -5,13 +5,18 @@ use rusqlite::Connection;
 use super::StoreError;
 
 /// Version a fully migrated database reports
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
-const MIGRATIONS: [Migration; 3] = [create_tables, create_oauth_tables, create_sessions];
+const MIGRATIONS: [Migration; 4] = [
+    create_tables,
+    create_oauth_tables,
+    create_sessions,
+    add_call_output,
+];
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 
@@ -29,6 +34,13 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
 
     Ok(())
+}
+
+/// How each upstream call's result was typed for the script (`schema`,
+/// `text` or `untyped`), so the review can rank tools that still return a
+/// `JsonValue` without knowing the catalog
+fn add_call_output(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute_batch("ALTER TABLE upstream_calls ADD COLUMN output TEXT;")
 }
 
 /// App sessions issued by the server. Only the SHA-256 of a token is kept,

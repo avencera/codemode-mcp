@@ -27,6 +27,7 @@ use tokio::{
 
 use crate::{
     approvals::Verdict,
+    bans,
     budget::Budget,
     catalog::Catalog,
     config::{Config, Limits},
@@ -417,6 +418,17 @@ impl Executor {
         code: String,
         caller: Caller,
     ) -> ExecutionOutcome {
+        // before taking a worker: a refused script costs no sandbox time
+        let bans = bans::find(&code);
+        if !bans.is_empty() {
+            let diagnostics = bans::diagnostics(&bans);
+
+            return ExecutionOutcome::TypeError {
+                class: classify_typing(&diagnostics),
+                diagnostics,
+            };
+        }
+
         let permit = match ticket.permit().await {
             Ok(permit) => permit,
             Err(message) => return ExecutionOutcome::failed(message, String::new(), Outcome::Busy),

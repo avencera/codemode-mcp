@@ -9,6 +9,7 @@ mod oauth;
 mod service;
 mod session_less;
 mod sessions;
+mod typed_outputs;
 mod usage;
 
 use std::{
@@ -222,8 +223,7 @@ async fn huge_shared_results_are_truncated_not_expanded() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ask_policy_fails_closed_without_a_notifier() -> TestResult {
-    let Some(harness) = Harness::start("", "[servers.fixture.tools.add]\npolicy = \"ask\"").await?
-    else {
+    let Some(harness) = Harness::start("", "tools.add.policy = \"ask\"").await? else {
         return Ok(());
     };
 
@@ -275,10 +275,14 @@ async fn root_ref_open_and_awkward_schemas_are_callable() -> TestResult {
 
     let body = harness
         .execute_json(
-            "by_ref = await fixture_ref_root(query=\"q\")\n\
+            "def field(value, key: str) -> JsonValue:\n    \
+                 if isinstance(value, dict):\n        \
+                 return value.get(key)\n    \
+                 return None\n\
+             by_ref = await fixture_ref_root(query=\"q\")\n\
              open_args = await fixture_open_args(a=\"1\", extra=2)\n\
              odd = await fixture_odd_names(**{\"page-size\": 5})\n\
-             {\"ref\": by_ref[\"query\"], \"extra\": open_args[\"extra\"], \"odd\": odd[\"page-size\"]}",
+             {\"ref\": field(by_ref, \"query\"), \"extra\": field(open_args, \"extra\"), \"odd\": field(odd, \"page-size\")}",
         )
         .await?;
     assert_eq!(

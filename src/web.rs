@@ -559,6 +559,46 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
             )
         })
         .collect();
+    let strictness: String = stats
+        .strictness
+        .clients
+        .iter()
+        .map(|client| {
+            let rules: String = client
+                .rules
+                .iter()
+                .take(3)
+                .map(|rule| {
+                    format!(
+                        "<code>{}</code> {} ({} unresolved)",
+                        escape(&rule.rule),
+                        rule.errors,
+                        escape(&percent(Some(rule.unresolved_share())))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let top = |rows: &[(String, i64)]| {
+                rows.first().map_or_else(
+                    || "-".to_owned(),
+                    |(tool, count)| format!("<code>{}</code> ({count})", escape(tool)),
+                )
+            };
+
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape(&client.client),
+                if rules.is_empty() { "-".to_owned() } else { rules },
+                client.abandoned_runs,
+                client.error_runs,
+                top(&client.mismatches),
+                client.typed_runtime_errors,
+                client.probes,
+                client.json_loads,
+                top(&client.untyped_calls),
+            )
+        })
+        .collect();
     let approvals = &stats.approvals;
 
     format!(
@@ -570,9 +610,13 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
 <table><tr><th>Count</th><th>Fingerprint</th></tr>{fingerprints}</table>
 <h2>Slowest upstream tools</h2>
 <table><tr><th>Tool</th><th>Mean</th><th>Max</th><th>Calls</th></tr>{slow}</table>
+<h2>Type strictness</h2>
+<p>{verdict}</p>
+<table><tr><th>Client</th><th>Type errors by rule</th><th>Runs abandoned after one / runs with one</th><th>Top output mismatch</th><th>Typed runtime errors</th><th>Probe executes</th><th>json.loads</th><th>Top untyped tool</th></tr>{strictness}</table>
 <h2>Approvals</h2>
 <p>{requested} requested, {approved} approved, {denied} denied, {expired} expired; median wait {wait}</p>"#,
         window = escape(&human_duration(window.as_millis() as i64)),
+        verdict = escape(&stats.strictness.verdict),
         requested = approvals.requested,
         approved = approvals.approved,
         denied = approvals.denied,

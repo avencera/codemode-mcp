@@ -3,12 +3,85 @@
 //! The stubs serve two readers: Monty's type checker (compact, no
 //! docstrings) and agents calling `describe_tools` (full documentation)
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 use serde_json::{Map, Value};
 
 /// Names every generated stub may use from `typing`
-pub const STUB_HEADER: &str = "from typing import Any, Literal, NotRequired, TypedDict\n";
+pub const STUB_HEADER: &str =
+    "from typing import Literal, Mapping, NotRequired, Sequence, TypedDict, Unpack\n";
+
+/// Name of the recursive alias for any JSON value
+pub const JSON_VALUE: &str = "JsonValue";
+
+/// Declaration of [`JSON_VALUE`], placed after the header wherever it is used
+///
+/// A PEP 695 `type` statement is the one recursive spelling both Monty's
+/// type checker and its parser accept; stubs are never executed, so the
+/// statement does not have to run
+pub const JSON_VALUE_ALIAS: &str =
+    "type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]\n";
+
+/// Names the header and the alias define, so no generated type reuses them
+const RESERVED_NAMES: [&str; 8] = [
+    "Literal",
+    "Mapping",
+    "NotRequired",
+    "Sequence",
+    "TypedDict",
+    "Unpack",
+    JSON_VALUE,
+    "None",
+];
+
+/// Which way a type travels, because unknown shapes differ by direction
+///
+/// A script may pass anything JSON-like into an unknown parameter, but
+/// reading an unknown result needs a type it can narrow
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Arguments the script passes to the tool
+    Input,
+    /// Results the tool returns
+    Output,
+}
+
+impl Direction {
+    /// Type of a value with no known shape
+    fn unknown(self) -> &'static str {
+        match self {
+            Self::Input => "object",
+            Self::Output => JSON_VALUE,
+        }
+    }
+
+    /// Type of a list with no known item shape
+    ///
+    /// Inputs use `Sequence` because `list` is invariant, so a `list[str]`
+    /// variable would be rejected where `list[object]` is expected
+    fn unknown_list(self) -> &'static str {
+        match self {
+            Self::Input => "Sequence[object]",
+            Self::Output => "list[JsonValue]",
+        }
+    }
+
+    /// Type of an object with no known properties
+    fn unknown_dict(self) -> &'static str {
+        match self {
+            Self::Input => "Mapping[str, object]",
+            Self::Output => "dict[str, JsonValue]",
+        }
+    }
+}
+
+/// Whether a rendered type is one of the catch-all types of either direction
+fn is_unknown(ty: &str) -> bool {
+    ty == "object" || ty == JSON_VALUE
+}
 
 /// Reserved words that cannot be keyword argument names
 const PYTHON_KEYWORDS: [&str; 35] = [
@@ -18,13 +91,29 @@ const PYTHON_KEYWORDS: [&str; 35] = [
     "with", "yield",
 ];
 
+/// One TypedDict shared by every tool that needs the same shape
+#[derive(Debug)]
+pub struct Declaration {
+    /// Name of the type
+    pub name: String,
+    /// Source for type checking, without docstrings
+    pub check: String,
+    /// Source with full documentation, for agents
+    pub describe: String,
+}
+
 /// Generated declarations for one tool
 #[derive(Debug, Clone)]
 pub struct ToolStub {
-    /// Declarations for type checking, without docstrings
-    pub check: String,
-    /// Declarations with full documentation, for agents
-    pub describe: String,
+    /// Types the signature uses, each after the types it refers to
+    ///
+    /// Tools with an identical type share one [`Declaration`], so a catalog
+    /// emits each name once
+    pub declarations: Vec<Arc<Declaration>>,
+    /// The `async def` line for type checking, without docstrings
+    pub signature: String,
+    /// The function with full documentation, for agents
+    pub documented: String,
     /// Optional parameters that do not accept JSON `null`; a script passing
     /// `None` for one of these means "omitted"
     pub omit_if_none: BTreeSet<String>,
@@ -33,12 +122,65 @@ pub struct ToolStub {
     pub non_identifier_params: bool,
     /// The stub is a permissive stand-in because the generated one was rejected
     pub degraded: bool,
+    /// The signature mentions [`JSON_VALUE`], so the alias must be declared
+    pub uses_json_value: bool,
 }
 
-/// Allocates globally unique type names across all generated tools
-#[derive(Debug, Default)]
+impl ToolStub {
+    /// This tool alone as documentation, after the header and alias
+    pub fn describe(&self) -> String {
+        let mut out = String::new();
+        for declaration in &self.declarations {
+            out.push_str(&declaration.describe);
+            out.push('\n');
+        }
+        out.push_str(&self.documented);
+
+        out
+    }
+
+    /// This tool alone as type-checker source, after the header and alias
+    pub fn check(&self) -> String {
+        let mut out = String::new();
+        for declaration in &self.declarations {
+            out.push_str(&declaration.check);
+            out.push('\n');
+        }
+        out.push_str(&self.signature);
+
+        out
+    }
+}
+
+/// The type a tool's result has in a script
+#[derive(Debug, Clone, Copy)]
+pub enum StubOutput<'a> {
+    /// The result follows this JSON Schema
+    Schema(&'a Map<String, Value>),
+    /// The result is the tool's text, joined
+    Text,
+    /// Nothing is known about the result shape
+    Untyped,
+}
+
+/// Allocates globally unique type names across all generated tools and
+/// shares identical declarations between them
+#[derive(Debug)]
 pub struct StubBook {
     used: HashSet<String>,
+    shared: HashMap<String, Arc<Declaration>>,
+}
+
+impl Default for StubBook {
+    fn default() -> Self {
+        Self {
+            used: RESERVED_NAMES
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            shared: HashMap::new(),
+        }
+    }
 }
 
 impl StubBook {
@@ -55,7 +197,7 @@ impl StubBook {
         function: &str,
         description: Option<&str>,
         input_schema: &Map<String, Value>,
-        output_schema: Option<&Map<String, Value>>,
+        output: StubOutput<'_>,
     ) -> ToolStub {
         self.used.insert(function.to_owned());
         let prefix = pascal_case(function);
@@ -63,7 +205,7 @@ impl StubBook {
 
         generator.set_root(Value::Object(input_schema.clone()));
         let shape = generator.root_shape(input_schema);
-        let properties = generator.properties(&shape.object, &prefix);
+        let mut properties = generator.properties(&shape.object, &prefix);
         let non_identifier = properties
             .iter()
             .any(|property| !is_identifier(&property.name));
@@ -74,34 +216,87 @@ impl StubBook {
                 omit_if_none.insert(property.name.clone());
             }
         }
+        let kwargs = generator.kwargs(&properties, shape.open, &prefix);
 
-        let return_type = match output_schema {
-            Some(schema) => {
+        generator.direction = Direction::Output;
+        let mut return_type = match output {
+            StubOutput::Schema(schema) => {
                 generator.set_root(Value::Object(schema.clone()));
                 let hint = format!("{prefix}Result");
 
                 generator.type_of(&Value::Object(schema.clone()), &hint)
             }
-            None => "Any".to_owned(),
+            StubOutput::Text => "str".to_owned(),
+            StubOutput::Untyped => JSON_VALUE.to_owned(),
         };
 
         let declarations = generator.take_declarations();
+        let (declarations, renames) = self.share(declarations);
+        return_type = rename_identifiers(&return_type, &renames);
+        for property in &mut properties {
+            property.ty = rename_identifiers(&property.ty, &renames);
+        }
+        let kwargs = kwargs.map(|kwargs| match kwargs {
+            Kwargs::Typed(name) => Kwargs::Typed(rename_identifiers(&name, &renames)),
+            Kwargs::Open => Kwargs::Open,
+        });
         let signature = Signature {
             function,
             properties: &properties,
-            open: shape.open,
+            kwargs: kwargs.as_ref(),
             return_type: &return_type,
         };
-        let check = render_check(&declarations, &signature.render());
-        let describe = render_describe(&declarations, &signature, description, shape.variants);
+        let rendered = signature.render();
+        let uses_json_value = declarations
+            .iter()
+            .any(|declaration| mentions_identifier(&declaration.check, JSON_VALUE))
+            || mentions_identifier(&rendered, JSON_VALUE);
 
         ToolStub {
-            check,
-            describe,
+            signature: format!("{rendered}: ...\n"),
+            documented: render_documented(&signature, description, shape.variants, shape.open),
+            declarations,
             omit_if_none,
             non_identifier_params: non_identifier,
             degraded: false,
+            uses_json_value,
         }
+    }
+
+    /// Replaces declarations an earlier tool already has with that tool's,
+    /// returning the kept declarations and the renames to apply to references
+    fn share(
+        &mut self,
+        declarations: Vec<TypedDictDecl>,
+    ) -> (Vec<Arc<Declaration>>, HashMap<String, String>) {
+        let mut renames: HashMap<String, String> = HashMap::new();
+        let mut kept: Vec<Arc<Declaration>> = Vec::new();
+
+        for mut declaration in declarations {
+            for field in &mut declaration.fields {
+                field.ty = rename_identifiers(&field.ty, &renames);
+            }
+            let key = declaration.canonical_key();
+            let shared = match self.shared.get(&key) {
+                Some(existing) => Arc::clone(existing),
+                None => {
+                    let rendered = Arc::new(Declaration {
+                        name: declaration.name.clone(),
+                        check: render_typed_dict(&declaration, false),
+                        describe: render_typed_dict(&declaration, true),
+                    });
+                    self.shared.insert(key, Arc::clone(&rendered));
+
+                    rendered
+                }
+            };
+            renames.insert(declaration.name, shared.name.clone());
+            if !kept.iter().any(|known| Arc::ptr_eq(known, &shared)) {
+                kept.push(shared);
+            }
+        }
+
+        (kept, renames)
     }
 }
 
@@ -117,7 +312,7 @@ pub fn fallback_stub(
     description: Option<&str>,
     input_schema: &Map<String, Value>,
 ) -> ToolStub {
-    let signature = format!("async def {function}(**kwargs: Any) -> Any");
+    let signature = format!("async def {function}(**kwargs: object) -> {JSON_VALUE}");
     let check = format!("{signature}: ...\n");
 
     let mut schema = serde_json::to_string(input_schema).unwrap_or_default();
@@ -134,17 +329,19 @@ pub fn fallback_stub(
          type-checked. Pass the parameters below as keyword arguments.\n\
          Parameters (JSON Schema): {schema}"
     ));
-    let describe = format!(
+    let documented = format!(
         "# degraded: typed signature unavailable for {function}\n{signature}:\n{}    ...\n",
         docstring(&doc, 1)
     );
 
     ToolStub {
-        check,
-        describe,
+        declarations: Vec::new(),
+        signature: check,
+        documented,
         omit_if_none: BTreeSet::new(),
         non_identifier_params: false,
         degraded: true,
+        uses_json_value: true,
     }
 }
 
@@ -153,6 +350,45 @@ struct TypedDictDecl {
     name: String,
     doc: Option<String>,
     fields: Vec<Property>,
+}
+
+/// Stands for a declaration's own name when comparing declarations
+const SELF_NAME: &str = "@";
+
+impl TypedDictDecl {
+    /// Text that equals another declaration's exactly when the two describe
+    /// the same type, whatever they are called
+    fn canonical_key(&self) -> String {
+        let own = HashMap::from([(self.name.clone(), SELF_NAME.to_owned())]);
+        let anonymous = Self {
+            name: SELF_NAME.to_owned(),
+            doc: self.doc.clone(),
+            fields: self
+                .fields
+                .iter()
+                .map(|field| Property {
+                    ty: rename_identifiers(&field.ty, &own),
+                    ..field.clone()
+                })
+                .collect(),
+        };
+
+        format!(
+            "{}\n{}",
+            render_typed_dict(&anonymous, false),
+            render_typed_dict(&anonymous, true)
+        )
+    }
+}
+
+/// How a signature takes keyword arguments beyond its named parameters
+#[derive(Debug, Clone)]
+enum Kwargs {
+    /// Arguments are passed through unchecked
+    Open,
+    /// Exactly the keys of this TypedDict, which holds the parameters whose
+    /// names are not Python identifiers
+    Typed(String),
 }
 
 /// The input schema reduced to an object: known properties plus whether
@@ -204,6 +440,7 @@ struct Property {
 
 struct StubGenerator<'a> {
     used: &'a mut HashSet<String>,
+    direction: Direction,
     prefix: String,
     root: Value,
     declarations: Vec<TypedDictDecl>,
@@ -215,6 +452,7 @@ impl<'a> StubGenerator<'a> {
     fn new(used: &'a mut HashSet<String>, prefix: String) -> Self {
         Self {
             used,
+            direction: Direction::Input,
             prefix,
             root: Value::Null,
             declarations: Vec::new(),
@@ -234,6 +472,34 @@ impl<'a> StubGenerator<'a> {
         std::mem::take(&mut self.declarations)
     }
 
+    /// Chooses how the signature takes keyword arguments, declaring a
+    /// TypedDict for parameters whose names are not Python identifiers
+    ///
+    /// A TypedDict cannot also admit unknown keys, so a tool that accepts
+    /// further arguments keeps the loosest form, `object`
+    fn kwargs(&mut self, properties: &[Property], open: bool, prefix: &str) -> Option<Kwargs> {
+        let awkward: Vec<Property> = properties
+            .iter()
+            .filter(|property| !is_identifier(&property.name))
+            .cloned()
+            .collect();
+        if open {
+            return Some(Kwargs::Open);
+        }
+        if awkward.is_empty() {
+            return None;
+        }
+
+        let name = self.unique_name(&format!("{prefix}Kwargs"));
+        self.declarations.push(TypedDictDecl {
+            name: name.clone(),
+            doc: None,
+            fields: awkward,
+        });
+
+        Some(Kwargs::Typed(name))
+    }
+
     fn unique_name(&mut self, hint: &str) -> String {
         let base = if hint.is_empty() {
             "Object".to_owned()
@@ -248,6 +514,16 @@ impl<'a> StubGenerator<'a> {
         }
 
         candidate
+    }
+
+    /// Joins member types; a union with no members is unknown
+    fn join(&self, types: Vec<String>) -> String {
+        let joined = union(types);
+        if joined.is_empty() {
+            return self.direction.unknown().to_owned();
+        }
+
+        joined
     }
 
     fn resolve(&self, reference: &str) -> Option<Value> {
@@ -418,7 +694,7 @@ impl<'a> StubGenerator<'a> {
             .map(|(name, schema)| {
                 let nested_hint = format!("{hint}{}", pascal_case(name));
                 let ty = self.type_of(schema, &nested_hint);
-                let accepts_null = ty == "Any" || union_members(&ty).contains(&"None");
+                let accepts_null = is_unknown(&ty) || union_members(&ty).contains(&"None");
 
                 Property {
                     name: name.clone(),
@@ -463,7 +739,7 @@ impl<'a> StubGenerator<'a> {
 
     fn type_of(&mut self, schema: &Value, hint: &str) -> String {
         let Some(object) = schema.as_object() else {
-            return "Any".to_owned();
+            return self.direction.unknown().to_owned();
         };
         let ty = self.base_type(object, hint);
 
@@ -493,7 +769,7 @@ impl<'a> StubGenerator<'a> {
                     types.push(self.type_of(member, &format!("{hint}Option{}", index + 1)));
                 }
 
-                return union(types);
+                return self.join(types);
             }
         }
         if let Some(members) = object.get("allOf").and_then(Value::as_array) {
@@ -508,13 +784,13 @@ impl<'a> StubGenerator<'a> {
                     types.push(self.typed(name, object, hint));
                 }
 
-                union(types)
+                self.join(types)
             }
             _ if object.contains_key("properties") => self.object_type(object, hint),
             _ if object.contains_key("items") || object.contains_key("prefixItems") => {
                 self.array_type(object, hint)
             }
-            _ => "Any".to_owned(),
+            _ => self.direction.unknown().to_owned(),
         }
     }
 
@@ -527,7 +803,7 @@ impl<'a> StubGenerator<'a> {
             "null" => "None".to_owned(),
             "array" => self.array_type(object, hint),
             "object" => self.object_type(object, hint),
-            _ => "Any".to_owned(),
+            _ => self.direction.unknown().to_owned(),
         }
     }
 
@@ -543,15 +819,22 @@ impl<'a> StubGenerator<'a> {
             }
 
             return if types.is_empty() {
-                "list[Any]".to_owned()
+                self.direction.unknown_list().to_owned()
             } else {
                 format!("tuple[{}]", types.join(", "))
             };
         }
 
         match object.get("items") {
-            Some(items) => format!("list[{}]", self.type_of(items, &format!("{hint}Item"))),
-            None => "list[Any]".to_owned(),
+            Some(items) => {
+                let item = self.type_of(items, &format!("{hint}Item"));
+                if is_unknown(&item) {
+                    return self.direction.unknown_list().to_owned();
+                }
+
+                format!("list[{item}]")
+            }
+            None => self.direction.unknown_list().to_owned(),
         }
     }
 
@@ -569,12 +852,14 @@ impl<'a> StubGenerator<'a> {
 
         match object.get("additionalProperties") {
             Some(schema @ Value::Object(_)) => {
-                format!(
-                    "dict[str, {}]",
-                    self.type_of(schema, &format!("{hint}Value"))
-                )
+                let value = self.type_of(schema, &format!("{hint}Value"));
+                if is_unknown(&value) {
+                    return self.direction.unknown_dict().to_owned();
+                }
+
+                format!("dict[str, {value}]")
             }
-            _ => "dict[str, Any]".to_owned(),
+            _ => self.direction.unknown_dict().to_owned(),
         }
     }
 
@@ -596,10 +881,10 @@ impl<'a> StubGenerator<'a> {
         }
         // a cycle through something other than an object: give up on precision
         if self.in_progress.contains(reference) {
-            return "Any".to_owned();
+            return self.direction.unknown().to_owned();
         }
         let Some(target) = self.resolve(reference) else {
-            return "Any".to_owned();
+            return self.direction.unknown().to_owned();
         };
         let definition = reference.rsplit('/').next().unwrap_or("Definition");
         let hint = format!("{}{}", self.prefix, pascal_case(definition));
@@ -637,7 +922,7 @@ impl<'a> StubGenerator<'a> {
 
         for source in &sources {
             let Some(source) = source.as_object() else {
-                return "Any".to_owned();
+                return self.direction.unknown().to_owned();
             };
             if let Some(properties) = source.get("properties").and_then(Value::as_object) {
                 merged.extend(
@@ -653,14 +938,14 @@ impl<'a> StubGenerator<'a> {
                     .and_then(Value::as_str)
                     .is_some_and(|name| name != "object")
             {
-                return "Any".to_owned();
+                return self.direction.unknown().to_owned();
             }
             if let Some(names) = source.get("required").and_then(Value::as_array) {
                 required.extend(names.iter().cloned());
             }
         }
         if merged.is_empty() {
-            return "Any".to_owned();
+            return self.direction.unknown().to_owned();
         }
 
         let mut synthetic = Map::new();
@@ -728,7 +1013,10 @@ fn literal_union(values: &[Value]) -> Option<String> {
     })
 }
 
-/// Joins types into a union, dropping duplicates; `Any` absorbs everything
+/// Joins types into a union, dropping duplicates and merging `Literal`s
+///
+/// A catch-all member absorbs everything else. An empty union is empty text,
+/// which the caller replaces with the unknown type of its direction
 fn union(types: impl IntoIterator<Item = String>) -> String {
     let mut seen: Vec<String> = Vec::new();
     for ty in types {
@@ -738,16 +1026,39 @@ fn union(types: impl IntoIterator<Item = String>) -> String {
             }
         }
     }
-    if seen.is_empty() || seen.iter().any(|member| member == "Any") {
-        return "Any".to_owned();
-    }
-    // None reads best at the end
-    if let Some(position) = seen.iter().position(|member| member == "None") {
-        let none = seen.remove(position);
-        seen.push(none);
+    if let Some(unknown) = seen.iter().find(|member| is_unknown(member)) {
+        return unknown.clone();
     }
 
-    seen.join(" | ")
+    // `Literal["a"] | Literal["b"]` reads better, and costs fewer bytes, as
+    // `Literal["a", "b"]`
+    let mut merged: Vec<String> = Vec::new();
+    let mut literal_slot: Option<usize> = None;
+    for member in seen {
+        let inner = member
+            .strip_prefix("Literal[")
+            .and_then(|rest| rest.strip_suffix(']'));
+        match (inner, literal_slot) {
+            (Some(inner), Some(slot)) => {
+                merged[slot].pop();
+                merged[slot].push_str(", ");
+                merged[slot].push_str(inner);
+                merged[slot].push(']');
+            }
+            (Some(_), None) => {
+                literal_slot = Some(merged.len());
+                merged.push(member);
+            }
+            (None, _) => merged.push(member),
+        }
+    }
+    // None reads best at the end
+    if let Some(position) = merged.iter().position(|member| member == "None") {
+        let none = merged.remove(position);
+        merged.push(none);
+    }
+
+    merged.join(" | ")
 }
 
 /// Splits a rendered type on top-level `|`
@@ -775,8 +1086,8 @@ fn union_members(ty: &str) -> Vec<&str> {
 struct Signature<'a> {
     function: &'a str,
     properties: &'a [Property],
-    /// Extra keyword arguments are accepted beyond the declared ones
-    open: bool,
+    /// How keyword arguments beyond the named parameters are taken
+    kwargs: Option<&'a Kwargs>,
     return_type: &'a str,
 }
 
@@ -795,10 +1106,6 @@ impl Signature<'_> {
             .filter(|property| !is_identifier(&property.name))
     }
 
-    fn takes_kwargs(&self) -> bool {
-        self.open || self.awkward().next().is_some()
-    }
-
     fn render(&self) -> String {
         let mut parameters: Vec<String> = self
             .identifiers()
@@ -815,8 +1122,10 @@ impl Signature<'_> {
         if !parameters.is_empty() {
             parameters.insert(0, "*".to_owned());
         }
-        if self.takes_kwargs() {
-            parameters.push("**kwargs: Any".to_owned());
+        match self.kwargs {
+            Some(Kwargs::Open) => parameters.push("**kwargs: object".to_owned()),
+            Some(Kwargs::Typed(name)) => parameters.push(format!("**kwargs: Unpack[{name}]")),
+            None => {}
         }
 
         format!(
@@ -828,30 +1137,12 @@ impl Signature<'_> {
     }
 }
 
-fn render_check(declarations: &[TypedDictDecl], signature: &str) -> String {
-    let mut out = String::new();
-    for declaration in declarations {
-        render_typed_dict(&mut out, declaration, false);
-        out.push('\n');
-    }
-    out.push_str(signature);
-    out.push_str(": ...\n");
-
-    out
-}
-
-fn render_describe(
-    declarations: &[TypedDictDecl],
+fn render_documented(
     signature: &Signature<'_>,
     description: Option<&str>,
     variants: bool,
+    open: bool,
 ) -> String {
-    let mut out = String::new();
-    for declaration in declarations {
-        render_typed_dict(&mut out, declaration, true);
-        out.push('\n');
-    }
-
     let mut doc = description.map(str::trim).unwrap_or_default().to_owned();
     let documented: Vec<&Property> = signature
         .identifiers()
@@ -899,14 +1190,14 @@ fn render_describe(
              them, so which are required depends on the variant; further keyword arguments are \
              passed through.",
         );
-    } else if signature.open {
+    } else if open {
         append_section(
             &mut doc,
             "Further keyword arguments are accepted and passed through to the tool.",
         );
     }
 
-    out.push_str(&signature.render());
+    let mut out = signature.render();
     if doc.trim().is_empty() {
         out.push_str(": ...\n");
     } else {
@@ -927,7 +1218,8 @@ fn append_section(doc: &mut String, heading: &str) {
     doc.push('\n');
 }
 
-fn render_typed_dict(out: &mut String, declaration: &TypedDictDecl, with_docs: bool) {
+fn render_typed_dict(declaration: &TypedDictDecl, with_docs: bool) -> String {
+    let mut out = String::new();
     let class_syntax = declaration
         .fields
         .iter()
@@ -948,7 +1240,7 @@ fn render_typed_dict(out: &mut String, declaration: &TypedDictDecl, with_docs: b
             entries = entries.join(", ")
         ));
 
-        return;
+        return out;
     }
 
     out.push_str(&format!("class {}(TypedDict):\n", declaration.name));
@@ -967,6 +1259,8 @@ fn render_typed_dict(out: &mut String, declaration: &TypedDictDecl, with_docs: b
     if !wrote_body {
         out.push_str("    pass\n");
     }
+
+    out
 }
 
 fn field_type(field: &Property) -> String {
@@ -1024,6 +1318,62 @@ fn compact_json(value: &Value) -> String {
     }
 
     text
+}
+
+/// Calls `visit` with every identifier in a rendered type and its byte range,
+/// skipping the contents of string literals
+fn for_each_identifier(ty: &str, mut visit: impl FnMut(&str, std::ops::Range<usize>)) {
+    let bytes = ty.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    // a backslash escapes the next byte
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            byte if byte == b'_' || byte.is_ascii_alphabetic() => {
+                let start = index;
+                while index < bytes.len()
+                    && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
+                {
+                    index += 1;
+                }
+                visit(&ty[start..index], start..index);
+            }
+            _ => index += 1,
+        }
+    }
+}
+
+/// Replaces whole identifiers of a rendered type; string literals stay as they are
+fn rename_identifiers(ty: &str, renames: &HashMap<String, String>) -> String {
+    if renames.is_empty() {
+        return ty.to_owned();
+    }
+    let mut out = String::with_capacity(ty.len());
+    let mut copied = 0;
+    for_each_identifier(ty, |name, range| {
+        if let Some(replacement) = renames.get(name) {
+            out.push_str(&ty[copied..range.start]);
+            out.push_str(replacement);
+            copied = range.end;
+        }
+    });
+    out.push_str(&ty[copied..]);
+
+    out
+}
+
+/// Whether the rendered source uses `name` as an identifier
+fn mentions_identifier(source: &str, name: &str) -> bool {
+    let mut found = false;
+    for_each_identifier(source, |identifier, _| found |= identifier == name);
+
+    found
 }
 
 /// Whether `name` can be used as a Python keyword argument
@@ -1101,50 +1451,50 @@ mod tests {
             "docs_search",
             Some("Search the docs\nsecond line"),
             &input,
-            Some(&output),
+            StubOutput::Schema(&output),
         );
 
         assert!(
-            stub.check
+            stub.check()
                 .contains("DocsSearchFilter = TypedDict(\"DocsSearchFilter\""),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.check
+            stub.check()
                 .contains("\"parent\": NotRequired[DocsSearchFilter]"),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.check.contains("mode: Literal[\"fast\", \"deep\"]"),
+            stub.check().contains("mode: Literal[\"fast\", \"deep\"]"),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.check.contains("limit: int | None = None"),
+            stub.check().contains("limit: int | None = None"),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.check.contains("either: str | int | None = None"),
+            stub.check().contains("either: str | int | None = None"),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.check.ends_with("-> DocsSearchResult: ...\n"),
+            stub.check().ends_with("-> DocsSearchResult: ...\n"),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.describe.contains("Search the docs\n    second line"),
+            stub.describe().contains("Search the docs\n    second line"),
             "{}",
-            stub.describe
+            stub.describe()
         );
         assert!(
-            stub.describe.contains("query: What to find"),
+            stub.describe().contains("query: What to find"),
             "{}",
-            stub.describe
+            stub.describe()
         );
         assert!(stub.omit_if_none.contains("either") && !stub.omit_if_none.contains("limit"));
     }
@@ -1157,19 +1507,19 @@ mod tests {
             "properties": {"q": {"type": "string"}, "class": {"type": "string"}},
         }));
 
-        let stub = StubBook::new().tool("t_x", None, &input, None);
+        let stub = StubBook::new().tool("t_x", None, &input, StubOutput::Untyped);
 
         assert!(stub.non_identifier_params);
         assert!(
-            stub.check
-                .contains("async def t_x(*, q: str, **kwargs: Any) -> Any"),
+            stub.check()
+                .contains("async def t_x(*, q: str, **kwargs: Unpack[TXKwargs]) -> JsonValue"),
             "{}",
-            stub.check
+            stub.check()
         );
         assert!(
-            stub.describe.contains("\"class\": str (optional)"),
+            stub.describe().contains("\"class\": str (optional)"),
             "{}",
-            stub.describe
+            stub.describe()
         );
     }
 
@@ -1192,13 +1542,13 @@ mod tests {
             },
         }));
 
-        let stub = StubBook::new().tool("t_x", None, &input, None);
+        let stub = StubBook::new().tool("t_x", None, &input, StubOutput::Untyped);
 
         assert!(
-            stub.check
-                .contains("async def t_x(*, query: str, limit: int | None = None) -> Any"),
+            stub.check()
+                .contains("async def t_x(*, query: str, limit: int | None = None) -> JsonValue"),
             "{}",
-            stub.check
+            stub.check()
         );
     }
 
@@ -1223,25 +1573,33 @@ mod tests {
         let unknown = schema(json!({"type": "object"}));
 
         let mut book = StubBook::new();
-        let one_of = book.tool("t_one", None, &one_of, None);
-        let open = book.tool("t_open", None, &open, None);
-        let closed = book.tool("t_closed", None, &closed, None);
-        let unknown = book.tool("t_unknown", None, &unknown, None);
+        let one_of = book.tool("t_one", None, &one_of, StubOutput::Untyped);
+        let open = book.tool("t_open", None, &open, StubOutput::Untyped);
+        let closed = book.tool("t_closed", None, &closed, StubOutput::Untyped);
+        let unknown = book.tool("t_unknown", None, &unknown, StubOutput::Untyped);
 
         assert!(
-            one_of.check.contains(
-                "async def t_one(*, id: str | None = None, name: str | None = None, **kwargs: Any)"
+            one_of.check().contains(
+                "async def t_one(*, id: str | None = None, name: str | None = None, **kwargs: object)"
             ),
             "{}",
-            one_of.check
+            one_of.check()
         );
-        assert!(one_of.describe.contains("id: str"), "{}", one_of.describe);
         assert!(
-            open.check
-                .contains("(*, a: str | None = None, **kwargs: Any)")
+            one_of.describe().contains("id: str"),
+            "{}",
+            one_of.describe()
         );
-        assert!(!closed.check.contains("kwargs"));
-        assert!(unknown.check.contains("async def t_unknown(**kwargs: Any)"));
+        assert!(
+            open.check()
+                .contains("(*, a: str | None = None, **kwargs: object)")
+        );
+        assert!(!closed.check().contains("kwargs"));
+        assert!(
+            unknown
+                .check()
+                .contains("async def t_unknown(**kwargs: object)")
+        );
     }
 
     #[test]
@@ -1254,8 +1612,12 @@ mod tests {
         let stub = fallback_stub("t_x", Some("Search"), &input);
 
         assert!(stub.degraded);
-        assert!(stub.check.contains("**kwargs: Any"));
-        assert!(stub.describe.contains("# degraded"), "{}", stub.describe);
-        assert!(stub.describe.contains("\"query\""), "{}", stub.describe);
+        assert!(stub.check().contains("**kwargs: object"));
+        assert!(
+            stub.describe().contains("# degraded"),
+            "{}",
+            stub.describe()
+        );
+        assert!(stub.describe().contains("\"query\""), "{}", stub.describe());
     }
 }

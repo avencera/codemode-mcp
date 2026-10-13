@@ -105,6 +105,41 @@ fn unstructured_route() -> ToolRoute<Fixture> {
     })
 }
 
+/// Declares an output schema and delivers structured content that breaks it
+/// three levels down
+fn mismatched_route() -> ToolRoute<Fixture> {
+    let schema = json!({"type": "object", "properties": {}});
+    let output = json!({
+        "type": "object",
+        "required": ["ok", "items"],
+        "properties": {
+            "ok": {"type": "boolean"},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
+        },
+    });
+    let tool = Tool::new(
+        "mismatched_output",
+        "Declares a schema its result does not follow",
+        Arc::new(schema.as_object().cloned().unwrap_or_default()),
+    )
+    .with_raw_output_schema(Arc::new(output.as_object().cloned().unwrap_or_default()));
+
+    ToolRoute::new_dyn(tool, |_context: ToolCallContext<'_, Fixture>| {
+        Box::pin(async {
+            Ok(CallToolResponse::Complete(CallToolResult::structured(
+                json!({"ok": true, "items": [{"name": "fine"}, {"name": 7}]}),
+            )))
+        })
+    })
+}
+
 /// Blocks until the client cancels the call, then writes `marker` so a test
 /// can tell the cancellation reached the server
 fn hang_route() -> ToolRoute<Fixture> {
@@ -178,6 +213,7 @@ impl Fixture {
                 }),
             ))
             .with_route(unstructured_route())
+            .with_route(mismatched_route())
             .with_route(hang_route());
 
         Self { tool_router }

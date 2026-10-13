@@ -1,14 +1,20 @@
 //! The merged tool catalog: namespacing, stubs and search
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 use rmcp::model::Tool;
 
 use crate::{
-    config::Config,
+    config::{Config, OutputMode, ToolOverride},
+    output::OutputSpec,
     policy::Policy,
     search::{SearchIndex, SearchText},
-    stubs::{STUB_HEADER, StubBook, ToolStub, fallback_stub},
+    stubs::{
+        Declaration, JSON_VALUE_ALIAS, STUB_HEADER, StubBook, StubOutput, ToolStub, fallback_stub,
+    },
 };
 
 /// Tools one upstream currently offers
@@ -39,8 +45,9 @@ pub struct ToolEntry {
     pub stub: ToolStub,
     /// Policy after applying per-tool overrides
     pub policy: Policy,
-    /// The tool declared an output schema, so scripts expect structured data
-    pub has_output_schema: bool,
+    /// What scripts get back: the upstream's or the config's schema, the
+    /// joined text, or an untyped `JsonValue`
+    pub output: OutputSpec,
     /// The typed stub was rejected by the type checker and replaced by a
     /// permissive one
     pub degraded: bool,
@@ -116,14 +123,25 @@ impl Catalog {
                     .unwrap_or("")
                     .to_owned();
                 let degraded = fallback.contains(&function);
+                let output = effective_output(
+                    &snapshot.name,
+                    tool,
+                    server.and_then(|server| server.tool_override(&tool.name)),
+                );
                 let stub = if degraded {
                     fallback_stub(&function, Some(&description), &tool.input_schema)
                 } else {
+                    let stub_output = match &output {
+                        OutputSpec::Schema(schema) => StubOutput::Schema(schema),
+                        OutputSpec::Text => StubOutput::Text,
+                        OutputSpec::Untyped => StubOutput::Untyped,
+                    };
+
                     book.tool(
                         &function,
                         Some(&description),
                         &tool.input_schema,
-                        tool.output_schema.as_deref(),
+                        stub_output,
                     )
                 };
                 let params = tool
@@ -141,7 +159,7 @@ impl Catalog {
                     params,
                     stub,
                     policy: server.map_or(Policy::Allow, |server| server.policy_for(&tool.name)),
-                    has_output_schema: tool.output_schema.is_some(),
+                    output,
                     degraded,
                     available: snapshot.available,
                 });
@@ -169,10 +187,19 @@ impl Catalog {
             .enumerate()
             .map(|(position, entry)| (entry.function.clone(), position))
             .collect();
-        let mut check_stubs = String::from(STUB_HEADER);
+        let mut check_stubs = format!("{STUB_HEADER}{JSON_VALUE_ALIAS}");
+        let mut declared = BTreeSet::new();
+        for entry in &entries {
+            for declaration in &entry.stub.declarations {
+                if declared.insert(declaration.name.clone()) {
+                    check_stubs.push('\n');
+                    check_stubs.push_str(&declaration.check);
+                }
+            }
+        }
         for entry in &entries {
             check_stubs.push('\n');
-            check_stubs.push_str(&entry.stub.check);
+            check_stubs.push_str(&entry.stub.signature);
         }
 
         Self {
@@ -203,7 +230,7 @@ impl Catalog {
 
     /// Declarations for a single tool, usable to validate it in isolation
     pub fn check_stub_for(entry: &ToolEntry) -> String {
-        format!("{STUB_HEADER}\n{}", entry.stub.check)
+        format!("{STUB_HEADER}{JSON_VALUE_ALIAS}\n{}", entry.stub.check())
     }
 
     /// Ranks tools against `query`; an empty query lists tools in catalog
@@ -227,12 +254,16 @@ impl Catalog {
 
     /// Documented declarations for the named tools, plus the names not found
     ///
-    /// Denied tools count as not found
+    /// Denied tools count as not found. A type several tools share is
+    /// declared once
     pub fn describe<'a>(&self, names: &'a [String]) -> (String, Vec<&'a str>) {
         let mut missing = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut declared: BTreeSet<&str> = BTreeSet::new();
+        let mut types = String::new();
         let mut bodies = String::new();
         let mut needs_kwargs_note = false;
+        let mut needs_json_value = false;
 
         for name in names {
             match self
@@ -241,8 +272,10 @@ impl Catalog {
             {
                 Some(entry) if seen.insert(entry.function.clone()) => {
                     needs_kwargs_note |= entry.stub.non_identifier_params;
+                    needs_json_value |= entry.stub.uses_json_value;
+                    declare_once(&mut types, &mut declared, &entry.stub.declarations);
                     bodies.push('\n');
-                    bodies.push_str(&entry.stub.describe);
+                    bodies.push_str(&entry.stub.documented);
                 }
                 Some(_) => {}
                 None => missing.push(name.as_str()),
@@ -250,12 +283,65 @@ impl Catalog {
         }
 
         let mut out = String::from(STUB_HEADER);
+        if needs_json_value {
+            out.push_str(JSON_VALUE_ALIAS);
+        }
         if needs_kwargs_note {
             out.push_str(KWARGS_NOTE);
         }
+        out.push_str(&types);
         out.push_str(&bodies);
 
         (out, missing)
+    }
+}
+
+/// Appends the documented form of each declaration not yet in `declared`
+fn declare_once<'a>(
+    out: &mut String,
+    declared: &mut BTreeSet<&'a str>,
+    declarations: &'a [Arc<Declaration>],
+) {
+    for declaration in declarations {
+        if declared.insert(&declaration.name) {
+            out.push('\n');
+            out.push_str(&declaration.describe);
+        }
+    }
+}
+
+/// The effective output of a tool: text when the config says so, else the
+/// schema the upstream declares or the config supplies
+///
+/// The config's schema only fills in for an upstream that declares none,
+/// unless it is forced
+fn effective_output(
+    server: &str,
+    tool: &rmcp::model::Tool,
+    tool_override: Option<&ToolOverride>,
+) -> OutputSpec {
+    if tool_override.is_some_and(|over| over.output == Some(OutputMode::Text)) {
+        return OutputSpec::Text;
+    }
+    let configured =
+        tool_override.and_then(|over| over.output_schema.as_ref().map(|schema| (over, schema)));
+
+    match (&tool.output_schema, configured) {
+        (Some(_), Some((over, schema))) if over.force_output_schema => {
+            OutputSpec::Schema(Arc::new(schema.clone()))
+        }
+        (Some(declared), Some(_)) => {
+            tracing::info!(
+                server,
+                tool = %tool.name,
+                "using the output schema the server declares; the configured one only applies when forced"
+            );
+
+            OutputSpec::Schema(Arc::clone(declared))
+        }
+        (Some(declared), None) => OutputSpec::Schema(Arc::clone(declared)),
+        (None, Some((_, schema))) => OutputSpec::Schema(Arc::new(schema.clone())),
+        (None, None) => OutputSpec::Untyped,
     }
 }
 

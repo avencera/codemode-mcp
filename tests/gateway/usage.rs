@@ -16,7 +16,9 @@ use super::harness::{Harness, Setup, TestResult, execute, temp_state_dir};
 #[tokio::test(flavor = "multi_thread")]
 async fn outcomes_are_classified_and_sensitive_servers_redacted() -> TestResult {
     let fixture = env!("CARGO_BIN_EXE_codemode-fixture");
-    let secret = format!("[servers.secret]\ncommand = \"{fixture}\"\nsensitive = true");
+    let secret = format!(
+        "[servers.secret]\ncommand = \"{fixture}\"\nsensitive = true\ntools.add.output = \"text\""
+    );
     let Some(harness) = Harness::with(Setup {
         top: "tool_timeout_secs = 1",
         limits: "max_workers = 1\nmax_queued_executions = 0",
@@ -261,6 +263,7 @@ async fn review_renders_sections_from_a_seeded_database() -> TestResult {
             classification: Classification::ok(),
             duration: Duration::from_millis(40),
             approval_id: None,
+            output: "untyped",
         });
     }
     log.execution(execution(

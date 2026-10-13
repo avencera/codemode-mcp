@@ -136,6 +136,8 @@ pub fn config_for(
 
         [servers.fixture]
         command = "{fixture}"
+        # plain-text sums keep `int(await fixture_add(...))` type-checking
+        tools.add.output = "text"
         {server}
 
         {extra}

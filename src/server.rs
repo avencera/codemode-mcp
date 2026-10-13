@@ -625,6 +625,18 @@ const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
         "Name `json` used when not defined",
         "Add `import json` at the top of the script",
     ),
+    (
+        "error[ban:any]",
+        "Any is not allowed: use the tool's declared return type, narrow a `JsonValue` with isinstance, or annotate with `object`",
+    ),
+    (
+        "error[ban:cast]",
+        "cast is not allowed: narrow with isinstance, or use the tool's declared return type",
+    ),
+    (
+        "error[ban:type-ignore]",
+        "type: ignore is not allowed: fix the mismatch, usually by narrowing with isinstance or using the tool's declared return type",
+    ),
 ];
 
 /// Hints for known mistakes in type-check diagnostics, or an empty string

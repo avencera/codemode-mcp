@@ -575,6 +575,46 @@ pub struct ToolOverride {
     /// How far one approval of this tool reaches; `session` when unset
     #[serde(default)]
     pub grant: Option<GrantMode>,
+    /// How the result reaches scripts; see [`OutputMode`]
+    #[serde(default)]
+    pub output: Option<OutputMode>,
+    /// JSON Schema of the result, used as if the upstream had declared it
+    ///
+    /// An upstream-declared schema wins over this one unless
+    /// `force_output_schema` is set, so a schema written for a server that
+    /// later documents its own stops applying without an edit here
+    #[serde(default)]
+    pub output_schema: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Use `output_schema` even when the upstream declares its own
+    #[serde(default)]
+    pub force_output_schema: bool,
+}
+
+/// How a tool's result is handed to scripts when the config overrides the default
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    /// The result is the tool's text blocks joined with newlines, typed
+    /// `str` and never parsed as JSON, whatever the upstream declares
+    Text,
+}
+
+impl ToolOverride {
+    fn validate(&self, server: &str, tool: &str) -> Result<(), ConfigError> {
+        let at = format!("servers.{server}.tools.{tool}");
+        if self.output.is_some() && self.output_schema.is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "{at}: `output` and `output_schema` cannot be combined; text results have no schema"
+            )));
+        }
+        if self.force_output_schema && self.output_schema.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "{at}: `force_output_schema` needs `output_schema`"
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// Warm-up calls for one server
@@ -629,6 +669,11 @@ impl ServerConfig {
             .unwrap_or(self.policy)
     }
 
+    /// The per-tool override for an upstream tool name
+    pub fn tool_override(&self, tool: &str) -> Option<&ToolOverride> {
+        self.tools.get(tool)
+    }
+
     /// Grant mode for a tool whose policy is `ask`
     pub fn grant_for(&self, tool: &str) -> GrantMode {
         self.tools
@@ -651,6 +696,10 @@ impl ServerConfig {
     }
 
     fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        for (tool, tool_override) in &self.tools {
+            tool_override.validate(name, tool)?;
+        }
+
         match (&self.command, &self.url) {
             (Some(_), Some(_)) => Err(ConfigError::Invalid(format!(
                 "servers.{name}: set either `command` or `url`, not both"
