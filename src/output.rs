@@ -6,13 +6,18 @@
 //! on) pass: the check exists to keep a wrong type from reaching a script,
 //! not to enforce every constraint a server documents
 
-use std::{fmt, sync::Arc};
+use std::{cell::Cell, fmt, sync::Arc};
 
 use serde_json::{Map, Value};
 
 /// Deepest `$ref` chain followed without consuming any data, so a schema
 /// that refers to itself cannot loop forever
 const MAX_REF_DEPTH: usize = 32;
+/// Schema nodes one validation may visit. `anyOf` branches that refer back
+/// to themselves multiply, so a hostile or careless upstream schema could
+/// otherwise keep the daemon busy for hours on one small result; past the
+/// budget the rest of the value passes unchecked
+const MAX_STEPS: usize = 100_000;
 /// Characters of an offending scalar quoted in a mismatch
 const MAX_QUOTED_CHARS: usize = 40;
 
@@ -65,11 +70,24 @@ impl fmt::Display for Mismatch {
 
 /// Checks `value` against `schema`, reporting the first mismatch
 pub fn validate(schema: &Map<String, Value>, value: &Value) -> Result<(), Mismatch> {
-    Checker { root: schema }.check(schema, value, "$", 0)
+    let checker = Checker {
+        root: schema,
+        steps: Cell::new(0),
+    };
+    let result = checker.check(schema, value, "$", 0);
+    if checker.steps.get() > MAX_STEPS {
+        tracing::warn!(
+            steps = MAX_STEPS,
+            "output schema check stopped at its step budget"
+        );
+    }
+
+    result
 }
 
 struct Checker<'a> {
     root: &'a Map<String, Value>,
+    steps: Cell<usize>,
 }
 
 impl Checker<'_> {
@@ -80,6 +98,12 @@ impl Checker<'_> {
         path: &str,
         refs: usize,
     ) -> Result<(), Mismatch> {
+        let steps = self.steps.get() + 1;
+        self.steps.set(steps);
+        if steps > MAX_STEPS {
+            return Ok(());
+        }
+
         // before `$ref`: a nullable reference is `X | None` in the stub
         if value.is_null() && schema.get("nullable").and_then(Value::as_bool) == Some(true) {
             return Ok(());

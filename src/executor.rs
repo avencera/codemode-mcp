@@ -419,6 +419,17 @@ impl Executor {
         caller: Caller,
     ) -> ExecutionOutcome {
         // before taking a worker: a refused script costs no sandbox time
+        if code.len() > self.limits.max_script_bytes {
+            return ExecutionOutcome::failed(
+                format!(
+                    "the script is {} bytes; scripts are limited to {} bytes",
+                    code.len(),
+                    self.limits.max_script_bytes
+                ),
+                String::new(),
+                Outcome::UnsupportedSyntax,
+            );
+        }
         let bans = bans::find(&code);
         if !bans.is_empty() {
             let diagnostics = bans::diagnostics(&bans);

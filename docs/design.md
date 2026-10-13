@@ -73,6 +73,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   raises `RuntimeError` naming the tool, the JSON path and the expected and actual type, and the upstream call is
   logged as `output_mismatch`
 - Upstream results are measured (depth, element count, bytes; `limits.max_tool_result_bytes`, default 4 MiB) before they are converted into Python values; an oversized result raises `ValueError` at the call site
+- The host parses scripts itself (bans, review heuristics), so a script is capped at `limits.max_script_bytes` (default 64 KiB) and parsed on a thread with a 256 MiB virtual stack: deep nesting such as `1+1+…` otherwise overflows a tokio worker stack and aborts the daemon. The output schema check visits at most 100,000 schema nodes per result, because self-referring `anyOf` branches multiply
 - While an execution waits only on approvals, its session is dumped (`Checkout::dump`), sealed with HMAC-SHA256 under a per-install key (`<state_dir>/snapshot.key`, mode 0600), the worker and its slot are released, and on the decision the dump is verified and restored on a fresh worker (see Approvals)
 
 ### Approvals
@@ -254,7 +255,7 @@ return type is `Any`.
   script sees it, by a validator for the subset `stubs` turns into types (`type`, `nullable`, `enum`, `const`,
   `required`, `properties`, `additionalProperties`, `items`/`prefixItems`, `allOf`/`anyOf`/`oneOf`, `$ref`); other
   keywords such as `pattern`, `minimum` and `format` pass. A text result for a `str` tool always passes. Sensitive
-  servers log the path and expected type of a mismatch and never the value
+  servers log only the expected type of a mismatch: the path can hold keys from the data
 - Bans before `ty` runs (`src/bans.rs`, `ruff_python_parser` pinned to the version Monty uses): a use of `Any` or
   `cast` imported under any alias, `<typing alias>.Any` and `<typing alias>.cast`, and `# type: ignore` /
   `# ty: ignore` comment tokens (text inside a string is not a comment). An unused import is allowed: it switches

@@ -17,6 +17,14 @@ use ruff_python_ast::{
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange};
 
+/// Stack for parsing and walking a script. The parser and the AST visitors
+/// recurse once per nesting level, so `1+1+…` with a few hundred thousand
+/// terms overflows a 2 MiB tokio worker stack and aborts the daemon. Scripts
+/// are capped at `limits.max_script_bytes`; at the default cap a debug build
+/// needs well over 32 MiB here. The reservation is virtual: pages are only
+/// committed as a deep script touches them
+const PARSER_STACK_BYTES: usize = 256 * 1024 * 1024;
+
 /// Modules that export `Any` and `cast`
 const TYPING_MODULES: [&str; 2] = ["typing", "typing_extensions"];
 
@@ -71,6 +79,31 @@ pub struct Ban {
 /// A script that does not parse reports nothing here: it never runs, and the
 /// type checker's own syntax error is the better message
 pub fn find(source: &str) -> Vec<Ban> {
+    on_parser_stack(|| find_here(source)).unwrap_or_default()
+}
+
+/// Runs `work` on a thread with room for deeply nested scripts
+///
+/// `None` when no such thread could be started; callers then skip their
+/// check, which the sandbox's own parser backs up
+pub(crate) fn on_parser_stack<T: Send>(work: impl FnOnce() -> T + Send) -> Option<T> {
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("script-parser".to_owned())
+            .stack_size(PARSER_STACK_BYTES)
+            .spawn_scoped(scope, work);
+
+        match spawned {
+            Ok(handle) => handle.join().ok(),
+            Err(error) => {
+                tracing::warn!(%error, "could not start the script parser thread");
+                None
+            }
+        }
+    })
+}
+
+fn find_here(source: &str) -> Vec<Ban> {
     let Ok(parsed) = parse_module(source) else {
         return Vec::new();
     };

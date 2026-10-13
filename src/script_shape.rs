@@ -12,6 +12,8 @@ use ruff_python_ast::{
 };
 use ruff_python_parser::parse_module;
 
+use crate::bans::on_parser_stack;
+
 /// Whether the script only calls tools and hands the result back
 ///
 /// Imports and blank lines do not count. The body must be a single awaited
@@ -19,6 +21,10 @@ use ruff_python_parser::parse_module;
 /// last expression, or assigned and then returned by name. `tools` are the
 /// Python names of the tools, such as `exa_web_search_exa`
 pub fn is_probe(source: &str, tools: &HashSet<String>) -> bool {
+    on_parser_stack(|| is_probe_here(source, tools)).unwrap_or(false)
+}
+
+fn is_probe_here(source: &str, tools: &HashSet<String>) -> bool {
     let Ok(parsed) = parse_module(source) else {
         return false;
     };
@@ -44,6 +50,10 @@ pub fn is_probe(source: &str, tools: &HashSet<String>) -> bool {
 
 /// Whether the script calls `json.loads`, however `json` was imported
 pub fn uses_json_loads(source: &str) -> bool {
+    on_parser_stack(|| uses_json_loads_here(source)).unwrap_or(false)
+}
+
+fn uses_json_loads_here(source: &str) -> bool {
     let Ok(parsed) = parse_module(source) else {
         return false;
     };

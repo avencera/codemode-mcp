@@ -215,12 +215,14 @@ async fn a_result_that_breaks_its_schema_raises_and_is_logged() -> TestResult {
         "{detail:?}"
     );
 
-    // a sensitive server keeps the path and the expected type, not the value
+    // a sensitive server keeps only the expected type: the path can carry
+    // keys from the data, and the value is the data
     let (server, outcome, detail, _) = &rows[1];
     assert_eq!(server, "secret");
     assert_eq!(outcome, "output_mismatch");
     let detail = detail.as_deref().ok_or("no detail")?;
-    assert!(detail.contains("$.items[1].name"), "{detail}");
+    assert!(detail.starts_with("expected "), "{detail}");
+    assert!(!detail.contains("items"), "{detail}");
     assert!(!detail.contains('7'), "{detail}");
 
     let uncaught: String = connection.query_row(
@@ -693,6 +695,54 @@ fn validator_agrees_with_the_stub_types() -> TestResult {
     let implied_array = schema(json!({"items": {"type": "string"}}))?;
     assert!(validate(&implied_array, &json!({"a": "x"})).is_err());
     assert!(validate(&implied_array, &json!(["x"])).is_ok());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hostile_scripts_cannot_take_the_daemon_down() -> TestResult {
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+
+    // the deepest nesting that fits under the size cap: overflowed a tokio
+    // worker stack when the host parsed it there
+    let deep = format!("x = 1{}\nx", "+1".repeat(32 * 1024 - 8));
+    let result = execute(&harness.client, &deep).await?;
+    assert!(!text_of(&result).is_empty());
+
+    let oversized = format!("x = 1{}\nx", "+1".repeat(40 * 1024));
+    let result = execute(&harness.client, &oversized).await?;
+    let text = text_of(&result);
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(
+        text.contains("scripts are limited to 65536 bytes"),
+        "{text}"
+    );
+
+    // still serving
+    let body = harness.execute_json("1 + 1").await?;
+    assert_eq!(body["result"], 2, "{body}");
+
+    harness.stop().await
+}
+
+#[test]
+fn self_referring_schema_branches_stay_bounded() -> TestResult {
+    // every level offers two branches that both refer back to the root, so
+    // an unbounded check would visit about 2^32 nodes
+    let schema = json!({"anyOf": [{"$ref": "#"}, {"$ref": "#"}], "type": "string"});
+    let schema = schema
+        .as_object()
+        .cloned()
+        .ok_or("schema is not an object")?;
+    let started = std::time::Instant::now();
+    let _ = validate(&schema, &json!(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 
     Ok(())
 }

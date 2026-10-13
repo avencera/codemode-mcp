@@ -426,6 +426,10 @@ pub struct Limits {
     pub max_queued_executions: usize,
     /// How long finished results stay available to `wait`
     pub result_ttl_secs: u64,
+    /// Largest script `execute` accepts, in bytes; agent scripts are glue
+    /// of a few hundred bytes, and the cap bounds how deeply a script can
+    /// nest before the host parses it
+    pub max_script_bytes: usize,
     /// Cap on captured `print` output per execution, in bytes
     pub max_output_bytes: usize,
     /// Cap on the JSON result of one execution, in bytes; the rest is cut
@@ -454,6 +458,7 @@ impl Default for Limits {
             result_ttl_secs: 30 * 60,
             max_output_bytes: 64 * 1024,
             max_result_bytes: 256 * 1024,
+            max_script_bytes: 64 * 1024,
             max_tool_result_bytes: 4 * 1024 * 1024,
             max_retained_result_bytes: 32 * 1024 * 1024,
         }

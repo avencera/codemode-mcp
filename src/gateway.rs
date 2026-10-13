@@ -554,12 +554,12 @@ impl Gateway {
                 outcome: error.outcome(),
                 detail: match error {
                     _ if !call.sensitive => Some(error.to_string()),
-                    // the path and the expected type are schema facts; only
-                    // the offending value is withheld
-                    ToolCallError::OutputMismatch { mismatch, .. } => Some(format!(
-                        "at {}: expected {}",
-                        mismatch.path, mismatch.expected
-                    )),
+                    // the path can hold keys taken from the data (through
+                    // `additionalProperties`), so only the expected type,
+                    // a schema fact, is kept
+                    ToolCallError::OutputMismatch { mismatch, .. } => {
+                        Some(format!("expected {}", mismatch.expected))
+                    }
                     _ => None,
                 },
             },
