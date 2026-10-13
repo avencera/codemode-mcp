@@ -16,13 +16,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, params};
 use serde::Serialize;
 use tokio::sync::oneshot;
+use turso::params;
 
 use crate::store::{
     self, StoreError, now_ms,
     sessions::{self, SessionState, short_hash},
+    sql::Connection,
 };
 
 /// Records buffered before new ones are dropped
@@ -474,28 +475,29 @@ impl Writer {
         &mut self,
         batch: Vec<Event>,
         flushes: &mut Vec<oneshot::Sender<()>>,
-    ) -> Result<(), rusqlite::Error> {
-        let transaction = self.connection.transaction()?;
-        for event in batch {
-            // a failed statement leaves the transaction usable, so one bad
-            // record costs only itself
-            let written = match event {
-                Event::Call(record) => insert_call(&transaction, &record),
-                Event::Execution(record) => insert_execution(&transaction, &record),
-                Event::Upstream(record) => insert_upstream(&transaction, &record),
-                Event::Approval(record) => write_approval(&transaction, &record),
-                Event::Flush(done) => {
-                    flushes.push(done);
+    ) -> Result<(), turso::Error> {
+        self.connection.transaction(|transaction| {
+            for event in batch {
+                // a failed statement leaves the transaction usable, so one
+                // bad record costs only itself
+                let written = match event {
+                    Event::Call(record) => insert_call(transaction, &record),
+                    Event::Execution(record) => insert_execution(transaction, &record),
+                    Event::Upstream(record) => insert_upstream(transaction, &record),
+                    Event::Approval(record) => write_approval(transaction, &record),
+                    Event::Flush(done) => {
+                        flushes.push(done);
 
-                    Ok(())
+                        Ok(())
+                    }
+                };
+                if let Err(error) = written {
+                    tracing::warn!(%error, "dropping a usage record that failed to write");
                 }
-            };
-            if let Err(error) = written {
-                tracing::warn!(%error, "dropping a usage record that failed to write");
             }
-        }
 
-        transaction.commit()
+            Ok(())
+        })
     }
 
     fn purge_if_due(&mut self) {
@@ -518,7 +520,7 @@ impl Writer {
 }
 
 /// Deletes usage records older than `cutoff_ms`; passkeys are kept
-pub fn purge(connection: &Connection, cutoff_ms: i64) -> Result<(), rusqlite::Error> {
+pub fn purge(connection: &Connection, cutoff_ms: i64) -> Result<(), turso::Error> {
     connection.execute("DELETE FROM calls WHERE at_ms < ?1", params![cutoff_ms])?;
     connection.execute(
         "DELETE FROM executions WHERE started_ms < ?1",
@@ -540,7 +542,7 @@ fn millis(duration: Duration) -> i64 {
     duration.as_millis().min(i64::MAX as u128) as i64
 }
 
-fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), rusqlite::Error> {
+fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), turso::Error> {
     connection.execute(
         "INSERT INTO calls (at_ms, session, client_name, client_version, tool, input, outcome, \
          detail, fingerprint, duration_ms, result_bytes, execution_id, session_state) \
@@ -548,16 +550,16 @@ fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), rusql
         params![
             now_ms() - millis(record.duration),
             record.caller.session_label(),
-            record.caller.client_name,
-            record.caller.client_version,
+            record.caller.client_name.as_deref(),
+            record.caller.client_version.as_deref(),
             record.tool,
-            record.input,
+            record.input.as_deref(),
             record.classification.outcome.as_str(),
-            record.classification.detail,
+            record.classification.detail.as_deref(),
             record.classification.fingerprint(),
             millis(record.duration),
             record.result_bytes as i64,
-            record.execution_id,
+            record.execution_id.as_deref(),
             record.caller.session_state.as_str(),
         ],
     )?;
@@ -565,23 +567,20 @@ fn insert_call(connection: &Connection, record: &CallRecord) -> Result<(), rusql
     Ok(())
 }
 
-fn insert_execution(
-    connection: &Connection,
-    record: &ExecutionRecord,
-) -> Result<(), rusqlite::Error> {
+fn insert_execution(connection: &Connection, record: &ExecutionRecord) -> Result<(), turso::Error> {
     connection.execute(
         "INSERT OR REPLACE INTO executions (id, started_ms, finished_ms, session, client_name, \
          script, outcome, detail, fingerprint, duration_ms, result_bytes) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
-            record.id,
+            record.id.as_str(),
             record.started_ms,
             record.started_ms + millis(record.duration),
             record.caller.session_label(),
-            record.caller.client_name,
-            record.script,
+            record.caller.client_name.as_deref(),
+            record.script.as_str(),
             record.classification.outcome.as_str(),
-            record.classification.detail,
+            record.classification.detail.as_deref(),
             record.classification.fingerprint(),
             millis(record.duration),
             record.result_bytes as i64,
@@ -591,25 +590,22 @@ fn insert_execution(
     Ok(())
 }
 
-fn insert_upstream(
-    connection: &Connection,
-    record: &UpstreamRecord,
-) -> Result<(), rusqlite::Error> {
+fn insert_upstream(connection: &Connection, record: &UpstreamRecord) -> Result<(), turso::Error> {
     connection.execute(
         "INSERT INTO upstream_calls (at_ms, execution_id, server, tool, function, arguments, \
          outcome, detail, duration_ms, approval_id, output) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             now_ms() - millis(record.duration),
-            record.execution_id,
-            record.server,
-            record.tool,
-            record.function,
-            record.arguments,
+            record.execution_id.as_deref(),
+            record.server.as_str(),
+            record.tool.as_str(),
+            record.function.as_str(),
+            record.arguments.as_deref(),
             record.classification.outcome.as_str(),
-            record.classification.detail,
+            record.classification.detail.as_deref(),
             millis(record.duration),
-            record.approval_id,
+            record.approval_id.as_deref(),
             record.output,
         ],
     )?;
@@ -617,7 +613,7 @@ fn insert_upstream(
     Ok(())
 }
 
-fn write_approval(connection: &Connection, record: &ApprovalRecord) -> Result<(), rusqlite::Error> {
+fn write_approval(connection: &Connection, record: &ApprovalRecord) -> Result<(), turso::Error> {
     match record {
         ApprovalRecord::Created {
             id,
@@ -630,14 +626,14 @@ fn write_approval(connection: &Connection, record: &ApprovalRecord) -> Result<()
             "INSERT OR IGNORE INTO approvals (id, created_ms, session, client_name, \
              execution_id, server, tool, grant_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                id,
+                id.as_str(),
                 now_ms(),
                 caller.session_label(),
-                caller.client_name,
-                execution_id,
-                server,
-                tool,
-                grant_mode
+                caller.client_name.as_deref(),
+                execution_id.as_str(),
+                server.as_str(),
+                tool.as_str(),
+                *grant_mode
             ],
         )?,
         ApprovalRecord::Decided {
@@ -647,7 +643,7 @@ fn write_approval(connection: &Connection, record: &ApprovalRecord) -> Result<()
         } => connection.execute(
             "UPDATE approvals SET decided_ms = ?1, decision = ?2, grant_minutes = ?3 \
              WHERE id = ?4 AND decision IS NULL",
-            params![now_ms(), decision, grant_minutes, id],
+            params![now_ms(), *decision, *grant_minutes, id.as_str()],
         )?,
     };
 

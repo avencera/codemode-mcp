@@ -10,6 +10,9 @@ async-trait = "0.1.92"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 color-eyre = "0.6"
+# turso's futures finish on the calling thread, so the store blocks on them
+# without a runtime
+futures-executor = "0.3.34"
 hmac = "0.13.0"
 http = "1.5.0"
 jiff = "0.2.38"
@@ -34,7 +37,6 @@ rmcp = { version = "=3.5.1", default-features = false, features = [
 ruff_python_ast = "=0.0.14"
 ruff_python_parser = "=0.0.14"
 ruff_text_size = "=0.0.14"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 # arbitrary_precision keeps integers beyond i64/u64 exact in both directions
@@ -44,6 +46,8 @@ thiserror = "2.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "signal", "sync", "io-util", "io-std"] }
 tokio-util = "0.7.20"
 toml = "1.1.8"
+# no mimalloc (it installs a global allocator) and no full-text search
+turso = { version = "0.8.3", default-features = false }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.28.0", features = ["v4"] }

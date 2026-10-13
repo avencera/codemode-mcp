@@ -57,12 +57,15 @@ type LoggedCall = (Option<String>, Option<String>);
 /// Every call's session label and state, oldest first
 fn logged(directory: &Path) -> Result<Vec<LoggedCall>, Box<dyn Error>> {
     let connection = store::open(directory)?;
-    let mut statement =
-        connection.prepare("SELECT session, session_state FROM calls ORDER BY id")?;
 
-    Ok(statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?)
+    Ok(connection
+        .query_map(
+            "SELECT session, session_state FROM calls ORDER BY id",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+        .into_iter()
+        .collect())
 }
 
 fn label(token: &str) -> Option<String> {
@@ -134,7 +137,7 @@ async fn passing_the_session_back_reuses_it() -> TestResult {
     assert!(calls.iter().all(|(session, _)| *session == label(&token)));
     let connection = store::open(harness.app.state_dir())?;
     let minted: i64 =
-        connection.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+        connection.query_row("SELECT COUNT(*) FROM sessions", (), |row| row.get(0))?;
     assert_eq!(minted, 1);
 
     harness.stop().await
@@ -176,7 +179,7 @@ async fn unknown_expired_and_foreign_sessions_are_replaced_with_a_note() -> Test
     let connection = store::open(harness.app.state_dir())?;
     connection.execute(
         "UPDATE sessions SET last_seen_ms = last_seen_ms - ?1 WHERE hash = ?2",
-        rusqlite::params![25 * 60 * 60 * 1000_i64, hash_token(&mine)],
+        turso::params![25 * 60 * 60 * 1000_i64, hash_token(&mine)],
     )?;
     let expired: Value = serde_json::from_str(&run(&harness.client, "1", Some(&mine)).await?)?;
     assert_ne!(expired["session"], mine, "{expired}");

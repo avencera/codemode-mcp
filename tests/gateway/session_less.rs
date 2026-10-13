@@ -127,15 +127,17 @@ async fn logged_calls(
 ) -> Result<Vec<(bool, Option<String>, Option<String>)>, Box<dyn std::error::Error>> {
     harness.app.usage().flush().await;
     let connection = store::open(harness.app.state_dir())?;
-    let mut statement = connection.prepare(
-        // the first column says whether the call logged an app session label
-        // (8 hex characters); the protocol itself carries no session
-        "SELECT COALESCE(length(session) = 8 AND session NOT GLOB '*[^0-9a-f]*', 0), \
+    let rows = connection
+        .query_map(
+            // the first column says whether the call logged an app session label
+            // (8 hex characters); the protocol itself carries no session
+            "SELECT COALESCE(length(session) = 8 AND session NOT GLOB '*[^0-9a-f]*', 0), \
          client_name, client_version FROM calls WHERE tool = 'execute' ORDER BY id",
-    )?;
-    let rows = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect::<Result<_, _>>()?;
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?
+        .into_iter()
+        .collect();
 
     Ok(rows)
 }

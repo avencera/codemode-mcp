@@ -198,11 +198,13 @@ async fn a_result_that_breaks_its_schema_raises_and_is_logged() -> TestResult {
     harness.app.usage().flush().await;
     let connection = store::open(harness.app.state_dir())?;
     let rows: Vec<(String, String, Option<String>, String)> = connection
-        .prepare("SELECT server, outcome, detail, output FROM upstream_calls ORDER BY at_ms")?
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<Result<_, _>>()?;
+        .query_map(
+            "SELECT server, outcome, detail, output FROM upstream_calls ORDER BY at_ms",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?
+        .into_iter()
+        .collect();
     assert_eq!(rows.len(), 2, "{rows:?}");
 
     let (_, outcome, detail, output) = &rows[0];
@@ -227,7 +229,7 @@ async fn a_result_that_breaks_its_schema_raises_and_is_logged() -> TestResult {
 
     let uncaught: String = connection.query_row(
         "SELECT outcome FROM executions WHERE script LIKE '%secret_mismatched_output%'",
-        [],
+        (),
         |row| row.get(0),
     )?;
     assert_eq!(uncaught, "output_mismatch");
@@ -295,12 +297,7 @@ async fn escape_hatches_are_rejected_before_the_checker() -> TestResult {
 
     harness.app.usage().flush().await;
     let connection = store::open(harness.app.state_dir())?;
-    let logged: Vec<(String, String)> = connection
-        .prepare(
-            "SELECT outcome, COALESCE(fingerprint, '') FROM executions WHERE outcome = 'type_error'",
-        )?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    let logged: Vec<(String, String)> = connection.query_map("SELECT outcome, COALESCE(fingerprint, '') FROM executions WHERE outcome = 'type_error'", (), |row| Ok((row.get(0)?, row.get(1)?)))?.into_iter().collect();
     assert_eq!(logged.len(), cases.len(), "{logged:?}");
     for rule in ["ban:any", "ban:cast", "ban:type-ignore"] {
         assert!(

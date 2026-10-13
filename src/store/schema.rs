@@ -1,13 +1,11 @@
 //! Numbered schema migrations tracked in `PRAGMA user_version`
 
-use rusqlite::Connection;
-
-use super::StoreError;
+use super::{StoreError, sql::Connection};
 
 /// Version a fully migrated database reports
 pub const SCHEMA_VERSION: i64 = 4;
 
-type Migration = fn(&Connection) -> Result<(), rusqlite::Error>;
+type Migration = fn(&Connection) -> Result<(), turso::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
@@ -23,14 +21,14 @@ const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 /// Brings the database up to [`SCHEMA_VERSION`]; runs inside the caller's
 /// transaction so a failure leaves the old version in place
 pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let version: i64 = connection.query_row("PRAGMA user_version", (), |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(StoreError::SchemaTooNew(version));
     }
 
     for (index, migration) in MIGRATIONS.iter().enumerate().skip(version.max(0) as usize) {
         migration(connection)?;
-        connection.pragma_update(None, "user_version", index as i64 + 1)?;
+        connection.execute_batch(&format!("PRAGMA user_version = {}", index + 1))?;
     }
 
     Ok(())
@@ -39,7 +37,7 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
 /// How each upstream call's result was typed for the script (`schema`,
 /// `text` or `untyped`), so the review can rank tools that still return a
 /// `JsonValue` without knowing the catalog
-fn add_call_output(connection: &Connection) -> Result<(), rusqlite::Error> {
+fn add_call_output(connection: &Connection) -> Result<(), turso::Error> {
     connection.execute_batch("ALTER TABLE upstream_calls ADD COLUMN output TEXT;")
 }
 
@@ -48,7 +46,7 @@ fn add_call_output(connection: &Connection) -> Result<(), rusqlite::Error> {
 /// on `calls` records how each call got its session (`reused`, `minted`,
 /// or `reminted` when the client already had a recent one), for the
 /// session-reuse numbers
-fn create_sessions(connection: &Connection) -> Result<(), rusqlite::Error> {
+fn create_sessions(connection: &Connection) -> Result<(), turso::Error> {
     connection.execute_batch(
         r#"
         CREATE TABLE sessions (
@@ -68,7 +66,7 @@ fn create_sessions(connection: &Connection) -> Result<(), rusqlite::Error> {
 /// tokens are written together when a login completes, so an abandoned
 /// flow never replaces a working login. Flows in progress live in
 /// `oauth_pending`, keyed by their CSRF state
-fn create_oauth_tables(connection: &Connection) -> Result<(), rusqlite::Error> {
+fn create_oauth_tables(connection: &Connection) -> Result<(), turso::Error> {
     connection.execute_batch(
         r#"
         CREATE TABLE oauth_logins (
@@ -89,7 +87,7 @@ fn create_oauth_tables(connection: &Connection) -> Result<(), rusqlite::Error> {
     )
 }
 
-fn create_tables(connection: &Connection) -> Result<(), rusqlite::Error> {
+fn create_tables(connection: &Connection) -> Result<(), turso::Error> {
     connection.execute_batch(
         r#"
         CREATE TABLE calls (

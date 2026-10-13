@@ -10,8 +10,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
-use rusqlite::params;
 use serde::Serialize;
+use turso::params;
 
 use super::{Attempt, Reporter, TOP_ROWS, cell, inline, percent};
 use crate::{
@@ -109,7 +109,7 @@ pub struct Strictness {
 
 impl Reporter<'_> {
     /// The strictness signals over the window
-    pub(super) fn strictness(&self) -> Result<Strictness, rusqlite::Error> {
+    pub(super) fn strictness(&self) -> Result<Strictness, turso::Error> {
         let tools = self.called_functions()?;
         let mut clients: BTreeMap<String, ClientStrictness> = BTreeMap::new();
         let mut rules: HashMap<(String, String), RuleStats> = HashMap::new();
@@ -203,40 +203,38 @@ impl Reporter<'_> {
     }
 
     /// Python names of the tools called in the window
-    fn called_functions(&self) -> Result<HashSet<String>, rusqlite::Error> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT DISTINCT function FROM upstream_calls WHERE at_ms >= ?1")?;
-        let functions = statement
-            .query_map(params![self.since_ms], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+    fn called_functions(&self) -> Result<HashSet<String>, turso::Error> {
+        let functions: Vec<String> = self.connection.query_map(
+            "SELECT DISTINCT function FROM upstream_calls WHERE at_ms >= ?1",
+            params![self.since_ms],
+            |row| row.get(0),
+        )?;
 
-        Ok(functions)
+        Ok(functions.into_iter().collect())
     }
 
     /// `(client, tool, calls)` of results that broke their schema
-    fn mismatches(&self) -> Result<Vec<(String, String, i64)>, rusqlite::Error> {
+    fn mismatches(&self) -> Result<Vec<(String, String, i64)>, turso::Error> {
         self.tool_counts("u.outcome = 'output_mismatch'")
     }
 
     /// `(client, tool, calls)` of tools whose results reach scripts as a
     /// `JsonValue`
-    fn untyped_calls(&self) -> Result<Vec<(String, String, i64)>, rusqlite::Error> {
+    fn untyped_calls(&self) -> Result<Vec<(String, String, i64)>, turso::Error> {
         self.tool_counts("u.output = 'untyped'")
     }
 
-    fn tool_counts(&self, condition: &str) -> Result<Vec<(String, String, i64)>, rusqlite::Error> {
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT COALESCE(e.client_name, 'unknown'), u.server || '.' || u.tool, COUNT(*) \
+    fn tool_counts(&self, condition: &str) -> Result<Vec<(String, String, i64)>, turso::Error> {
+        let rows = self.connection.query_map(
+            &format!(
+                "SELECT COALESCE(e.client_name, 'unknown'), u.server || '.' || u.tool, COUNT(*) \
              FROM upstream_calls u LEFT JOIN executions e ON e.id = u.execution_id \
              WHERE u.at_ms >= ?1 AND e.client_name IS NOT ?2 AND {condition} \
              GROUP BY 1, 2"
-        ))?;
-        let rows = statement
-            .query_map(params![self.since_ms, EXEC_CLIENT], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<Result<_, _>>()?;
+            ),
+            params![self.since_ms, EXEC_CLIENT],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
 
         Ok(rows)
     }

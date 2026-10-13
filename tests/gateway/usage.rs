@@ -74,13 +74,14 @@ async fn outcomes_are_classified_and_sensitive_servers_redacted() -> TestResult 
 
     harness.app.usage().flush().await;
     let connection = store::open(harness.app.state_dir())?;
-    let mut statement =
-        connection.prepare("SELECT script, outcome, detail, fingerprint FROM executions")?;
-    let executions: HashMap<String, (String, Option<String>, Option<String>)> = statement
-        .query_map([], |row| {
-            Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
-        })?
-        .collect::<Result<_, _>>()?;
+    let executions: HashMap<String, (String, Option<String>, Option<String>)> = connection
+        .query_map(
+            "SELECT script, outcome, detail, fingerprint FROM executions",
+            (),
+            |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?))),
+        )?
+        .into_iter()
+        .collect();
 
     for (script, expected) in &cases {
         let (outcome, detail, _) = executions
@@ -120,9 +121,13 @@ async fn outcomes_are_classified_and_sensitive_servers_redacted() -> TestResult 
     );
 
     let call_outcomes: Vec<String> = connection
-        .prepare("SELECT outcome FROM calls WHERE tool = 'execute'")?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
+        .query_map(
+            "SELECT outcome FROM calls WHERE tool = 'execute'",
+            (),
+            |row| row.get(0),
+        )?
+        .into_iter()
+        .collect();
     assert!(
         call_outcomes.iter().any(|outcome| outcome == "pending"),
         "{call_outcomes:?}"
@@ -133,9 +138,13 @@ async fn outcomes_are_classified_and_sensitive_servers_redacted() -> TestResult 
     );
 
     let secret_calls: Vec<(Option<String>, Option<String>)> = connection
-        .prepare("SELECT arguments, detail FROM upstream_calls WHERE server = 'secret'")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+        .query_map(
+            "SELECT arguments, detail FROM upstream_calls WHERE server = 'secret'",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+        .into_iter()
+        .collect();
     assert_eq!(secret_calls.len(), 3, "{secret_calls:?}");
     assert!(
         secret_calls
@@ -144,7 +153,7 @@ async fn outcomes_are_classified_and_sensitive_servers_redacted() -> TestResult 
     );
     let fixture_arguments: Option<String> = connection.query_row(
         "SELECT arguments FROM upstream_calls WHERE function = 'fixture_hang'",
-        [],
+        (),
         |row| row.get(0),
     )?;
     assert!(

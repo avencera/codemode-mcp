@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use turso::params;
 
-use super::{Store, StoreError, now_ms};
+use super::{Store, StoreError, now_ms, sql::Connection};
 use crate::approvals::hex;
 
 /// Prefix of every token, so an agent can tell it from other ids
@@ -107,70 +107,65 @@ impl Store {
     ) -> Result<ResolvedSession, StoreError> {
         let now = now_ms();
         let provided = provided.map(str::trim).filter(|value| !value.is_empty());
-        let mut connection = self.connection();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        if let Some(token) = provided
-            && token.starts_with(TOKEN_PREFIX)
-            && token.chars().count() <= MAX_TOKEN_CHARS
-        {
-            let hash = hash_token(token);
-            let known: Option<(Option<String>, i64)> = transaction
-                .query_row(
-                    "SELECT client, last_seen_ms FROM sessions WHERE hash = ?1",
-                    params![hash],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            let idle_ms = idle.as_millis().min(i64::MAX as u128) as i64;
-            if let Some((owner, last_seen)) = known
-                && owner.as_deref() == client
-                && now.saturating_sub(last_seen) < idle_ms
+        self.connection().transaction(|transaction| {
+            if let Some(token) = provided
+                && token.starts_with(TOKEN_PREFIX)
+                && token.chars().count() <= MAX_TOKEN_CHARS
             {
-                transaction.execute(
-                    "UPDATE sessions SET last_seen_ms = ?1 WHERE hash = ?2",
-                    params![now, hash],
+                let hash = hash_token(token);
+                let known: Option<(Option<String>, i64)> = transaction.query_optional(
+                    "SELECT client, last_seen_ms FROM sessions WHERE hash = ?1",
+                    params![hash.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                transaction.commit()?;
+                let idle_ms = idle.as_millis().min(i64::MAX as u128) as i64;
+                if let Some((owner, last_seen)) = known
+                    && owner.as_deref() == client
+                    && now.saturating_sub(last_seen) < idle_ms
+                {
+                    transaction.execute(
+                        "UPDATE sessions SET last_seen_ms = ?1 WHERE hash = ?2",
+                        params![now, hash.as_str()],
+                    )?;
 
-                return Ok(ResolvedSession {
-                    token: token.to_owned(),
-                    hash,
-                    state: SessionState::Reused,
-                    replaced: false,
-                });
+                    return Ok(ResolvedSession {
+                        token: token.to_owned(),
+                        hash,
+                        state: SessionState::Reused,
+                        replaced: false,
+                    });
+                }
             }
-        }
 
-        let forgot: bool = transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sessions WHERE client IS ?1 AND last_seen_ms >= ?2)",
-            params![client, now - ACTIVE_WINDOW_MS],
-            |row| row.get(0),
-        )?;
-        let token = new_token();
-        let hash = hash_token(&token);
-        transaction.execute(
-            "INSERT INTO sessions (hash, client, created_ms, last_seen_ms) \
-             VALUES (?1, ?2, ?3, ?3)",
-            params![hash, client, now],
-        )?;
-        transaction.commit()?;
+            let forgot: bool = transaction.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sessions WHERE client IS ?1 AND last_seen_ms >= ?2)",
+                params![client, now - ACTIVE_WINDOW_MS],
+                |row| row.get(0),
+            )?;
+            let token = new_token();
+            let hash = hash_token(&token);
+            transaction.execute(
+                "INSERT INTO sessions (hash, client, created_ms, last_seen_ms) \
+                     VALUES (?1, ?2, ?3, ?3)",
+                params![hash.as_str(), client, now],
+            )?;
 
-        Ok(ResolvedSession {
-            token,
-            hash,
-            state: if forgot {
-                SessionState::Reminted
-            } else {
-                SessionState::Minted
-            },
-            replaced: provided.is_some(),
+            Ok(ResolvedSession {
+                token,
+                hash,
+                state: if forgot {
+                    SessionState::Reminted
+                } else {
+                    SessionState::Minted
+                },
+                replaced: provided.is_some(),
+            })
         })
     }
 }
 
 /// Deletes sessions not seen since `cutoff_ms`
-pub fn purge(connection: &Connection, cutoff_ms: i64) -> Result<(), rusqlite::Error> {
+pub fn purge(connection: &Connection, cutoff_ms: i64) -> Result<(), turso::Error> {
     connection.execute(
         "DELETE FROM sessions WHERE last_seen_ms < ?1",
         params![cutoff_ms],

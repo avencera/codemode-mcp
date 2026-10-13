@@ -298,7 +298,10 @@ relax that rule (or drop its ban) instead of adding hints.
 
 Goal: see whether agents use Code Mode well or get confused, and feed that back into the directions and stubs
 
-- SQLite at `<state_dir>/codemode.sqlite` (WAL, numbered migrations in `PRAGMA user_version`, mode 0600).
+- SQLite-format database at `<state_dir>/codemode.sqlite`, kept with turso (WAL, numbered migrations in
+  `PRAGMA user_version`, mode 0600). Every open uses turso's multiprocess WAL so the CLI can read and write while
+  the daemon runs; a SQLite build must not open the file at the same time, since the two coordinate WAL access
+  differently.
   Tables: `sessions`, `calls` (every agent-facing call: time, app session label, session state, client name/version, tool,
   input — query, described names or script —, outcome, detail, fingerprint, duration, result bytes, execution id),
   `executions` (one row per finished execution with its script and final outcome), `upstream_calls` (server,
@@ -426,7 +429,7 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 
 ### Service
 
-- Rust 2024, tokio, axum 0.8, rmcp, monty-pool, webauthn-rs, rusqlite; conventions match homebased (color-eyre, thiserror, no unwrap/expect)
+- Rust 2024, tokio, axum 0.8, rmcp, monty-pool, webauthn-rs, turso; conventions match homebased (color-eyre, thiserror, no unwrap/expect)
 - launchd agent `dev.praveen.codemode-mcp`, listening on `0.0.0.0`, Host header rules accept localhost, private, Tailscale and `*.ts.net` names (plus `extra_allowed_hosts`)
 - `codemode-mcp service install` copies the running binary to `~/.local/bin/codemode-mcp` and the Monty worker
   (`worker_path`, else `.tools/bin/monty` in the current directory) to `~/.local/share/codemode-mcp/monty`, both

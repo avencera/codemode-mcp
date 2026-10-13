@@ -1,7 +1,9 @@
-//! SQLite state: usage records, approvals, enrolled passkeys and OAuth logins
+//! SQLite-format state, kept with turso: usage records, approvals,
+//! enrolled passkeys and OAuth logins
 
 pub mod schema;
 pub mod sessions;
+pub mod sql;
 
 use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -10,7 +12,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use turso::params;
+
+use self::sql::Connection;
 
 /// File name of the database inside the state directory
 pub const DATABASE_FILE: &str = "codemode.sqlite";
@@ -20,9 +24,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Failures reading or writing the database
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// SQLite reported an error
+    /// The database reported an error
     #[error("database error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Database(#[from] turso::Error),
     /// The state directory could not be created
     #[error("failed to prepare state directory {path}: {source}")]
     Directory {
@@ -62,30 +66,32 @@ pub fn prepare_state_dir(directory: &Path) -> Result<(), StoreError> {
 pub fn open(directory: &Path) -> Result<Connection, StoreError> {
     prepare_state_dir(directory)?;
     let path = directory.join(DATABASE_FILE);
-    let mut connection = Connection::open(&path)?;
-    // the database holds scripts and passkeys, so only the owner may read it
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    connection.busy_timeout(BUSY_TIMEOUT)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    schema::migrate(&transaction)?;
-    transaction.commit()?;
+    // turso always journals to a WAL, so there is no journal mode to set
+    let connection = Connection::open(&path, false, BUSY_TIMEOUT)?;
+    // the database holds scripts and passkeys, so only the owner may read
+    // it; unlike SQLite, turso creates the WAL and its coordination file
+    // with the default mode rather than the database's
+    for suffix in ["", "-wal", "-tshm"] {
+        let mut file = path.clone().into_os_string();
+        file.push(suffix);
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+    }
+    connection.execute_batch("PRAGMA foreign_keys = ON")?;
+    connection.transaction(schema::migrate)?;
 
     Ok(connection)
 }
 
-/// Opens an existing database read-only, without migrating; for report
-/// pages that must never contend with the writer
+/// Opens an existing database without creating or migrating it; for
+/// report pages. Inside a process that already has the database open,
+/// turso hands back that writable instance, so read-only is a promise of
+/// the callers rather than of the open
 pub fn open_read_only(directory: &Path) -> Result<Connection, StoreError> {
-    let connection = Connection::open_with_flags(
-        directory.join(DATABASE_FILE),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
-
-    Ok(connection)
+    Ok(Connection::open(
+        &directory.join(DATABASE_FILE),
+        true,
+        BUSY_TIMEOUT,
+    )?)
 }
 
 /// One enrolled passkey as listed to the owner
@@ -128,56 +134,46 @@ impl Store {
         credential: &str,
         only_if_none: bool,
     ) -> Result<Option<i64>, StoreError> {
-        let mut connection = self.connection();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if only_if_none {
-            let count: i64 =
-                transaction.query_row("SELECT COUNT(*) FROM passkeys", [], |row| row.get(0))?;
-            if count > 0 {
-                return Ok(None);
+        self.connection().transaction(|transaction| {
+            if only_if_none {
+                let count: i64 =
+                    transaction.query_row("SELECT COUNT(*) FROM passkeys", (), |row| row.get(0))?;
+                if count > 0 {
+                    return Ok(None);
+                }
             }
-        }
-        transaction.execute(
-            "INSERT INTO passkeys (label, created_ms, credential) VALUES (?1, ?2, ?3)",
-            params![label, now_ms(), credential],
-        )?;
-        let id = transaction.last_insert_rowid();
-        transaction.commit()?;
+            transaction.execute(
+                "INSERT INTO passkeys (label, created_ms, credential) VALUES (?1, ?2, ?3)",
+                params![label, now_ms(), credential],
+            )?;
 
-        Ok(Some(id))
+            Ok(Some(transaction.last_insert_rowid()))
+        })
     }
 
     /// Every enrolled passkey, oldest first
     pub fn list_passkeys(&self) -> Result<Vec<PasskeyRecord>, StoreError> {
-        let connection = self.connection();
-        let mut statement = connection
-            .prepare("SELECT id, label, created_ms, last_used_ms FROM passkeys ORDER BY id")?;
-        let rows = statement.query_map([], |row| {
-            Ok(PasskeyRecord {
-                id: row.get(0)?,
-                label: row.get(1)?,
-                created_ms: row.get(2)?,
-                last_used_ms: row.get(3)?,
-            })
-        })?;
-
-        Ok(rows.collect::<Result<_, _>>()?)
+        Ok(self.connection().query_map(
+            "SELECT id, label, created_ms, last_used_ms FROM passkeys ORDER BY id",
+            (),
+            passkey_record,
+        )?)
     }
 
     /// Stored credential JSON of every passkey with its id
     pub fn passkey_credentials(&self) -> Result<Vec<(i64, String)>, StoreError> {
-        let connection = self.connection();
-        let mut statement = connection.prepare("SELECT id, credential FROM passkeys")?;
-        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-
-        Ok(rows.collect::<Result<_, _>>()?)
+        Ok(self
+            .connection()
+            .query_map("SELECT id, credential FROM passkeys", (), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?)
     }
 
     /// Number of enrolled passkeys
     pub fn passkey_count(&self) -> Result<usize, StoreError> {
         let count: i64 =
             self.connection()
-                .query_row("SELECT COUNT(*) FROM passkeys", [], |row| row.get(0))?;
+                .query_row("SELECT COUNT(*) FROM passkeys", (), |row| row.get(0))?;
 
         Ok(count.max(0) as usize)
     }
@@ -212,14 +208,11 @@ impl Store {
 
     /// Client registration and credentials JSON of a server's OAuth login
     pub fn oauth_login(&self, server: &str) -> Result<Option<(String, String)>, StoreError> {
-        Ok(self
-            .connection()
-            .query_row(
-                "SELECT client, credentials FROM oauth_logins WHERE server = ?1",
-                params![server],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?)
+        Ok(self.connection().query_optional(
+            "SELECT client, credentials FROM oauth_logins WHERE server = ?1",
+            params![server],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
     }
 
     /// Stores a completed login and forgets the server's flows in progress
@@ -229,21 +222,21 @@ impl Store {
         client: &str,
         credentials: &str,
     ) -> Result<(), StoreError> {
-        let mut connection = self.connection();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO oauth_logins (server, client, credentials, updated_ms) \
-             VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (server) DO UPDATE SET client = ?2, credentials = ?3, updated_ms = ?4",
-            params![server, client, credentials, now_ms()],
-        )?;
-        transaction.execute(
-            "DELETE FROM oauth_pending WHERE server = ?1",
-            params![server],
-        )?;
-        transaction.commit()?;
+        self.connection().transaction(|transaction| {
+            transaction.execute(
+                "INSERT INTO oauth_logins (server, client, credentials, updated_ms) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT (server) DO UPDATE SET client = ?2, credentials = ?3, \
+                     updated_ms = ?4",
+                params![server, client, credentials, now_ms()],
+            )?;
+            transaction.execute(
+                "DELETE FROM oauth_pending WHERE server = ?1",
+                params![server],
+            )?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Replaces the credentials of an existing login (a refresh); does
@@ -264,19 +257,18 @@ impl Store {
     /// Deletes a server's login and flows in progress, returning whether a
     /// login existed
     pub fn remove_oauth_login(&self, server: &str) -> Result<bool, StoreError> {
-        let mut connection = self.connection();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let removed = transaction.execute(
-            "DELETE FROM oauth_logins WHERE server = ?1",
-            params![server],
-        )?;
-        transaction.execute(
-            "DELETE FROM oauth_pending WHERE server = ?1",
-            params![server],
-        )?;
-        transaction.commit()?;
+        self.connection().transaction(|transaction| {
+            let removed = transaction.execute(
+                "DELETE FROM oauth_logins WHERE server = ?1",
+                params![server],
+            )?;
+            transaction.execute(
+                "DELETE FROM oauth_pending WHERE server = ?1",
+                params![server],
+            )?;
 
-        Ok(removed > 0)
+            Ok(removed > 0)
+        })
     }
 
     /// Stores the PKCE state of a flow in progress, dropping flows older
@@ -325,15 +317,12 @@ impl Store {
         csrf: &str,
         max_age_ms: i64,
     ) -> Result<Option<(String, Option<String>)>, StoreError> {
-        Ok(self
-            .connection()
-            .query_row(
-                "SELECT state, client FROM oauth_pending \
-                 WHERE server = ?1 AND csrf = ?2 AND created_ms >= ?3",
-                params![server, csrf, now_ms() - max_age_ms],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?)
+        Ok(self.connection().query_optional(
+            "SELECT state, client FROM oauth_pending \
+             WHERE server = ?1 AND csrf = ?2 AND created_ms >= ?3",
+            params![server, csrf, now_ms() - max_age_ms],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
     }
 
     /// Forgets one flow in progress
@@ -348,20 +337,19 @@ impl Store {
 
     /// One passkey, if it exists
     pub fn passkey(&self, id: i64) -> Result<Option<PasskeyRecord>, StoreError> {
-        Ok(self
-            .connection()
-            .query_row(
-                "SELECT id, label, created_ms, last_used_ms FROM passkeys WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok(PasskeyRecord {
-                        id: row.get(0)?,
-                        label: row.get(1)?,
-                        created_ms: row.get(2)?,
-                        last_used_ms: row.get(3)?,
-                    })
-                },
-            )
-            .optional()?)
+        Ok(self.connection().query_optional(
+            "SELECT id, label, created_ms, last_used_ms FROM passkeys WHERE id = ?1",
+            params![id],
+            passkey_record,
+        )?)
     }
+}
+
+fn passkey_record(row: &turso::Row) -> Result<PasskeyRecord, turso::Error> {
+    Ok(PasskeyRecord {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        created_ms: row.get(2)?,
+        last_used_ms: row.get(3)?,
+    })
 }
