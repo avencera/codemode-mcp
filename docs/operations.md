@@ -1,6 +1,7 @@
 # Operating codemode-mcp
 
-Commands below assume the binary is on `PATH` (`~/.local/bin/codemode-mcp` after install). Times in logs are UTC.
+Commands below assume the binary is on `PATH` (`~/.local/bin/codemode-mcp` after install). `cmcp` is the same
+binary under a shorter name. Times in logs are UTC.
 
 ## Install
 
@@ -22,9 +23,10 @@ Commands below assume the binary is on `PATH` (`~/.local/bin/codemode-mcp` after
    ./target/release/codemode-mcp service install
    ```
 
-   This copies the binary to `~/.local/bin/codemode-mcp` and the worker to
+   This copies the binary to `~/.local/bin/codemode-mcp`, links `~/.local/bin/cmcp` to it, copies the worker to
    `~/.local/share/codemode-mcp/monty`, writes `~/Library/LaunchAgents/dev.praveen.codemode-mcp.plist` and loads
-   it. Run it again after every rebuild; it replaces both files and reloads the service.
+   it. Run it again after every rebuild; it replaces both files and reloads the service. If something else is
+   already at `~/.local/bin/cmcp`, the install leaves it alone and logs a warning.
 4. Check it: `codemode-mcp service status` (plist, launchd state, `/healthz`).
 5. Expose the approval pages to the phone: `tailscale serve --bg --https=8443 http://127.0.0.1:7681`.
    `public_origin` (default `https://mac.tailnet-name.ts.net:8443`) must match.
@@ -167,5 +169,5 @@ codemode-mcp service uninstall
 ```
 
 This unloads the service and removes the plist. State (`~/.local/state/codemode-mcp`), the config and the
-installed binary and worker stay; delete them by hand if wanted. Remove the agents' `codemode` MCP entries and
+installed binary, the `cmcp` link and the worker stay; delete them by hand if wanted. Remove the agents' `codemode` MCP entries and
 `tailscale serve --https=8443 off` as well.

@@ -20,6 +20,8 @@ pub const LABEL: &str = "dev.praveen.codemode-mcp";
 const EXIT_GRACE: Duration = Duration::from_secs(30);
 /// How long `launchctl bootstrap` is retried while a previous instance exits
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(10);
+/// Short name `service install` links to the installed binary
+pub const ALIAS: &str = "cmcp";
 /// Starter configuration; `{{HOME}}` is replaced with the home directory
 const STARTER_CONFIG: &str = include_str!("../assets/starter-config.toml");
 
@@ -68,6 +70,8 @@ pub struct ServicePaths {
     pub home: PathBuf,
     /// Installed binary, `~/.local/bin/codemode-mcp`
     pub binary: PathBuf,
+    /// Short-name symlink to the binary, `~/.local/bin/cmcp`
+    pub alias: PathBuf,
     /// Installed Monty worker, `~/.local/share/codemode-mcp/monty`
     pub worker: PathBuf,
     /// LaunchAgent plist
@@ -82,6 +86,7 @@ impl ServicePaths {
         Self {
             home: home.to_owned(),
             binary: home.join(".local/bin/codemode-mcp"),
+            alias: home.join(".local/bin").join(ALIAS),
             worker: default_worker_path(home),
             plist: home.join(format!("Library/LaunchAgents/{LABEL}.plist")),
             logs: state_dir.join("logs"),
@@ -128,6 +133,14 @@ pub enum Action {
         /// Destination
         to: PathBuf,
     },
+    /// Point the symlink `link` at `target`, leaving anything else already
+    /// at `link` in place
+    Link {
+        /// What the link points to, relative to its directory
+        target: PathBuf,
+        /// The symlink
+        link: PathBuf,
+    },
     /// Remove a file if it exists
     Remove(PathBuf),
     /// Run a command
@@ -162,6 +175,9 @@ impl Action {
                 format!("write {} ({} bytes)", path.display(), contents.len())
             }
             Self::Rename { from, to } => format!("mv {} {}", from.display(), to.display()),
+            Self::Link { target, link } => {
+                format!("ln -s {} {}", target.display(), link.display())
+            }
             Self::Remove(path) => format!("rm -f {}", path.display()),
             Self::Run {
                 argv,
@@ -196,6 +212,7 @@ impl Action {
             Self::Rename { from, to } => {
                 std::fs::rename(from, to).map_err(io(format!("rename to {}", to.display())))
             }
+            Self::Link { target, link } => link_alias(target, link),
             Self::Remove(path) => match std::fs::remove_file(path) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     Err(ServiceError::Io {
@@ -412,6 +429,28 @@ pub fn render_plist(paths: &ServicePaths, config: Option<&Path>, drain: Duration
 }
 
 /// `gui/<uid>/<label>`
+/// Creates the symlink unless something is already at `link`: our own link
+/// is left as is, and anything else (a user's script, another tool's link)
+/// is left alone with a warning rather than failing the install halfway
+fn link_alias(target: &Path, link: &Path) -> Result<(), ServiceError> {
+    match std::fs::read_link(link) {
+        Ok(existing) if existing == target => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::os::unix::fs::symlink(target, link)
+                .map_err(io(format!("link {}", link.display())));
+        }
+        // a regular file or directory: read_link fails with InvalidInput
+        Err(_) => {}
+    }
+
+    tracing::warn!(
+        path = %link.display(),
+        "something else is already at this path, so the short name was not linked"
+    );
+    Ok(())
+}
+
 fn target(uid: u32) -> String {
     format!("gui/{uid}/{LABEL}")
 }
@@ -436,6 +475,15 @@ pub fn install_plan(
         Action::Install {
             from: binary.to_owned(),
             to: paths.binary.clone(),
+        },
+        // relative, so the link follows the binary whatever the home path
+        Action::Link {
+            target: paths
+                .binary
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            link: paths.alias.clone(),
         },
         Action::CreateDir(parent(&paths.worker)),
         Action::Install {
@@ -471,7 +519,8 @@ pub fn install_plan(
     ]
 }
 
-/// Steps of `service uninstall`; state and installed files stay
+/// Steps of `service uninstall`; state and installed files, including the
+/// `cmcp` link, stay
 pub fn uninstall_plan(paths: &ServicePaths, uid: u32) -> Vec<Action> {
     vec![
         Action::Run {
@@ -548,6 +597,39 @@ mod tests {
         assert!(!plist.contains("a&b"));
         // drain 20s plus the grace period, so launchd waits out the drain
         assert!(plist.contains("<key>ExitTimeOut</key>\n  <integer>50</integer>"));
+    }
+
+    #[test]
+    fn the_short_name_links_once_and_never_replaces_a_users_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!("codemode-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let binary = Path::new("codemode-mcp");
+        let link = directory.join(ALIAS);
+        let link_action = Action::Link {
+            target: binary.to_owned(),
+            link: link.clone(),
+        };
+
+        // a fresh install links, and a reinstall keeps the same link
+        link_action.apply()?;
+        link_action.apply()?;
+        assert_eq!(std::fs::read_link(&link)?, binary);
+
+        // a file the user put there survives the install untouched
+        std::fs::remove_file(&link)?;
+        std::fs::write(&link, "#!/bin/sh\necho mine\n")?;
+        link_action.apply()?;
+        assert_eq!(std::fs::read_to_string(&link)?, "#!/bin/sh\necho mine\n");
+
+        // so does a link of theirs pointing elsewhere
+        std::fs::remove_file(&link)?;
+        std::os::unix::fs::symlink("/usr/bin/true", &link)?;
+        link_action.apply()?;
+        assert_eq!(std::fs::read_link(&link)?, Path::new("/usr/bin/true"));
+
+        std::fs::remove_dir_all(&directory)?;
+        Ok(())
     }
 
     #[test]
