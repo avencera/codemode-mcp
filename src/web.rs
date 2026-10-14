@@ -107,6 +107,13 @@ button.deny {{ background: #b3261e; color: #fff; }}
 button:disabled {{ opacity: .5; }}
 input {{ font-size: 1.1rem; padding: 12px; border-radius: 10px; border: 1px solid #999; width: 100%; box-sizing: border-box; }}
 #status {{ margin-top: 12px; font-weight: 600; min-height: 1.4em; }}
+/* once decided, a full-width banner replaces the buttons so the outcome is visible at a glance */
+main[data-outcome] .buttons, main[data-outcome] .countdown {{ display: none; }}
+main[data-outcome] #status {{ margin-top: 16px; padding: 18px 14px; border-radius: 14px; color: #fff; font-size: 1.3rem; text-align: center; }}
+main[data-outcome] #status small {{ display: block; margin-top: 4px; font-size: .9rem; font-weight: 400; opacity: .9; }}
+main[data-outcome="approved"] #status {{ background: #1f7a3a; }}
+main[data-outcome="denied"] #status {{ background: #b3261e; }}
+main[data-outcome="expired"] #status {{ background: #6b6b6b; }}
 table {{ border-collapse: collapse; width: 100%; font-size: .9rem; }}
 td, th {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(127,127,127,.3); vertical-align: top; overflow-wrap: anywhere; }}
 .kw {{ color: #a626a4; }}
@@ -281,7 +288,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         r#"<main data-kind="approve" data-base="/approve/{id}">
 <h1>{title}</h1>
 <p class="meta">Client {client} {version}{session}<br>Execution {execution}</p>
-<p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
+<p class="meta countdown">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
 <div class="buttons">
 <button class="approve" data-choice="once">Approve once</button>
 {client_buttons}
@@ -317,7 +324,7 @@ fn admin_page(info: &ApprovalInfo, title: &str) -> Response {
         r#"<main data-kind="approve" data-base="/approve/{id}">
 <h1>{title}</h1>
 <p class="meta">Requested by the codemode-mcp command line on the Mac. Approve only if you started this; an unexpected request means something on the Mac is trying to change who can approve tool calls.</p>
-<p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
+<p class="meta countdown">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
 <div class="buttons">
 <button class="approve" data-choice="once">Approve</button>
 <button class="deny" data-choice="deny">Deny</button>
@@ -402,7 +409,7 @@ async fn approve_confirm(
     }
 
     match state.approvals.decide(&id, choice) {
-        Ok(()) => Json(json!({ "ok": true, "message": "Approved." })).into_response(),
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(error) => decide_error(&error),
     }
 }
@@ -414,7 +421,7 @@ async fn approve_deny(
     Json(_body): Json<Value>,
 ) -> Response {
     match state.approvals.decide(&id, Choice::Deny) {
-        Ok(()) => Json(json!({ "ok": true, "message": "Denied." })).into_response(),
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(error) => decide_error(&error),
     }
 }
@@ -495,7 +502,6 @@ async fn enroll_finish(
         Ok(Ok(id)) => Json(json!({
             "ok": true,
             "id": id,
-            "message": "Passkey added. You can close this page.",
         }))
         .into_response(),
         Ok(Err(error)) => passkey_error(&error),

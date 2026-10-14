@@ -32,9 +32,17 @@
   const setBusy = (busy) => {
     for (const button of document.querySelectorAll("button")) button.disabled = busy;
   };
-  const finish = (text) => {
-    show(text);
+  let countdown = null;
+  // outcome is approved, denied or expired; the page styles it as a banner in place of the buttons
+  const finish = (outcome, text) => {
+    if (countdown) clearInterval(countdown);
+    status.textContent = text;
+    const hint = document.createElement("small");
+    hint.textContent = "You can close this page.";
+    status.append(hint);
+    main.dataset.outcome = outcome;
     for (const button of document.querySelectorAll("button")) button.disabled = true;
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   if (!window.PublicKeyCredential) {
@@ -46,16 +54,17 @@
     if (left) {
       let seconds = Number(left.dataset.seconds);
       const tick = () => {
-        if (seconds <= 0) { finish("Expired."); return; }
+        if (seconds <= 0) { finish("expired", "Expired"); return; }
         const minutes = Math.floor(seconds / 60);
         left.textContent = minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
         seconds -= 1;
       };
       tick();
-      setInterval(tick, 1000);
+      countdown = setInterval(tick, 1000);
     }
 
-    const approve = async (choice) => {
+    const approve = async (button) => {
+      const choice = button.dataset.choice;
       const { ceremony, options } = await post("/options", { choice });
       const publicKey = options.publicKey;
       publicKey.challenge = toBuffer(publicKey.challenge);
@@ -79,7 +88,9 @@
           extensions: assertion.getClientExtensionResults(),
         },
       });
-      finish(result.message || "Approved.");
+      // name the choice so a session or client grant reads differently from a single call
+      const label = button.textContent.trim().replace(/^Approve\b/, "Approved");
+      finish("approved", `\u2713 ${label}`);
     };
 
     for (const button of document.querySelectorAll("button[data-choice]")) {
@@ -89,10 +100,10 @@
         show(choice === "deny" ? "Denying..." : "Waiting for your passkey...");
         try {
           if (choice === "deny") {
-            const result = await post("/deny", {});
-            finish(result.message || "Denied.");
+            await post("/deny", {});
+            finish("denied", "\u2715 Denied");
           } else {
-            await approve(choice);
+            await approve(button);
           }
         } catch (error) {
           show(error.message || String(error));
@@ -119,7 +130,7 @@
         }
         const created = await navigator.credentials.create({ publicKey });
         const response = created.response;
-        const result = await post("/finish", {
+        await post("/finish", {
           ceremony,
           credential: {
             id: created.id,
@@ -133,7 +144,7 @@
             extensions: created.getClientExtensionResults(),
           },
         });
-        finish(result.message || "Passkey added.");
+        finish("approved", "\u2713 Passkey added");
       } catch (error) {
         show(error.message || String(error));
         setBusy(false);
