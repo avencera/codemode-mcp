@@ -264,6 +264,9 @@ impl UpstreamStatus {
 #[derive(Default)]
 struct Inner {
     peer: Option<Peer<RoleClient>>,
+    /// Connection epoch `peer` belongs to, read with it so setup is never
+    /// recorded against a newer connection than the one it ran on
+    peer_epoch: u64,
     tools: Vec<Tool>,
     instructions: Option<String>,
 }
@@ -339,10 +342,14 @@ impl Upstream {
         self.connected_peer().map(|_| ())
     }
 
-    fn connected_peer(&self) -> Result<Peer<RoleClient>, UpstreamError> {
-        self.read()
+    /// The live peer and the connection epoch it belongs to, read together
+    fn connected_peer(&self) -> Result<(Peer<RoleClient>, u64), UpstreamError> {
+        let inner = self.read();
+
+        inner
             .peer
             .clone()
+            .map(|peer| (peer, inner.peer_epoch))
             .ok_or_else(|| UpstreamError::Unavailable {
                 server: self.name.clone(),
                 category: self
@@ -361,8 +368,8 @@ impl Upstream {
         tool: &str,
         arguments: Map<String, Value>,
     ) -> Result<CallToolResult, UpstreamError> {
-        let peer = self.connected_peer()?;
-        self.ensure_setup(&peer, tool).await?;
+        let (peer, epoch) = self.connected_peer()?;
+        self.ensure_setup(&peer, epoch, tool).await?;
 
         self.send_call(&peer, tool, self.with_fixed_arguments(tool, arguments))
             .await
@@ -400,13 +407,17 @@ impl Upstream {
 
     /// Runs the configured `setup` calls once per connection, before the
     /// first other call on it
-    async fn ensure_setup(&self, peer: &Peer<RoleClient>, tool: &str) -> Result<(), UpstreamError> {
+    async fn ensure_setup(
+        &self,
+        peer: &Peer<RoleClient>,
+        epoch: u64,
+        tool: &str,
+    ) -> Result<(), UpstreamError> {
         let setup = &self.config.setup;
         if setup.is_empty() || setup.iter().any(|call| call.tool == tool) {
             return Ok(());
         }
 
-        let epoch = self.epoch.load(Ordering::SeqCst);
         if self.setup_epoch.load(Ordering::SeqCst) == epoch {
             return Ok(());
         }
@@ -719,6 +730,7 @@ impl Upstream {
         {
             let mut inner = self.write();
             inner.peer = Some(peer);
+            inner.peer_epoch = epoch;
             inner.instructions = instructions;
         }
         // availability flipped, so the catalog needs a rebuild even when the
@@ -888,6 +900,7 @@ impl Upstreams {
                 cache_unshown: AtomicBool::new(!tools.is_empty()),
                 inner: RwLock::new(Inner {
                     peer: None,
+                    peer_epoch: 0,
                     tools,
                     instructions: None,
                 }),
