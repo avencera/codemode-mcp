@@ -471,6 +471,9 @@ impl Gateway {
             arguments: &call.arguments,
             script: &context.script,
             grant_mode: grant_mode.unwrap_or_default(),
+            summary: server_config
+                .and_then(|server| server.tool_override(&entry.tool))
+                .and_then(|tool| tool.summary.as_deref()),
             sensitivity: Sensitivity::of(call.sensitive).or(prior),
         });
 

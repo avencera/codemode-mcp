@@ -31,6 +31,7 @@ use crate::{
         now_ms,
         sessions::SessionState,
     },
+    summary::{Template, prompt_text, summarize_arguments},
     usage::Caller,
 };
 
@@ -195,6 +196,10 @@ pub struct ApprovalInfo {
     pub script: Arc<str>,
     /// Whether a client grant may be given
     pub grant_mode: GrantMode,
+    /// The tool's `summary` template filled from the arguments, for the
+    /// Touch ID prompt; absent for tools without one
+    #[serde(default)]
+    pub summary: Option<String>,
     /// When the request is denied automatically, ms since the epoch; a wall
     /// clock time because it must mean the same to the next process
     pub expires_ms: i64,
@@ -248,6 +253,8 @@ pub struct GateRequest<'a> {
     pub script: &'a Arc<str>,
     /// The tool's grant mode
     pub grant_mode: GrantMode,
+    /// The tool's `summary` template, checked when the config was loaded
+    pub summary: Option<&'a str>,
     /// Whether the call or its execution holds data from a sensitive
     /// server, so the request must not reach the disk
     pub sensitivity: Sensitivity,
@@ -514,6 +521,10 @@ impl Approvals {
             arguments: request.arguments.clone(),
             script: Arc::clone(request.script),
             grant_mode: request.grant_mode,
+            summary: request
+                .summary
+                .and_then(|template| Template::parse(template).ok())
+                .map(|template| template.render(request.arguments)),
             expires_ms: self.expiry(),
         };
 
@@ -583,6 +594,7 @@ impl Approvals {
             arguments: details,
             script: Arc::from(""),
             grant_mode: GrantMode::PerCall,
+            summary: None,
             expires_ms: self.expiry(),
         };
         let notifier = self.notifier.clone();
@@ -771,13 +783,15 @@ impl Approvals {
                         }
                     }
                     TouchId::Approved => now.cancel(),
-                    TouchId::Review => match on_mac.mac.open(&url).await {
-                        Ok(()) => restart.notify_one(),
-                        Err(error) => {
+                    TouchId::Review => {
+                        // before opening the page, so a press just ahead of
+                        // the deadline still holds the phone back
+                        restart.notify_one();
+                        if let Err(error) = on_mac.mac.open(&url).await {
                             tracing::warn!(%error, "could not open the approval page");
                             now.cancel();
                         }
-                    },
+                    }
                     TouchId::Away => now.cancel(),
                     TouchId::Unavailable => {
                         let local = MacNotification {
@@ -1293,96 +1307,23 @@ impl Approvals {
     }
 }
 
-/// Longest argument summary shown in a Touch ID prompt, before `+N more`
-const SUMMARY_CHARS: usize = 200;
-/// Longest string argument shown whole; a longer one is cut and sized
-const SUMMARY_STRING_CHARS: usize = 40;
-/// Object keys named before the rest are elided
-const SUMMARY_KEYS: usize = 3;
-
 /// Text of the Touch ID prompt: the call, the client and a summary of the
 /// arguments, since a fingerprint approves without the page
 ///
 /// Unlike the phone notification, which crosses the ntfy server, the prompt
 /// stays on the Mac, so it may show arguments
 fn touch_id_reason(info: &ApprovalInfo) -> String {
-    let mut reason = format!(
-        "approve one call of {} by {}",
-        info.waiting_for(),
-        info.caller.client_label()
-    );
-    if !info.arguments.is_empty() {
-        reason.push_str(" with ");
-        reason.push_str(&summarize_arguments(&info.arguments));
-    }
+    let details = match &info.summary {
+        Some(summary) => Some(summary.clone()),
+        None if info.arguments.is_empty() => None,
+        None => Some(summarize_arguments(&info.arguments)),
+    };
 
-    reason
-}
-
-/// One `name: value` per argument, built from the arguments themselves
-/// rather than written by a model, so an agent cannot word its way past it:
-/// short values whole, long strings cut with their length, lists and
-/// objects by size and keys
-fn summarize_arguments(arguments: &Map<String, Value>) -> String {
-    let mut summary = String::new();
-    for (index, (name, value)) in arguments.iter().enumerate() {
-        let part = format!("{}: {}", printable(name, 30), summarize_value(value));
-        if !summary.is_empty() && summary.chars().count() + part.chars().count() > SUMMARY_CHARS {
-            summary.push_str(&format!(", +{} more", arguments.len() - index));
-
-            break;
-        }
-        if !summary.is_empty() {
-            summary.push_str(", ");
-        }
-        summary.push_str(&part);
-    }
-
-    summary
-}
-
-fn summarize_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => {
-            let length = text.chars().count();
-            if length <= SUMMARY_STRING_CHARS {
-                format!("\"{}\"", printable(text, SUMMARY_STRING_CHARS))
-            } else {
-                format!("\"{}…\" ({length} chars)", printable(text, 30))
-            }
-        }
-        Value::Array(items) => match items.len() {
-            1 => "1 item".to_owned(),
-            count => format!("{count} items"),
-        },
-        Value::Object(fields) => {
-            let mut keys: Vec<String> = fields
-                .keys()
-                .take(SUMMARY_KEYS)
-                .map(|key| printable(key, 20))
-                .collect();
-            if fields.len() > SUMMARY_KEYS {
-                keys.push("…".to_owned());
-            }
-            format!("{{{}}}", keys.join(", "))
-        }
-        other => printable(&other.to_string(), SUMMARY_STRING_CHARS),
-    }
-}
-
-/// The first `limit` characters with line breaks shown as `⏎` and other
-/// control and direction-changing characters as `?`, so an argument cannot
-/// lay out text that reads as part of the prompt
-fn printable(text: &str, limit: usize) -> String {
-    text.chars()
-        .take(limit)
-        .map(|character| match character {
-            '\n' | '\r' => '⏎',
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '?',
-            other if other.is_control() => '?',
-            other => other,
-        })
-        .collect()
+    prompt_text(
+        &info.waiting_for(),
+        info.caller.client_label(),
+        details.as_deref(),
+    )
 }
 
 /// What a script reads when its request ran out of time
@@ -1411,53 +1352,4 @@ pub fn random_token() -> String {
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::{Map, Value, json};
-
-    use super::summarize_arguments;
-
-    fn summary(arguments: Value) -> String {
-        let arguments: Map<String, Value> = match arguments {
-            Value::Object(arguments) => arguments,
-            _ => Map::new(),
-        };
-
-        summarize_arguments(&arguments)
-    }
-
-    #[test]
-    fn summaries_show_short_values_and_size_long_ones() {
-        assert_eq!(
-            summary(json!({ "to": "ana@example.com", "count": 3, "dry_run": false })),
-            r#"count: 3, dry_run: false, to: "ana@example.com""#
-        );
-        assert_eq!(
-            summary(
-                json!({ "body": "x".repeat(500), "cc": ["a", "b"], "meta": { "a": 1, "b": 2, "c": 3, "d": 4 } })
-            ),
-            r#"body: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…" (500 chars), cc: 2 items, meta: {a, b, c, …}"#
-        );
-    }
-
-    #[test]
-    fn summaries_cannot_fake_prompt_text() {
-        assert_eq!(
-            summary(json!({ "note": "ok\nApprove \u{202e}all" })),
-            r#"note: "ok⏎Approve ?all""#
-        );
-    }
-
-    #[test]
-    fn long_summaries_count_what_they_leave_out() {
-        let arguments: Map<String, Value> = (0..20)
-            .map(|index| (format!("field{index:02}"), json!("a value of some length")))
-            .collect();
-        let text = summarize_arguments(&arguments);
-
-        assert!(text.chars().count() < 230, "{text}");
-        assert!(text.ends_with(" more"), "{text}");
-    }
 }

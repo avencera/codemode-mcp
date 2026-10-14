@@ -10,7 +10,8 @@ use super::harness::{FakeMac, Harness, ORIGIN, Setup, TestResult, approval_id, t
 
 async fn mac_harness(mac: &Arc<FakeMac>) -> Result<Option<Harness>, Box<dyn std::error::Error>> {
     Harness::with(Setup {
-        server: "tools.add.policy = \"ask\"",
+        // the summary leaves `b` out, which the prompt must still name
+        server: "tools.add.policy = \"ask\"\ntools.add.summary = \"add {a}\"",
         // longer than `execute_wait_secs` (2), so a pending answer comes back
         // before the phone is told
         extra: "[notify.mac]\nescalate_after_secs = 3",
@@ -57,11 +58,12 @@ async fn tool_calls_are_asked_on_the_mac_while_the_owner_is_there() -> TestResul
     let shown = mac.shown();
     assert_eq!(shown.len(), 1, "{shown:?}");
     assert!(
-        shown[0].starts_with("touch_id approve one call of fixture.add by "),
+        shown[0].starts_with("touch_id approve one call of fixture.add by client \""),
         "{shown:?}"
     );
-    // a fingerprint approves without the page, so the prompt shows the arguments
-    assert!(shown[0].ends_with(" with a: 1, b: 2"), "{shown:?}");
+    // a fingerprint approves without the page, so the prompt summarizes the
+    // arguments, naming any the tool's summary leaves out
+    assert!(shown[0].ends_with(": add 1 (also b)"), "{shown:?}");
     assert!(harness.notifier.tool_requests().is_empty());
 
     // an unanswered prompt reaches the phone after the delay, and leaves the

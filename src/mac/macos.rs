@@ -1,7 +1,12 @@
 //! The real Mac: CoreGraphics for presence, LocalAuthentication for Touch
 //! ID, `terminal-notifier` for notifications and `open` for the page
 
-use std::{ffi::c_void, path::Path, sync::Mutex, time::Duration};
+use std::{
+    ffi::c_void,
+    path::Path,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use block2::RcBlock;
 use objc2::{rc::Retained, runtime::Bool};
@@ -32,8 +37,8 @@ const PROMPT_GAP: Duration = Duration::from_secs(1);
 /// The Mac the daemon runs on
 #[derive(Default)]
 pub struct MacOs {
-    /// One Touch ID prompt at a time; a second request waits its turn
-    prompt: tokio::sync::Mutex<()>,
+    /// One Touch ID prompt at a time, a gap apart
+    prompts: PromptQueue,
 }
 
 impl MacOs {
@@ -66,6 +71,36 @@ fn idle() -> Duration {
     );
 
     Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+}
+
+/// Hands out Touch ID prompts one at a time, with [`PROMPT_GAP`] between
+/// the end of one and the start of the next, however the first ended
+///
+/// A prompt that appears right as another closes could catch a touch meant
+/// for the one that closed, including one taken down because its request
+/// was denied on the page
+#[derive(Default)]
+struct PromptQueue(tokio::sync::Mutex<Option<Instant>>);
+
+/// The right to show one prompt; dropping it, by finishing or by being
+/// cancelled, starts the gap
+struct Turn<'a>(tokio::sync::MutexGuard<'a, Option<Instant>>);
+
+impl PromptQueue {
+    async fn turn(&self) -> Turn<'_> {
+        let ended = self.0.lock().await;
+        if let Some(ended) = *ended {
+            tokio::time::sleep_until((ended + PROMPT_GAP).into()).await;
+        }
+
+        Turn(ended)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.0 = Some(Instant::now());
+    }
 }
 
 /// An `LAContext` that can cross threads, and is invalidated when dropped
@@ -155,7 +190,7 @@ impl Mac for MacOs {
 
     fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId> {
         Box::pin(async move {
-            let _turn = self.prompt.lock().await;
+            let _turn = self.prompts.turn().await;
             let (context, receiver) = match evaluate(reason) {
                 Ok(started) => started,
                 Err(answer) => return answer,
@@ -163,9 +198,6 @@ impl Mac for MacOs {
             // a sender dropped without a reply counts as a failed prompt
             let reply = receiver.await.unwrap_or(Err(LAError(0)));
             drop(context);
-            // a second prompt right behind the first could catch a touch
-            // meant for the one that just closed
-            tokio::time::sleep(PROMPT_GAP).await;
 
             answer_for(reply)
         })
@@ -222,7 +254,7 @@ impl Mac for MacOs {
 mod tests {
     use objc2_local_authentication::LAError;
 
-    use super::{TouchId, answer_for};
+    use super::{PROMPT_GAP, PromptQueue, TouchId, answer_for};
 
     #[test]
     fn only_a_matched_fingerprint_approves() {
@@ -246,5 +278,22 @@ mod tests {
         for error in failures {
             assert_ne!(answer_for(Err(error)), TouchId::Approved, "{error:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_next_prompt_waits_a_gap_even_after_a_cancelled_one() {
+        let queue = PromptQueue::default();
+
+        // a turn dropped mid-await, as when a request is denied elsewhere
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async {
+            let _turn = queue.turn().await;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(cancelled.is_err());
+
+        let started = std::time::Instant::now();
+        let _next = queue.turn().await;
+        assert!(started.elapsed() >= PROMPT_GAP - std::time::Duration::from_millis(50));
     }
 }

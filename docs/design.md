@@ -98,10 +98,15 @@ idempotent. `tools/list_changed` refreshes the catalog
   `notify.mac.escalate_after_secs` (60), going out only if the request is still pending. The Mac shows a Touch ID
   prompt (LocalAuthentication, biometrics only, no password fallback) naming the call, the client and a summary of
   the arguments built from their values (short values whole, long strings cut with their length, lists and
-  objects by size and keys; never model-written), which approves the call once; its other button, "Review…", opens the
+  objects by size and keys; never model-written), or a tool's own `summary` template (`{name}` placeholders
+  filled the same way, then `(also …)` naming every argument it left out, passed as `null` or cut off by the
+  300-character limit, so a template cannot hide one; checked when the config loads). Agent-chosen text (client
+  label, argument names and values) is quoted with quotes escaped, and line breaks, Unicode line separators,
+  invisible and direction-changing characters are replaced, so none of it can pass for prompt text, which approves the call once; its other button, "Review…", opens the
   approval page in the default browser for grants or Deny and starts the push delay over. A prompt the system
   takes down (the screen locked) sends the push at once, and one still up when the request is decided elsewhere
-  is taken down. Prompts show one at a time, a second apart, so a touch meant for one cannot land on the next. Without Touch ID (no sensor, none enrolled, `notify.mac.touch_id = false`) the
+  is taken down. Prompts show one at a time, a second apart however the previous one ended (answered, or taken down because
+  the request was decided elsewhere), so a touch meant for one cannot land on the next. Without Touch ID (no sensor, none enrolled, `notify.mac.touch_id = false`) the
   Mac shows a notification through `terminal-notifier` whose click opens the page. Presence only picks where the
   request appears first: approval still takes a fingerprint or a passkey assertion. Admin requests never offer
   Touch ID; on the Mac they show the notification and the push goes out at once. `notify.mac.enabled = false`
@@ -532,7 +537,9 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   declares an output schema, and the bridge sends `tools/list_changed`, so the catalog follows Xcode's tool set
 - Approval is Xcode's: an agent must be approved, along with each project folder, and the request is raised by
   `XcodeOpenWorkspace` or `XcodeNewProject`. Through the gateway the daemon is one agent, so one approval covers
-  every client; the phone policies below are the per-call layer on top
+  every client; the phone policies below are the per-call layer on top. Xcode records the agent by its signature
+  (`signed Q8UP8C53Y8 com.avencera.codemode-mcp` in `xcrun mcp-server status`), so the grant survives rebuilds
+  signed by `service install`. A folder grant covers that folder and its subfolders, so each worktree asks again
 - Starter policies: building, testing, running the scheme, reading and editing project files, build settings and
   string catalogs are `allow`, as a local agent could do the same from its shell. `RunCodeSnippet` and
   `InvokeDebuggerCommand` run arbitrary code and `XcodeRM` can delete files from disk, so those three `ask`. The

@@ -76,7 +76,9 @@ While you are at the Mac (screen unlocked, input in the last 5 minutes), a tool 
 a Touch ID prompt there instead of buzzing the phone:
 
 - Touch the sensor to approve that one call. The prompt names the tool, the agent and a summary of the
-  arguments; press **Review…** to see them in full.
+  arguments; press **Review…** to see them in full. Give a tool its own line with a `summary` template, such as
+  `tools.send_message.summary = "send to {to}: {subject}"`; arguments the template leaves out are still named
+  after it, as `(also bcc)`.
 - Press **Review…** to open the approval page in the browser, for a 15 or 60 minute grant, or to deny. The
   page takes your passkey, which Touch ID unlocks if it syncs to this Mac through iCloud Keychain or a password
   manager; otherwise enroll one here with `codemode-mcp passkey enroll --label mac`.

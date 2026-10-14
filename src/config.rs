@@ -12,6 +12,7 @@ use serde::Deserialize;
 use crate::{
     policy::{GrantMode, Policy},
     stubs::is_brand_name,
+    summary::Template,
 };
 
 /// Origin the approval and enrollment pages are reached through; its host is
@@ -681,6 +682,11 @@ pub struct ToolOverride {
     /// tool that produces the value
     #[serde(default)]
     pub param_types: BTreeMap<String, String>,
+    /// One line shown in the Touch ID prompt for this tool, with `{name}`
+    /// placeholders filled from the call's arguments, such as
+    /// `send to {to}: {subject}`; arguments it leaves out are still named
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 /// How a tool's result is handed to scripts when the config overrides the default
@@ -704,6 +710,11 @@ impl ToolOverride {
             return Err(ConfigError::Invalid(format!(
                 "{at}: `force_output_schema` needs `output_schema`"
             )));
+        }
+        if let Some(summary) = &self.summary
+            && let Err(error) = Template::parse(summary)
+        {
+            return Err(ConfigError::Invalid(format!("{at}: `summary`: {error}")));
         }
         for (param, brand) in &self.param_types {
             if !is_brand_name(brand) {
