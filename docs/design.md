@@ -89,7 +89,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   grant and cannot create one. A caller that sent no client name cannot get a client grant. `per_call` tools ask
   on every call and refuse both kinds of grant
 - An `ask` call needs a notifier and at least one enrolled passkey; otherwise it is refused at once
-  (`no passkey enrolled; run \`codemode-mcp passkey enroll\``)
+  (`no passkey enrolled; run \`codemode-mcp passkey enroll --label NAME\``)
 - On an `ask` call the gateway creates a pending request (random 128-bit id) and sends an ntfy notification:
   title `codemode: <client> wants <server>.<tool>`, high priority, click URL `<public_origin>/approve/<id>`.
   Arguments never go into the notification

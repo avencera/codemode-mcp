@@ -33,7 +33,7 @@ use crate::{
 };
 
 /// Reason given when an `ask` call arrives before any passkey exists
-pub const NO_PASSKEY: &str = "no passkey enrolled; run `codemode-mcp passkey enroll`";
+pub const NO_PASSKEY: &str = "no passkey enrolled; run `codemode-mcp passkey enroll --label NAME`";
 /// Reason given when no notification channel is configured
 pub const NO_NOTIFIER: &str = "approvals are not configured: add a [notify.ntfy] section \
      (or one in homebased's config) so requests can reach your phone";

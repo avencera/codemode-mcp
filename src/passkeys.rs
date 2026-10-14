@@ -55,7 +55,7 @@ pub enum PasskeyError {
     #[error("too many passkey requests in progress; try again in a few minutes")]
     Busy,
     /// No passkey is enrolled
-    #[error("no passkey enrolled; run `codemode-mcp passkey enroll`")]
+    #[error("no passkey enrolled; run `codemode-mcp passkey enroll --label NAME`")]
     NoPasskeys,
     /// The label is empty or too long
     #[error("enter a label of 1 to {MAX_LABEL_CHARS} characters, without quotes")]

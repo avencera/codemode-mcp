@@ -716,7 +716,7 @@ async fn passkey_command(config: &Config, command: PasskeyCommand) -> Result<()>
         PasskeyCommand::List => {
             let passkeys = Store::open(&config.state_dir()?)?.list_passkeys()?;
             if passkeys.is_empty() {
-                println!("No passkeys enrolled; run `codemode-mcp passkey enroll`.");
+                println!("No passkeys enrolled; run `codemode-mcp passkey enroll --label NAME`.");
             }
             let now = store::now_ms();
             for passkey in passkeys {

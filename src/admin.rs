@@ -268,7 +268,7 @@ async fn enroll(State(state): State<AdminState>, Json(request): Json<EnrollReque
 
 /// Refusal for removing the only passkey
 const LAST_PASSKEY: &str = "cannot remove the last passkey; enroll a replacement first \
-                            (`codemode-mcp passkey enroll`), then remove this one";
+                            (`codemode-mcp passkey enroll --label NAME`), then remove this one";
 
 /// Asks an existing passkey to approve removing one; the passkey is removed
 /// only once approved, and never the last one
