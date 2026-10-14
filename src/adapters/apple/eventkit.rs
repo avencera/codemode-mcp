@@ -26,7 +26,7 @@ use std::{
 
 use block2::RcBlock;
 use jiff::{
-    Timestamp,
+    SignedDuration, Timestamp,
     civil::{Date, DateTime},
     tz::TimeZone,
 };
@@ -45,7 +45,7 @@ use super::{
     BackendError, Entity, Frequency, RecurrenceRecord,
     calendar::{
         Availability, CalendarBackend, CalendarInfo, EventDraft, EventRecord, EventStatus,
-        ParticipantStatus, Person,
+        EventTarget, ParticipantStatus, Person, Span,
     },
     dates::{self, When},
     reminders::{
@@ -57,6 +57,11 @@ use super::{
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest a reminders fetch may take
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Further wait for a fetch whose completion had begun when it timed out
+const FETCH_DRAIN: Duration = Duration::from_secs(20);
+/// Wait after cancelling a fetch whose completion had not begun, in case it
+/// was already queued
+const FETCH_CANCEL_GRACE: Duration = Duration::from_secs(1);
 /// An access request still unanswered after this is sent again
 const REQUEST_RETRY_AFTER: Duration = Duration::from_secs(30);
 
@@ -434,9 +439,77 @@ fn event_record(event: &EKEvent) -> Option<EventRecord> {
             .unwrap_or_default(),
         recurrence: recurrence(event),
         detached: unsafe { event.isDetached() },
+        occurrence: unsafe { event.occurrenceDate() }.map(|date| timestamp(&date)),
         created: unsafe { event.creationDate() }.map(|date| timestamp(&date)),
         last_modified: unsafe { event.lastModifiedDate() }.map(|date| timestamp(&date)),
     })
+}
+
+/// How far from an occurrence's place in the series the search for it
+/// reaches; an occurrence moved further than this on its own is not found
+const OCCURRENCE_SEARCH: SignedDuration = SignedDuration::from_hours(31 * 24);
+
+/// Event `id`, or its occurrence that the series placed at `occurrence`
+///
+/// EventKit looks events up by id only, which gives the first occurrence, so
+/// an occurrence is found among the series' events around that time
+fn find_event(
+    store: &EKEventStore,
+    id: &str,
+    occurrence: Option<Timestamp>,
+    zone: &TimeZone,
+) -> Option<Retained<EKEvent>> {
+    let first = unsafe { store.eventWithIdentifier(&ns(id)) }?;
+    let Some(occurrence) = occurrence else {
+        return Some(first);
+    };
+
+    let calendars =
+        unsafe { first.calendar() }.map(|calendar| NSArray::from_retained_slice(&[calendar]));
+    let window = |sign: i32| {
+        occurrence
+            .checked_add(OCCURRENCE_SEARCH * sign)
+            .unwrap_or(occurrence)
+    };
+    let predicate = unsafe {
+        store.predicateForEventsWithStartDate_endDate_calendars(
+            &ns_date(window(-1)),
+            &ns_date(window(1)),
+            calendars.as_deref(),
+        )
+    };
+    let events = unsafe { store.eventsMatchingPredicate(&predicate) };
+
+    events.iter().find(|event| {
+        let same_series = unsafe { event.eventIdentifier() }
+            .is_some_and(|other| series_id(&other.to_string()) == series_id(id));
+        // agents send occurrences back at second precision, and an all-day
+        // one as a date, which an event kept in another zone places at a
+        // different midnight
+        let same_place = unsafe { event.occurrenceDate() }.is_some_and(|date| {
+            let date = timestamp(&date);
+            if unsafe { event.isAllDay() } {
+                dates::day_of(date, zone) == dates::day_of(occurrence, zone)
+            } else {
+                date.as_second() == occurrence.as_second()
+            }
+        });
+
+        same_series && same_place
+    })
+}
+
+/// The series part of an event id: an occurrence changed on its own gets
+/// the series id plus `/RID=<seconds since 2001>`
+fn series_id(id: &str) -> &str {
+    id.split_once("/RID=").map_or(id, |(series, _)| series)
+}
+
+fn ek_span(target: Option<&EventTarget>) -> EKSpan {
+    match target.map(|target| target.span) {
+        Some(Span::Future) => EKSpan::FutureEvents,
+        _ => EKSpan::ThisEvent,
+    }
 }
 
 impl CalendarBackend for EventKit {
@@ -479,22 +552,32 @@ impl CalendarBackend for EventKit {
         })
     }
 
-    fn event(&self, id: &str) -> Result<Option<EventRecord>, BackendError> {
+    fn event(
+        &self,
+        id: &str,
+        occurrence: Option<Timestamp>,
+    ) -> Result<Option<EventRecord>, BackendError> {
         let id = id.to_owned();
 
-        self.run(move |store, _| {
-            Ok(unsafe { store.eventWithIdentifier(&ns(&id)) }
-                .and_then(|event| event_record(&event)))
+        self.run(move |store, zone| {
+            Ok(find_event(store, &id, occurrence, zone).and_then(|event| event_record(&event)))
         })
     }
 
-    fn save_event(&self, id: Option<&str>, draft: EventDraft) -> Result<EventRecord, BackendError> {
-        let id = id.map(str::to_owned);
+    fn save_event(
+        &self,
+        target: Option<&EventTarget>,
+        draft: EventDraft,
+    ) -> Result<EventRecord, BackendError> {
+        let target = target.cloned();
 
         self.run(move |store, zone| {
-            let event = match &id {
-                Some(id) => unsafe { store.eventWithIdentifier(&ns(id)) }
-                    .ok_or_else(|| BackendError::NotFound(format!("no event has id {id:?}")))?,
+            let event = match &target {
+                Some(target) => {
+                    find_event(store, &target.id, target.occurrence, zone).ok_or_else(|| {
+                        BackendError::NotFound(format!("no event has id {:?}", target.id))
+                    })?
+                }
                 None => unsafe { EKEvent::eventWithEventStore(store) },
             };
             let calendar = unsafe { store.calendarWithIdentifier(&ns(&draft.calendar_id)) }
@@ -504,20 +587,32 @@ impl CalendarBackend for EventKit {
             let url = ns_url(draft.url.as_deref())?;
 
             unsafe {
-                event.setCalendar(Some(&calendar));
+                // an occurrence cannot move calendars on its own, so the
+                // calendar is only set when it changes
+                let current = event
+                    .calendar()
+                    .map(|calendar| calendar.calendarIdentifier().to_string());
+                if current.as_deref() != Some(draft.calendar_id.as_str()) {
+                    event.setCalendar(Some(&calendar));
+                }
                 event.setTitle(Some(&ns(&draft.title)));
-                event.setAllDay(draft.all_day);
-                // timed events are pinned to the Mac's zone rather than left
-                // to EventKit's default; all-day events float
-                let event_zone = (!draft.all_day).then(|| mac_zone(zone));
-                event.setTimeZone(event_zone.as_deref());
+                // all-day events always float, so their dates stay the Mac's
+                // dates; new timed events are pinned to the Mac's zone, and an
+                // existing timed one keeps its own
+                if draft.all_day {
+                    event.setAllDay(true);
+                    event.setTimeZone(None);
+                } else if target.is_none() || event.isAllDay() {
+                    event.setAllDay(false);
+                    event.setTimeZone(Some(&mac_zone(zone)));
+                }
                 event.setStartDate(Some(&ns_date(draft.start)));
                 event.setEndDate(Some(&ns_date(draft.end)));
                 event.setLocation(draft.location.as_deref().map(ns).as_deref());
                 event.setNotes(draft.notes.as_deref().map(ns).as_deref());
                 event.setURL(url.as_deref());
                 store
-                    .saveEvent_span_commit_error(&event, EKSpan::ThisEvent, true)
+                    .saveEvent_span_commit_error(&event, ek_span(target.as_ref()), true)
                     .map_err(|error| ns_failure("save the event", &error))?;
             }
 
@@ -526,14 +621,16 @@ impl CalendarBackend for EventKit {
         })
     }
 
-    fn remove_event(&self, id: &str) -> Result<(), BackendError> {
-        let id = id.to_owned();
+    fn remove_event(&self, target: &EventTarget) -> Result<(), BackendError> {
+        let target = target.clone();
 
-        self.run(move |store, _| {
-            let event = unsafe { store.eventWithIdentifier(&ns(&id)) }
-                .ok_or_else(|| BackendError::NotFound(format!("no event has id {id:?}")))?;
+        self.run(move |store, zone| {
+            let event =
+                find_event(store, &target.id, target.occurrence, zone).ok_or_else(|| {
+                    BackendError::NotFound(format!("no event has id {:?}", target.id))
+                })?;
 
-            unsafe { store.removeEvent_span_commit_error(&event, EKSpan::ThisEvent, true) }
+            unsafe { store.removeEvent_span_commit_error(&event, ek_span(Some(&target)), true) }
                 .map_err(|error| ns_failure("delete the event", &error))
         })
     }
@@ -714,7 +811,10 @@ impl RemindersBackend for EventKit {
             // built there, so no EventKit object crosses threads
             let (answer, receiver) = mpsc::sync_channel(1);
             let zone = zone.clone();
+            let started = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&started);
             let completion = RcBlock::new(move |reminders: *mut NSArray<EKReminder>| {
+                flag.store(true, Ordering::Release);
                 let records = unsafe { reminders.as_ref() }
                     .map(|reminders| {
                         reminders
@@ -729,8 +829,21 @@ impl RemindersBackend for EventKit {
                 store.fetchRemindersMatchingPredicate_completion(&predicate, &completion)
             };
 
-            receiver.recv_timeout(FETCH_TIMEOUT).map_err(|_| {
-                unsafe { store.cancelFetchRequest(&fetch) };
+            if let Ok(records) = receiver.recv_timeout(FETCH_TIMEOUT) {
+                return Ok(records);
+            }
+
+            // a cancel stops a completion that has not begun; one already
+            // reading EventKit objects is waited for, so the next call never
+            // uses the store alongside it, and its records are still used
+            unsafe { store.cancelFetchRequest(&fetch) };
+            let drain = if started.load(Ordering::Acquire) {
+                FETCH_DRAIN
+            } else {
+                FETCH_CANCEL_GRACE
+            };
+
+            receiver.recv_timeout(drain).map_err(|_| {
                 BackendError::Failed(format!(
                     "EventKit did not return the reminders within {}s",
                     FETCH_TIMEOUT.as_secs()
@@ -817,5 +930,18 @@ impl RemindersBackend for EventKit {
             unsafe { store.removeReminder_commit_error(&reminder, true) }
                 .map_err(|error| ns_failure("delete the reminder", &error))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::series_id;
+
+    #[test]
+    fn detached_occurrences_belong_to_their_series() {
+        let series = "570D76A3-1DD8-49AE-99CB-DB40EE537A03:64D4D650-04C3-4A89-A427-D329FEB4EECE";
+
+        assert_eq!(series_id(&format!("{series}/RID=814417200")), series);
+        assert_eq!(series_id(series), series);
     }
 }

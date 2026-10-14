@@ -2,7 +2,9 @@
 //!
 //! Runs the real adapter (`calendar` or `reminders` as the only argument)
 //! over an in-memory store seeded with a few items. Each save moves the
-//! item's `last_modified` one second on, so stale tokens are easy to make
+//! item's `last_modified` one second on, so stale tokens are easy to make.
+//! Repeating events expand daily or weekly (other rules repeat weekly here),
+//! with changed and deleted occurrences kept as exceptions, as EventKit does
 
 use std::sync::{Arc, Mutex};
 
@@ -10,7 +12,7 @@ use codemode_mcp::adapters::apple::{
     BackendError, Frequency, RecurrenceRecord,
     calendar::{
         Availability, CalendarAdapter, CalendarBackend, CalendarInfo, EventDraft, EventRecord,
-        EventStatus,
+        EventStatus, EventTarget, Span,
     },
     dates::{self, When},
     reminders::{
@@ -18,11 +20,22 @@ use codemode_mcp::adapters::apple::{
         RemindersBackend,
     },
 };
-use jiff::{Timestamp, civil::date, tz::TimeZone};
+use jiff::{SignedDuration, Timestamp, civil::date, tz::TimeZone};
+
+/// One occurrence changed (`Some`) or deleted (`None`) on its own
+struct Exception {
+    id: String,
+    occurrence: Timestamp,
+    record: Option<EventRecord>,
+}
 
 struct State {
     calendars: Vec<CalendarInfo>,
+    /// One-off events and the first occurrence of each series
     events: Vec<EventRecord>,
+    exceptions: Vec<Exception>,
+    /// Zone repeating events keep their local time in
+    zone: TimeZone,
     lists: Vec<ListInfo>,
     reminders: Vec<ReminderRecord>,
     next_id: u32,
@@ -81,6 +94,7 @@ fn event(id: &str, calendar: &CalendarInfo, title: &str, start: &str, end: &str)
         attendees: Vec::new(),
         recurrence: None,
         detached: false,
+        occurrence: None,
         created: Some(time("2026-10-01T12:00:00Z")),
         last_modified: Some(time("2026-10-01T12:00:00.250Z")),
     }
@@ -187,6 +201,8 @@ impl Fake {
             state: Mutex::new(State {
                 calendars: vec![home, holidays],
                 events: vec![dentist, standup, holiday],
+                exceptions: Vec::new(),
+                zone: dates::local_zone(),
                 lists: vec![groceries, shared],
                 reminders: vec![milk, call, undated, done, locked],
                 next_id: 0,
@@ -201,6 +217,140 @@ impl Fake {
             .lock()
             .map_err(|_| BackendError::Failed("fake store poisoned".into()))
     }
+}
+
+/// Seconds from 1970 to 2001, EventKit's reference date
+const REFERENCE_SECONDS: i64 = 978_307_200;
+
+/// A series id and, for an occurrence changed on its own, the place EventKit
+/// writes after `/RID=` in seconds since 2001
+fn split_id(id: &str) -> (&str, Option<Timestamp>) {
+    match id.split_once("/RID=") {
+        Some((series, seconds)) => (
+            series,
+            seconds
+                .parse::<i64>()
+                .ok()
+                .and_then(|seconds| Timestamp::from_second(seconds + REFERENCE_SECONDS).ok()),
+        ),
+        None => (id, None),
+    }
+}
+
+/// The id EventKit gives an occurrence changed on its own
+fn detached_id(series: &str, at: Timestamp) -> String {
+    format!("{series}/RID={}", at.as_second() - REFERENCE_SECONDS)
+}
+
+/// Local days between occurrences of a series
+fn period(series: &EventRecord) -> Option<i64> {
+    let rule = series.recurrence.as_ref()?;
+    let days = match rule.frequency {
+        Frequency::Daily => 1,
+        _ => 7,
+    };
+
+    Some(days * i64::from(rule.interval.max(1)))
+}
+
+impl State {
+    /// The occurrence the series places at `at`, with its exception applied;
+    /// `None` when deleted or not in the series
+    fn occurrence(&self, series: &EventRecord, at: Timestamp) -> Option<EventRecord> {
+        if let Some(exception) = self
+            .exceptions
+            .iter()
+            .find(|exception| exception.id == series.id && exception.occurrence == at)
+        {
+            return exception.record.clone();
+        }
+        let until = series.recurrence.as_ref().and_then(|rule| rule.until);
+        if until.is_some_and(|until| at > until) {
+            return None;
+        }
+
+        let mut occurrence = series.clone();
+        occurrence.start = at;
+        occurrence.end = at + series.end.duration_since(series.start);
+        occurrence.occurrence = Some(at);
+        Some(occurrence)
+    }
+
+    /// Where the series places occurrence `index`: the same local time,
+    /// across daylight-saving changes, as EventKit keeps it
+    fn place(&self, series: &EventRecord, step: i64, index: i64) -> Option<Timestamp> {
+        series
+            .start
+            .to_zoned(self.zone.clone())
+            .checked_add(jiff::Span::new().days(step * index))
+            .ok()
+            .map(|zoned| zoned.timestamp())
+    }
+
+    /// Every occurrence of `series` starting before `end`
+    fn expand(&self, series: &EventRecord, end: Timestamp) -> Vec<EventRecord> {
+        let Some(step) = period(series) else {
+            let mut event = series.clone();
+            event.occurrence = Some(series.start);
+            return vec![event];
+        };
+
+        (0..1000)
+            .map_while(|index| self.place(series, step, index))
+            .take_while(|at| *at < end)
+            .filter_map(|at| self.occurrence(series, at))
+            .collect()
+    }
+
+    fn series(&self, id: &str) -> Result<EventRecord, BackendError> {
+        let (id, _) = split_id(id);
+        self.events
+            .iter()
+            .find(|event| event.id == id)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("no event has id {id:?}")))
+    }
+
+    /// The occurrence `at` of event `id`, or the event itself
+    fn find(&self, id: &str, at: Option<Timestamp>) -> Option<EventRecord> {
+        let series = self.series(id).ok()?;
+        // a changed occurrence's own id names it, as in EventKit
+        match at.or(split_id(id).1) {
+            None => self
+                .expand(&series, series.start + SignedDuration::from_secs(1))
+                .pop(),
+            Some(at) => {
+                let step = period(&series)?;
+                let placed = (0..1000)
+                    .map_while(|index| self.place(&series, step, index))
+                    .take_while(|placed| *placed <= at)
+                    .any(|placed| placed == at);
+
+                placed.then(|| self.occurrence(&series, at)).flatten()
+            }
+        }
+    }
+}
+
+/// `event` with the drafted fields written
+fn apply(
+    mut event: EventRecord,
+    draft: EventDraft,
+    calendar: &CalendarInfo,
+    now: Timestamp,
+) -> EventRecord {
+    event.calendar_id = calendar.id.clone();
+    event.calendar = calendar.title.clone();
+    event.writable = calendar.writable;
+    event.title = draft.title;
+    event.start = draft.start;
+    event.end = draft.end;
+    event.all_day = draft.all_day;
+    event.location = draft.location;
+    event.notes = draft.notes;
+    event.url = draft.url;
+    event.last_modified = Some(now);
+    event
 }
 
 impl CalendarBackend for Fake {
@@ -228,22 +378,25 @@ impl CalendarBackend for Fake {
         Ok(state
             .events
             .iter()
-            .filter(|event| event.start < end && event.end > start)
             .filter(|event| calendar_ids.is_none_or(|ids| ids.contains(&event.calendar_id)))
-            .cloned()
+            .flat_map(|series| state.expand(series, end))
+            .filter(|event| event.start < end && event.end > start)
             .collect())
     }
 
-    fn event(&self, id: &str) -> Result<Option<EventRecord>, BackendError> {
-        Ok(self
-            .state()?
-            .events
-            .iter()
-            .find(|event| event.id == id)
-            .cloned())
+    fn event(
+        &self,
+        id: &str,
+        occurrence: Option<Timestamp>,
+    ) -> Result<Option<EventRecord>, BackendError> {
+        Ok(self.state()?.find(id, occurrence))
     }
 
-    fn save_event(&self, id: Option<&str>, draft: EventDraft) -> Result<EventRecord, BackendError> {
+    fn save_event(
+        &self,
+        target: Option<&EventTarget>,
+        draft: EventDraft,
+    ) -> Result<EventRecord, BackendError> {
         let mut state = self.state()?;
         let calendar = state
             .calendars
@@ -252,48 +405,106 @@ impl CalendarBackend for Fake {
             .cloned()
             .ok_or_else(|| BackendError::NotFound("no such calendar".into()))?;
         let now = state.tick();
-        let id = match id {
-            Some(id) => id.to_owned(),
-            None => {
-                let id = state.id("ev");
-                let mut fresh = event(
-                    &id,
-                    &calendar,
-                    "",
-                    "2026-01-01T00:00:00Z",
-                    "2026-01-01T00:00:00Z",
-                );
-                fresh.created = Some(now);
-                state.events.push(fresh);
-                id
-            }
-        };
-        let event = state
-            .events
-            .iter_mut()
-            .find(|event| event.id == id)
-            .ok_or_else(|| BackendError::NotFound(format!("no event has id {id:?}")))?;
-        event.calendar_id = calendar.id;
-        event.calendar = calendar.title;
-        event.writable = calendar.writable;
-        event.title = draft.title;
-        event.start = draft.start;
-        event.end = draft.end;
-        event.all_day = draft.all_day;
-        event.location = draft.location;
-        event.notes = draft.notes;
-        event.url = draft.url;
-        event.last_modified = Some(now);
 
-        Ok(event.clone())
+        let Some(target) = target else {
+            let id = state.id("ev");
+            let mut fresh = event(
+                &id,
+                &calendar,
+                "",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            );
+            fresh.created = Some(now);
+            let saved = apply(fresh, draft, &calendar, now);
+            state.events.push(saved.clone());
+            return Ok(saved);
+        };
+        let series = state.series(&target.id)?;
+        let at = target.occurrence;
+        let current = state
+            .find(&target.id, at)
+            .ok_or_else(|| BackendError::NotFound("no such occurrence".into()))?;
+
+        // a one-off event, or a whole series changed from its first occurrence
+        let whole = at.is_none_or(|at| target.span == Span::Future && at == series.start);
+        if whole {
+            let saved = apply(series, draft, &calendar, now);
+            if let Some(slot) = state.events.iter_mut().find(|event| event.id == saved.id) {
+                *slot = saved.clone();
+            }
+            return Ok(saved);
+        }
+        let Some(at) = at else {
+            return Err(BackendError::Failed("no occurrence".into()));
+        };
+
+        if target.span == Span::This {
+            let mut saved = apply(current, draft, &calendar, now);
+            saved.id = detached_id(&series.id, at);
+            saved.detached = true;
+            saved.occurrence = Some(at);
+            state
+                .exceptions
+                .retain(|exception| !(exception.id == series.id && exception.occurrence == at));
+            state.exceptions.push(Exception {
+                id: series.id.clone(),
+                occurrence: at,
+                record: Some(saved.clone()),
+            });
+            return Ok(saved);
+        }
+
+        // from a later occurrence on: the old series ends before it and a new
+        // one starts, as EventKit splits a series
+        let id = state.id("ev");
+        if let Some(old) = state.events.iter_mut().find(|event| event.id == series.id)
+            && let Some(rule) = old.recurrence.as_mut()
+        {
+            rule.until = Some(at - SignedDuration::from_secs(1));
+        }
+        let mut fresh = series;
+        fresh.id = id;
+        if let Some(rule) = fresh.recurrence.as_mut() {
+            rule.until = None;
+        }
+        let mut saved = apply(fresh, draft, &calendar, now);
+        saved.occurrence = Some(saved.start);
+        state.events.push(saved.clone());
+
+        Ok(saved)
     }
 
-    fn remove_event(&self, id: &str) -> Result<(), BackendError> {
+    fn remove_event(&self, target: &EventTarget) -> Result<(), BackendError> {
         let mut state = self.state()?;
-        let before = state.events.len();
-        state.events.retain(|event| event.id != id);
-        if state.events.len() == before {
-            return Err(BackendError::NotFound(format!("no event has id {id:?}")));
+        let series = state.series(&target.id)?;
+        let now = state.tick();
+
+        match (target.occurrence, target.span) {
+            // deleting an occurrence writes an exception date into the series,
+            // so every unchanged occurrence's last_modified moves on too
+            (Some(at), Span::This) => {
+                state
+                    .exceptions
+                    .retain(|exception| !(exception.id == series.id && exception.occurrence == at));
+                state.exceptions.push(Exception {
+                    id: series.id.clone(),
+                    occurrence: at,
+                    record: None,
+                });
+                if let Some(old) = state.events.iter_mut().find(|event| event.id == series.id) {
+                    old.last_modified = Some(now);
+                }
+            }
+            (Some(at), Span::Future) if at != series.start => {
+                if let Some(old) = state.events.iter_mut().find(|event| event.id == series.id) {
+                    old.last_modified = Some(now);
+                    if let Some(rule) = old.recurrence.as_mut() {
+                        rule.until = Some(at - SignedDuration::from_secs(1));
+                    }
+                }
+            }
+            _ => state.events.retain(|event| event.id != series.id),
         }
 
         Ok(())

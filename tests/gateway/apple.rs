@@ -156,7 +156,12 @@ calendars, listed, dentist = await asyncio.gather(
     assert_eq!(events[0]["end"], "2026-10-12", "{listed}");
     assert_eq!(events[0]["editable"], false, "{listed}");
     assert_eq!(events[1]["recurring"], true, "{listed}");
-    assert_eq!(events[1]["editable"], false, "{listed}");
+    assert_eq!(events[1]["editable"], true, "{listed}");
+    assert_eq!(
+        events[1]["occurrence"], "2026-10-13T08:30:00-05:00",
+        "{listed}"
+    );
+    assert!(events[2].get("occurrence").is_none(), "{listed}");
     assert_eq!(events[2]["start"], "2026-10-14T09:00:00-05:00", "{listed}");
     // details stay out of the list
     assert!(events[2].get("notes").is_none(), "{listed}");
@@ -234,10 +239,7 @@ remaining = await calendar_list_events(start="2026-10-15", end="2026-10-22")
         errors[0].contains("changed since you read it"),
         "{errors:?}"
     );
-    assert!(
-        errors[1].contains("repeating events are read-only"),
-        "{errors:?}"
-    );
+    assert!(errors[1].contains("pass the `occurrence`"), "{errors:?}");
     assert!(
         errors[2].contains("\"US Holidays\" is read-only"),
         "{errors:?}"
@@ -260,7 +262,163 @@ remaining = await calendar_list_events(start="2026-10-15", end="2026-10-22")
     assert_eq!(retitled["location"], "12 Main St", "{retitled}");
 
     assert_eq!(deleted["id"], created["id"], "{deleted}");
-    assert_eq!(titles(remaining, "events"), ["Trip"]);
+    // the weekly standup's next occurrence falls in the window too
+    assert_eq!(titles(remaining, "events"), ["Trip", "Standup"]);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeating_events_change_one_occurrence_or_the_rest() -> TestResult {
+    let Some(harness) = harness().await? else {
+        return Ok(());
+    };
+
+    // the standup repeats weekly from Tuesday 2026-10-13 08:30 local
+    let script = format!(
+        r#"{ATTEMPT}
+listed = await calendar_list_events(start="2026-10-13", end="2026-10-27")
+standups = [e for e in listed["events"] if e["title"] == "Standup"]
+second = standups[1]
+moved = await calendar_update_event(
+    id="ev-standup", occurrence=second.get("occurrence"), last_modified=second.get("last_modified"),
+    start="2026-10-20T10:00", end="2026-10-20T10:15",
+)
+fetched = await calendar_get_event(id="ev-standup", occurrence=second.get("occurrence"))
+# a changed occurrence has its own id, which names it without `occurrence`
+by_own_id = await calendar_get_event(id=moved["id"])
+renotes = await calendar_update_event(
+    id=moved["id"], occurrence=moved.get("occurrence"), last_modified=moved.get("last_modified"),
+    notes="moved for the offsite",
+)
+skipped = await calendar_delete_event(
+    id="ev-standup", occurrence=standups[2].get("occurrence"),
+    last_modified=standups[2].get("last_modified"),
+)
+# deleting an occurrence changes the series, so tokens read before it are stale
+stale = await attempt(calendar_update_event(
+    id="ev-standup", occurrence="2026-11-03T08:30", and_future=True,
+    last_modified=standups[0].get("last_modified"), title="Sync",
+))
+relisted = await calendar_list_events(start="2026-11-03", end="2026-11-03")
+renamed = await calendar_update_event(
+    id="ev-standup", occurrence="2026-11-03T08:30", and_future=True,
+    last_modified=relisted["events"][0].get("last_modified"), title="Sync",
+)
+first = await calendar_list_events(start="2026-10-13", end="2026-10-13")
+first_token = first["events"][0].get("last_modified")
+errors = [
+    await attempt(calendar_update_event(
+        id="ev-standup", last_modified="2026-10-01T12:00:00.250Z", title="x",
+    )),
+    await attempt(calendar_update_event(
+        id="ev-dentist", occurrence="2026-10-14T09:00", last_modified="2026-10-01T12:00:00.250Z",
+        title="x",
+    )),
+    await attempt(calendar_delete_event(
+        id="ev-dentist", and_future=True, last_modified="2026-10-01T12:00:00.250Z",
+    )),
+    await attempt(calendar_update_event(
+        id="ev-standup", occurrence="2026-10-14T08:30", last_modified="2026-10-01T12:00:00.250Z",
+        title="x",
+    )),
+    await attempt(calendar_update_event(
+        id="ev-standup", occurrence="2026-10-13T08:30", last_modified=first_token,
+        calendar_id="cal-holidays", title="x",
+    )),
+    await attempt(calendar_get_event(id="ev-nope", occurrence="2026-10-13T08:30")),
+    await attempt(calendar_get_event(id="ev-standup", occurrence="2026-10-14T08:30")),
+]
+same_calendar = await calendar_update_event(
+    id="ev-standup", occurrence="2026-10-13T08:30", last_modified=first_token,
+    calendar_id="cal-home", title="Standup",
+)
+after = await calendar_list_events(start="2026-10-13", end="2026-11-10")
+[moved, fetched, skipped, renamed, errors, [[e["title"], e["start"]] for e in after["events"] if e["title"] != "Dentist"], by_own_id, renotes, stale, same_calendar]"#
+    );
+    let (result, _) = run_approving(&harness, &script).await?;
+    let [
+        moved,
+        fetched,
+        skipped,
+        renamed,
+        errors,
+        after,
+        by_own_id,
+        renotes,
+        stale,
+        same_calendar,
+    ] = result.as_array().ok_or("no result")?.as_slice()
+    else {
+        return Err(format!("unexpected result {result}").into());
+    };
+
+    // one occurrence moved keeps its name in the series
+    assert_eq!(moved["start"], "2026-10-20T10:00:00-05:00", "{moved}");
+    assert_eq!(moved["occurrence"], "2026-10-20T08:30:00-05:00", "{moved}");
+    assert_eq!(moved["recurring"], true, "{moved}");
+    assert_eq!(fetched["start"], "2026-10-20T10:00:00-05:00", "{fetched}");
+    assert!(
+        moved["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ev-standup/RID=")),
+        "{moved}"
+    );
+    assert_eq!(
+        by_own_id["start"], "2026-10-20T10:00:00-05:00",
+        "{by_own_id}"
+    );
+    assert_eq!(renotes["notes"], "moved for the offsite", "{renotes}");
+    assert_eq!(renotes["start"], "2026-10-20T10:00:00-05:00", "{renotes}");
+    assert!(
+        stale
+            .as_str()
+            .is_some_and(|text| text.contains("changed since you read it")),
+        "{stale}"
+    );
+    assert_eq!(same_calendar["calendar"], "Home", "{same_calendar}");
+    assert_eq!(
+        skipped["occurrence"], "2026-10-27T08:30:00-05:00",
+        "{skipped}"
+    );
+    assert_eq!(renamed["title"], "Sync", "{renamed}");
+    assert_eq!(renamed["start"], "2026-11-03T08:30:00-06:00", "{renamed}");
+
+    let errors: Vec<&str> = errors
+        .as_array()
+        .ok_or("no errors")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(errors.len(), 7, "{errors:?}");
+    assert!(errors[0].contains("pass the `occurrence`"), "{errors:?}");
+    assert!(errors[1].contains("does not repeat"), "{errors:?}");
+    assert!(
+        errors[2].contains("`and_future` needs `occurrence`"),
+        "{errors:?}"
+    );
+    assert!(errors[3].contains("no occurrence"), "{errors:?}");
+    assert!(
+        errors[4].contains("changes calendar as a whole"),
+        "{errors:?}"
+    );
+    assert!(
+        errors[5].contains("no event has id \"ev-nope\""),
+        "{errors:?}"
+    );
+    assert!(errors[6].contains("no occurrence"), "{errors:?}");
+
+    // the 27th is gone, the 20th moved, and the series is renamed from Nov 3
+    assert_eq!(
+        after,
+        &json!([
+            ["Standup", "2026-10-13T08:30:00-05:00"],
+            ["Standup", "2026-10-20T10:00:00-05:00"],
+            // local time holds across the end of daylight saving on Nov 1
+            ["Sync", "2026-11-03T08:30:00-06:00"],
+            ["Sync", "2026-11-10T08:30:00-06:00"],
+        ]),
+    );
 
     harness.stop().await
 }

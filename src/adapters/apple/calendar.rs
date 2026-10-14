@@ -1,11 +1,11 @@
 //! MCP adapter for Calendar
 //!
 //! Reads every calendar macOS Calendar shows: iCloud, Google, Exchange,
-//! subscribed and birthdays. Writes are limited to one-off events, because
-//! changing one occurrence of a repeating event means writing exceptions to
-//! the series, which this adapter leaves out. An update or delete must send
-//! back the `last_modified` the agent read, so a change made since then fails
-//! instead of being overwritten
+//! subscribed and birthdays. A repeating event is changed one occurrence at a
+//! time, or from one occurrence on, never as a whole by accident: its
+//! updates and deletes must name the `occurrence`. An update or delete must
+//! send back the `last_modified` the agent read, so a change made since then
+//! fails instead of being overwritten
 
 use std::sync::Arc;
 
@@ -28,9 +28,9 @@ use super::{
 const MAX_WINDOW_DAYS: i64 = 4 * 365;
 
 const INSTRUCTIONS: &str = "Read and change events in the Mac's Calendar app, across its iCloud, \
-     Google and Exchange accounts. Times without an offset are the Mac's local time. Repeating \
-     events are read-only. update_event and delete_event need the event's last_modified from \
-     list_events or get_event.";
+     Google and Exchange accounts. Times without an offset are the Mac's local time. \
+     update_event and delete_event need the event's last_modified from list_events or \
+     get_event, and for a repeating event its `occurrence`.";
 
 /// A calendar as the store reports it
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +123,9 @@ pub struct EventRecord {
     pub recurrence: Option<RecurrenceRecord>,
     /// An occurrence of a repeating event that was changed on its own
     pub detached: bool,
+    /// For a repeating event, the start this occurrence had in the series
+    /// before any change; it names the occurrence
+    pub occurrence: Option<Timestamp>,
     pub created: Option<Timestamp>,
     pub last_modified: Option<Timestamp>,
 }
@@ -149,6 +152,24 @@ pub struct EventDraft {
     pub url: Option<String>,
 }
 
+/// How far a change to a repeating event reaches
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    /// Only the named occurrence, or a one-off event
+    This,
+    /// The named occurrence and every later one
+    Future,
+}
+
+/// The event or occurrence a change applies to
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventTarget {
+    pub id: String,
+    /// Names the occurrence of a repeating event; none for a one-off event
+    pub occurrence: Option<Timestamp>,
+    pub span: Span,
+}
+
 /// Reads and writes events; implementations block, and the adapter calls
 /// them off the async workers
 pub trait CalendarBackend: Send + Sync + 'static {
@@ -164,14 +185,23 @@ pub trait CalendarBackend: Send + Sync + 'static {
         calendar_ids: Option<&[String]>,
     ) -> Result<Vec<EventRecord>, BackendError>;
 
-    /// One event by id; for a repeating event, its first occurrence
-    fn event(&self, id: &str) -> Result<Option<EventRecord>, BackendError>;
+    /// One event by id: the occurrence named by `occurrence`, else a one-off
+    /// event or a repeating event's first occurrence
+    fn event(
+        &self,
+        id: &str,
+        occurrence: Option<Timestamp>,
+    ) -> Result<Option<EventRecord>, BackendError>;
 
-    /// Creates an event, or rewrites the drafted fields of event `id`
-    fn save_event(&self, id: Option<&str>, draft: EventDraft) -> Result<EventRecord, BackendError>;
+    /// Creates an event, or rewrites the drafted fields of `target`
+    fn save_event(
+        &self,
+        target: Option<&EventTarget>,
+        draft: EventDraft,
+    ) -> Result<EventRecord, BackendError>;
 
-    /// Deletes event `id`
-    fn remove_event(&self, id: &str) -> Result<(), BackendError>;
+    /// Deletes `target`
+    fn remove_event(&self, target: &EventTarget) -> Result<(), BackendError>;
 }
 
 /// Arguments of `list_events`
@@ -190,6 +220,9 @@ pub struct ListEventsParams {
 pub struct EventIdParams {
     /// Event id from list_events
     pub id: String,
+    /// A repeating event's `occurrence` from list_events; its first
+    /// occurrence when omitted
+    pub occurrence: Option<String>,
 }
 
 /// Arguments of `create_event`
@@ -225,13 +258,17 @@ pub struct UpdateEventParams {
     pub id: String,
     /// The event's last_modified as you read it
     pub last_modified: Option<String>,
+    /// Required for a repeating event: the `occurrence` from list_events
+    pub occurrence: Option<String>,
+    /// With `occurrence`: also change every later occurrence
+    pub and_future: Option<bool>,
     pub title: Option<String>,
     /// A date for an all-day event, else a time; to switch between all-day
     /// and timed, pass both `start` and `end`
     pub start: Option<String>,
     /// The last day for an all-day event (inclusive), else the end time
     pub end: Option<String>,
-    /// Move to this calendar
+    /// Move to this calendar; not for a repeating event
     pub calendar_id: Option<String>,
     pub location: Option<String>,
     pub notes: Option<String>,
@@ -247,6 +284,10 @@ pub struct DeleteEventParams {
     pub id: String,
     /// The event's last_modified as you read it
     pub last_modified: Option<String>,
+    /// Required for a repeating event: the `occurrence` from list_events
+    pub occurrence: Option<String>,
+    /// With `occurrence`: also delete every later occurrence
+    pub and_future: Option<bool>,
 }
 
 /// One calendar
@@ -284,10 +325,15 @@ pub struct Event {
     pub end: String,
     pub all_day: bool,
     pub status: EventStatus,
-    /// Part of a repeating series, which this adapter does not change
+    /// Part of a repeating series; changes need `occurrence`
     pub recurring: bool,
     /// Whether update_event and delete_event accept it
     pub editable: bool,
+    /// For a repeating event, names this occurrence: pass it to get_event,
+    /// update_event and delete_event
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub occurrence: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
     pub location: Option<String>,
@@ -338,10 +384,18 @@ impl Event {
             )
         };
         let recurring = record.recurring();
+        let occurrence = record.occurrence.filter(|_| recurring).map(|time| {
+            if record.all_day {
+                dates::day_of(time, zone).to_string()
+            } else {
+                dates::format_time(time, zone)
+            }
+        });
 
         Self {
-            editable: record.writable && !recurring,
+            editable: record.writable,
             recurring,
+            occurrence,
             id: record.id,
             calendar_id: record.calendar_id,
             calendar: record.calendar,
@@ -383,6 +437,10 @@ pub struct EventList {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct Deleted {
     pub id: String,
+    /// The occurrence deleted, as given
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub occurrence: Option<String>,
 }
 
 /// An event's start and end, checked to be the same form and in order
@@ -445,19 +503,54 @@ fn target_calendar(
     Ok(found)
 }
 
-/// The event `id`, refused unless this adapter may change it and the agent
-/// read its current version
+/// The event or occurrence an update or delete names, as parsed arguments
+struct Change<'a> {
+    id: &'a str,
+    occurrence: Option<When>,
+    and_future: bool,
+    last_modified: Option<&'a str>,
+}
+
+/// The event or occurrence `change` names, refused unless it may be changed
+/// and the agent read its current version
 fn editable_event(
     backend: &dyn CalendarBackend,
-    id: &str,
-    last_modified: Option<&str>,
-) -> Result<EventRecord, BackendError> {
-    let event = backend
-        .event(id)?
-        .ok_or_else(|| BackendError::NotFound(format!("no event has id {id:?}")))?;
-    if event.recurring() {
+    change: &Change<'_>,
+    zone: &TimeZone,
+) -> Result<(EventRecord, EventTarget), BackendError> {
+    let id = change.id;
+    let occurrence = change
+        .occurrence
+        .map(|when| when.start(zone).map_err(BackendError::Invalid))
+        .transpose()?;
+    if change.and_future && occurrence.is_none() {
         return Err(BackendError::Invalid(
-            "repeating events are read-only here; change them in Calendar".into(),
+            "`and_future` needs `occurrence`".into(),
+        ));
+    }
+    // check what the id names first, so a wrong id or a one-off event is
+    // reported as such rather than as a missing occurrence
+    if occurrence.is_some() {
+        let named = backend
+            .event(id, None)?
+            .ok_or_else(|| BackendError::NotFound(format!("no event has id {id:?}")))?;
+        if !named.recurring() {
+            return Err(BackendError::Invalid(
+                "this event does not repeat; leave out `occurrence`".into(),
+            ));
+        }
+    }
+    let event = backend.event(id, occurrence)?.ok_or_else(|| {
+        BackendError::NotFound(match occurrence {
+            Some(_) => format!("event {id:?} has no occurrence at that `occurrence`"),
+            None => format!("no event has id {id:?}"),
+        })
+    })?;
+    if event.recurring() && occurrence.is_none() {
+        return Err(BackendError::Invalid(
+            "this event repeats; pass the `occurrence` from list_events to change one \
+             occurrence, and `and_future=true` to change it and every later one"
+                .into(),
         ));
     }
     if !event.writable {
@@ -466,11 +559,20 @@ fn editable_event(
             event.calendar
         )));
     }
-    if !dates::stamp_matches(last_modified, event.last_modified) {
+    if !dates::stamp_matches(change.last_modified, event.last_modified) {
         return Err(stale("event", event.last_modified));
     }
+    let target = EventTarget {
+        id: event.id.clone(),
+        occurrence,
+        span: if change.and_future {
+            Span::Future
+        } else {
+            Span::This
+        },
+    };
 
-    Ok(event)
+    Ok((event, target))
 }
 
 /// Optional text, with an empty string meaning none
@@ -512,6 +614,17 @@ impl CalendarAdapter {
 
     fn parse(&self, field: &str, value: &str) -> Result<When, BackendError> {
         When::parse(field, value, &self.0.zone).map_err(BackendError::Invalid)
+    }
+
+    fn parse_optional(
+        &self,
+        field: &str,
+        value: Option<&str>,
+    ) -> Result<Option<When>, CallToolResult> {
+        value
+            .map(|text| self.parse(field, text))
+            .transpose()
+            .map_err(super::failed)
     }
 
     async fn call<T: Send + 'static>(
@@ -596,16 +709,30 @@ impl CalendarAdapter {
 
     #[tool(
         description = "One event with its notes, URL, organizer, attendees and repeat rule. \
-                          For a repeating event this is its first occurrence."
+                          For a repeating event, pass `occurrence` for one occurrence; without \
+                          it this is the first."
     )]
     async fn get_event(
         &self,
         Parameters(params): Parameters<EventIdParams>,
     ) -> Result<Json<Event>, CallToolResult> {
+        let occurrence = self.parse_optional("occurrence", params.occurrence.as_deref())?;
+
         self.call(move |backend, zone| {
-            let record = backend.event(&params.id)?.ok_or_else(|| {
-                BackendError::NotFound(format!("no event has id {:?}", params.id))
-            })?;
+            let occurrence = occurrence
+                .map(|when| when.start(zone).map_err(BackendError::Invalid))
+                .transpose()?;
+            let Some(record) = backend.event(&params.id, occurrence)? else {
+                let id = &params.id;
+                let message = match occurrence {
+                    Some(_) if backend.event(id, None)?.is_some() => {
+                        format!("event {id:?} has no occurrence at that `occurrence`")
+                    }
+                    _ => format!("no event has id {id:?}"),
+                };
+
+                return Err(BackendError::NotFound(message));
+            };
 
             Ok(Json(Event::new(record, zone, true)))
         })
@@ -614,7 +741,8 @@ impl CalendarAdapter {
 
     #[tool(
         description = "Add a one-off event. Dates make an all-day event (end is its last \
-                          day); times make a timed one. Returns the new event with its id."
+                          day); times make a timed one. Returns the new event with its id. \
+                          Repeating events cannot be created here."
     )]
     async fn create_event(
         &self,
@@ -650,10 +778,11 @@ impl CalendarAdapter {
     }
 
     #[tool(
-        description = "Change a one-off event; omitted fields stay, an empty string clears \
-                          one. Pass the last_modified \
-                          you read: if the event changed since, this fails and you must read it \
-                          again. Repeating events are refused."
+        description = "Change an event; omitted fields stay, an empty string clears one. \
+                          Pass the last_modified you read: if the event changed since, this \
+                          fails and you must read it again. For a repeating event pass its \
+                          `occurrence` to change that one, plus and_future=true to change it \
+                          and every later one."
     )]
     async fn update_event(
         &self,
@@ -667,9 +796,16 @@ impl CalendarAdapter {
         };
         let start = parse("start", &params.start).map_err(super::failed)?;
         let end = parse("end", &params.end).map_err(super::failed)?;
+        let occurrence = self.parse_optional("occurrence", params.occurrence.as_deref())?;
 
         self.call(move |backend, zone| {
-            let event = editable_event(backend, &params.id, params.last_modified.as_deref())?;
+            let change = Change {
+                id: &params.id,
+                occurrence,
+                and_future: params.and_future.unwrap_or(false),
+                last_modified: params.last_modified.as_deref(),
+            };
+            let (event, target) = editable_event(backend, &change, zone)?;
             // an all-day event's stored end is a moment on its last day, so
             // it maps back to that day; a timed event keeps its times as they are
             let (current_start, current_end) = if event.all_day {
@@ -696,6 +832,11 @@ impl CalendarAdapter {
             }
             let (start, end, all_day) = span(start, end, zone)?;
             let calendar_id = match params.calendar_id.as_deref() {
+                Some(id) if id != event.calendar_id && target.occurrence.is_some() => {
+                    return Err(BackendError::Invalid(
+                        "a repeating event changes calendar as a whole; do it in Calendar".into(),
+                    ));
+                }
                 Some(id) if id != event.calendar_id => target_calendar(backend, Some(id))?.id,
                 _ => event.calendar_id.clone(),
             };
@@ -730,7 +871,7 @@ impl CalendarAdapter {
             };
 
             Ok(Json(Event::new(
-                backend.save_event(Some(&event.id), draft)?,
+                backend.save_event(Some(&target), draft)?,
                 zone,
                 true,
             )))
@@ -739,18 +880,31 @@ impl CalendarAdapter {
     }
 
     #[tool(
-        description = "Delete a one-off event. Pass the last_modified you read: if the event \
-                          changed since, this fails. Repeating events are refused."
+        description = "Delete an event. Pass the last_modified you read: if the event \
+                          changed since, this fails. For a repeating event pass its `occurrence` \
+                          to delete that one, plus and_future=true to delete it and every later \
+                          one."
     )]
     async fn delete_event(
         &self,
         Parameters(params): Parameters<DeleteEventParams>,
     ) -> Result<Json<Deleted>, CallToolResult> {
-        self.call(move |backend, _| {
-            let event = editable_event(backend, &params.id, params.last_modified.as_deref())?;
-            backend.remove_event(&event.id)?;
+        let occurrence = self.parse_optional("occurrence", params.occurrence.as_deref())?;
 
-            Ok(Json(Deleted { id: event.id }))
+        self.call(move |backend, zone| {
+            let change = Change {
+                id: &params.id,
+                occurrence,
+                and_future: params.and_future.unwrap_or(false),
+                last_modified: params.last_modified.as_deref(),
+            };
+            let (event, target) = editable_event(backend, &change, zone)?;
+            backend.remove_event(&target)?;
+
+            Ok(Json(Deleted {
+                id: event.id,
+                occurrence: params.occurrence,
+            }))
         })
         .await
     }

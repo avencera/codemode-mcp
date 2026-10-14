@@ -446,9 +446,20 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   back unchanged and are refused when the item changed since, with the current value in the error.
   `complete_reminder` does not need it, since marking a reminder done twice is harmless. The check and the save
   are two store calls, so a change landing between them is not caught
-- Repeating events are read-only: `list_events` expands occurrences, but changing one occurrence means writing
-  exceptions to the series. EventKit could do it (`EKSpanThisEvent`); it was left out of v1. Repeating reminders
-  can be edited. Completing one (checked live with a weekly reminder) leaves it open with its next due date and
+- Repeating events: `list_events` expands occurrences, and each carries an `occurrence`, the start the series gave
+  it before any change. `update_event` and `delete_event` refuse a repeating event without one, so a whole series
+  is never changed by accident; with it they change that occurrence (`EKSpanThisEvent`), and with
+  `and_future=true` it and every later one (`EKSpanFutureEvents`), which EventKit does by ending the series and
+  starting a new one with a new id. Passing the first occurrence with `and_future` changes or deletes the whole
+  series; deleting an original series that way also removed a continuation split off from it (checked live).
+  EventKit finds events by id only, so an occurrence is looked up among the series' events within 31 days of its
+  place; one moved further on its own is not found. Timed occurrences match to the second; all-day ones match by
+  day in the Mac's zone, since an event kept in another zone places them at another midnight. Changing or deleting
+  one occurrence changes the series, so every other occurrence's `last_modified` moves on and tokens read before
+  it are stale (checked live). An occurrence changed on its own gets the id
+  `<series id>/RID=<seconds>`, matched to its series by the part before `/RID=`. Moving a single occurrence to
+  another calendar is refused, and `create_event` makes one-off events only. Saving an all-day event always
+  clears its zone so its dates stay the Mac's dates; a timed event keeps its own zone unless it was all-day. Repeating reminders can be edited. Completing one (checked live with a weekly reminder) leaves it open with its next due date and
   adds a separate completed reminder, with a new id, for the finished occurrence; `complete_reminder` returns the
   open one, and its description says so
 - New timed events are pinned to the Mac's zone (`timeZone`) and all-day ones float. Due date components are
@@ -670,9 +681,9 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - Calls after a resume use the live catalog, not the one the script was checked against
 - `flock` is advisory and local: a state directory on a network file system is not protected from two daemons
 - Calendar and Reminders: an edit that lands between the `last_modified` check and the save is overwritten;
-  occurrences of repeating events cannot be changed; Reminders' tags, sections, subtasks and flags are not
-  reachable through EventKit. After a reminders fetch times out (30 s) its completion may still be building
-  records on EventKit's queue while the next call uses the store
+  an occurrence moved more than 31 days from its place in the series cannot be found; Reminders' tags, sections, subtasks and flags are not
+  reachable through EventKit. A reminders fetch that times out (30 s) is cancelled, and a completion already
+  running is waited for (20 s more) so it does not overlap the next call; one still running after that can
 
 ## Open questions
 
