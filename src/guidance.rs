@@ -66,8 +66,8 @@ pub const INSTRUCTIONS: &str = concat!(
     "Many upstream tools are reachable through scripts. Workflow: search_tools to find tools by keyword, \
      describe_tools to get their typed Python signatures, then execute a script that calls them. \
      execute returns status \"pending\" with an execution_id if the script is slow; call wait(execution_id). \
-     Some tools need the user's approval: a pending answer with approval_url and waiting_for means pass its \
-     message and the approval_url on to the user, then call wait. ",
+     Some tools need the user's approval on their phone: a pending answer with approval_url and waiting_for \
+     means tell the user to check their phone, then call wait. ",
     session_rule!(),
     "\n\n",
     script_rules!()
