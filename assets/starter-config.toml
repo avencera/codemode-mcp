@@ -119,3 +119,22 @@ policy = "ask"
 policy = "ask"
 [servers.reminders.tools.delete_reminder]
 policy = "ask"
+
+# Xcode's own MCP bridge (Xcode 26.3 or later). Xcode approves the daemon as
+# one agent for every client: the first XcodeOpenWorkspace or XcodeNewProject
+# asks on the Mac to approve it and that project's folder, and other tools
+# fail until then. Builds, tests, runs and project edits are
+# allowed like a shell's; running a code snippet or an lldb command, and
+# removing files, ask on the phone. Not `sensitive`, so file contents reach
+# the usage log
+[servers.xcode]
+command = "/usr/bin/xcrun"
+args = ["mcpbridge"]
+sensitive = false
+
+[servers.xcode.tools.RunCodeSnippet]
+policy = "ask"
+[servers.xcode.tools.InvokeDebuggerCommand]
+policy = "ask"
+[servers.xcode.tools.XcodeRM]
+policy = "ask"

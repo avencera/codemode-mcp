@@ -779,6 +779,21 @@ mod tests {
             }
         }
 
+        // Xcode: arbitrary code and deletes ask, the rest of the coding loop runs
+        let xcode = &config.servers["xcode"];
+        assert!(!xcode.is_sensitive());
+        for tool in ["RunCodeSnippet", "InvokeDebuggerCommand", "XcodeRM"] {
+            assert_eq!(xcode.policy_for(tool), Policy::Ask, "{tool}");
+        }
+        for tool in [
+            "XcodeOpenWorkspace",
+            "XcodeUpdate",
+            "BuildProject",
+            "RunAllTests",
+        ] {
+            assert_eq!(xcode.policy_for(tool), Policy::Allow, "{tool}");
+        }
+
         Ok(())
     }
 }

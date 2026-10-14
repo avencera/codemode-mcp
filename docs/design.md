@@ -42,7 +42,7 @@ rmcp 3.x clients, one long-lived connection per configured server
 
 | Kind | Example | Notes |
 |---|---|---|
-| stdio | `1password-mcp`, our own MCPs (`codemode-mcp adapter homebased`, `calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
+| stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter homebased`, `calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
 | HTTP | `openaiDeveloperDocs` | plain Streamable HTTP |
 | HTTP + OAuth | Exa | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
@@ -480,6 +480,20 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 - Not on Linux: the EventKit code and its dependencies are macOS-only; elsewhere the subcommands exit with an
   error
 
+### Xcode
+
+- The `xcode` server is Xcode's own stdio bridge, `/usr/bin/xcrun mcpbridge`, with no adapter of ours. It talks
+  to Xcode's background tool service (XcodeService), which runs with or without the Xcode window. Every tool
+  declares an output schema, and the bridge sends `tools/list_changed`, so the catalog follows Xcode's tool set
+- Approval is Xcode's: an agent must be approved, along with each project folder, and the request is raised by
+  `XcodeOpenWorkspace` or `XcodeNewProject`. Through the gateway the daemon is one agent, so one approval covers
+  every client; the phone policies below are the per-call layer on top
+- Starter policies: building, testing, running the scheme, reading and editing project files, build settings and
+  string catalogs are `allow`, as a local agent could do the same from its shell. `RunCodeSnippet` and
+  `InvokeDebuggerCommand` run arbitrary code and `XcodeRM` can delete files from disk, so those three `ask`. The
+  server is not `sensitive`, so file contents reach the usage log
+- `MCP_XCODE_PID` is left unset: pointed at a process that is not Xcode, the bridge never answers `initialize`
+
 ### Durability
 
 A daemon restart, whether a deploy, a crash or a reboot, must not lose what an agent or the owner is waiting on.
@@ -640,6 +654,8 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - OAuth registrations and tokens are committed together at the end of a login, in SQLite
 - T3 Code stays outside the gateway for now
 - The homebased adapter ships in the main binary; submit is split by workload (`agent` allowed, `task` asks)
+- Xcode goes through Apple's `mcpbridge` unchanged rather than an adapter: its tools already declare output
+  schemas, and Xcode owns the agent and folder approvals
 - Calendar and Reminders go through EventKit rather than CalDAV: no password to store, every account the Mac
   shows, and a one-time macOS grant kept across rebuilds by the stable signature. They stay local; exposing them
   to ChatGPT would need endpoint authentication first (see Non-goals)

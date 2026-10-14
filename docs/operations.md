@@ -14,7 +14,7 @@ binary under a shorter name. Times in logs are UTC.
    codemode-mcp config init --print    # or look first
    ```
 
-   It configures 1Password, the OpenAI docs, Exa (OAuth), homebased, Calendar and Reminders. Approval notifications use the
+   It configures 1Password, the OpenAI docs, Exa (OAuth), homebased, Calendar, Reminders and Xcode. Approval notifications use the
    `[notify.ntfy]` section of `~/.config/homebased/config.toml` unless you add one here.
 3. Preview, then install the LaunchAgent from the repository root:
 
@@ -95,6 +95,18 @@ with what to do instead of data.
 
 Run by hand from a terminal (`codemode-mcp adapter calendar`), the request is attributed to the terminal app
 instead, so test through the daemon.
+
+## Xcode access
+
+The `xcode` server runs Xcode's own bridge, `xcrun mcpbridge` (Xcode 26.3 or later), against the Xcode that
+`xcode-select` picks. Xcode approves agents itself, and through the gateway the daemon is that agent for every
+client. Until it is approved every tool fails with "This agent isn't approved to use Xcode's tools yet".
+
+- Approve: have an agent call `XcodeOpenWorkspace` with a project path (or `XcodeNewProject`). Xcode asks on the
+  Mac to approve the agent and that project's folder; accept both. Each new folder asks again.
+- Check: `xcrun mcp-server status` shows whether Xcode's tool service is running and which workspaces are open.
+  In headless mode, `sudo xcrun mcp-server approve <id>` approves a pending request by the id `status` shows.
+- Revoke: `sudo xcrun mcp-server clear-permissions` removes every agent and folder grant.
 
 ## OAuth sign-in
 
@@ -199,6 +211,7 @@ The "Type strictness" section ends with a verdict line:
 - The homebased adapter answers `homebased error <code>`: the code is homebased's own (see its skill's
   `errors.md`). `unknown_thread` means the `thread` argument is not a live session on this Mac.
 - A calendar or reminders tool says macOS denied access, or is asking: see Calendar and Reminders access.
+- An Xcode tool says the agent isn't approved: see Xcode access.
 
 ## Uninstall
 
