@@ -12,9 +12,10 @@ command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
 policy = "ask"
 
 # authenticate returns the account ID every other 1Password tool takes as
-# `accountId`; the upstream says so only in server instructions scripts never see
+# `accountId` and grants the scopes they check; the upstream says so only in
+# server instructions scripts never see
 [servers.onepassword.tools.authenticate]
-output_schema = { type = "object", required = ["account_id"], properties = { account_id = { type = "string", description = "Pass as `accountId` to the other 1Password tools" } } }
+output_schema = { type = "object", required = ["account_id"], properties = { account_id = { type = "string", description = "Pass as `accountId` to the other 1Password tools. Call authenticate first in every script that uses them: it also grants the scopes they check" } } }
 
 [servers.onepassword.tools.create_environment]
 grant = "per_call"
