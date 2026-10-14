@@ -656,6 +656,10 @@ const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
         "Add `import json` at the top of the script",
     ),
     (
+        "has no member `JsonValue`",
+        "JsonValue is predefined in every script, like the tool functions: remove it from the import",
+    ),
+    (
         "`JsonValue`, found `dict[",
         "dict is invariant, so a dict[str, str] is not a JsonValue: annotate the dict you build as dict[str, JsonValue]",
     ),

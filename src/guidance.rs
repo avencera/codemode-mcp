@@ -19,7 +19,8 @@ macro_rules! script_rules {
              - ",
             $crate::guidance::tool_call_rule!(),
             "\n\
-             - Results are typed. A tool with no declared result type returns `JsonValue`; narrow it with isinstance:\n  \
+             - Results are typed. A tool with no declared result type returns `JsonValue` (predefined, never \
+             imported); narrow it with isinstance:\n  \
              `v = r.get(\"k\") if isinstance(r, dict) else None`\n  \
              `name = v if isinstance(v, str) else \"\"`\n  \
              `Any`, `cast` and `# type: ignore` are rejected.\n\
