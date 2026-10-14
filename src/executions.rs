@@ -12,6 +12,7 @@ use std::{
 
 use rustix::process::{Pid, test_kill_process};
 use tokio::{sync::watch, task::AbortHandle};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     durable::{Durable, Sensitivity},
@@ -87,6 +88,10 @@ struct Shared {
     /// task that dies afterwards is being torn down, not failing
     frozen: AtomicBool,
     draining: AtomicBool,
+    /// Cancelled at the end of a drain so every `wait` answers pending at
+    /// once, with an execution_id the next process can resume, instead of
+    /// being cut off when the server stops
+    released: CancellationToken,
     last_purge: Mutex<Option<Instant>>,
 }
 
@@ -126,6 +131,7 @@ impl Executions {
                 store,
                 frozen: AtomicBool::new(false),
                 draining: AtomicBool::new(false),
+                released: CancellationToken::new(),
                 last_purge: Mutex::new(None),
             }),
             ttl,
@@ -345,7 +351,10 @@ impl Executions {
         else {
             return self.stored(id);
         };
-        let finished = tokio::time::timeout(budget, receiver.wait_for(Option::is_some)).await;
+        let finished = tokio::select! {
+            finished = tokio::time::timeout(budget, receiver.wait_for(Option::is_some)) => finished,
+            () = self.shared.released.cancelled() => return WaitResult::Pending,
+        };
 
         match finished {
             Ok(Ok(outcome)) => match outcome.as_ref() {
@@ -471,6 +480,7 @@ impl Executions {
         for id in &interrupted {
             self.interrupt(id, false);
         }
+        self.shared.released.cancel();
 
         interrupted
     }

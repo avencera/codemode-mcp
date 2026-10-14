@@ -11,6 +11,7 @@ use std::{
 
 use codemode_mcp::{
     approvals::Choice,
+    executions::WaitResult,
     durable::{Durable, Sensitivity},
     store::{Store, approvals::NewApproval, now_ms, parked::ParkedPayload},
     usage::{Caller, Classification, EXEC_CLIENT, ExecutionRecord},
@@ -295,6 +296,33 @@ async fn a_drain_past_its_limit_interrupts_what_is_still_running() -> TestResult
     let harness = harness.restart(Stop::Drain).await?;
     let text = text_of(&harness.wait_done(&id).await?);
     assert!(text.contains("daemon restarted"), "{text}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_answers_waits_on_parked_executions_at_once() -> TestResult {
+    let Some(harness) = harness_with(PLAIN_ASK, "", "").await? else {
+        return Ok(());
+    };
+    let _passkey = harness.enroll_passkey().await?;
+    let pending = harness.execute_body(ADD).await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let execution = execution_id(&pending)?;
+
+    // a client long-polling while the user approves; the stop must answer
+    // it with something resumable, not hold it past the server's shutdown
+    let executions = harness.app.executions().clone();
+    let waiting = tokio::spawn(async move {
+        executions
+            .wait(&execution, Duration::from_secs(60))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    harness.app.drain().await;
+
+    let answered = tokio::time::timeout(Duration::from_secs(5), waiting).await??;
+    assert!(matches!(answered, WaitResult::Pending));
 
     harness.stop().await
 }

@@ -2,14 +2,18 @@
 
 use std::{
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Request, State},
     middleware,
+    response::Response,
     routing::get,
 };
 use rmcp::{
@@ -28,13 +32,12 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     admin,
     app::App,
-    approvals::Approvals,
     config::Config,
     executions::{Executions, StartError, WaitResult},
     executor::{CompletedCall, ExecutionOutcome, InterruptReason},
@@ -88,7 +91,14 @@ pub struct WaitParams {
     pub execution_id: String,
     /// Session value from your previous codemode result; omit if you have none
     pub session: Option<String>,
+    /// Seconds to keep waiting before answering pending again (default 25,
+    /// at most 100); use a longer wait while the user approves on their phone
+    pub timeout_secs: Option<u64>,
 }
+
+/// Longest `wait` a caller may ask for, under Codex's default 120 second
+/// tool timeout
+const MAX_WAIT: Duration = Duration::from_secs(100);
 
 /// MCP handler exposing search, describe, execute and wait
 #[derive(Clone)]
@@ -228,21 +238,29 @@ struct Logged {
 }
 
 /// Pending answer, naming the approval an execution waits on, if any
-pub fn pending_body(approvals: &Approvals, id: &str) -> Value {
+pub fn pending_body(gateway: &Gateway, id: &str) -> Value {
+    let approvals = gateway.approvals();
     match approvals.pending_for_execution(id) {
         Some(approval) => {
+            // agents call `onepassword_authenticate`, not `onepassword.authenticate`
+            let waiting_for = gateway
+                .catalog()
+                .entries()
+                .iter()
+                .find(|entry| entry.server == approval.server && entry.tool == approval.tool)
+                .map_or_else(|| approval.waiting_for(), |entry| entry.function.clone());
             let message = if approvals.notification_failed(&approval.id) {
                 format!(
                     "Waiting for the user to approve {}, but the phone notification could not \
                      be delivered. Give the user the approval_url to open, then call wait with \
                      this execution_id.",
-                    approval.waiting_for()
+                    waiting_for
                 )
             } else {
                 format!(
                     "Waiting for the user to approve {} on their phone. Tell them to check \
                      their notifications, then call wait with this execution_id.",
-                    approval.waiting_for()
+                    waiting_for
                 )
             };
 
@@ -250,7 +268,7 @@ pub fn pending_body(approvals: &Approvals, id: &str) -> Value {
                 "status": "pending",
                 "execution_id": id,
                 "approval_url": approvals.url_for(&approval.id),
-                "waiting_for": approval.waiting_for(),
+                "waiting_for": waiting_for,
                 "message": message,
             })
         }
@@ -310,10 +328,11 @@ impl CodeModeServer {
     async fn await_outcome(
         &self,
         id: &str,
+        budget: Duration,
         context: &RequestContext<RoleServer>,
         session: Option<&SessionNote>,
     ) -> (CallToolResult, Classification) {
-        let wait = self.executions.wait(id, self.wait_budget);
+        let wait = self.executions.wait(id, budget);
         tokio::pin!(wait);
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + self.progress_interval,
@@ -347,7 +366,7 @@ impl CodeModeServer {
                 outcome.classification(),
             ),
             WaitResult::Pending => {
-                let mut body = pending_body(self.gateway.approvals(), id);
+                let mut body = pending_body(&self.gateway, id);
                 if let Some(session) = session {
                     session.insert(&mut body);
                 }
@@ -546,8 +565,9 @@ impl CodeModeServer {
         let (result, classification, id) =
             match self.executions.start(params.code.clone(), caller.clone()) {
                 Ok(id) => {
-                    let (result, classification) =
-                        self.await_outcome(&id, &context, session.as_ref()).await;
+                    let (result, classification) = self
+                        .await_outcome(&id, self.wait_budget, &context, session.as_ref())
+                        .await;
 
                     (result, classification, Some(id))
                 }
@@ -590,8 +610,11 @@ impl CodeModeServer {
         let started = Instant::now();
         let mut caller = caller_of(&context);
         let session = self.open_session(params.session.as_deref(), &mut caller);
+        let budget = params.timeout_secs.map_or(self.wait_budget, |secs| {
+            Duration::from_secs(secs).min(MAX_WAIT)
+        });
         let (result, classification) = self
-            .await_outcome(&params.execution_id, &context, session.as_ref())
+            .await_outcome(&params.execution_id, budget, &context, session.as_ref())
             .await;
         self.record(
             Logged {
@@ -633,6 +656,14 @@ const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
         "Add `import json` at the top of the script",
     ),
     (
+        "`JsonValue`, found `dict[",
+        "dict is invariant, so a dict[str, str] is not a JsonValue: annotate the dict you build as dict[str, JsonValue]",
+    ),
+    (
+        "`JsonValue`, found `list[",
+        "list is invariant, so a list[dict[str, str]] is not a JsonValue: annotate the list you build as list[JsonValue]",
+    ),
+    (
         "error[ban:any]",
         "Any is not allowed: use the tool's declared return type, narrow a `JsonValue` with isinstance, or annotate with `object`",
     ),
@@ -645,6 +676,10 @@ const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
         "type: ignore is not allowed: fix the mismatch, usually by narrowing with isinstance or using the tool's declared return type",
     ),
 ];
+
+/// Result size past which a completed answer asks for less; agents have
+/// returned whole documents that their client then truncated mid-result
+const LARGE_RESULT_BYTES: usize = 16 * 1024;
 
 /// Hints for known mistakes in type-check diagnostics, or an empty string
 fn type_error_hints(diagnostics: &str) -> String {
@@ -701,6 +736,15 @@ fn outcome_text_for(
             let mut body = json!({"status": "completed", "result": value});
             if *truncated {
                 body["truncated"] = Value::Bool(true);
+            }
+            let mut notes = notes.clone();
+            let size = value.to_string().len();
+            if size > LARGE_RESULT_BYTES {
+                notes.push(format!(
+                    "This result is {} KB. Return only the fields asked for, such as titles, URLs \
+                     and short excerpts, so it is not truncated before it reaches you",
+                    size / 1024
+                ));
             }
             if !notes.is_empty() {
                 body["notes"] = json!(notes);
@@ -835,6 +879,7 @@ pub struct RunningServer {
     address: SocketAddr,
     admin_address: SocketAddr,
     shutdown: CancellationToken,
+    in_flight: InFlight,
     tasks: Vec<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -869,6 +914,66 @@ impl RunningServer {
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
     }
+
+    /// Counter of MCP requests still being answered
+    pub fn in_flight(&self) -> InFlight {
+        self.in_flight.clone()
+    }
+}
+
+/// Counts MCP requests in progress, so a stop can let them answer first:
+/// cancelling the server drops a request whose handler has not replied, and
+/// the client sees "no response message received from handler"
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<InFlightInner>);
+
+#[derive(Default)]
+struct InFlightInner {
+    count: AtomicUsize,
+    idle: Notify,
+}
+
+impl InFlight {
+    fn enter(&self) -> InFlightGuard {
+        self.0.count.fetch_add(1, Ordering::SeqCst);
+
+        InFlightGuard(self.clone())
+    }
+
+    /// Resolves once no request is in progress, or after `limit`
+    pub async fn settled(&self, limit: Duration) {
+        let _ = tokio::time::timeout(limit, async {
+            loop {
+                let idle = self.0.idle.notified();
+                if self.0.count.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                idle.await;
+            }
+        })
+        .await;
+    }
+}
+
+struct InFlightGuard(InFlight);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let inner = &(self.0).0;
+        if inner.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            inner.idle.notify_waiters();
+        }
+    }
+}
+
+async fn track_in_flight(
+    State(in_flight): State<InFlight>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let _guard = in_flight.enter();
+
+    next.run(request).await
 }
 
 /// Binds the configured addresses: `/mcp`, `/healthz`, `/stats` and the
@@ -927,6 +1032,13 @@ fn serve_on(
             .with_cancellation_token(shutdown.child_token()),
     );
     let hosts = Arc::new(HostPolicy::new(&app.config().extra_allowed_hosts));
+    let in_flight = InFlight::default();
+    let mcp = Router::new()
+        .fallback_service(mcp)
+        .layer(middleware::from_fn_with_state(
+            in_flight.clone(),
+            track_in_flight,
+        ));
     let router = Router::new()
         .route("/healthz", get(healthz))
         .with_state(Arc::clone(app.gateway()))
@@ -959,6 +1071,7 @@ fn serve_on(
         address,
         admin_address,
         shutdown,
+        in_flight,
         tasks: vec![main, admin],
     })
 }

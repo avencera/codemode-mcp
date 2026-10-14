@@ -34,6 +34,9 @@ use tracing_subscriber::EnvFilter;
 /// How long startup waits for upstreams to finish their first connection attempt
 const SETTLE_LIMIT: Duration = Duration::from_secs(15);
 
+/// How long a stop lets in-flight MCP requests answer after the drain
+const ANSWER_GRACE: Duration = Duration::from_secs(5);
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -611,11 +614,14 @@ async fn serve_command(config: Config) -> Result<()> {
         .wrap_err("failed to start the server")?;
 
     let token = server.shutdown_token();
+    let in_flight = server.in_flight();
     let stopping = app.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         // the server keeps answering `wait` and the approval pages meanwhile
         stopping.drain().await;
+        // the drain released every `wait`, so these answer within moments
+        in_flight.settled(ANSWER_GRACE).await;
         token.cancel();
     });
 

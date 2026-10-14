@@ -56,7 +56,7 @@ async fn approve_once_through_the_passkey_page() -> TestResult {
         .execute_body("# <script>alert(1)</script>\nint(await fixture_add(a=1, b=2))")
         .await?;
     assert_eq!(pending["status"], "pending", "{pending}");
-    assert_eq!(pending["waiting_for"], "fixture.add", "{pending}");
+    assert_eq!(pending["waiting_for"], "fixture_add", "{pending}");
     let id = approval_id(&pending)?;
     assert_eq!(
         pending["approval_url"],
@@ -151,7 +151,7 @@ async fn client_grants_cover_the_client_and_per_call_tools_ask_again() -> TestRe
     // a per-call tool asks even inside a granted client, and refuses a
     // client grant
     let per_call = harness.execute_body("await fixture_json_text()").await?;
-    assert_eq!(per_call["waiting_for"], "fixture.json_text", "{per_call}");
+    assert_eq!(per_call["waiting_for"], "fixture_json_text", "{per_call}");
     let id = approval_id(&per_call)?;
     let (status, _) = harness
         .post_json(
