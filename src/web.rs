@@ -26,6 +26,8 @@ use crate::{
     usage::report::{Reporter, Stats, human_duration, parse_since, percent},
 };
 
+mod highlight;
+
 /// Browser-side WebAuthn helpers
 const WEBAUTHN_JS: &str = include_str!("../assets/webauthn.js");
 /// Inline styles only; scripts come from `/assets/webauthn.js`
@@ -95,16 +97,33 @@ h1 {{ font-size: 1.35rem; margin: 20px 0 8px; overflow-wrap: anywhere; }}
 h2 {{ font-size: 1rem; margin: 20px 0 6px; }}
 .meta {{ color: #777; font-size: .9rem; overflow-wrap: anywhere; }}
 pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 10px; overflow-x: auto; font-size: .85rem; white-space: pre-wrap; overflow-wrap: anywhere; }}
-.buttons {{ display: grid; gap: 12px; margin-top: 24px; }}
-button {{ font-size: 1.1rem; padding: 16px; border-radius: 14px; border: 0; font-weight: 600; min-height: 56px; }}
+.buttons {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 16px; }}
+button {{ font-size: 1.1rem; padding: 14px; border-radius: 14px; border: 0; font-weight: 600; min-height: 52px; grid-column: 1 / -1; }}
+/* grant buttons pair up, 15 and 60 min side by side, so every choice fits above the script on a phone */
+button.client {{ grid-column: auto; font-size: .95rem; padding: 10px; }}
 button.approve {{ background: #1f7a3a; color: #fff; }}
 button.client {{ background: #2457a6; color: #fff; }}
 button.deny {{ background: #b3261e; color: #fff; }}
 button:disabled {{ opacity: .5; }}
 input {{ font-size: 1.1rem; padding: 12px; border-radius: 10px; border: 1px solid #999; width: 100%; box-sizing: border-box; }}
-#status {{ margin-top: 20px; font-weight: 600; min-height: 1.4em; }}
+#status {{ margin-top: 12px; font-weight: 600; min-height: 1.4em; }}
 table {{ border-collapse: collapse; width: 100%; font-size: .9rem; }}
 td, th {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid rgba(127,127,127,.3); vertical-align: top; overflow-wrap: anywhere; }}
+.kw {{ color: #a626a4; }}
+.def {{ color: #0f6fbf; font-weight: 600; }}
+.call {{ color: #0f6fbf; }}
+.str {{ color: #3f8a1f; }}
+.key {{ color: #b0461a; }}
+.num, .lit {{ color: #986801; }}
+.com {{ color: #6a737d; font-style: italic; }}
+@media (prefers-color-scheme: dark) {{
+  .kw {{ color: #d58fe0; }}
+  .def, .call {{ color: #6cb6ff; }}
+  .str {{ color: #98c379; }}
+  .key {{ color: #f0a070; }}
+  .num, .lit {{ color: #e5c07b; }}
+  .com {{ color: #8b949e; }}
+}}
 </style>
 </head>
 <body>
@@ -243,7 +262,11 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
             }
         }
     }
-    let grant_note = notes.join(" ");
+    let grant_note = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p class="meta">{}</p>"#, escape(&notes.join(" ")))
+    };
     let session = info
         .caller
         .session_label()
@@ -258,17 +281,18 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         r#"<main data-kind="approve" data-base="/approve/{id}">
 <h1>{title}</h1>
 <p class="meta">Client {client} {version}{session}<br>Execution {execution}</p>
-<p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>. {grant_note}</p>
-<h2>Arguments</h2>
-<pre>{arguments}</pre>
-<h2>Script</h2>
-<pre>{script}</pre>
+<p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
 <div class="buttons">
 <button class="approve" data-choice="once">Approve once</button>
 {client_buttons}
 <button class="deny" data-choice="deny">Deny</button>
 </div>
 <p id="status" role="status"></p>
+{grant_note}
+<h2>Arguments</h2>
+<pre>{arguments}</pre>
+<h2>Script</h2>
+<pre>{script}</pre>
 </main>
 <script src="/assets/webauthn.js"></script>"#,
         id = escape(&info.id),
@@ -278,8 +302,8 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         execution = escape(&info.execution_id),
         left = info.time_left().as_secs(),
         left_text = escape(&human_duration(info.time_left().as_millis() as i64)),
-        arguments = escape(&arguments),
-        script = escape(&info.script),
+        arguments = highlight::json(&arguments),
+        script = highlight::python(&info.script),
     );
 
     page(StatusCode::OK, &title, &body)
@@ -294,20 +318,20 @@ fn admin_page(info: &ApprovalInfo, title: &str) -> Response {
 <h1>{title}</h1>
 <p class="meta">Requested by the codemode-mcp command line on the Mac. Approve only if you started this; an unexpected request means something on the Mac is trying to change who can approve tool calls.</p>
 <p class="meta">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
-<h2>Details</h2>
-<pre>{details}</pre>
 <div class="buttons">
 <button class="approve" data-choice="once">Approve</button>
 <button class="deny" data-choice="deny">Deny</button>
 </div>
 <p id="status" role="status"></p>
+<h2>Details</h2>
+<pre>{details}</pre>
 </main>
 <script src="/assets/webauthn.js"></script>"#,
         id = escape(&info.id),
         title = escape(title),
         left = info.time_left().as_secs(),
         left_text = escape(&human_duration(info.time_left().as_millis() as i64)),
-        details = escape(&details),
+        details = highlight::json(&details),
     );
 
     page(StatusCode::OK, title, &body)

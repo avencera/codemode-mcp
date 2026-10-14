@@ -88,8 +88,14 @@ async fn approve_once_through_the_passkey_page() -> TestResult {
         html.contains(&format!("Approve {DEFAULT_CLIENT} for 15 min")),
         "{html}"
     );
-    assert!(html.contains("&quot;a&quot;: 1"), "{html}");
-    assert!(html.contains("&lt;script&gt;alert(1)"), "{html}");
+    assert!(
+        html.contains(r#"<span class="key">&quot;a&quot;</span>: <span class="num">1</span>"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<span class="com"># &lt;script&gt;alert(1)&lt;/script&gt;</span>"#),
+        "{html}"
+    );
     assert!(!html.contains("<script>alert"), "{html}");
 
     let missing = harness
