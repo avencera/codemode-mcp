@@ -21,9 +21,13 @@ grant = "per_call"
 grant = "per_call"
 
 # `codemode-mcp op warm` runs these on the Mac so the 1Password app's own
-# prompts appear there first
+# prompts appear there first; list_environments needs the account ID that
+# `op account list` prints
 [servers.onepassword.warm]
-calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
+calls = [
+    { tool = "authenticate" },
+    { tool = "list_environments", arguments = { accountId = "YOUR_ACCOUNT_ID" } },
+]
 
 # Result types. A tool that declares no output schema returns a `JsonValue`
 # the script has to narrow, so the tools below say what they return. An
