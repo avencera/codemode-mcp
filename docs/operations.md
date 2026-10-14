@@ -40,6 +40,10 @@ binary under a shorter name. Times in logs are UTC.
    The first signing may ask whether codesign can use the key; choose Always Allow. Check an installed binary
    with `codesign -dv ~/.local/bin/codemode-mcp`, which should show `TeamIdentifier=Q8UP8C53Y8`.
 
+4. Check it: `codemode-mcp service status` (plist, launchd state, `/healthz`).
+5. Expose the approval pages to the phone: `tailscale serve --bg --https=8443 http://127.0.0.1:7681`.
+   `public_origin` (default `https://mac.tailnet-name.ts.net:8443`) must match.
+
 ## Releases
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds `aarch64-apple-darwin`, signs it with the
@@ -47,9 +51,6 @@ same identity and identifier, and attaches `codemode-mcp-<tag>-aarch64-apple-dar
 It reads the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the
 `MACOS_SIGNING_IDENTITY` variable, the same names homebased uses, and fails rather than ship unsigned. The
 Monty worker is not part of the release.
-4. Check it: `codemode-mcp service status` (plist, launchd state, `/healthz`).
-5. Expose the approval pages to the phone: `tailscale serve --bg --https=8443 http://127.0.0.1:7681`.
-   `public_origin` (default `https://mac.tailnet-name.ts.net:8443`) must match.
 
 ## Enroll a passkey
 
