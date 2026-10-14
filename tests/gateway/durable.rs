@@ -11,8 +11,8 @@ use std::{
 
 use codemode_mcp::{
     approvals::Choice,
-    executions::WaitResult,
     durable::{Durable, Sensitivity},
+    executions::WaitResult,
     store::{Store, approvals::NewApproval, now_ms, parked::ParkedPayload},
     usage::{Caller, Classification, EXEC_CLIENT, ExecutionRecord},
 };
@@ -313,11 +313,8 @@ async fn a_drain_answers_waits_on_parked_executions_at_once() -> TestResult {
     // a client long-polling while the user approves; the stop must answer
     // it with something resumable, not hold it past the server's shutdown
     let executions = harness.app.executions().clone();
-    let waiting = tokio::spawn(async move {
-        executions
-            .wait(&execution, Duration::from_secs(60))
-            .await
-    });
+    let waiting =
+        tokio::spawn(async move { executions.wait(&execution, Duration::from_secs(60)).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
     harness.app.drain().await;
 

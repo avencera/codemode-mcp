@@ -111,6 +111,16 @@ pub enum UpstreamError {
     /// The OAuth client could not be prepared (discovery or stored login)
     #[error("oauth: {0}")]
     OAuth(String),
+    /// A configured setup call answered with an error, so the call that
+    /// needed it was not sent; its text stays out, since the server may be
+    /// sensitive
+    #[error("server `{server}`'s setup call `{tool}` failed; the call was not sent")]
+    SetupFailed {
+        /// Server name
+        server: String,
+        /// Setup tool that failed
+        tool: String,
+    },
 }
 
 impl UpstreamError {
@@ -122,7 +132,9 @@ impl UpstreamError {
             Self::Header(_) => ErrorCategory::Configuration,
             Self::Initialize(_) => ErrorCategory::Initialize,
             Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
-            Self::Service(_) | Self::InputRequired => ErrorCategory::Protocol,
+            Self::Service(_) | Self::InputRequired | Self::SetupFailed { .. } => {
+                ErrorCategory::Protocol
+            }
             Self::Interrupted { .. } => ErrorCategory::ConnectionClosed,
             Self::NeedsLogin(_) => ErrorCategory::NeedsLogin,
             Self::OAuth(_) => ErrorCategory::Transport,
@@ -138,6 +150,7 @@ impl UpstreamError {
             Self::Unavailable { .. }
             | Self::TimedOut { .. }
             | Self::InputRequired
+            | Self::SetupFailed { .. }
             | Self::NeedsLogin(_) => self.to_string(),
             Self::Service(ServiceError::McpError(error)) => {
                 format!("the server returned an error: {}", error.message)
@@ -269,6 +282,10 @@ pub struct Upstream {
     refresh_seq: AtomicU64,
     /// Serializes tool-list refreshes so a stale response never overwrites a newer one
     refresh_turn: Mutex<()>,
+    /// Connection epoch whose `setup` calls have run
+    setup_epoch: AtomicU64,
+    /// Serializes setup, so concurrent first calls run it once
+    setup_turn: Mutex<()>,
     /// Logins for `oauth = true` servers
     oauth: Option<Arc<OAuth>>,
     /// Where the last tool list is kept for the next start
@@ -345,7 +362,80 @@ impl Upstream {
         arguments: Map<String, Value>,
     ) -> Result<CallToolResult, UpstreamError> {
         let peer = self.connected_peer()?;
+        self.ensure_setup(&peer, tool).await?;
 
+        self.send_call(&peer, tool, self.with_fixed_arguments(tool, arguments))
+            .await
+    }
+
+    /// Adds the server's configured `arguments` that `tool` declares and the
+    /// caller left out; the stubs hide them, so scripts never pass them
+    fn with_fixed_arguments(
+        &self,
+        tool: &str,
+        mut arguments: Map<String, Value>,
+    ) -> Map<String, Value> {
+        if self.config.arguments.is_empty() {
+            return arguments;
+        }
+
+        let inner = self.read();
+        let Some(declared) = inner
+            .tools
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .and_then(|tool| tool.input_schema.get("properties"))
+            .and_then(Value::as_object)
+        else {
+            return arguments;
+        };
+        for (name, value) in &self.config.arguments {
+            if declared.contains_key(name) && !arguments.contains_key(name) {
+                arguments.insert(name.clone(), value.clone());
+            }
+        }
+
+        arguments
+    }
+
+    /// Runs the configured `setup` calls once per connection, before the
+    /// first other call on it
+    async fn ensure_setup(&self, peer: &Peer<RoleClient>, tool: &str) -> Result<(), UpstreamError> {
+        let setup = &self.config.setup;
+        if setup.is_empty() || setup.iter().any(|call| call.tool == tool) {
+            return Ok(());
+        }
+
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        if self.setup_epoch.load(Ordering::SeqCst) == epoch {
+            return Ok(());
+        }
+        let _turn = self.setup_turn.lock().await;
+        if self.setup_epoch.load(Ordering::SeqCst) == epoch {
+            return Ok(());
+        }
+
+        for call in setup {
+            let arguments = self.with_fixed_arguments(&call.tool, call.arguments.clone());
+            let result = self.send_call(peer, &call.tool, arguments).await?;
+            if result.is_error == Some(true) {
+                return Err(UpstreamError::SetupFailed {
+                    server: self.name.clone(),
+                    tool: call.tool.clone(),
+                });
+            }
+        }
+        self.setup_epoch.store(epoch, Ordering::SeqCst);
+
+        Ok(())
+    }
+
+    async fn send_call(
+        &self,
+        peer: &Peer<RoleClient>,
+        tool: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<CallToolResult, UpstreamError> {
         let params = CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments);
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
         let handle = peer
@@ -806,6 +896,8 @@ impl Upstreams {
                 epoch: AtomicU64::new(0),
                 refresh_seq: AtomicU64::new(0),
                 refresh_turn: Mutex::new(()),
+                setup_epoch: AtomicU64::new(0),
+                setup_turn: Mutex::new(()),
                 oauth: oauth.clone(),
                 store: store.clone(),
                 reconnect: watch::channel(0).0,

@@ -251,6 +251,13 @@ return type is `Any`.
   later documents its own stops applying without an edit; `force_output_schema = true` makes the configured schema
   win. `output` and `output_schema` cannot be combined. The starter config types the OpenAI docs search, list and
   endpoint tools and marks Exa and `fetch_openai_doc` as text
+- Server-level helpers (`[servers.<s>]`): `arguments` is a table the gateway passes to every tool that declares
+  one of its keys, and those parameters are dropped from the stubs, so a script cannot guess them (1Password's
+  `accountId`). `setup` lists calls made once per connection, lazily, before the first other call on it, inside
+  that call's approval; a server that grants scopes per connection, such as 1Password's `authenticate`, needs
+  this, and running it lazily keeps the 1Password app from prompting at boot. A failed setup call fails the call
+  that needed it with a message naming only the setup tool. `aliases` are extra search terms for the server's
+  tools (`1password` for `onepassword`)
 - Runtime check. Every result is validated against its effective schema (upstream, config or adapter) before the
   script sees it, by a validator for the subset `stubs` turns into types (`type`, `nullable`, `enum`, `const`,
   `required`, `properties`, `additionalProperties`, `items`/`prefixItems`, `allOf`/`anyOf`/`oneOf`, `$ref`); other

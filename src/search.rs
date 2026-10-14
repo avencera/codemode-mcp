@@ -19,6 +19,8 @@ pub struct SearchText<'a> {
     pub description: &'a str,
     /// Parameter names
     pub params: &'a [String],
+    /// Other names of the tool's server, such as `1password`
+    pub aliases: &'a [String],
 }
 
 #[derive(Debug)]
@@ -54,6 +56,10 @@ impl SearchIndex {
             add(tokenize(text.description), 1);
             for param in text.params {
                 add(tokenize(param), PARAM_WEIGHT);
+            }
+            // weighted like the name, which already carries the server's own name
+            for alias in text.aliases {
+                add(tokenize(alias), NAME_WEIGHT);
             }
 
             for term in terms.keys() {
@@ -173,16 +179,19 @@ mod tests {
                 name: "docs_searchDocs",
                 description: "Find pages",
                 params: &params,
+                aliases: &none,
             },
             SearchText {
                 name: "mail_send",
                 description: "Send mail; can also search docs",
                 params: &none,
+                aliases: &none,
             },
             SearchText {
                 name: "calc_add",
                 description: "Add numbers",
                 params: &none,
+                aliases: &none,
             },
         ]);
 
@@ -190,5 +199,29 @@ mod tests {
 
         assert_eq!(ranked.first().map(|hit| hit.0), Some(0));
         assert!(ranked.iter().all(|hit| hit.0 != 2));
+    }
+
+    #[test]
+    fn a_server_alias_finds_its_tools() {
+        let none: Vec<String> = Vec::new();
+        let aliases = vec!["1password".to_owned()];
+        let index = SearchIndex::build([
+            SearchText {
+                name: "onepassword_list_environments",
+                description: "List all Environments in an account",
+                params: &none,
+                aliases: &aliases,
+            },
+            SearchText {
+                name: "calc_add",
+                description: "Add numbers",
+                params: &none,
+                aliases: &none,
+            },
+        ]);
+
+        let ranked = index.query("1password", 5);
+
+        assert_eq!(ranked.first().map(|hit| hit.0), Some(0));
     }
 }

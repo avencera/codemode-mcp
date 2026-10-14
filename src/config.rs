@@ -579,6 +579,19 @@ pub struct ServerConfig {
     /// Calls `codemode-mcp op warm` runs to front-load prompts on the Mac
     #[serde(default)]
     pub warm: Option<WarmConfig>,
+    /// Arguments the gateway passes to every tool of this server that takes
+    /// them; they disappear from the stubs, so scripts cannot get them wrong
+    #[serde(default)]
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// Calls made once on each new connection, before the first other call
+    /// on it, such as a login that grants the scopes the other tools check;
+    /// they run inside that call, so it needs no approval of its own
+    #[serde(default)]
+    pub setup: Vec<WarmCall>,
+    /// Other names agents search for this server by, such as `1password`
+    /// for `onepassword`
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 /// Per-tool settings that override the server defaults

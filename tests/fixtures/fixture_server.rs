@@ -1,6 +1,12 @@
 //! Tiny stdio MCP server used by the integration tests
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -17,6 +23,12 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WhoamiParams {
+    /// Account to describe; only `login` makes it usable
+    account: String,
+}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct AddParams {
@@ -179,6 +191,8 @@ fn hang_route() -> ToolRoute<Fixture> {
 #[derive(Clone)]
 struct Fixture {
     tool_router: ToolRouter<Fixture>,
+    /// Set by `login`, like a server that grants scopes per connection
+    logged_in: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -216,12 +230,34 @@ impl Fixture {
             .with_route(mismatched_route())
             .with_route(hang_route());
 
-        Self { tool_router }
+        Self {
+            tool_router,
+            logged_in: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
 #[tool_router]
 impl Fixture {
+    #[tool(description = "Log in for this connection; whoami refuses until then")]
+    fn login(&self) -> String {
+        self.logged_in.store(true, Ordering::SeqCst);
+
+        "logged in".to_owned()
+    }
+
+    #[tool(description = "Name the account, once logged in")]
+    fn whoami(
+        &self,
+        Parameters(WhoamiParams { account }): Parameters<WhoamiParams>,
+    ) -> Result<String, String> {
+        if self.logged_in.load(Ordering::SeqCst) {
+            Ok(format!("account {account}"))
+        } else {
+            Err("Missing required scope. Call the login tool first.".to_owned())
+        }
+    }
+
     #[tool(description = "Add two integers")]
     fn add(&self, Parameters(AddParams { a, b }): Parameters<AddParams>) -> String {
         (a + b).to_string()

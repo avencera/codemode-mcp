@@ -1,14 +1,16 @@
 //! The merged tool catalog: namespacing, stubs and search
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
 use rmcp::model::Tool;
+use serde_json::{Map, Value};
 
 use crate::{
-    config::{Config, OutputMode, ToolOverride},
+    config::{Config, OutputMode, ServerConfig, ToolOverride},
     output::OutputSpec,
     policy::Policy,
     search::{SearchIndex, SearchText},
@@ -120,6 +122,7 @@ impl Catalog {
 
             for (tool, function) in snapshot.tools.iter().zip(function_names) {
                 let function = function.clone();
+                let input = shown_input(&tool.input_schema, server);
                 let description = tool
                     .description
                     .as_deref()
@@ -133,7 +136,7 @@ impl Catalog {
                     server.and_then(|server| server.tool_override(&tool.name)),
                 );
                 let stub = if degraded {
-                    fallback_stub(&function, Some(&description), &tool.input_schema)
+                    fallback_stub(&function, Some(&description), &input)
                 } else {
                     let stub_output = match &output {
                         OutputSpec::Schema(schema) => StubOutput::Schema(schema),
@@ -141,15 +144,9 @@ impl Catalog {
                         OutputSpec::Untyped => StubOutput::Untyped,
                     };
 
-                    book.tool(
-                        &function,
-                        Some(&description),
-                        &tool.input_schema,
-                        stub_output,
-                    )
+                    book.tool(&function, Some(&description), &input, stub_output)
                 };
-                let params = tool
-                    .input_schema
+                let params = input
                     .get("properties")
                     .and_then(|properties| properties.as_object())
                     .map(|properties| properties.keys().cloned().collect())
@@ -184,6 +181,10 @@ impl Catalog {
                 name: &entry.function,
                 description: &entry.description,
                 params: &entry.params,
+                aliases: config
+                    .servers
+                    .get(&entry.server)
+                    .map_or(&[][..], |server| server.aliases.as_slice()),
             }
         }));
         let by_function = entries
@@ -366,6 +367,37 @@ fn effective_output(
         (None, Some((_, schema))) => OutputSpec::Schema(Arc::new(schema.clone())),
         (None, None) => OutputSpec::Untyped,
     }
+}
+
+/// The input schema scripts see: arguments the server config supplies are
+/// left out, so a script cannot pass a wrong one
+fn shown_input<'a>(
+    schema: &'a Map<String, Value>,
+    server: Option<&ServerConfig>,
+) -> Cow<'a, Map<String, Value>> {
+    let Some(fixed) = server
+        .map(|server| &server.arguments)
+        .filter(|fixed| !fixed.is_empty())
+    else {
+        return Cow::Borrowed(schema);
+    };
+    let declares_one = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| fixed.keys().any(|name| properties.contains_key(name)));
+    if !declares_one {
+        return Cow::Borrowed(schema);
+    }
+
+    let mut shown = schema.clone();
+    if let Some(Value::Object(properties)) = shown.get_mut("properties") {
+        properties.retain(|name, _| !fixed.contains_key(name));
+    }
+    if let Some(Value::Array(required)) = shown.get_mut("required") {
+        required.retain(|name| name.as_str().is_none_or(|name| !fixed.contains_key(name)));
+    }
+
+    Cow::Owned(shown)
 }
 
 /// Longest server note `describe` repeats; instructions are upstream text

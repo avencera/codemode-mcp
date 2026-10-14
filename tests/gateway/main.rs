@@ -480,3 +480,41 @@ async fn healthz_reports_categories_not_raw_errors() -> TestResult {
 
     harness.stop().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_arguments_setup_and_aliases_serve_the_script() -> TestResult {
+    let Some(harness) = Harness::start(
+        "",
+        "arguments = { account = \"acct-1\" }\nsetup = [{ tool = \"login\" }]\naliases = [\"fixtureland\"]",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = &harness.client;
+
+    // the configured argument is gone from the stub, so a script cannot pass
+    // a wrong one
+    let described = text_of(
+        &call(
+            client,
+            "describe_tools",
+            json!({ "names": ["fixture_whoami"] }),
+        )
+        .await?,
+    );
+    assert!(
+        described.contains("async def fixture_whoami() ->"),
+        "{described}"
+    );
+
+    // whoami refuses until login ran on the connection, and gets the account
+    // from the config
+    let body = harness.execute_json("await fixture_whoami()").await?;
+    assert_eq!(body["result"], "account acct-1", "{body}");
+
+    let found = text_of(&call(client, "search_tools", json!({ "query": "fixtureland" })).await?);
+    assert!(found.contains("fixture_"), "{found}");
+
+    harness.stop().await
+}
