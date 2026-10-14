@@ -340,6 +340,10 @@ async fn service_command(
 ) -> Result<()> {
     let paths = ServicePaths::from_env(&config.state_dir()?)?;
     let uid = service::current_uid()?;
+    let starts_daemon = matches!(
+        command,
+        ServiceCommand::Install { .. } | ServiceCommand::Restart { .. }
+    );
 
     let (plan, dry_run) = match command {
         ServiceCommand::Install { dry_run } => {
@@ -397,12 +401,55 @@ async fn service_command(
 
         return Ok(());
     }
+
+    let previous_pid = service::running_pid(uid);
     for action in &plan {
         println!("{}", action.describe());
         action.apply()?;
     }
 
+    // launchctl returns before the new daemon listens, so a follow-up such
+    // as `op warm` would hit a closed admin port
+    if starts_daemon {
+        wait_until_serving(config, uid, previous_pid).await?;
+    }
+
     Ok(())
+}
+
+/// Waits until a daemon other than `previous_pid` answers on both listeners
+async fn wait_until_serving(config: &Config, uid: u32, previous_pid: Option<u32>) -> Result<()> {
+    // the old daemon may drain for the full window before launchd starts the
+    // new one
+    let deadline = Instant::now() + config.limits.drain() + Duration::from_secs(30);
+    let health = format!("http://127.0.0.1:{}/healthz", config.listen.port());
+    let client = reqwest::Client::new();
+
+    loop {
+        if let Some(pid) = service::running_pid(uid).filter(|pid| Some(*pid) != previous_pid) {
+            let healthy = client
+                .get(&health)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success());
+            let admin_open = tokio::net::TcpStream::connect(config.admin_listen)
+                .await
+                .is_ok();
+            if healthy && admin_open {
+                println!("daemon is serving (pid {pid})");
+
+                return Ok(());
+            }
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "the daemon did not start serving; check `codemode-mcp service status` and the logs"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 fn print_plan(plan: &[Action]) {

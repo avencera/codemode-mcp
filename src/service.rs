@@ -542,6 +542,16 @@ pub fn status_command(uid: u32) -> Vec<String> {
     vec!["launchctl".into(), "print".into(), target(uid)]
 }
 
+/// The pid launchd reports for the running service, if it is running
+pub fn running_pid(uid: u32) -> Option<u32> {
+    let output = run_command(&status_command(uid)).ok()?;
+
+    output
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("pid = ")?.parse().ok())
+}
+
 /// The starter config for `home`
 pub fn starter_config(home: &Path) -> String {
     STARTER_CONFIG.replace("{{HOME}}", &home.display().to_string())
