@@ -240,8 +240,10 @@ return type is `Any`.
 
 - Result types. A tool with an `outputSchema` returns the `TypedDict` (or type) generated from it. A tool without
   one returns `JsonValue`, declared once in the stub header as
-  `type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]` (PEP 695; ty 0.0.14
-  narrows it with `isinstance`, the stubs are never executed, so Monty never sees the statement). Parameters of
+  `type JsonValue = str | int | float | bool | None | Sequence[JsonValue] | Mapping[str, JsonValue]` (PEP 695; ty
+  0.0.14 narrows it with `isinstance`, the stubs are never executed, so Monty never sees the statement). The
+  covariant `Sequence` and `Mapping` let a helper declared `-> JsonValue` return a `dict[str, str]` or a
+  `list[dict[str, str]]`; with invariant `list` and `dict` that was the most common type error agents hit. Parameters of
   unknown type accept `object`, results of unknown type are `JsonValue`; the header has no `Any`. The
   `**kwargs` fallback for parameter names that are not identifiers is `**kwargs: Unpack[<TypedDict>]` using the
   functional `TypedDict` syntax, which ty accepts

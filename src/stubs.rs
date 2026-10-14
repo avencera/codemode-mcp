@@ -29,9 +29,12 @@ pub const JSON_VALUE: &str = "JsonValue";
 ///
 /// A PEP 695 `type` statement is the one recursive spelling both Monty's
 /// type checker and its parser accept; stubs are never executed, so the
-/// statement does not have to run
-pub const JSON_VALUE_ALIAS: &str =
-    "type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]\n";
+/// statement does not have to run. `Sequence` and `Mapping` rather than
+/// `list` and `dict`: those are invariant, so a helper declared `-> JsonValue`
+/// that returned a `dict[str, str]` or a `list[dict[str, str]]` failed the
+/// check, the most common type error agents hit. `isinstance(r, dict)` and
+/// `isinstance(r, list)` still narrow a result
+pub const JSON_VALUE_ALIAS: &str = "type JsonValue = str | int | float | bool | None | Sequence[JsonValue] | Mapping[str, JsonValue]\n";
 
 /// Names the header and the alias define, so no generated type reuses them
 const RESERVED_NAMES: [&str; 9] = [

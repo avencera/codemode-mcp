@@ -24,8 +24,9 @@ macro_rules! script_rules {
              `v = r.get(\"k\") if isinstance(r, dict) else None`\n  \
              `name = v if isinstance(v, str) else \"\"`\n  \
              `Any`, `cast` and `# type: ignore` are rejected.\n\
-             - Build results as `dict[str, JsonValue]` and `list[JsonValue]` (annotate them): dict and list are \
-             invariant, so a `dict[str, str]` or `list[dict[str, str]]` is not a `JsonValue`.\n\
+             - A helper may return any JSON-like value as `JsonValue`, `dict[str, str]` and `list[dict[str, int]]` \
+             included. A variable annotated `dict[str, JsonValue]` or `list[JsonValue]` is stricter: build it \
+             with that annotation from the start.\n\
              - Allowed: top-level `await`; `async def` helpers; `await asyncio.gather(a(), b())` for concurrency \
              (no keyword args such as return_exceptions); if/for/while; list/dict/set comprehensions; f-strings; \
              try/except/finally with built-in exceptions (a refused or unapproved tool call raises \
@@ -65,8 +66,8 @@ pub const INSTRUCTIONS: &str = concat!(
     "Many upstream tools are reachable through scripts. Workflow: search_tools to find tools by keyword, \
      describe_tools to get their typed Python signatures, then execute a script that calls them. \
      execute returns status \"pending\" with an execution_id if the script is slow; call wait(execution_id). \
-     Some tools need the user's approval on their phone: a pending answer with approval_url and waiting_for \
-     means tell the user to check their phone, then call wait. ",
+     Some tools need the user's approval: a pending answer with approval_url and waiting_for means pass its \
+     message and the approval_url on to the user, then call wait. ",
     session_rule!(),
     "\n\n",
     script_rules!()

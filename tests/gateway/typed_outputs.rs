@@ -781,6 +781,30 @@ fn validator_agrees_with_the_stub_types() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn helpers_return_concrete_containers_as_json_value() -> TestResult {
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+
+    // with invariant list and dict in the alias, both returns were the type
+    // error agents hit most; an untyped result must still narrow
+    let body = harness
+        .execute_json(
+            "async def pick() -> JsonValue:\n    out: dict[str, str] = {\"a\": \"b\"}\n    return out\n\n\
+             async def rows() -> JsonValue:\n    found: list[dict[str, str | None]] = [{\"a\": None}]\n    return found\n\n\
+             r = await fixture_json_text()\n\
+             n = len(r) if isinstance(r, list) else -1\n\
+             {\"pick\": await pick(), \"rows\": await rows(), \"n\": n}",
+        )
+        .await?;
+    assert_eq!(body["result"]["pick"], json!({ "a": "b" }), "{body}");
+    assert_eq!(body["result"]["rows"], json!([{ "a": null }]), "{body}");
+    assert_eq!(body["result"]["n"], 3, "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn hostile_scripts_cannot_take_the_daemon_down() -> TestResult {
     let Some(harness) = Harness::start("", "").await? else {
         return Ok(());

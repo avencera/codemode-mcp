@@ -92,7 +92,7 @@ pub struct WaitParams {
     /// Session value from your previous codemode result; omit if you have none
     pub session: Option<String>,
     /// Seconds to keep waiting before answering pending again (default 25,
-    /// at most 100); use a longer wait while the user approves on their phone
+    /// at most 100); use a longer wait while the user approves
     pub timeout_secs: Option<u64>,
 }
 
@@ -256,10 +256,19 @@ pub fn pending_body(gateway: &Gateway, id: &str) -> Value {
                      this execution_id.",
                     waiting_for
                 )
+            } else if approvals.asked_on_mac(&approval.id) {
+                format!(
+                    "Waiting for the user to approve {} on this Mac: a Touch ID prompt or a \
+                     notification is showing, and their phone is told if they do not answer \
+                     here. Tell them, give them the approval_url to review it in a browser, then \
+                     call wait with this execution_id.",
+                    waiting_for
+                )
             } else {
                 format!(
-                    "Waiting for the user to approve {} on their phone. Tell them to check \
-                     their notifications, then call wait with this execution_id.",
+                    "Waiting for the user to approve {} on their phone, or at the approval_url \
+                     in a browser on this Mac. Tell them and give them the approval_url, then \
+                     call wait with this execution_id.",
                     waiting_for
                 )
             };
@@ -660,12 +669,12 @@ const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
         "JsonValue is predefined in every script, like the tool functions: remove it from the import",
     ),
     (
-        "`JsonValue`, found `dict[",
-        "dict is invariant, so a dict[str, str] is not a JsonValue: annotate the dict you build as dict[str, JsonValue]",
+        "`dict[str, JsonValue]`, found `dict[",
+        "dict is invariant, so a dict[str, str] is not a dict[str, JsonValue]: annotate the dict where you build it, or type the target JsonValue",
     ),
     (
-        "`JsonValue`, found `list[",
-        "list is invariant, so a list[dict[str, str]] is not a JsonValue: annotate the list you build as list[JsonValue]",
+        "`list[JsonValue]`, found `list[",
+        "list is invariant, so a list[str] is not a list[JsonValue]: annotate the list where you build it, or type the target JsonValue",
     ),
     (
         "error[ban:any]",
