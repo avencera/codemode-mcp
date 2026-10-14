@@ -46,6 +46,12 @@ struct EchoParams {
     delay_ms: u64,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct UseTokenParams {
+    /// The token to use
+    token: String,
+}
+
 #[derive(Serialize, schemars::JsonSchema)]
 struct EchoResult {
     echoed: String,
@@ -285,6 +291,19 @@ impl Fixture {
     #[tool(description = "A JSON array delivered as plain text")]
     fn json_text(&self) -> String {
         "[1, 2, {\"k\": \"v\"}]".to_owned()
+    }
+
+    #[tool(description = "Hand out a token as JSON text, with no declared output schema")]
+    fn issue_token(&self) -> String {
+        json!({"token": "tok-1"}).to_string()
+    }
+
+    #[tool(description = "Echo the token it was given")]
+    fn use_token(
+        &self,
+        Parameters(UseTokenParams { token }): Parameters<UseTokenParams>,
+    ) -> String {
+        format!("used {token}")
     }
 
     #[tool(description = "Look things up with an optional nested filter")]

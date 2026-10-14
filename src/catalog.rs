@@ -15,7 +15,8 @@ use crate::{
     policy::Policy,
     search::{SearchIndex, SearchText},
     stubs::{
-        Declaration, JSON_VALUE_ALIAS, STUB_HEADER, StubBook, StubOutput, ToolStub, fallback_stub,
+        Declaration, JSON_VALUE_ALIAS, STUB_HEADER, StubBook, StubOutput, TYPE_KEYWORD, ToolStub,
+        branded_outputs, fallback_stub,
     },
 };
 
@@ -88,6 +89,8 @@ pub struct Catalog {
     visible: Vec<usize>,
     index: SearchIndex,
     check_stubs: String,
+    /// Names of the branded string types the stubs declare
+    brands: HashSet<String>,
     /// Each server's handshake instructions as stub comments, by server name
     notes: HashMap<String, String>,
 }
@@ -104,7 +107,35 @@ impl Catalog {
         let names = function_names(snapshots);
         let mut book = StubBook::new();
 
-        for (snapshot, function_names) in snapshots.iter().zip(&names) {
+        // results are typed before any parameter is, so a parameter's docs
+        // can name the tool whose result it takes
+        let outputs: Vec<Vec<OutputSpec>> = snapshots
+            .iter()
+            .map(|snapshot| {
+                let server = config.servers.get(&snapshot.name);
+
+                snapshot
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        effective_output(
+                            &snapshot.name,
+                            tool,
+                            server.and_then(|server| server.tool_override(&tool.name)),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        for (function_names, outputs) in names.iter().zip(&outputs) {
+            for (function, output) in function_names.iter().zip(outputs) {
+                if let OutputSpec::Schema(schema) = output {
+                    book.add_brand_sources(branded_outputs(function, schema));
+                }
+            }
+        }
+
+        for ((snapshot, function_names), outputs) in snapshots.iter().zip(&names).zip(outputs) {
             let server = config.servers.get(&snapshot.name);
             if let Some(server) = server
                 && !snapshot.tools.is_empty()
@@ -120,9 +151,17 @@ impl Catalog {
                 }
             }
 
-            for (tool, function) in snapshot.tools.iter().zip(function_names) {
+            for ((tool, function), output) in snapshot.tools.iter().zip(function_names).zip(outputs)
+            {
                 let function = function.clone();
-                let input = shown_input(&tool.input_schema, server);
+                // configured arguments come out first, so a brand can only
+                // land on a parameter the script still passes
+                let input = branded_input(
+                    &snapshot.name,
+                    &tool.name,
+                    shown_input(&tool.input_schema, server),
+                    server.and_then(|server| server.tool_override(&tool.name)),
+                );
                 let description = tool
                     .description
                     .as_deref()
@@ -130,11 +169,6 @@ impl Catalog {
                     .unwrap_or("")
                     .to_owned();
                 let degraded = fallback.contains(&function);
-                let output = effective_output(
-                    &snapshot.name,
-                    tool,
-                    server.and_then(|server| server.tool_override(&tool.name)),
-                );
                 let stub = if degraded {
                     fallback_stub(&function, Some(&description), &input)
                 } else {
@@ -222,8 +256,17 @@ impl Catalog {
             visible,
             index,
             check_stubs,
+            brands: book.brands(),
             notes,
         }
+    }
+
+    /// Whether `name` is a branded string type the stubs declare
+    ///
+    /// The sandbox has no such name, so a script that calls one as a
+    /// constructor would otherwise fail in a confusing way
+    pub fn is_brand(&self, name: &str) -> bool {
+        self.brands.contains(name)
     }
 
     /// Every tool, in server then tool order
@@ -331,6 +374,67 @@ fn declare_once<'a>(
             out.push('\n');
             out.push_str(&declaration.describe);
         }
+    }
+}
+
+/// The tool's input schema with the configured brands written into it
+///
+/// Only a parameter declared directly in `properties` with a string type can
+/// be branded; a name that is missing or has another type is reported and
+/// left as the upstream declares it
+fn branded_input<'a>(
+    server: &str,
+    tool: &str,
+    input: Cow<'a, Map<String, Value>>,
+    tool_override: Option<&ToolOverride>,
+) -> Cow<'a, Map<String, Value>> {
+    let Some(over) = tool_override.filter(|over| !over.param_types.is_empty()) else {
+        return input;
+    };
+    let mut schema = input.into_owned();
+
+    for (param, brand) in &over.param_types {
+        let property = schema
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|properties| properties.get_mut(param))
+            .and_then(serde_json::Value::as_object_mut);
+        let Some(property) = property else {
+            tracing::warn!(
+                server,
+                tool,
+                param,
+                "param_types names a parameter the tool does not declare"
+            );
+
+            continue;
+        };
+        if !allows_string(property) {
+            tracing::warn!(
+                server,
+                tool,
+                param,
+                "param_types only brands string parameters; this one is typed otherwise"
+            );
+
+            continue;
+        }
+
+        property.insert(
+            TYPE_KEYWORD.to_owned(),
+            serde_json::Value::String(brand.clone()),
+        );
+    }
+
+    Cow::Owned(schema)
+}
+
+/// Whether a property schema declares a `string` type, alone or in a list
+fn allows_string(property: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match property.get("type") {
+        Some(serde_json::Value::String(name)) => name == "string",
+        Some(serde_json::Value::Array(names)) => names.iter().any(|name| name == "string"),
+        _ => false,
     }
 }
 

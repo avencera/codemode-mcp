@@ -258,6 +258,18 @@ return type is `Any`.
   this, and running it lazily keeps the 1Password app from prompting at boot. A failed setup call fails the call
   that needed it with a message naming only the setup tool. `aliases` are extra search terms for the server's
   tools (`1password` for `onepassword`)
+- Branded strings. The schema keyword `"x-codemode-type" = "Name"` on a string schema renders the type as
+  `Name = NewType("Name", str)` (declared once, ahead of the TypedDicts, and never renamed or reused for a
+  generated type; a name that is not a capitalized Python identifier, or that a generated type already holds, is
+  ignored with a warning). A `str` literal or plain `str` is not assignable to it, so a parameter typed this way
+  accepts only a value some tool returned typed the same way. The output side is the keyword inside an
+  `output_schema`; the input side is `param_types = { <param> = "Name" }` in the same per-tool table, which
+  writes the keyword into that property of the tool's input schema before the stub is generated (only
+  top-level string parameters; a missing or non-string one is skipped with a warning, an invalid name is a config
+  error). The parameter's doc line names a tool result that yields the brand. `ty` reports a bad call as
+  ``Expected `Name`, found `Literal["..."]` ``. Nothing is wrapped at runtime, values stay plain `str`, and a
+  local annotation `x: Name = ...` runs because Monty does not evaluate it. The name itself does not exist in the
+  sandbox, so `Name("x")` passes the checker and then raises `TypeError` before any tool is called
 - Runtime check. Every result is validated against its effective schema (upstream, config or adapter) before the
   script sees it, by a validator for the subset `stubs` turns into types (`type`, `nullable`, `enum`, `const`,
   `required`, `properties`, `additionalProperties`, `items`/`prefixItems`, `allOf`/`anyOf`/`oneOf`, `$ref`); other

@@ -12,7 +12,15 @@ use serde_json::{Map, Value};
 
 /// Names every generated stub may use from `typing`
 pub const STUB_HEADER: &str =
-    "from typing import Literal, Mapping, NotRequired, Sequence, TypedDict, Unpack\n";
+    "from typing import Literal, Mapping, NewType, NotRequired, Sequence, TypedDict, Unpack\n";
+
+/// JSON Schema keyword that renders a string schema as the named `NewType`
+/// of `str` instead of plain `str`
+///
+/// A literal or an unbranded `str` is not assignable to the branded type, so
+/// a parameter typed this way only accepts a value some tool returned typed
+/// the same way
+pub const TYPE_KEYWORD: &str = "x-codemode-type";
 
 /// Name of the recursive alias for any JSON value
 pub const JSON_VALUE: &str = "JsonValue";
@@ -26,9 +34,10 @@ pub const JSON_VALUE_ALIAS: &str =
     "type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]\n";
 
 /// Names the header and the alias define, so no generated type reuses them
-const RESERVED_NAMES: [&str; 8] = [
+const RESERVED_NAMES: [&str; 9] = [
     "Literal",
     "Mapping",
+    "NewType",
     "NotRequired",
     "Sequence",
     "TypedDict",
@@ -36,6 +45,42 @@ const RESERVED_NAMES: [&str; 8] = [
     JSON_VALUE,
     "None",
 ];
+
+/// Whether `name` can be a brand: a Python identifier that starts with an
+/// uppercase letter, so it reads as a type and cannot be mistaken for a tool
+/// function
+pub fn is_brand_name(name: &str) -> bool {
+    is_identifier(name) && name.starts_with(|first: char| first.is_ascii_uppercase())
+}
+
+/// The brand a schema asks for, when its name is usable
+pub fn brand_of(schema: &Map<String, Value>) -> Option<&str> {
+    let name = schema.get(TYPE_KEYWORD)?.as_str()?;
+
+    is_brand_name(name).then_some(name)
+}
+
+/// Brands the result schema of `function` yields, each with a short
+/// expression that produces a value of that brand
+///
+/// Only the result itself and its top-level properties are found; a brand
+/// nested deeper still works, it just has no example
+pub fn branded_outputs(function: &str, schema: &Map<String, Value>) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    if let Some(brand) = brand_of(schema) {
+        found.push((brand.to_owned(), format!("await {function}()")));
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, property) in properties {
+            if let Some(brand) = property.as_object().and_then(brand_of) {
+                let key = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_owned());
+                found.push((brand.to_owned(), format!("(await {function}())[{key}]")));
+            }
+        }
+    }
+
+    found
+}
 
 /// Which way a type travels, because unknown shapes differ by direction
 ///
@@ -168,6 +213,10 @@ pub enum StubOutput<'a> {
 #[derive(Debug)]
 pub struct StubBook {
     used: HashSet<String>,
+    /// Brand names already claimed, so tools can share one `NewType`
+    brands: HashSet<String>,
+    /// An expression producing a value of each brand, for parameter hints
+    brand_sources: HashMap<String, String>,
     shared: HashMap<String, Arc<Declaration>>,
 }
 
@@ -178,6 +227,8 @@ impl Default for StubBook {
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect(),
+            brands: HashSet::new(),
+            brand_sources: HashMap::new(),
             shared: HashMap::new(),
         }
     }
@@ -187,6 +238,21 @@ impl StubBook {
     /// Creates an empty book
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every brand some generated stub declares
+    pub fn brands(&self) -> HashSet<String> {
+        self.brands.clone()
+    }
+
+    /// Records, per brand, an expression that yields a value of that brand,
+    /// which parameter docs quote as the way to get one
+    ///
+    /// The first source for a brand wins
+    pub fn add_brand_sources(&mut self, sources: impl IntoIterator<Item = (String, String)>) {
+        for (brand, source) in sources {
+            self.brand_sources.entry(brand).or_insert(source);
+        }
     }
 
     /// Generates the stub for one tool
@@ -201,7 +267,12 @@ impl StubBook {
     ) -> ToolStub {
         self.used.insert(function.to_owned());
         let prefix = pascal_case(function);
-        let mut generator = StubGenerator::new(&mut self.used, prefix.clone());
+        let mut generator = StubGenerator::new(
+            &mut self.used,
+            &mut self.brands,
+            &self.brand_sources,
+            prefix.clone(),
+        );
 
         generator.set_root(Value::Object(input_schema.clone()));
         let shape = generator.root_shape(input_schema);
@@ -231,7 +302,13 @@ impl StubBook {
         };
 
         let declarations = generator.take_declarations();
+        let brands = generator.take_brands();
         let (declarations, renames) = self.share(declarations);
+        // brands come first: a later declaration may mention them
+        let declarations: Vec<Arc<Declaration>> = self
+            .brand_declarations(brands)
+            .chain(declarations)
+            .collect();
         return_type = rename_identifiers(&return_type, &renames);
         for property in &mut properties {
             property.ty = rename_identifiers(&property.ty, &renames);
@@ -261,6 +338,34 @@ impl StubBook {
             degraded: false,
             uses_json_value,
         }
+    }
+
+    /// The `NewType` declarations for brands a tool uses, shared with every
+    /// tool that uses the same brand
+    fn brand_declarations(
+        &mut self,
+        brands: Vec<String>,
+    ) -> impl Iterator<Item = Arc<Declaration>> {
+        let declarations: Vec<Arc<Declaration>> = brands
+            .into_iter()
+            .map(|name| {
+                let source = format!("{name} = NewType(\"{name}\", str)\n");
+
+                Arc::clone(
+                    self.shared
+                        .entry(format!("newtype {name}"))
+                        .or_insert_with(|| {
+                            Arc::new(Declaration {
+                                name,
+                                check: source.clone(),
+                                describe: source,
+                            })
+                        }),
+                )
+            })
+            .collect();
+
+        declarations.into_iter()
     }
 
     /// Replaces declarations an earlier tool already has with that tool's,
@@ -440,6 +545,11 @@ struct Property {
 
 struct StubGenerator<'a> {
     used: &'a mut HashSet<String>,
+    /// Brand names the whole book has claimed
+    brands: &'a mut HashSet<String>,
+    brand_sources: &'a HashMap<String, String>,
+    /// Brands this tool's types mention, in first-use order
+    tool_brands: Vec<String>,
     direction: Direction,
     prefix: String,
     root: Value,
@@ -449,9 +559,17 @@ struct StubGenerator<'a> {
 }
 
 impl<'a> StubGenerator<'a> {
-    fn new(used: &'a mut HashSet<String>, prefix: String) -> Self {
+    fn new(
+        used: &'a mut HashSet<String>,
+        brands: &'a mut HashSet<String>,
+        brand_sources: &'a HashMap<String, String>,
+        prefix: String,
+    ) -> Self {
         Self {
             used,
+            brands,
+            brand_sources,
+            tool_brands: Vec::new(),
             direction: Direction::Input,
             prefix,
             root: Value::Null,
@@ -466,6 +584,54 @@ impl<'a> StubGenerator<'a> {
         self.root = root;
         self.ref_types.clear();
         self.in_progress.clear();
+    }
+
+    fn take_brands(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.tool_brands)
+    }
+
+    /// Claims the brand a string schema asks for, or `None` when its name is
+    /// unusable or already names a generated type
+    fn brand(&mut self, object: &Map<String, Value>) -> Option<String> {
+        let requested = object.get(TYPE_KEYWORD)?;
+        let Some(name) = brand_of(object) else {
+            tracing::warn!(
+                keyword = TYPE_KEYWORD,
+                value = %requested,
+                "ignoring a type name that is not a capitalized Python identifier"
+            );
+
+            return None;
+        };
+
+        // a name some other type already holds cannot also be a brand
+        if !self.brands.contains(name) {
+            if !self.used.insert(name.to_owned()) {
+                tracing::warn!(
+                    keyword = TYPE_KEYWORD,
+                    name,
+                    "ignoring a type name that collides with another generated name"
+                );
+
+                return None;
+            }
+            self.brands.insert(name.to_owned());
+        }
+        if !self.tool_brands.iter().any(|known| known == name) {
+            self.tool_brands.push(name.to_owned());
+        }
+
+        Some(name.to_owned())
+    }
+
+    /// Parameter documentation pointing at where a branded value comes from
+    fn brand_hint(&self, brand: &str) -> String {
+        let how = match self.brand_sources.get(brand) {
+            Some(source) => format!("take it from a tool result typed {brand}, such as {source}"),
+            None => format!("take it from a tool result typed {brand}"),
+        };
+
+        format!("type {brand}, not a plain str: {how}")
     }
 
     fn take_declarations(&mut self) -> Vec<TypedDictDecl> {
@@ -695,12 +861,25 @@ impl<'a> StubGenerator<'a> {
                 let nested_hint = format!("{hint}{}", pascal_case(name));
                 let ty = self.type_of(schema, &nested_hint);
                 let accepts_null = is_unknown(&ty) || union_members(&ty).contains(&"None");
+                let mut doc = self.property_doc(schema);
+                // an agent that sees `accountId: OnepasswordAccountId` still has
+                // to learn which call produces one
+                if self.direction == Direction::Input
+                    && let Some(brand) = schema.as_object().and_then(brand_of)
+                    && mentions_identifier(&ty, brand)
+                {
+                    let hint = self.brand_hint(brand);
+                    doc = Some(match doc {
+                        Some(text) => format!("{text} ({hint})"),
+                        None => hint,
+                    });
+                }
 
                 Property {
                     name: name.clone(),
                     ty,
                     required: required.contains(name.as_str()),
-                    doc: self.property_doc(schema),
+                    doc,
                     accepts_null,
                 }
             })
@@ -796,7 +975,7 @@ impl<'a> StubGenerator<'a> {
 
     fn typed(&mut self, name: &str, object: &Map<String, Value>, hint: &str) -> String {
         match name {
-            "string" => "str".to_owned(),
+            "string" => self.brand(object).unwrap_or_else(|| "str".to_owned()),
             "integer" => "int".to_owned(),
             "number" => "float".to_owned(),
             "boolean" => "bool".to_owned(),
@@ -1619,5 +1798,55 @@ mod tests {
             stub.describe()
         );
         assert!(stub.describe().contains("\"query\""), "{}", stub.describe());
+    }
+
+    #[test]
+    fn a_brand_never_shadows_a_generated_type_and_must_be_a_capitalized_identifier() {
+        let input = schema(json!({
+            "type": "object",
+            "required": ["box", "word", "wrong"],
+            "properties": {
+                "box": {"type": "object", "properties": {"n": {"type": "integer"}}},
+                "word": {"type": "string", "x-codemode-type": "TXBox"},
+                "wrong": {"type": "string", "x-codemode-type": "not valid"},
+            },
+        }));
+        let output = schema(json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "string", "x-codemode-type": "TicketId"}},
+        }));
+        let later = schema(json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "object", "properties": {"m": {"type": "integer"}}}},
+        }));
+
+        let mut book = StubBook::new();
+        let first = book.tool("t_x", None, &input, StubOutput::Schema(&output));
+        // "TicketId" is a brand now, so the object this tool's `id` would be
+        // named after it gets another name
+        let second = book.tool("ticket", None, &later, StubOutput::Untyped);
+
+        assert!(
+            first
+                .check()
+                .contains("async def t_x(*, box: TXBox, word: str, wrong: str)"),
+            "a colliding or malformed brand falls back to str:\n{}",
+            first.check()
+        );
+        assert!(
+            first
+                .check()
+                .contains("TicketId = NewType(\"TicketId\", str)"),
+            "{}",
+            first.check()
+        );
+        assert!(
+            second.check().contains("class TicketId2(TypedDict)")
+                && !second.check().contains("class TicketId(TypedDict)"),
+            "a generated type does not reuse a brand's name:\n{}",
+            second.check()
+        );
     }
 }

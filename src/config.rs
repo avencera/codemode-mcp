@@ -9,7 +9,10 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::policy::{GrantMode, Policy};
+use crate::{
+    policy::{GrantMode, Policy},
+    stubs::is_brand_name,
+};
 
 /// Origin the approval and enrollment pages are reached through; its host is
 /// the WebAuthn relying party id
@@ -617,6 +620,14 @@ pub struct ToolOverride {
     /// Use `output_schema` even when the upstream declares its own
     #[serde(default)]
     pub force_output_schema: bool,
+    /// Branded types for string parameters, by parameter name
+    ///
+    /// A parameter listed here is typed as the named `NewType` of `str`, so
+    /// only a value some tool returned with the same type passes the type
+    /// check. Pair it with `x-codemode-type` in the `output_schema` of the
+    /// tool that produces the value
+    #[serde(default)]
+    pub param_types: BTreeMap<String, String>,
 }
 
 /// How a tool's result is handed to scripts when the config overrides the default
@@ -640,6 +651,13 @@ impl ToolOverride {
             return Err(ConfigError::Invalid(format!(
                 "{at}: `force_output_schema` needs `output_schema`"
             )));
+        }
+        for (param, brand) in &self.param_types {
+            if !is_brand_name(brand) {
+                return Err(ConfigError::Invalid(format!(
+                    "{at}: `param_types.{param}` must name a type that is a Python identifier starting with a capital letter, got `{brand}`"
+                )));
+            }
         }
 
         Ok(())

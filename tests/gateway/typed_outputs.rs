@@ -165,6 +165,94 @@ async fn output_overrides_change_the_return_type_and_obey_precedence() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn branded_types_only_accept_a_value_a_tool_returned() -> TestResult {
+    let Some(harness) = Harness::start(
+        "",
+        "tools.issue_token.output_schema = { type = \"object\", required = [\"token\"], properties = { token = { type = \"string\", \"x-codemode-type\" = \"FixtureToken\" } } }\n\
+         tools.use_token.param_types = { token = \"FixtureToken\" }",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let shown = described(&harness, &["fixture_use_token", "fixture_issue_token"]).await?;
+    assert_eq!(
+        shown
+            .matches("FixtureToken = NewType(\"FixtureToken\", str)")
+            .count(),
+        1,
+        "the brand is declared once for both tools:\n{shown}"
+    );
+    assert!(
+        shown.contains("fixture_use_token(*, token: FixtureToken)"),
+        "the parameter takes the brand:\n{shown}"
+    );
+    assert!(
+        shown.contains("(await fixture_issue_token())[\"token\"]"),
+        "the parameter docs say where a token comes from:\n{shown}"
+    );
+    assert!(
+        shown.contains("class FixtureIssueTokenResult(TypedDict):\n    token: FixtureToken\n"),
+        "the result field carries the brand:\n{shown}"
+    );
+
+    // a literal is the guess an agent makes; the checker names the missing brand
+    let result = execute(
+        &harness.client,
+        "await fixture_use_token(token=\"tok-guess\")",
+    )
+    .await?;
+    let text = text_of(&result);
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(
+        text.contains("Expected `FixtureToken`, found `Literal[\"tok-guess\"]`"),
+        "{text}"
+    );
+
+    // wrapping the guess in the brand's name passes the checker, so the
+    // sandbox refuses it before the tool is called
+    let result = execute(
+        &harness.client,
+        "token = FixtureToken(\"tok-guess\")\nawait fixture_use_token(token=token)",
+    )
+    .await?;
+    let text = text_of(&result);
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(
+        text.contains("FixtureToken cannot be constructed"),
+        "{text}"
+    );
+
+    // so is an unbranded str
+    let result = execute(
+        &harness.client,
+        "guess: str = \"tok-1\"\nawait fixture_use_token(token=guess)",
+    )
+    .await?;
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
+
+    // the value from the issuing tool passes, with or without an annotation
+    let body = harness
+        .execute_json(
+            "issued = await fixture_issue_token()\nawait fixture_use_token(token=issued[\"token\"])",
+        )
+        .await?;
+    assert_eq!(body["result"], "used tok-1", "{body}");
+
+    let body = harness
+        .execute_json(
+            "issued = await fixture_issue_token()\n\
+             token: FixtureToken = issued[\"token\"]\n\
+             await fixture_use_token(token=token)",
+        )
+        .await?;
+    assert_eq!(body["result"], "used tok-1", "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_result_that_breaks_its_schema_raises_and_is_logged() -> TestResult {
     let fixture = env!("CARGO_BIN_EXE_codemode-fixture");
     let secret = format!("[servers.secret]\ncommand = \"{fixture}\"\nsensitive = true");

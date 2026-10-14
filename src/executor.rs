@@ -933,6 +933,24 @@ impl Driver<'_> {
         loop {
             event = match event {
                 TurnEvent::Complete(value) => return Ok(value),
+                TurnEvent::FunctionCall { function_name, .. }
+                    if self.context.catalog.is_brand(&function_name)
+                        // a tool whose name a brand shadows stays callable
+                        && self.context.catalog.get(&function_name).is_none() =>
+                {
+                    // a brand is a type-check-only name; `Brand("x")` passes the
+                    // checker, and answering it with a future would hand the
+                    // tool a stringified coroutine instead of failing
+                    let answer = Answer::error(
+                        ExcType::TypeError,
+                        format!(
+                            "{function_name} cannot be constructed; pass a value a tool returned typed as {function_name}"
+                        ),
+                    );
+                    let value = self.deliver_one(answer);
+
+                    self.session()?.resume(value, &mut *print).await?
+                }
                 TurnEvent::FunctionCall {
                     function_name,
                     args,
