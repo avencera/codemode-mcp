@@ -61,6 +61,41 @@ uuid = { version = "1.28.0", features = ["v4"] }
 # restart still completes; the state never goes to the browser
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 
+# EventKit for the calendar and reminders adapters; defaults off, since they
+# pull in AppKit, MapKit and CoreLocation bindings nothing here uses
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-event-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "EKAlarm",
+    "EKCalendar",
+    "EKCalendarItem",
+    "EKEvent",
+    "EKEventStore",
+    "EKObject",
+    "EKParticipant",
+    "EKRecurrenceEnd",
+    "EKRecurrenceRule",
+    "EKReminder",
+    "EKSource",
+    "EKTypes",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSCalendar",
+    "NSDate",
+    "NSEnumerator",
+    "NSError",
+    "NSObject",
+    "NSPredicate",
+    "NSString",
+    "NSTimeZone",
+    "NSURL",
+] }
+
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
@@ -70,6 +105,12 @@ webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
 [[bin]]
 name = "codemode-fixture"
 path = "tests/fixtures/fixture_server.rs"
+
+# the calendar and reminders adapters over an in-memory store, standing in
+# for EventKit in the adapter tests
+[[bin]]
+name = "codemode-fake-eventkit"
+path = "tests/fixtures/fake_eventkit.rs"
 
 # fake homebased CLI for the adapter tests
 [[bin]]

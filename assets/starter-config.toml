@@ -78,3 +78,34 @@ policy = "ask"
 policy = "ask"
 [servers.homebased.tools.message_send]
 policy = "ask"
+
+# Calendar and Reminders through EventKit, covering every account the Mac's
+# apps show. macOS asks once for each, on the Mac, the first time the daemon
+# starts the adapter. Reads run freely; every change asks on the phone, and a
+# session grant covers that session's later changes. Not `sensitive`, so
+# titles and times reach the usage log like any other result
+[servers.calendar]
+command = "{{HOME}}/.local/bin/codemode-mcp"
+args = ["adapter", "calendar"]
+sensitive = false
+
+[servers.calendar.tools.create_event]
+policy = "ask"
+[servers.calendar.tools.update_event]
+policy = "ask"
+[servers.calendar.tools.delete_event]
+policy = "ask"
+
+[servers.reminders]
+command = "{{HOME}}/.local/bin/codemode-mcp"
+args = ["adapter", "reminders"]
+sensitive = false
+
+[servers.reminders.tools.create_reminder]
+policy = "ask"
+[servers.reminders.tools.update_reminder]
+policy = "ask"
+[servers.reminders.tools.complete_reminder]
+policy = "ask"
+[servers.reminders.tools.delete_reminder]
+policy = "ask"

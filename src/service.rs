@@ -751,6 +751,34 @@ mod tests {
             assert_eq!(homebased.policy_for(tool), Policy::Allow, "{tool}");
         }
 
+        // EventKit adapters: reads free, every write asks
+        for (server, reads, writes) in [
+            (
+                "calendar",
+                &["list_calendars", "list_events", "get_event"][..],
+                &["create_event", "update_event", "delete_event"][..],
+            ),
+            (
+                "reminders",
+                &["list_reminder_lists", "list_reminders", "get_reminder"][..],
+                &[
+                    "create_reminder",
+                    "update_reminder",
+                    "complete_reminder",
+                    "delete_reminder",
+                ][..],
+            ),
+        ] {
+            let config = &config.servers[server];
+            assert!(!config.is_sensitive(), "{server}");
+            for tool in reads {
+                assert_eq!(config.policy_for(tool), Policy::Allow, "{server}.{tool}");
+            }
+            for tool in writes {
+                assert_eq!(config.policy_for(tool), Policy::Ask, "{server}.{tool}");
+            }
+        }
+
         Ok(())
     }
 }

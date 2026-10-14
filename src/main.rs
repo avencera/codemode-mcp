@@ -10,7 +10,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use codemode_mcp::{
-    adapters::homebased::HomebasedAdapter,
+    adapters::{apple::Entity, homebased::HomebasedAdapter},
     admin::{
         EnrollRequest, EnrollResponse, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
         OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
@@ -175,6 +175,10 @@ enum AdapterCommand {
         #[arg(long)]
         homebased_bin: Option<PathBuf>,
     },
+    /// The Calendar app's events as MCP tools, through EventKit (macOS)
+    Calendar,
+    /// The Reminders app as MCP tools, through EventKit (macOS)
+    Reminders,
 }
 
 #[derive(Subcommand)]
@@ -245,6 +249,12 @@ async fn main() -> Result<()> {
         Command::Adapter {
             command: AdapterCommand::Homebased { homebased_bin },
         } => adapter_command(&load_or_default(&path)?, homebased_bin).await,
+        Command::Adapter {
+            command: AdapterCommand::Calendar,
+        } => eventkit_adapter_command(Entity::Events).await,
+        Command::Adapter {
+            command: AdapterCommand::Reminders,
+        } => eventkit_adapter_command(Entity::Reminders).await,
     }
 }
 
@@ -547,6 +557,33 @@ async fn adapter_command(config: &Config, homebased_bin: Option<PathBuf>) -> Res
         .serve_stdio()
         .await
         .map_err(|error| eyre!(error))
+}
+
+/// Serves the calendar or reminders adapter over EventKit
+///
+/// macOS asks the owner the first time; the prompt names the daemon, since
+/// it started this process
+#[cfg(target_os = "macos")]
+async fn eventkit_adapter_command(entity: Entity) -> Result<()> {
+    use codemode_mcp::adapters::apple::{
+        calendar::CalendarAdapter, dates, eventkit::EventKit, reminders::RemindersAdapter,
+    };
+
+    let zone = dates::local_zone();
+    let store = Arc::new(
+        EventKit::start(entity, zone.clone()).wrap_err("failed to start the EventKit thread")?,
+    );
+    let served = match entity {
+        Entity::Events => CalendarAdapter::new(store, zone).serve_stdio().await,
+        Entity::Reminders => RemindersAdapter::new(store, zone).serve_stdio().await,
+    };
+
+    served.map_err(|error| eyre!(error))
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn eventkit_adapter_command(_entity: Entity) -> Result<()> {
+    bail!("the calendar and reminders adapters use EventKit, which needs macOS")
 }
 
 async fn serve_command(config: Config) -> Result<()> {

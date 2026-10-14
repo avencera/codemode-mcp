@@ -42,7 +42,7 @@ rmcp 3.x clients, one long-lived connection per configured server
 
 | Kind | Example | Notes |
 |---|---|---|
-| stdio | `1password-mcp`, our own MCPs (`codemode-mcp adapter homebased`) | child process supervised by the daemon; restart with backoff |
+| stdio | `1password-mcp`, our own MCPs (`codemode-mcp adapter homebased`, `calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
 | HTTP | `openaiDeveloperDocs` | plain Streamable HTTP |
 | HTTP + OAuth | Exa | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
@@ -427,6 +427,59 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   `-c model_reasoning_effort=LEVEL`) as a cheap extra layer, and the prompt is logged, so misuse shows up in
   `review`. Revisit if MCP-only agents (no shell) start using the adapter
 
+### Our own MCPs: Calendar and Reminders adapters
+
+- `codemode-mcp adapter calendar` and `codemode-mcp adapter reminders` are stdio servers over EventKit
+  (`src/adapters/apple/`), so they cover every account the Mac's Calendar and Reminders apps show (iCloud, Google,
+  Exchange, subscribed). They are two processes because macOS grants calendars and reminders separately
+- Calendar tools: `list_calendars`, `list_events`, `get_event`, `create_event`, `update_event`, `delete_event`.
+  Reminders tools: `list_reminder_lists`, `list_reminders`, `get_reminder`, `create_reminder`, `update_reminder`,
+  `complete_reminder`, `delete_reminder`. There is no free-time tool: a script computes it from `list_events`
+- Starter policies: reads `allow`, every write `ask` with session grants, and both servers are not `sensitive`, so
+  titles and times reach the usage log
+- Times: agents pass ISO 8601. A date (`2026-10-14`) is a whole day; a time without an offset is the Mac's local
+  time; times come back in the Mac's zone with its offset and each list result names the zone. Window and filter
+  ends given as dates include that whole day. An all-day event takes dates (its `end` is the last day, inclusive)
+  and a timed one takes times; mixing them is refused. jiff parses `2026-10-14T09:30` as a date too, so only text
+  with no time part is read as a date
+- Lost updates: every item carries `last_modified` (UTC, milliseconds). `update_*` and `delete_*` must send it
+  back unchanged and are refused when the item changed since, with the current value in the error.
+  `complete_reminder` does not need it, since marking a reminder done twice is harmless. The check and the save
+  are two store calls, so a change landing between them is not caught
+- Repeating events are read-only: `list_events` expands occurrences, but changing one occurrence means writing
+  exceptions to the series. EventKit could do it (`EKSpanThisEvent`); it was left out of v1. Repeating reminders
+  can be edited. Completing one (checked live with a weekly reminder) leaves it open with its next due date and
+  adds a separate completed reminder, with a new id, for the finished occurrence; `complete_reminder` returns the
+  open one, and its description says so
+- New timed events are pinned to the Mac's zone (`timeZone`) and all-day ones float. Due date components are
+  written and read as Gregorian whatever calendar the Mac displays. An empty string in an update clears that text
+  field, as does naming it in `clear`
+- Reminders: a due time also gets an alert at that time, as the Reminders app adds one; fixed-time alerts are
+  replaced only when the due date changes, so a hand-set alert survives other edits. Priority maps EventKit's
+  0-9 to `none`/`high` (1-4)/`medium` (5)/`low` (6-9) and writes 1, 5 or 9. `list_reminders` sorts not-done items
+  by due date (undated last), cuts notes to 200 characters and returns at most `limit` (default 200, cap 1000)
+  with `truncated`. EventKit does not expose sections, tags, subtasks, flags or smart lists, so neither do the
+  tools. Reading the Reminders database directly would add them but needs Full Disk Access for the daemon, and
+  its schema is private; not done
+- Structure: the adapters check arguments and the rules above, then call a `CalendarBackend` or
+  `RemindersBackend` that only reads and writes. The shipped backend is `EventKit`: one thread owns the
+  `EKEventStore` (it and its objects are not thread-safe) and callers block on its answer, off the async
+  workers. A panic in a call (the bindings panic when EventKit returns nil where it promised an object) is caught
+  and returned as an error, so the thread keeps serving. The tests run the same adapters over an in-memory backend
+  (`tests/fixtures/fake_eventkit.rs`, `tests/gateway/apple.rs`). A long-lived store sees changes made elsewhere
+  (checked with a reminder added by another process)
+- Permission: macOS shows its prompt once per entity type and binary identity. It reads the prompt text and
+  identifier from an Info.plist that `build.rs` embeds (`assets/Info.plist`, `-sectcreate __TEXT
+  __info_plist`); without one the request is refused silently. The grant goes to the responsible process, which
+  for an adapter is the launchd-started daemon, and is keyed to the signing identity and identifier, so it
+  survives rebuilds signed by `service install` (checked across a rebuild). The adapter asks at startup, so the
+  prompt appears when the daemon starts it. In testing, a request sent straight after the store was created never
+  reached the privacy service; the adapter queries the store first and asks again when a request is still
+  unanswered after 30 s. Until access is granted every tool fails with what to do: click Allow, or turn the
+  binary on in System Settings > Privacy & Security
+- Not on Linux: the EventKit code and its dependencies are macOS-only; elsewhere the subcommands exit with an
+  error
+
 ### Durability
 
 A daemon restart, whether a deploy, a crash or a reboot, must not lose what an agent or the owner is waiting on.
@@ -587,6 +640,9 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - OAuth registrations and tokens are committed together at the end of a login, in SQLite
 - T3 Code stays outside the gateway for now
 - The homebased adapter ships in the main binary; submit is split by workload (`agent` allowed, `task` asks)
+- Calendar and Reminders go through EventKit rather than CalDAV: no password to store, every account the Mac
+  shows, and a one-time macOS grant kept across rebuilds by the stable signature. They stay local; exposing them
+  to ChatGPT would need endpoint authentication first (see Non-goals)
 - No tool returns `Any`; `Any`, `cast` and `type: ignore` in scripts are refused; the review decides whether to tighten or relax (see Type strictness)
 
 ## Known gaps
@@ -597,6 +653,10 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
   ends as an error, not a silent wrong answer
 - Calls after a resume use the live catalog, not the one the script was checked against
 - `flock` is advisory and local: a state directory on a network file system is not protected from two daemons
+- Calendar and Reminders: an edit that lands between the `last_modified` check and the save is overwritten;
+  occurrences of repeating events cannot be changed; Reminders' tags, sections, subtasks and flags are not
+  reachable through EventKit. After a reminders fetch times out (30 s) its completion may still be building
+  records on EventKit's queue while the next call uses the store
 
 ## Open questions
 

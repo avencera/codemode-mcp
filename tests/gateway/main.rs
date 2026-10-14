@@ -3,6 +3,7 @@
 
 mod adapter;
 mod admin_gate;
+mod apple;
 mod approvals;
 mod durable;
 mod harness;

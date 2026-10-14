@@ -14,7 +14,7 @@ binary under a shorter name. Times in logs are UTC.
    codemode-mcp config init --print    # or look first
    ```
 
-   It configures 1Password, the OpenAI docs, Exa (OAuth) and homebased. Approval notifications use the
+   It configures 1Password, the OpenAI docs, Exa (OAuth), homebased, Calendar and Reminders. Approval notifications use the
    `[notify.ntfy]` section of `~/.config/homebased/config.toml` unless you add one here.
 3. Preview, then install the LaunchAgent from the repository root:
 
@@ -77,6 +77,23 @@ codemode-mcp op warm
 
 Runs the configured warm calls on the daemon so the 1Password app's prompts appear on the Mac now. Accept them
 there; agent calls then only need the phone approval. Results are never printed.
+
+## Calendar and Reminders access
+
+The `calendar` and `reminders` servers read the Mac's Calendar and Reminders apps through EventKit, across every
+account those apps show. The first time the daemon starts each adapter, macOS asks on the Mac whether
+"codemode-mcp" may use your calendars, then your reminders; click Allow on both. Until then their tools answer
+with what to do instead of data.
+
+- The grant belongs to the signed binary (`com.avencera.codemode-mcp`), so reinstalling a rebuild keeps it. A
+  binary signed with another identity, or not signed, is asked again or refused.
+- Denied by mistake: turn codemode-mcp on in System Settings > Privacy & Security > Calendars (or Reminders);
+  no restart is needed.
+- No prompt appeared: the adapter asks again 30 seconds after an unanswered request, on the next tool call.
+  `codemode-mcp service restart` asks at once.
+
+Run by hand from a terminal (`codemode-mcp adapter calendar`), the request is attributed to the terminal app
+instead, so test through the daemon.
 
 ## OAuth sign-in
 
@@ -180,6 +197,7 @@ The "Type strictness" section ends with a verdict line:
 - Monty worker not found: `service install` again, or set `worker_path`.
 - The homebased adapter answers `homebased error <code>`: the code is homebased's own (see its skill's
   `errors.md`). `unknown_thread` means the `thread` argument is not a live session on this Mac.
+- A calendar or reminders tool says macOS denied access, or is asking: see Calendar and Reminders access.
 
 ## Uninstall
 
