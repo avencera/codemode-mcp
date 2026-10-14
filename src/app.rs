@@ -10,6 +10,7 @@ use crate::{
     executions::Executions,
     executor::{Executor, ExecutorError},
     gateway::Gateway,
+    mac::{Mac, OnMac},
     notify::{Notifier, Ntfy},
     oauth::OAuth,
     passkeys::{PasskeyError, Passkeys},
@@ -81,7 +82,8 @@ pub struct App {
 
 impl App {
     /// Starts state, upstream connections and the worker pool, notifying
-    /// through the configured ntfy topic
+    /// through the configured ntfy topic and, on macOS, asking on the Mac
+    /// while the owner is at it
     pub async fn start(config: Config) -> Result<Self, AppError> {
         let notifier: Option<Arc<dyn Notifier>> = match config.notify.resolve_ntfy() {
             Ok(Some(ntfy)) => Some(Arc::new(Ntfy::new(ntfy))),
@@ -95,27 +97,35 @@ impl App {
             }
         };
 
-        Self::start_with(config, notifier).await
+        #[cfg(target_os = "macos")]
+        let mac: Option<Arc<dyn Mac>> = Some(Arc::new(crate::mac::MacOs::new()));
+        #[cfg(not(target_os = "macos"))]
+        let mac: Option<Arc<dyn Mac>> = None;
+
+        Self::start_with(config, notifier, mac).await
     }
 
-    /// Like [`App::start`] with a caller-supplied notifier; `None` refuses
-    /// every `ask` call
+    /// Like [`App::start`] with a caller-supplied notifier and Mac; a `None`
+    /// notifier refuses every `ask` call, and a `None` Mac asks on the phone
+    /// only
     pub async fn start_with(
         config: Config,
         notifier: Option<Arc<dyn Notifier>>,
+        mac: Option<Arc<dyn Mac>>,
     ) -> Result<Self, AppError> {
-        Self::build(config, notifier, NO_NOTIFIER).await
+        Self::build(config, notifier, mac, NO_NOTIFIER).await
     }
 
     /// For one-off runs outside the daemon: nobody can reach an approval
     /// page, so `ask` calls are refused with a reason saying so
     pub async fn start_without_approvals(config: Config) -> Result<Self, AppError> {
-        Self::build(config, None, NO_APPROVAL_PAGE).await
+        Self::build(config, None, None, NO_APPROVAL_PAGE).await
     }
 
     async fn build(
         config: Config,
         notifier: Option<Arc<dyn Notifier>>,
+        mac: Option<Arc<dyn Mac>>,
         unavailable: &'static str,
     ) -> Result<Self, AppError> {
         let config = Arc::new(config);
@@ -126,10 +136,15 @@ impl App {
         let passkeys = Arc::new(Passkeys::new(&config.public_origin, store.clone())?);
         let session_store = store.clone();
         let oauth = OAuth::new(&config, store.clone());
+        let on_mac = mac.filter(|_| config.notify.mac.enabled).map(|mac| OnMac {
+            mac,
+            config: config.notify.mac.clone(),
+        });
         let approvals = Approvals::new(
             config.public_base(),
             config.approvals.timeout(),
             notifier,
+            on_mac,
             unavailable,
             store.clone(),
         );

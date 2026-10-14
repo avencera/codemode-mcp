@@ -7,6 +7,7 @@ mod apple;
 mod approvals;
 mod durable;
 mod harness;
+mod mac;
 mod oauth;
 mod service;
 mod session_less;

@@ -362,7 +362,7 @@ async fn sessions_survive_an_app_restart() -> TestResult {
     let directory = temp_state_dir();
     let setup = Setup::default();
 
-    let app = App::start_with(config_for(&worker, &directory, &setup)?, None).await?;
+    let app = App::start_with(config_for(&worker, &directory, &setup)?, None, None).await?;
     let server = serve(&app).await?;
     let base = format!("http://127.0.0.1:{}", server.local_addr().port());
     let client = connect_as(&base, &format!("{DEFAULT_CLIENT}/1.0")).await?;
@@ -372,7 +372,7 @@ async fn sessions_survive_an_app_restart() -> TestResult {
     app.usage().flush().await;
     drop(app);
 
-    let app = App::start_with(config_for(&worker, &directory, &setup)?, None).await?;
+    let app = App::start_with(config_for(&worker, &directory, &setup)?, None, None).await?;
     let server = serve(&app).await?;
     let base = format!("http://127.0.0.1:{}", server.local_addr().port());
     let client = connect_as(&base, &format!("{DEFAULT_CLIENT}/1.0")).await?;

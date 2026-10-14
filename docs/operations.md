@@ -70,6 +70,31 @@ codemode-mcp passkey enroll --label iPhone
 - Every enrollment or removal request notifies the phone. One you did not start means something on the Mac
   is running the CLI: deny it and look.
 
+## Approve at the Mac
+
+While you are at the Mac (screen unlocked, input in the last 5 minutes), a tool call waiting for approval shows
+a Touch ID prompt there instead of buzzing the phone:
+
+- Touch the sensor to approve that one call. The prompt names the tool, the agent and a summary of the
+  arguments; press **Review…** to see them in full.
+- Press **Review…** to open the approval page in the browser, for a 15 or 60 minute grant, or to deny. The
+  page takes your passkey, which Touch ID unlocks if it syncs to this Mac through iCloud Keychain or a password
+  manager; otherwise enroll one here with `codemode-mcp passkey enroll --label mac`.
+- Leave it, and after 60 seconds the phone is told too (60 seconds after **Review…** if you opened the page).
+  Locking the screen sends it to the phone at once.
+
+Passkey enrollment and removal requests never offer Touch ID: they show a Mac notification and notify the
+phone at once. On a Mac without Touch ID the prompt is replaced by a notification that opens the page, which
+needs `terminal-notifier` (`brew install terminal-notifier`); allow its notifications the first time macOS asks.
+
+```toml
+[notify.mac]
+enabled = true              # false: phone only
+idle_secs = 300             # no input for this long counts as away
+escalate_after_secs = 60    # then the phone is told as well
+touch_id = true             # false: a notification instead of the prompt
+```
+
 ## Warm up 1Password
 
 ```sh
@@ -207,6 +232,8 @@ The "Type strictness" section ends with a verdict line:
   path; launchd's PATH is `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 - `ask` calls are refused at once: no notifier (add `[notify.ntfy]`) or no passkey (enroll one).
 - An approval link does not open on the phone: check `tailscale serve status` and `public_origin`.
+- Requests go to the phone while you are at the Mac: the log says why (`Touch ID is not available`,
+  `Mac notification failed`). The daemon must run as a LaunchAgent in your login session to see the screen.
 - Monty worker not found: `service install` again, or set `worker_path`.
 - The homebased adapter answers `homebased error <code>`: the code is homebased's own (see its skill's
   `errors.md`). `unknown_thread` means the `thread` argument is not a live session on this Mac.

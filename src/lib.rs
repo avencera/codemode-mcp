@@ -16,6 +16,7 @@ pub mod executor;
 pub mod gateway;
 mod guidance;
 pub mod host;
+pub mod mac;
 pub mod notify;
 pub mod oauth;
 pub mod output;

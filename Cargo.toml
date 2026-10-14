@@ -82,6 +82,19 @@ objc2-event-kit = { version = "0.3.2", default-features = false, features = [
     "EKSource",
     "EKTypes",
 ] }
+# screen lock and input idle time, to tell whether the owner is at the Mac
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGSession",
+] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSArray",
@@ -94,6 +107,13 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSString",
     "NSTimeZone",
     "NSURL",
+] }
+# Touch ID prompts for approving a tool call at the Mac
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "LAContext",
+    "LAError",
 ] }
 
 [dev-dependencies]

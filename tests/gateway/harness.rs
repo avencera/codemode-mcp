@@ -12,6 +12,7 @@ use codemode_mcp::{
     app::App,
     config::Config,
     durable::{Durable, Sensitivity},
+    mac::{Mac, MacError, MacNotification, TouchId},
     notify::{BoxFuture, Notification, Notifier, NotifyError},
     server::{RunningServer, serve},
     store::{self, DaemonLock, Store, approvals::NewApproval},
@@ -177,6 +178,9 @@ pub struct Setup<'a> {
     pub top: &'a str,
     /// Install a recording notifier; without one every `ask` call is refused
     pub notify: bool,
+    /// The Mac requests are asked on while the owner is at it; without one
+    /// they go to the phone only
+    pub mac: Option<Arc<FakeMac>>,
 }
 
 /// Config with one fixture upstream
@@ -252,12 +256,103 @@ impl Notifier for RecordingNotifier {
     }
 }
 
+/// A Mac whose owner's presence and Touch ID answer the test sets, and
+/// which records what was shown on it
+#[derive(Default)]
+pub struct FakeMac {
+    present: std::sync::atomic::AtomicBool,
+    /// `None` leaves the prompt up until it is taken down
+    answer: Mutex<Option<TouchId>>,
+    shown: Mutex<Vec<String>>,
+}
+
+impl FakeMac {
+    /// Whether the owner counts as at the Mac
+    pub fn set_present(&self, present: bool) {
+        self.present
+            .store(present, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How later Touch ID prompts end; `None` leaves them up until they are
+    /// taken down
+    pub fn set_answer(&self, answer: Option<TouchId>) {
+        if let Ok(mut slot) = self.answer.lock() {
+            *slot = answer;
+        }
+    }
+
+    /// What was shown, in order: `touch_id <reason>`, `dismissed`,
+    /// `notify <title>`, `open <url>`
+    pub fn shown(&self) -> Vec<String> {
+        self.shown
+            .lock()
+            .map(|shown| shown.clone())
+            .unwrap_or_default()
+    }
+
+    fn record(&self, entry: String) {
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.push(entry);
+        }
+    }
+}
+
+/// Records `dismissed` when a prompt's future is dropped before it answered
+struct Prompt<'a>(&'a FakeMac);
+
+impl Drop for Prompt<'_> {
+    fn drop(&mut self) {
+        self.0.record("dismissed".to_owned());
+    }
+}
+
+impl Mac for FakeMac {
+    fn present(&self, _idle: Duration) -> BoxFuture<'_, bool> {
+        let present = self.present.load(std::sync::atomic::Ordering::SeqCst);
+
+        Box::pin(std::future::ready(present))
+    }
+
+    fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId> {
+        self.record(format!("touch_id {reason}"));
+        let answer = self.answer.lock().ok().and_then(|answer| *answer);
+
+        Box::pin(async move {
+            let prompt = Prompt(self);
+            match answer {
+                Some(answer) => {
+                    std::mem::forget(prompt);
+
+                    answer
+                }
+                None => std::future::pending().await,
+            }
+        })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        notification: &'a MacNotification,
+    ) -> BoxFuture<'a, Result<(), MacError>> {
+        self.record(format!("notify {}", notification.title));
+
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn open<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<(), MacError>> {
+        self.record(format!("open {url}"));
+
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
 /// A running app, HTTP server and MCP client wired to the fixture upstream
 pub struct Harness {
     pub app: App,
     pub server: RunningServer,
     pub client: Client,
     pub notifier: Arc<RecordingNotifier>,
+    pub mac: Option<Arc<FakeMac>>,
     pub http: reqwest::Client,
     state_dir: PathBuf,
     config: Config,
@@ -290,6 +385,7 @@ pub struct Left {
     config: Config,
     state_dir: PathBuf,
     notifier: Arc<RecordingNotifier>,
+    mac: Option<Arc<FakeMac>>,
     notifying: bool,
 }
 
@@ -300,6 +396,7 @@ impl Left {
             self.config,
             self.state_dir,
             self.notifier,
+            self.mac,
             self.notifying,
             true,
         )
@@ -338,7 +435,7 @@ impl Harness {
         let notifier = Arc::new(RecordingNotifier::default());
 
         Ok(Some(
-            Self::boot(config, state_dir, notifier, setup.notify, false).await?,
+            Self::boot(config, state_dir, notifier, setup.mac, setup.notify, false).await?,
         ))
     }
 
@@ -346,6 +443,7 @@ impl Harness {
         config: Config,
         state_dir: PathBuf,
         notifier: Arc<RecordingNotifier>,
+        mac: Option<Arc<FakeMac>>,
         notifying: bool,
         recover: bool,
     ) -> Result<Self, Box<dyn Error>> {
@@ -355,7 +453,8 @@ impl Harness {
         } else {
             None
         };
-        let app = App::start_with(config.clone(), installed).await?;
+        let installed_mac = mac.clone().map(|mac| mac as Arc<dyn Mac>);
+        let app = App::start_with(config.clone(), installed, installed_mac).await?;
         if recover {
             app.recover();
         }
@@ -369,6 +468,7 @@ impl Harness {
             server,
             client,
             notifier,
+            mac,
             http: reqwest::Client::new(),
             state_dir,
             config,
@@ -386,6 +486,7 @@ impl Harness {
             server,
             client,
             notifier,
+            mac,
             state_dir,
             config,
             notifying,
@@ -399,6 +500,7 @@ impl Harness {
             config,
             state_dir,
             notifier,
+            mac,
             notifying,
         })
     }
@@ -421,6 +523,7 @@ impl Harness {
             server,
             client,
             notifier,
+            mac,
             state_dir,
             mut config,
             notifying,
@@ -442,7 +545,7 @@ impl Harness {
         drop(lock);
         change(&mut config);
 
-        Self::boot(config, state_dir, notifier, notifying, true).await
+        Self::boot(config, state_dir, notifier, mac, notifying, true).await
     }
 
     /// Another connection from the same client as the harness client

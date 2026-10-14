@@ -18,9 +18,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::oneshot;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     durable::{Durable, Sensitivity},
+    mac::{MacNotification, OnMac, TouchId},
     notify::{Notification, Notifier, Priority},
     policy::GrantMode,
     store::{
@@ -361,6 +363,10 @@ pub enum DecideError {
 struct Pending {
     info: Arc<ApprovalInfo>,
     sender: oneshot::Sender<Verdict>,
+    /// Cancels the request's token when it leaves the map in any way,
+    /// including a service dropped without settling it: a Touch ID prompt
+    /// comes down and a phone push still waiting is dropped
+    _settled: DropGuard,
 }
 
 struct Grant {
@@ -377,6 +383,8 @@ struct State {
     session_grants: HashMap<(String, String), Grant>,
     /// Pending requests whose notification could not be delivered
     unnotified: HashSet<String>,
+    /// Pending requests asked on the Mac, because the owner was at it
+    on_mac: HashSet<String>,
 }
 
 /// The approval service
@@ -384,6 +392,8 @@ pub struct Approvals {
     base_url: String,
     timeout: Duration,
     notifier: Option<Arc<dyn Notifier>>,
+    /// The Mac, when requests are asked there first while the owner is at it
+    on_mac: Option<OnMac>,
     /// Why requests are refused when there is no notifier
     unavailable: &'static str,
     store: Store,
@@ -400,6 +410,7 @@ impl Approvals {
         base_url: &str,
         timeout: Duration,
         notifier: Option<Arc<dyn Notifier>>,
+        on_mac: Option<OnMac>,
         unavailable: &'static str,
         store: Store,
     ) -> Arc<Self> {
@@ -425,6 +436,7 @@ impl Approvals {
             base_url: base_url.trim_end_matches('/').to_owned(),
             timeout,
             notifier,
+            on_mac,
             unavailable,
             store,
             state: Mutex::new(state),
@@ -610,11 +622,13 @@ impl Approvals {
         let info = Arc::new(info);
         let id = info.id.clone();
         let (sender, receiver) = oneshot::channel();
+        let settled = CancellationToken::new();
         self.state().pending.insert(
             id.clone(),
             Pending {
                 info: Arc::clone(&info),
                 sender,
+                _settled: settled.clone().drop_guard(),
             },
         );
 
@@ -645,7 +659,7 @@ impl Approvals {
         });
 
         if let Some(notifier) = notifier {
-            self.notify(notifier, &info);
+            self.ask(&info, notifier, settled);
         }
         self.expire_after(&id, self.timeout);
 
@@ -657,6 +671,133 @@ impl Approvals {
             approvals: Arc::downgrade(self),
             frozen: Arc::clone(&self.frozen),
         }
+    }
+
+    /// Announces a new request: while the owner is at the Mac it is asked
+    /// there first, with Touch ID for a tool call or else a notification, and
+    /// the phone is told only if it is still pending after
+    /// `escalate_after_secs`; otherwise the phone is told at once
+    ///
+    /// An admin request still reaches the phone at once, so one the owner did
+    /// not start is seen wherever they are, and never offers Touch ID, since
+    /// only a passkey may change who can approve
+    fn ask(
+        self: &Arc<Self>,
+        info: &Arc<ApprovalInfo>,
+        phone: Arc<dyn Notifier>,
+        settled: CancellationToken,
+    ) {
+        let Some(on_mac) = self.on_mac.clone() else {
+            self.notify(phone, info);
+
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let info = Arc::clone(info);
+        tokio::spawn(async move {
+            let present = on_mac.mac.present(on_mac.config.idle()).await;
+            let Some(approvals) = weak.upgrade() else {
+                return;
+            };
+            {
+                let mut state = approvals.state();
+                if !state.pending.contains_key(&info.id) {
+                    return;
+                }
+                if present {
+                    state.on_mac.insert(info.id.clone());
+                }
+            }
+            if !present {
+                approvals.notify(phone, &info);
+
+                return;
+            }
+
+            let url = approvals.url_for(&info.id);
+            let notification = approvals.notification_for(&info);
+            drop(approvals);
+            let admin = matches!(info.kind, ApprovalKind::Admin { .. });
+            let touch_id = on_mac.config.touch_id && !admin;
+            let delay = if admin {
+                Duration::ZERO
+            } else {
+                on_mac.config.escalate_after()
+            };
+            // `now` tells the phone without waiting; `restart` starts the
+            // delay over, because the owner opened the page here
+            let now = CancellationToken::new();
+            let restart = tokio::sync::Notify::new();
+
+            let phone_later = async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = settled.cancelled() => return,
+                        () = restart.notified() => continue,
+                        () = tokio::time::sleep(delay) => break,
+                        () = now.cancelled() => break,
+                    }
+                }
+                if let Some(approvals) = weak.upgrade() {
+                    // the owner may have left, so the pending answer stops
+                    // pointing the agent at the Mac
+                    approvals.state().on_mac.remove(&info.id);
+                    approvals.notify(phone, &info);
+                }
+            };
+
+            let ask_here = async {
+                let answer = if touch_id {
+                    let reason = touch_id_reason(&info);
+                    // dropping the prompt's future takes it off the screen
+                    tokio::select! {
+                        answer = on_mac.mac.touch_id(&reason) => answer,
+                        () = settled.cancelled() => return,
+                    }
+                } else {
+                    TouchId::Unavailable
+                };
+
+                match answer {
+                    // checked again here so a change above cannot let a
+                    // fingerprint approve an admin request
+                    TouchId::Approved if !admin => {
+                        // the page or the phone may have answered first
+                        if let Some(approvals) = weak.upgrade()
+                            && let Err(error) = approvals.decide(&info.id, Choice::Once)
+                        {
+                            tracing::debug!(%error, "Touch ID approval came too late");
+                        }
+                    }
+                    TouchId::Approved => now.cancel(),
+                    TouchId::Review => match on_mac.mac.open(&url).await {
+                        Ok(()) => restart.notify_one(),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not open the approval page");
+                            now.cancel();
+                        }
+                    },
+                    TouchId::Away => now.cancel(),
+                    TouchId::Unavailable => {
+                        let local = MacNotification {
+                            title: notification.title,
+                            message: match &info.kind {
+                                ApprovalKind::ToolCall => "Click to review.".to_owned(),
+                                ApprovalKind::Admin { .. } => notification.message,
+                            },
+                            click: url.clone(),
+                        };
+                        if let Err(error) = on_mac.mac.notify(&local).await {
+                            tracing::warn!(%error, "Mac notification failed");
+                            now.cancel();
+                        }
+                    }
+                }
+            };
+
+            tokio::join!(phone_later, ask_here);
+        });
     }
 
     /// Sends the notification of a pending request; a failure is remembered,
@@ -794,6 +935,7 @@ impl Approvals {
                 Pending {
                     info: Arc::clone(&info),
                     sender,
+                    _settled: CancellationToken::new().drop_guard(),
                 },
             );
             if stored.unnotified {
@@ -941,6 +1083,12 @@ impl Approvals {
     /// Whether the notification for a pending request failed
     pub fn notification_failed(&self, id: &str) -> bool {
         self.state().unnotified.contains(id)
+    }
+
+    /// Whether a pending request was asked on the Mac rather than only on
+    /// the phone
+    pub fn asked_on_mac(&self, id: &str) -> bool {
+        self.state().on_mac.contains(id)
     }
 
     /// The first pending request of an execution, for the `pending` answer
@@ -1119,6 +1267,7 @@ impl Approvals {
         let pending = {
             let mut state = self.state();
             state.unnotified.remove(id);
+            state.on_mac.remove(id);
 
             state.pending.remove(id)
         };
@@ -1142,6 +1291,98 @@ impl Approvals {
 
         true
     }
+}
+
+/// Longest argument summary shown in a Touch ID prompt, before `+N more`
+const SUMMARY_CHARS: usize = 200;
+/// Longest string argument shown whole; a longer one is cut and sized
+const SUMMARY_STRING_CHARS: usize = 40;
+/// Object keys named before the rest are elided
+const SUMMARY_KEYS: usize = 3;
+
+/// Text of the Touch ID prompt: the call, the client and a summary of the
+/// arguments, since a fingerprint approves without the page
+///
+/// Unlike the phone notification, which crosses the ntfy server, the prompt
+/// stays on the Mac, so it may show arguments
+fn touch_id_reason(info: &ApprovalInfo) -> String {
+    let mut reason = format!(
+        "approve one call of {} by {}",
+        info.waiting_for(),
+        info.caller.client_label()
+    );
+    if !info.arguments.is_empty() {
+        reason.push_str(" with ");
+        reason.push_str(&summarize_arguments(&info.arguments));
+    }
+
+    reason
+}
+
+/// One `name: value` per argument, built from the arguments themselves
+/// rather than written by a model, so an agent cannot word its way past it:
+/// short values whole, long strings cut with their length, lists and
+/// objects by size and keys
+fn summarize_arguments(arguments: &Map<String, Value>) -> String {
+    let mut summary = String::new();
+    for (index, (name, value)) in arguments.iter().enumerate() {
+        let part = format!("{}: {}", printable(name, 30), summarize_value(value));
+        if !summary.is_empty() && summary.chars().count() + part.chars().count() > SUMMARY_CHARS {
+            summary.push_str(&format!(", +{} more", arguments.len() - index));
+
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push_str(", ");
+        }
+        summary.push_str(&part);
+    }
+
+    summary
+}
+
+fn summarize_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            let length = text.chars().count();
+            if length <= SUMMARY_STRING_CHARS {
+                format!("\"{}\"", printable(text, SUMMARY_STRING_CHARS))
+            } else {
+                format!("\"{}…\" ({length} chars)", printable(text, 30))
+            }
+        }
+        Value::Array(items) => match items.len() {
+            1 => "1 item".to_owned(),
+            count => format!("{count} items"),
+        },
+        Value::Object(fields) => {
+            let mut keys: Vec<String> = fields
+                .keys()
+                .take(SUMMARY_KEYS)
+                .map(|key| printable(key, 20))
+                .collect();
+            if fields.len() > SUMMARY_KEYS {
+                keys.push("…".to_owned());
+            }
+            format!("{{{}}}", keys.join(", "))
+        }
+        other => printable(&other.to_string(), SUMMARY_STRING_CHARS),
+    }
+}
+
+/// The first `limit` characters with line breaks shown as `⏎` and other
+/// control and direction-changing characters as `?`, so an argument cannot
+/// lay out text that reads as part of the prompt
+fn printable(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .map(|character| match character {
+            '\n' | '\r' => '⏎',
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => '?',
+            other if other.is_control() => '?',
+            other => other,
+        })
+        .collect()
 }
 
 /// What a script reads when its request ran out of time
@@ -1170,4 +1411,53 @@ pub fn random_token() -> String {
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Map, Value, json};
+
+    use super::summarize_arguments;
+
+    fn summary(arguments: Value) -> String {
+        let arguments: Map<String, Value> = match arguments {
+            Value::Object(arguments) => arguments,
+            _ => Map::new(),
+        };
+
+        summarize_arguments(&arguments)
+    }
+
+    #[test]
+    fn summaries_show_short_values_and_size_long_ones() {
+        assert_eq!(
+            summary(json!({ "to": "ana@example.com", "count": 3, "dry_run": false })),
+            r#"count: 3, dry_run: false, to: "ana@example.com""#
+        );
+        assert_eq!(
+            summary(
+                json!({ "body": "x".repeat(500), "cc": ["a", "b"], "meta": { "a": 1, "b": 2, "c": 3, "d": 4 } })
+            ),
+            r#"body: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…" (500 chars), cc: 2 items, meta: {a, b, c, …}"#
+        );
+    }
+
+    #[test]
+    fn summaries_cannot_fake_prompt_text() {
+        assert_eq!(
+            summary(json!({ "note": "ok\nApprove \u{202e}all" })),
+            r#"note: "ok⏎Approve ?all""#
+        );
+    }
+
+    #[test]
+    fn long_summaries_count_what_they_leave_out() {
+        let arguments: Map<String, Value> = (0..20)
+            .map(|index| (format!("field{index:02}"), json!("a value of some length")))
+            .collect();
+        let text = summarize_arguments(&arguments);
+
+        assert!(text.chars().count() < 230, "{text}");
+        assert!(text.ends_with(" more"), "{text}");
+    }
 }

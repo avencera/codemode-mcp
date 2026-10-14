@@ -93,6 +93,19 @@ idempotent. `tools/list_changed` refreshes the catalog
 - On an `ask` call the gateway creates a pending request (random 128-bit id) and sends an ntfy notification:
   title `codemode: <client> wants <server>.<tool>`, high priority, click URL `<public_origin>/approve/<id>`.
   Arguments never go into the notification
+- While the owner is at the Mac (screen unlocked, keyboard or mouse input within `notify.mac.idle_secs`, 300;
+  read through CoreGraphics), a tool call is asked there first and the ntfy push waits
+  `notify.mac.escalate_after_secs` (60), going out only if the request is still pending. The Mac shows a Touch ID
+  prompt (LocalAuthentication, biometrics only, no password fallback) naming the call, the client and a summary of
+  the arguments built from their values (short values whole, long strings cut with their length, lists and
+  objects by size and keys; never model-written), which approves the call once; its other button, "Review…", opens the
+  approval page in the default browser for grants or Deny and starts the push delay over. A prompt the system
+  takes down (the screen locked) sends the push at once, and one still up when the request is decided elsewhere
+  is taken down. Prompts show one at a time, a second apart, so a touch meant for one cannot land on the next. Without Touch ID (no sensor, none enrolled, `notify.mac.touch_id = false`) the
+  Mac shows a notification through `terminal-notifier` whose click opens the page. Presence only picks where the
+  request appears first: approval still takes a fingerprint or a passkey assertion. Admin requests never offer
+  Touch ID; on the Mac they show the notification and the push goes out at once. `notify.mac.enabled = false`
+  asks on the phone only
 - `GET /approve/{id}` (server-rendered, mobile layout, all agent-supplied text escaped, strict CSP) shows the
   client, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
   "Approve this session for 15 / 60 min" (only for `session` tools; every MCP call has a session) and, for a
@@ -354,10 +367,10 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 
 ### Threat model
 
-- Trusted: the owner, the phone holding the passkey, the Mac's user account
+- Trusted: the owner, the phone holding the passkey, the Mac's Touch ID sensor, the Mac's user account
 - Defended against:
   - agents limited to MCP tools: they reach tools only through `execute`, and `ask` tools wait for a passkey
-    assertion on the phone
+    assertion on the phone or a fingerprint on the Mac's Touch ID sensor
   - confused agents with a shell: the CLI cannot approve anything. Enrolling a second passkey or removing one
     needs an existing passkey's approval, and every such request is announced on the phone. A first passkey
     can still be enrolled from the CLI while none exists

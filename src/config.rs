@@ -217,6 +217,13 @@ impl Config {
         if let Some(ntfy) = &self.notify.ntfy {
             ntfy.validate()?;
         }
+        if self.notify.mac.idle_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "notify.mac.idle_secs must be positive; set notify.mac.enabled = false to ask \
+                 on the phone only"
+                    .into(),
+            ));
+        }
         self.limits.validate()?;
 
         for (name, server) in &self.servers {
@@ -296,6 +303,8 @@ pub struct NotifyConfig {
     pub ntfy: Option<NtfyConfig>,
     /// homebased config read for the fallback ntfy section
     pub homebased_config: Option<PathBuf>,
+    /// Asking on the Mac itself while the owner is at it
+    pub mac: MacConfig,
 }
 
 impl Default for NotifyConfig {
@@ -304,7 +313,51 @@ impl Default for NotifyConfig {
             ntfy: None,
             homebased_config: std::env::var_os("HOME")
                 .map(|home| PathBuf::from(home).join(".config/homebased/config.toml")),
+            mac: MacConfig::default(),
         }
+    }
+}
+
+/// How requests reach the owner while they are at the Mac
+///
+/// A request made while the screen is unlocked and recently used shows a
+/// notification on the Mac, and for a tool call a Touch ID prompt, before
+/// the phone is told; one made while the owner is away goes to the phone
+/// at once
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MacConfig {
+    /// Whether to ask on the Mac at all; off means phone only
+    pub enabled: bool,
+    /// Seconds without keyboard or mouse input after which the owner counts
+    /// as away
+    pub idle_secs: u64,
+    /// Seconds a request may wait on the Mac before the phone is told too
+    pub escalate_after_secs: u64,
+    /// Whether a tool call shows a Touch ID prompt that approves it once
+    pub touch_id: bool,
+}
+
+impl Default for MacConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_secs: 5 * 60,
+            escalate_after_secs: 60,
+            touch_id: true,
+        }
+    }
+}
+
+impl MacConfig {
+    /// Input idle time after which the owner counts as away
+    pub fn idle(&self) -> Duration {
+        Duration::from_secs(self.idle_secs)
+    }
+
+    /// Delay before a request asked on the Mac also goes to the phone
+    pub fn escalate_after(&self) -> Duration {
+        Duration::from_secs(self.escalate_after_secs)
     }
 }
 

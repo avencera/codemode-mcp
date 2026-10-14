@@ -3,10 +3,13 @@
 # Written by `codemode-mcp config init`. Every option and its default is
 # described in docs/design.md and docs/operations.md. Approval notifications
 # use the [notify.ntfy] section of ~/.config/homebased/config.toml unless a
-# [notify.ntfy] section is added here
+# [notify.ntfy] section is added here. While you are at the Mac, a request
+# shows a Touch ID prompt there first and reaches the phone only if it is
+# still waiting a minute later; [notify.mac] tunes or turns this off
 
-# 1Password Environments: every call needs a phone passkey approval. Read
-# tools accept a 15 or 60 minute session grant; writes ask on every call
+# 1Password Environments: every call needs approval, with Touch ID at the Mac
+# or a passkey on the phone. Read tools accept a 15 or 60 minute session
+# grant; writes ask on every call
 [servers.onepassword]
 command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
 policy = "ask"
