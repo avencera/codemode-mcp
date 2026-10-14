@@ -10,12 +10,19 @@
 [servers.onepassword]
 command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
 policy = "ask"
+# every Environments tool takes the account ID; the gateway passes it, so
+# scripts never see the parameter. `op account list` prints yours
+arguments = { accountId = "YOUR_ACCOUNT_ID" }
+# authenticate grants the scopes the other tools check, for the life of the
+# connection; it runs before the first call on each one, inside that call's
+# approval, so nothing prompts on the Mac until a call is approved
+setup = [{ tool = "authenticate" }]
+aliases = ["1password"]
 
-# authenticate returns the account ID every other 1Password tool takes as
-# `accountId` and grants the scopes they check; the upstream says so only in
-# server instructions scripts never see
 [servers.onepassword.tools.authenticate]
-output_schema = { type = "object", required = ["account_id"], properties = { account_id = { type = "string", description = "Pass as `accountId` to the other 1Password tools. Call authenticate first in every script that uses them: it also grants the scopes they check" } } }
+output_schema = { type = "object", required = ["account_id"], properties = { account_id = { type = "string" } } }
+[servers.onepassword.tools.list_environments]
+output_schema = { type = "object", required = ["environments"], properties = { environments = { type = "array", items = { type = "object", properties = { id = { type = "string" }, name = { type = "string" } } } } } }
 
 [servers.onepassword.tools.create_environment]
 grant = "per_call"
@@ -27,13 +34,9 @@ grant = "per_call"
 grant = "per_call"
 
 # `codemode-mcp op warm` runs these on the Mac so the 1Password app's own
-# prompts appear there first; list_environments needs the account ID that
-# `op account list` prints
+# prompts appear there first
 [servers.onepassword.warm]
-calls = [
-    { tool = "authenticate" },
-    { tool = "list_environments", arguments = { accountId = "YOUR_ACCOUNT_ID" } },
-]
+calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 
 # Result types. A tool that declares no output schema returns a `JsonValue`
 # the script has to narrow, so the tools below say what they return. An
