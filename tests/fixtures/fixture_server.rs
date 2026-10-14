@@ -273,6 +273,7 @@ impl Fixture {
 impl ServerHandler for Fixture {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Call fixture_add before anything else.\nThen any tool.")
     }
 }
 

@@ -24,6 +24,8 @@ pub struct ServerSnapshot {
     pub name: String,
     /// Last tool list received from the server
     pub tools: Vec<Tool>,
+    /// Instructions the server sent in its handshake
+    pub instructions: Option<String>,
     /// Whether the server is connected right now
     pub available: bool,
 }
@@ -84,6 +86,8 @@ pub struct Catalog {
     visible: Vec<usize>,
     index: SearchIndex,
     check_stubs: String,
+    /// Each server's handshake instructions as stub comments, by server name
+    notes: HashMap<String, String>,
 }
 
 impl Catalog {
@@ -202,12 +206,22 @@ impl Catalog {
             check_stubs.push_str(&entry.stub.signature);
         }
 
+        let notes = snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                let note = server_note(&snapshot.name, snapshot.instructions.as_deref()?)?;
+
+                Some((snapshot.name.clone(), note))
+            })
+            .collect();
+
         Self {
             entries,
             by_function,
             visible,
             index,
             check_stubs,
+            notes,
         }
     }
 
@@ -264,6 +278,7 @@ impl Catalog {
         let mut bodies = String::new();
         let mut needs_kwargs_note = false;
         let mut needs_json_value = false;
+        let mut servers: BTreeSet<&str> = BTreeSet::new();
 
         for name in names {
             match self
@@ -271,6 +286,7 @@ impl Catalog {
                 .filter(|entry| entry.policy != Policy::Deny)
             {
                 Some(entry) if seen.insert(entry.function.clone()) => {
+                    servers.insert(&entry.server);
                     needs_kwargs_note |= entry.stub.non_identifier_params;
                     needs_json_value |= entry.stub.uses_json_value;
                     declare_once(&mut types, &mut declared, &entry.stub.declarations);
@@ -288,6 +304,13 @@ impl Catalog {
         }
         if needs_kwargs_note {
             out.push_str(KWARGS_NOTE);
+        }
+        // rules such as "call authenticate first" often live only here, and
+        // an agent reads the stubs of the tool it wants, not its siblings'
+        for server in servers {
+            if let Some(note) = self.notes.get(server) {
+                out.push_str(note);
+            }
         }
         out.push_str(&types);
         out.push_str(&bodies);
@@ -343,6 +366,30 @@ fn effective_output(
         (None, Some((_, schema))) => OutputSpec::Schema(Arc::new(schema.clone())),
         (None, None) => OutputSpec::Untyped,
     }
+}
+
+/// Longest server note `describe` repeats; instructions are upstream text
+/// and some servers send pages of it
+const NOTE_LIMIT: usize = 2000;
+
+/// A server's instructions as Python comments, or nothing when they are blank
+fn server_note(server: &str, instructions: &str) -> Option<String> {
+    let instructions = instructions.trim();
+    if instructions.is_empty() {
+        return None;
+    }
+
+    let mut text: String = instructions.chars().take(NOTE_LIMIT).collect();
+    if text.len() < instructions.len() {
+        text.push('…');
+    }
+    let mut note = format!("# Instructions from the {server} server:\n");
+    for line in text.lines() {
+        note.push_str(format!("#   {line}").trim_end());
+        note.push('\n');
+    }
+
+    Some(note)
 }
 
 /// Shown when a described tool has parameters that are not Python identifiers
@@ -474,6 +521,7 @@ mod tests {
             let snapshots = [ServerSnapshot {
                 name: "docs".into(),
                 tools,
+                instructions: None,
                 available: true,
             }];
             let catalog = Catalog::build(&Config::default(), &snapshots, &HashSet::new());
@@ -510,6 +558,7 @@ mod tests {
         let snapshots = [ServerSnapshot {
             name: "docs".into(),
             tools: vec![tool("drop_all", "Drop everything"), tool("list", "List")],
+            instructions: None,
             available: true,
         }];
 

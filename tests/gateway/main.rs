@@ -62,6 +62,13 @@ async fn scripts_run_against_the_fixture_upstream() -> TestResult {
         described.contains("delay_ms"),
         "describe output: {described}"
     );
+    // the server's handshake instructions travel with its tools' stubs
+    assert!(
+        described.contains(
+            "# Instructions from the fixture server:\n#   Call fixture_add before anything else.\n#   Then any tool.\n"
+        ),
+        "describe output: {described}"
+    );
 
     // a plain call returns the tool's value
     let sum = execute(client, "int(await fixture_add(a=1, b=2))").await?;

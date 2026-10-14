@@ -662,6 +662,7 @@ impl Gateway {
             .map(|upstream| ServerSnapshot {
                 name: upstream.name().to_owned(),
                 tools: upstream.tools(),
+                instructions: upstream.instructions(),
                 available: upstream.status() == UpstreamStatus::Connected,
             })
             .collect();

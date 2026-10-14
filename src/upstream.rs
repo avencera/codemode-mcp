@@ -252,6 +252,7 @@ impl UpstreamStatus {
 struct Inner {
     peer: Option<Peer<RoleClient>>,
     tools: Vec<Tool>,
+    instructions: Option<String>,
 }
 
 /// One upstream server with its supervisor task
@@ -296,6 +297,12 @@ impl Upstream {
     /// precise "unavailable" error instead of a missing name
     pub fn tools(&self) -> Vec<Tool> {
         self.read().tools.clone()
+    }
+
+    /// Instructions the server sent when it last connected, kept like the
+    /// tool list while it is down
+    pub fn instructions(&self) -> Option<String> {
+        self.read().instructions.clone()
     }
 
     /// Resolves once the first connection attempt has either succeeded or failed
@@ -618,7 +625,12 @@ impl Upstream {
 
         let peer = service.peer().clone();
         self.refresh_tools(&peer, epoch, None).await?;
-        self.write().peer = Some(peer);
+        let instructions = peer.peer_info().and_then(|info| info.instructions.clone());
+        {
+            let mut inner = self.write();
+            inner.peer = Some(peer);
+            inner.instructions = instructions;
+        }
         // availability flipped, so the catalog needs a rebuild even when the
         // tool list is identical to the one kept from before
         self.status.send_replace(UpstreamStatus::Connected);
@@ -784,7 +796,11 @@ impl Upstreams {
                 config: config.clone(),
                 call_timeout,
                 cache_unshown: AtomicBool::new(!tools.is_empty()),
-                inner: RwLock::new(Inner { peer: None, tools }),
+                inner: RwLock::new(Inner {
+                    peer: None,
+                    tools,
+                    instructions: None,
+                }),
                 status,
                 changed: Arc::clone(&changed),
                 epoch: AtomicU64::new(0),
