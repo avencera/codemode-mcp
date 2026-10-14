@@ -362,6 +362,9 @@ async fn service_command(
             if !worker.is_file() {
                 return Err(service::ServiceError::NoWorker(worker).into());
             }
+            if !dry_run {
+                service::check_signing_identity()?;
+            }
             if config.worker_path.is_some() {
                 eprintln!(
                     "note: `worker_path` is set, so the service keeps using {} rather than the \

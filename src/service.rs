@@ -22,6 +22,12 @@ const EXIT_GRACE: Duration = Duration::from_secs(30);
 const BOOTSTRAP_WAIT: Duration = Duration::from_secs(10);
 /// Short name `service install` links to the installed binary
 pub const ALIAS: &str = "cmcp";
+/// Developer ID that signs installed binaries, the one homebased releases use.
+/// macOS and the 1Password app key their grants to an ad-hoc binary by its
+/// hash, so every rebuild prompted again; a stable certificate keeps them
+pub const SIGNING_IDENTITY: &str = "Developer ID Application: InfraOps LLC (Q8UP8C53Y8)";
+/// Prefix of each signed binary's identifier, as in `com.avencera.codemode-mcp`
+const SIGNING_PREFIX: &str = "com.avencera.";
 /// Starter configuration; `{{HOME}}` is replaced with the home directory
 const STARTER_CONFIG: &str = include_str!("../assets/starter-config.toml");
 
@@ -55,6 +61,13 @@ pub enum ServiceError {
     /// The config file already exists
     #[error("{0} already exists; edit it or move it away first")]
     ConfigExists(PathBuf),
+    /// The signing certificate is not in any keychain
+    #[error(
+        "the signing identity \"{SIGNING_IDENTITY}\" is not in your keychain; import the InfraOps \
+         Developer ID .p12 (the one in the homebased release secrets) into the login keychain, then \
+         install again"
+    )]
+    NoSigningIdentity,
 }
 
 fn io(action: impl Into<String>) -> impl FnOnce(std::io::Error) -> ServiceError {
@@ -112,7 +125,8 @@ pub fn default_worker_path(home: &Path) -> PathBuf {
 pub enum Action {
     /// Create a directory (mode 0700 when new)
     CreateDir(PathBuf),
-    /// Copy an executable, replacing the target atomically
+    /// Copy an executable, sign the copy with [`SIGNING_IDENTITY`] and
+    /// replace the target atomically
     Install {
         /// Source file
         from: PathBuf,
@@ -168,9 +182,12 @@ impl Action {
     pub fn describe(&self) -> String {
         match self {
             Self::CreateDir(path) => format!("mkdir -p {}", path.display()),
-            Self::Install { from, to } => {
-                format!("install -m 755 {} {}", from.display(), to.display())
-            }
+            Self::Install { from, to } => format!(
+                "install -m 755 {} {}  # signed as {}",
+                from.display(),
+                to.display(),
+                signing_identifier(to)
+            ),
             Self::Write { path, contents } => {
                 format!("write {} ({} bytes)", path.display(), contents.len())
             }
@@ -265,6 +282,9 @@ fn install_file(from: &Path, to: &Path) -> Result<(), ServiceError> {
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
                 .map_err(io(format!("chmod {}", temporary.display())))
         })
+        // signed before the rename, so the path never holds an unsigned binary
+        // and a running daemon's file is never rewritten in place
+        .and_then(|()| sign(&temporary, &signing_identifier(to)))
         .and_then(|()| {
             std::fs::rename(&temporary, to).map_err(io(format!("rename to {}", to.display())))
         });
@@ -273,6 +293,48 @@ fn install_file(from: &Path, to: &Path) -> Result<(), ServiceError> {
     }
 
     copied
+}
+
+/// Identifier `to` is signed under; named after the destination, since the
+/// file codesign sees is a temporary copy
+fn signing_identifier(to: &Path) -> String {
+    let name = to
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    format!("{SIGNING_PREFIX}{name}")
+}
+
+fn sign(path: &Path, identifier: &str) -> Result<(), ServiceError> {
+    // --force replaces the linker's ad-hoc signature
+    run_command(&[
+        "codesign".into(),
+        "--force".into(),
+        "--sign".into(),
+        SIGNING_IDENTITY.into(),
+        "--identifier".into(),
+        identifier.into(),
+        path.display().to_string(),
+    ])
+    .map(drop)
+}
+
+/// Fails unless [`SIGNING_IDENTITY`] can sign, so an install stops before it
+/// changes anything rather than halfway through
+pub fn check_signing_identity() -> Result<(), ServiceError> {
+    let identities = run_command(&[
+        "security".into(),
+        "find-identity".into(),
+        "-v".into(),
+        "-p".into(),
+        "codesigning".into(),
+    ])?;
+    if identities.contains(&format!("\"{SIGNING_IDENTITY}\"")) {
+        Ok(())
+    } else {
+        Err(ServiceError::NoSigningIdentity)
+    }
 }
 
 /// Runs a command and returns its stdout

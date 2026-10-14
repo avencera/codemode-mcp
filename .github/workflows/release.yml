@@ -1,0 +1,74 @@
+# Publish a signed macOS binary when a version tag is pushed.
+#
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# Asset name: codemode-mcp-<tag>-<target>.tar.gz. Only Apple silicon is built,
+# since the service is a launchd agent and this Mac is the only host
+
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+
+  upload-assets:
+    needs: create-release
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      # macOS and the 1Password app key their grants to an ad-hoc binary by its
+      # hash, so each build re-prompted; a stable certificate lets a grant
+      # survive updates. A missing secret fails the release instead of shipping
+      # unsigned. Same identity and secrets as homebased
+      - name: Import signing certificate
+        env:
+          P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          : "${IDENTITY:?set the MACOS_SIGNING_IDENTITY repository variable}"
+          : "${P12_BASE64:?set the MACOS_SIGNING_P12_BASE64 repository secret}"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$keychain" | grep -F "\"$IDENTITY\""
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: codemode-mcp
+          package: codemode-mcp
+          target: aarch64-apple-darwin
+          archive: $bin-$tag-$target
+          tar: unix
+          checksum: sha256
+          locked: true
+          # the prefix makes the identifier com.avencera.codemode-mcp, matching
+          # what `service install` signs a local build as
+          codesign: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          codesign-prefix: com.avencera.

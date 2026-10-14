@@ -27,6 +27,26 @@ binary under a shorter name. Times in logs are UTC.
    `~/.local/share/codemode-mcp/monty`, writes `~/Library/LaunchAgents/dev.praveen.codemode-mcp.plist` and loads
    it. Run it again after every rebuild; it replaces both files and reloads the service. If something else is
    already at `~/.local/bin/cmcp`, the install leaves it alone and logs a warning.
+
+   Both binaries are signed with the InfraOps LLC Developer ID, the one homebased releases use, as
+   `com.avencera.codemode-mcp` and `com.avencera.monty`. macOS and the 1Password app tie their approvals to an
+   ad-hoc binary's hash, so without the certificate every rebuild would prompt again. The install refuses to
+   run when the identity is not in the keychain. To set it up once, import the .p12:
+
+   ```sh
+   security import InfraOps.p12 -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign
+   ```
+
+   The first signing may ask whether codesign can use the key; choose Always Allow. Check an installed binary
+   with `codesign -dv ~/.local/bin/codemode-mcp`, which should show `TeamIdentifier=Q8UP8C53Y8`.
+
+## Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds `aarch64-apple-darwin`, signs it with the
+same identity and identifier, and attaches `codemode-mcp-<tag>-aarch64-apple-darwin.tar.gz` and its checksum.
+It reads the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the
+`MACOS_SIGNING_IDENTITY` variable, the same names homebased uses, and fails rather than ship unsigned. The
+Monty worker is not part of the release.
 4. Check it: `codemode-mcp service status` (plist, launchd state, `/healthz`).
 5. Expose the approval pages to the phone: `tailscale serve --bg --https=8443 http://127.0.0.1:7681`.
    `public_origin` (default `https://mac.tailnet-name.ts.net:8443`) must match.
