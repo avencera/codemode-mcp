@@ -11,6 +11,11 @@
 command = "/Applications/1Password.app/Contents/MacOS/1password-mcp"
 policy = "ask"
 
+# authenticate returns the account ID every other 1Password tool takes as
+# `accountId`; the upstream says so only in server instructions scripts never see
+[servers.onepassword.tools.authenticate]
+output_schema = { type = "object", required = ["account_id"], properties = { account_id = { type = "string", description = "Pass as `accountId` to the other 1Password tools" } } }
+
 [servers.onepassword.tools.create_environment]
 grant = "per_call"
 [servers.onepassword.tools.rename_environment]
