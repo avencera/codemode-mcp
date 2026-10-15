@@ -79,7 +79,10 @@ the thread title and reason the agent passed to `execute`; those two are the age
 - Touch the sensor to approve the call and every tool of that server not marked `grant = "per_call"` for 60
   minutes in the agent's session. Mark writes you want asked every time, such as calendar deletes,
   `per_call`. A tool with `grant = "per_call"`, such as a
-  1Password write, is approved for that one call only, and the prompt says `once`.
+  1Password write, is approved for that one call only, and the prompt says `once`. When a script starts
+  several such calls together, such as a set of deletes under `asyncio.gather`, one prompt names them all
+  (`calendar.delete_event ×5 once`) and one touch approves the set. The phone push and the page cover the
+  same set, and the page lists every call's arguments.
 - Press **Open Page** to open the approval page in the browser, for a single call, 15 minutes, or to deny. The
   page takes your passkey.
 - Leave it, and after 60 seconds the phone is told too (60 seconds after **Open Page** if you opened the page).

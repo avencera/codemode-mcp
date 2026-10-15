@@ -11,8 +11,9 @@ use serde_json::{Map, Value};
 
 use crate::{
     config::{Config, OutputMode, ServerConfig, ToolOverride},
+    json_access,
     output::OutputSpec,
-    policy::Policy,
+    policy::{GrantMode, Policy},
     search::{SearchIndex, SearchText},
     stubs::{
         Declaration, JSON_VALUE_ALIAS, STUB_HEADER, StubBook, StubOutput, TYPE_KEYWORD, ToolStub,
@@ -168,9 +169,16 @@ impl Catalog {
                     .or(tool.title.as_deref())
                     .unwrap_or("")
                     .to_owned();
+                // only the docstring carries the note, so search ranks tools
+                // by what they do
+                let documented = match server.and_then(|server| approval_note(server, &tool.name)) {
+                    Some(note) if description.trim().is_empty() => note.to_owned(),
+                    Some(note) => format!("{}\n\n{note}", description.trim_end()),
+                    None => description.clone(),
+                };
                 let degraded = fallback.contains(&function);
                 let stub = if degraded {
-                    fallback_stub(&function, Some(&description), &input)
+                    fallback_stub(&function, Some(&documented), &input)
                 } else {
                     let stub_output = match &output {
                         OutputSpec::Schema(schema) => StubOutput::Schema(schema),
@@ -178,7 +186,7 @@ impl Catalog {
                         OutputSpec::Untyped => StubOutput::Untyped,
                     };
 
-                    book.tool(&function, Some(&description), &input, stub_output)
+                    book.tool(&function, Some(&documented), &input, stub_output)
                 };
                 let params = input
                     .get("properties")
@@ -226,7 +234,10 @@ impl Catalog {
             .enumerate()
             .map(|(position, entry)| (entry.function.clone(), position))
             .collect();
-        let mut check_stubs = format!("{STUB_HEADER}{JSON_VALUE_ALIAS}");
+        let mut check_stubs = format!(
+            "{STUB_HEADER}{JSON_VALUE_ALIAS}{}",
+            json_access::CHECK_STUBS
+        );
         let mut declared = BTreeSet::new();
         for entry in &entries {
             for declaration in &entry.stub.declarations {
@@ -345,6 +356,7 @@ impl Catalog {
         let mut out = String::from(STUB_HEADER);
         if needs_json_value {
             out.push_str(JSON_VALUE_ALIAS);
+            out.push_str(json_access::DOCUMENTED);
         }
         if needs_kwargs_note {
             out.push_str(KWARGS_NOTE);
@@ -540,6 +552,25 @@ const HASH_HEX_DIGITS: usize = 6;
 /// Names that collide after sanitizing are resolved by sorting, not by the
 /// order tools arrived in: a tool whose own name needs no sanitizing keeps the
 /// plain name, the rest get a short stable hash of `server` and `tool`
+/// What an agent should know about approving a call of `tool`, when it
+/// needs approval
+fn approval_note(server: &ServerConfig, tool: &str) -> Option<&'static str> {
+    if server.policy_for(tool) != Policy::Ask {
+        return None;
+    }
+
+    Some(match server.grant_for(tool) {
+        GrantMode::PerCall => {
+            "Needs the user's approval for every call. To make several calls, start them \
+             together with asyncio.gather instead of awaiting each in a loop: the user then \
+             approves the whole set at once, and a loop asks once per call."
+        }
+        GrantMode::Session => {
+            "Needs the user's approval; one approval can cover this server's tools for a while."
+        }
+    })
+}
+
 fn function_names(snapshots: &[ServerSnapshot]) -> Vec<Vec<String>> {
     struct Candidate<'a> {
         slot: (usize, usize),
@@ -577,7 +608,12 @@ fn function_names(snapshots: &[ServerSnapshot]) -> Vec<Vec<String>> {
         .iter()
         .map(|snapshot| vec![String::new(); snapshot.tools.len()])
         .collect();
-    let mut taken: HashSet<String> = HashSet::new();
+    // the accessors are predefined in every script, so a tool named like one
+    // is renamed as if another tool held the name
+    let mut taken: HashSet<String> = json_access::NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
     for candidate in candidates {
         let mut name = candidate.base.clone();
         if taken.contains(&name) {

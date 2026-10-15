@@ -20,10 +20,11 @@ macro_rules! script_rules {
             $crate::guidance::tool_call_rule!(),
             "\n\
              - Results are typed. A tool with no declared result type returns `JsonValue` (predefined, never \
-             imported); narrow it with isinstance:\n  \
-             `v = r.get(\"k\") if isinstance(r, dict) else None`\n  \
-             `name = v if isinstance(v, str) else \"\"`\n  \
-             `Any`, `cast` and `# type: ignore` are rejected.\n\
+             imported). Read it with the predefined accessors, which take a path and raise naming it when a \
+             step is missing or has another type:\n  \
+             `url = json_str(r, \"$.hits[0].url\")`; also json_int, json_float, json_bool, json_list, json_dict\n  \
+             `cursor = json_get(r, \"$.next\")` is None when missing; `data = json_parse(text)` parses JSON text\n  \
+             `Any`, `cast`, `# type: ignore` and `json.loads` are rejected.\n\
              - A helper may return any JSON-like value as `JsonValue`, `dict[str, str]` and `list[dict[str, int]]` \
              included. A variable annotated `dict[str, JsonValue]` or `list[JsonValue]` is stricter: build it \
              with that annotation from the start.\n\
@@ -68,7 +69,9 @@ pub const INSTRUCTIONS: &str = concat!(
      execute returns status \"pending\" with an execution_id if the script is slow; call wait(execution_id). \
      Some tools need the user's approval: pass execute a short `thread` title for your task and a one-line \
      `reason` for the script, which the user sees when approving. A pending answer with approval_url and \
-     waiting_for means pass its message and the approval_url on to the user, then call wait. ",
+     waiting_for means pass its message and the approval_url on to the user, then call wait. When a script \
+     makes several such calls, such as a set of deletes, start them together with `asyncio.gather` instead \
+     of awaiting each in a loop, so the user approves the whole set at once. ",
     session_rule!(),
     "\n\n",
     script_rules!()

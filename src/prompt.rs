@@ -26,14 +26,15 @@ pub struct Asker<'a> {
     pub reason: Option<&'a str>,
 }
 
-/// Text of the Touch ID prompt approving `waiting_for` with `grant` (such as
-/// `once` or `and all fixture tools not marked per-call, for 60 min`), asked for by `asker`
+/// Text of the Touch ID prompt approving `calls` (each tool with how many
+/// of its calls one decision answers) with `grant` (such as `once` or `and
+/// all fixture tools not marked per-call, for 60 min`), asked for by `asker`
 ///
 /// macOS shows it as "codemode-mcp is trying to …", so it starts with a verb
-pub fn prompt_text(waiting_for: &str, grant: &str, asker: Asker<'_>) -> String {
+pub fn prompt_text(calls: &[(String, usize)], grant: &str, asker: Asker<'_>) -> String {
     let mut text = format!(
         "approve {} {grant}, asked by {}",
-        printable(waiting_for, TOOL_CHARS),
+        calls_text(calls),
         quoted(asker.client, CLIENT_CHARS)
     );
     if let Some(thread) = asker.thread.filter(|thread| !thread.trim().is_empty()) {
@@ -49,6 +50,22 @@ pub fn prompt_text(waiting_for: &str, grant: &str, asker: Asker<'_>) -> String {
     }
 
     text
+}
+
+/// The tools of a batch, such as `calendar.delete_event ×3,
+/// reminders.delete_reminder`; a count shows only when it is above one
+pub fn calls_text(calls: &[(String, usize)]) -> String {
+    calls
+        .iter()
+        .map(|(tool, count)| {
+            let tool = printable(tool, TOOL_CHARS);
+            match count {
+                1 => tool,
+                count => format!("{tool} ×{count}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The first `limit` characters in double quotes, with quotes and
@@ -106,7 +123,7 @@ mod tests {
     fn prompts_name_the_grant_thread_and_reason() {
         assert_eq!(
             prompt_text(
-                "onepassword.list_environments",
+                &[("onepassword.list_environments".to_owned(), 1)],
                 "for 60 min",
                 Asker {
                     client: "claude-code",
@@ -118,7 +135,7 @@ mod tests {
         );
         assert_eq!(
             prompt_text(
-                "fixture.add",
+                &[("fixture.add".to_owned(), 1)],
                 "once",
                 Asker {
                     client: "codex",
@@ -132,7 +149,7 @@ mod tests {
     #[test]
     fn agent_text_cannot_pass_for_prompt_text() {
         let text = prompt_text(
-            "mail.send",
+            &[("mail.send".to_owned(), 1)],
             "once",
             Asker {
                 client: "evil\u{202e}tneilc",
@@ -150,7 +167,7 @@ mod tests {
     #[test]
     fn long_reasons_are_cut_and_marked() {
         let text = prompt_text(
-            "fixture.add",
+            &[("fixture.add".to_owned(), 1)],
             "once",
             Asker {
                 client: "codex",

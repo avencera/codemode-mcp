@@ -19,9 +19,12 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use crate::{
     app::App,
-    approvals::{ApprovalInfo, ApprovalKind, Approvals, Choice, DecideError, GRANT_MINUTES},
+    approvals::{
+        ApprovalInfo, ApprovalKind, Approvals, Choice, DecideError, GRANT_MINUTES, tool_counts,
+    },
     passkeys::{PasskeyError, Passkeys},
     policy::GrantMode,
+    prompt::calls_text,
     store,
     usage::report::{Reporter, Stats, human_duration, parse_since, percent},
 };
@@ -227,9 +230,31 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     if let ApprovalKind::Admin { title } = &info.kind {
         return admin_page(&info, title);
     }
+    // closed first, so the buttons answer exactly the calls listed here
+    state.approvals.close_batch(&info);
+    let batch = state.approvals.batch(&id);
+    let several = batch.len() > 1;
 
-    let arguments = serde_json::to_string_pretty(&Value::Object(info.arguments.clone()))
-        .unwrap_or_else(|_| "{}".to_owned());
+    let arguments: String = batch
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let arguments = serde_json::to_string_pretty(&Value::Object(call.arguments.clone()))
+                .unwrap_or_else(|_| "{}".to_owned());
+            let heading = if several {
+                format!(
+                    "<h3>{} of {}: {}</h3>",
+                    index + 1,
+                    batch.len(),
+                    escape(&call.waiting_for())
+                )
+            } else {
+                String::new()
+            };
+
+            format!("{heading}<pre>{}</pre>", highlight::json(&arguments))
+        })
+        .collect();
     let grant_buttons = |class: &str, prefix: &str, subject: &str| -> String {
         GRANT_MINUTES
             .iter()
@@ -253,6 +278,9 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     }
     let mut notes = Vec::new();
     match info.grant_mode {
+        GrantMode::PerCall if several => notes.push(
+            "The script made these calls together. Approving runs all of them, and denying refuses all of them.",
+        ),
         GrantMode::PerCall => notes.push("This tool needs approval for every call."),
         GrantMode::Session => {
             if info.session_grant_allowed() {
@@ -284,8 +312,16 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
     let title = format!(
         "{} wants {}",
         info.caller.client_label(),
-        info.waiting_for()
+        calls_text(&tool_counts(&batch))
     );
+    let (approve, deny) = if several {
+        (
+            format!("Approve all {}", batch.len()),
+            format!("Deny all {}", batch.len()),
+        )
+    } else {
+        ("Approve once".to_owned(), "Deny".to_owned())
+    };
     // the agent's own words, so they are labelled as such
     let mut asked = Vec::new();
     if let Some(thread) = &info.caller.thread {
@@ -309,14 +345,14 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
 <p class="meta">Client {client} {version}{session}<br>Execution {execution}</p>
 <p class="meta countdown">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
 <div class="buttons">
-<button class="approve" data-choice="once">Approve once</button>
+<button class="approve" data-choice="once">{approve}</button>
 {client_buttons}
-<button class="deny" data-choice="deny">Deny</button>
+<button class="deny" data-choice="deny">{deny}</button>
 </div>
 <p id="status" role="status"></p>
 {grant_note}
 <h2>Arguments</h2>
-<pre>{arguments}</pre>
+{arguments}
 <h2>Script</h2>
 <pre>{script}</pre>
 </main>
@@ -328,7 +364,6 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         execution = escape(&info.execution_id),
         left = info.time_left().as_secs(),
         left_text = escape(&human_duration(info.time_left().as_millis() as i64)),
-        arguments = highlight::json(&arguments),
         script = highlight::python(&info.script),
     );
 

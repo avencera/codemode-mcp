@@ -264,3 +264,42 @@ async fn admin_requests_never_offer_touch_id() -> TestResult {
 
     harness.stop().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_fingerprint_approves_per_call_calls_started_together() -> TestResult {
+    let mac = Arc::new(FakeMac::default());
+    let Some(harness) = Harness::with(Setup {
+        server: "tools.add.policy = \"ask\"\n\
+                 tools.add.grant = \"per_call\"",
+        extra: "[notify.mac]\nescalate_after_secs = 3",
+        notify: true,
+        mac: Some(Arc::clone(&mac)),
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let _passkey = harness.enroll_passkey().await?;
+    mac.set_present(true);
+    mac.set_answer(Some(TouchId::Approved));
+
+    let body = execute(
+        &harness,
+        "import asyncio\n\
+         sums = await asyncio.gather(fixture_add(a=1, b=2), fixture_add(a=3, b=4), fixture_add(a=5, b=6))\n\
+         [int(total) for total in sums]",
+        None,
+    )
+    .await?;
+    assert_eq!(body["result"], json!([3, 7, 11]), "{body}");
+    let shown = mac.shown();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(
+        shown[0].starts_with("touch_id approve fixture.add ×3 once, asked by \""),
+        "{shown:?}"
+    );
+    assert!(harness.notifier.tool_requests().is_empty());
+
+    harness.stop().await
+}

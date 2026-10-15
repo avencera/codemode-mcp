@@ -269,26 +269,32 @@ pub fn pending_body(gateway: &Gateway, id: &str) -> Value {
                 .iter()
                 .find(|entry| entry.server == approval.server && entry.tool == approval.tool)
                 .map_or_else(|| approval.waiting_for(), |entry| entry.function.clone());
+            let others = approvals.batch(&approval.id).len().saturating_sub(1);
+            let calls = match others {
+                0 => waiting_for.clone(),
+                1 => format!("{waiting_for} and 1 other call together"),
+                others => format!("{waiting_for} and {others} other calls together"),
+            };
             let message = if approvals.notification_failed(&approval.id) {
                 format!(
                     "Waiting for the user to approve {}, but the phone notification could not \
                      be delivered. Give the user the approval_url to open, then call wait with \
                      this execution_id.",
-                    waiting_for
+                    calls
                 )
             } else if approvals.asked_on_mac(&approval.id) {
                 format!(
                     "Waiting for the user to approve {} on this Mac, where they are being asked \
                      now, and their phone is told if they do not answer there. Tell them and give \
                      them the approval_url, then call wait with this execution_id.",
-                    waiting_for
+                    calls
                 )
             } else {
                 format!(
                     "Waiting for the user to approve {} on their phone, or at the approval_url \
                      in a browser on this Mac. Tell them and give them the approval_url, then \
                      call wait with this execution_id.",
-                    waiting_for
+                    calls
                 )
             };
 

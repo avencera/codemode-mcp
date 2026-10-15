@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -25,7 +25,7 @@ use crate::{
     mac::{MacNotification, OnMac, TouchId},
     notify::{Notification, Notifier, Priority},
     policy::GrantMode,
-    prompt::{Asker, prompt_text},
+    prompt::{Asker, calls_text, prompt_text},
     store::{
         Store,
         approvals::{NewApproval, StoredApproval, StoredGrant},
@@ -56,6 +56,10 @@ pub const WITHDRAWN: &str = "the approval request was withdrawn";
 const PRESENCE_CHECK: Duration = Duration::from_secs(2);
 /// Grant lengths offered on the approval page, in minutes
 pub const GRANT_MINUTES: [u64; 2] = [15, 60];
+/// How long a per-call request waits before it is announced, so the calls
+/// a script makes together under `asyncio.gather` join it and are asked
+/// for as one batch; they all arrive within a few milliseconds
+const BATCH_WINDOW: Duration = Duration::from_millis(250);
 
 /// What the owner chose on the approval page
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +206,15 @@ pub struct ApprovalInfo {
     /// When the request is denied automatically, ms since the epoch; a wall
     /// clock time because it must mean the same to the next process
     pub expires_ms: i64,
+    /// The first request of the batch this one joined, when it is a per-call
+    /// request made together with others of the same execution; one
+    /// decision answers the whole batch
+    #[serde(default)]
+    pub batch: Option<String>,
+    /// Creation order within this process, so a batch lists its calls in the
+    /// order the script made them, though many share a millisecond
+    #[serde(default)]
+    pub order: u64,
 }
 
 impl ApprovalInfo {
@@ -213,6 +226,18 @@ impl ApprovalInfo {
     /// `<server>.<tool>`
     pub fn waiting_for(&self) -> String {
         format!("{}.{}", self.server, self.tool)
+    }
+
+    /// Id of the batch this request belongs to: the first request's id, its
+    /// own when it started one or stands alone
+    pub fn batch_id(&self) -> &str {
+        self.batch.as_deref().unwrap_or(&self.id)
+    }
+
+    /// Whether this request may join or start a batch: a tool call that asks
+    /// on every call. Grants already cover the other kinds of call
+    fn batchable(&self) -> bool {
+        self.kind == ApprovalKind::ToolCall && self.grant_mode == GrantMode::PerCall
     }
 
     /// Whether a session grant may answer this request: a `session` tool
@@ -403,6 +428,11 @@ struct State {
     unnotified: HashSet<String>,
     /// Pending requests asked on the Mac, because the owner was at it
     on_mac: HashSet<String>,
+    /// Batches still open to the per-call requests of their execution,
+    /// keyed by execution id, holding the first request's id; a batch closes
+    /// once it is announced, shown on the page or decided, so a decision
+    /// never covers a call the owner was not shown
+    forming: HashMap<String, String>,
 }
 
 /// The approval service
@@ -419,6 +449,8 @@ pub struct Approvals {
     /// Set once the process stops writing, because another daemon took over
     /// the database (tests) or this one is shutting down after a drain
     frozen: Arc<AtomicBool>,
+    /// Next [`ApprovalInfo::order`]
+    order: AtomicU64,
 }
 
 impl Approvals {
@@ -459,6 +491,7 @@ impl Approvals {
             store,
             state: Mutex::new(state),
             frozen: Arc::new(AtomicBool::new(false)),
+            order: AtomicU64::new(0),
         })
     }
 
@@ -533,6 +566,8 @@ impl Approvals {
             script: Arc::clone(request.script),
             grant_mode: request.grant_mode,
             expires_ms: self.expiry(),
+            batch: None,
+            order: self.order.fetch_add(1, Ordering::SeqCst),
         };
 
         Gate::Wait(self.open(info, request.sensitivity, None, Some(notifier)))
@@ -542,8 +577,9 @@ impl Approvals {
         now_ms().saturating_add(self.timeout.as_millis().min(i64::MAX as u128) as i64)
     }
 
-    /// The notification announcing a request; arguments stay on the passkey
-    /// page, so it names the client and tool only
+    /// The notification announcing a request and the rest of its batch;
+    /// arguments stay on the passkey page, so it names the client and tools
+    /// only
     fn notification_for(&self, info: &ApprovalInfo) -> Notification {
         let minutes = info.time_left().as_secs().div_ceil(60);
         match &info.kind {
@@ -551,7 +587,7 @@ impl Approvals {
                 title: format!(
                     "codemode: {} wants {}",
                     info.caller.client_label(),
-                    info.waiting_for()
+                    calls_text(&self.calls(info))
                 ),
                 message: format!("Tap to review. Denied automatically in {minutes} min."),
                 click: Some(self.url_for(&info.id)),
@@ -602,6 +638,8 @@ impl Approvals {
             script: Arc::from(""),
             grant_mode: GrantMode::PerCall,
             expires_ms: self.expiry(),
+            batch: None,
+            order: self.order.fetch_add(1, Ordering::SeqCst),
         };
         let notifier = self.notifier.clone();
 
@@ -630,25 +668,46 @@ impl Approvals {
 
     /// Registers a pending request, stores it, announces it and schedules its
     /// expiry
+    ///
+    /// A per-call request joins the open batch of its execution, if any, and
+    /// is then announced only as part of that batch; otherwise it opens a
+    /// batch and is announced once [`BATCH_WINDOW`] has passed
     fn open(
         self: &Arc<Self>,
-        info: ApprovalInfo,
+        mut info: ApprovalInfo,
         sensitivity: Sensitivity,
         action: Option<AdminAction>,
         notifier: Option<Arc<dyn Notifier>>,
     ) -> Waiting {
-        let info = Arc::new(info);
         let id = info.id.clone();
         let (sender, receiver) = oneshot::channel();
         let settled = CancellationToken::new();
-        self.state().pending.insert(
-            id.clone(),
-            Pending {
-                info: Arc::clone(&info),
-                sender,
-                _settled: settled.clone().drop_guard(),
-            },
-        );
+        let info = {
+            // one lock, so a batch cannot close between the check and the insert
+            let mut state = self.state();
+            if info.batchable() {
+                match state.forming.get(&info.execution_id) {
+                    Some(first) if state.pending.contains_key(first) => {
+                        info.batch = Some(first.clone());
+                    }
+                    _ => {
+                        state.forming.insert(info.execution_id.clone(), id.clone());
+                    }
+                }
+            }
+            let info = Arc::new(info);
+            state.pending.insert(
+                id.clone(),
+                Pending {
+                    info: Arc::clone(&info),
+                    sender,
+                    _settled: settled.clone().drop_guard(),
+                },
+            );
+
+            info
+        };
+        let joined = info.batch.is_some();
 
         let payload = Durable::gate(sensitivity, || {
             serde_json::to_string(&*info).unwrap_or_else(|error| {
@@ -670,14 +729,28 @@ impl Approvals {
                     tool: &info.tool,
                     grant_mode: info.grant_mode.as_str(),
                     action: action.as_deref(),
-                    notify: notifier.is_some(),
+                    // the batch's first request carries the notification
+                    notify: notifier.is_some() && !joined,
                 },
                 &payload,
             )
         });
 
-        if let Some(notifier) = notifier {
-            self.ask(&info, notifier, settled);
+        match notifier {
+            Some(_) if joined => {}
+            Some(notifier) if info.batchable() => {
+                let weak = Arc::downgrade(self);
+                let first = Arc::clone(&info);
+                tokio::spawn(async move {
+                    tokio::time::sleep(BATCH_WINDOW).await;
+                    if let Some(approvals) = weak.upgrade() {
+                        approvals.close_batch(&first);
+                        approvals.ask(&first, notifier, settled);
+                    }
+                });
+            }
+            Some(notifier) => self.ask(&info, notifier, settled),
+            None => {}
         }
         self.expire_after(&id, self.timeout);
 
@@ -732,6 +805,7 @@ impl Approvals {
             }
             let url = approvals.url_for(&info.id);
             let notification = approvals.notification_for(&info);
+            let calls = approvals.calls(&info);
 
             if let ApprovalKind::Admin { .. } = &info.kind {
                 approvals.notify(phone, &info);
@@ -806,7 +880,7 @@ impl Approvals {
 
             let ask_here = async {
                 let answer = if on_mac.config.touch_id {
-                    let reason = touch_id_reason(&info);
+                    let reason = touch_id_reason(&info, &calls);
                     // dropping the prompt's future takes it off the screen
                     tokio::select! {
                         answer = on_mac.mac.touch_id(&reason) => answer,
@@ -1142,15 +1216,60 @@ impl Approvals {
             .map(|pending| Arc::clone(&pending.info))
     }
 
-    /// Whether the notification for a pending request failed
+    /// Whether the notification for a pending request, or for the batch it
+    /// joined, failed
     pub fn notification_failed(&self, id: &str) -> bool {
-        self.state().unnotified.contains(id)
+        let state = self.state();
+
+        state.unnotified.contains(batch_of(&state, id))
     }
 
-    /// Whether a pending request was asked on the Mac rather than only on
-    /// the phone
+    /// Whether a pending request, or the batch it joined, was asked on the
+    /// Mac rather than only on the phone
     pub fn asked_on_mac(&self, id: &str) -> bool {
-        self.state().on_mac.contains(id)
+        let state = self.state();
+
+        state.on_mac.contains(batch_of(&state, id))
+    }
+
+    /// The pending requests one decision on request `id` answers: its batch,
+    /// first request first, or just the request itself; empty when it is
+    /// not pending
+    pub fn batch(&self, id: &str) -> Vec<Arc<ApprovalInfo>> {
+        let state = self.state();
+        let Some(pending) = state.pending.get(id) else {
+            return Vec::new();
+        };
+        let batch = pending.info.batch_id();
+        let mut members: Vec<Arc<ApprovalInfo>> = state
+            .pending
+            .values()
+            .filter(|pending| pending.info.batch_id() == batch)
+            .map(|pending| Arc::clone(&pending.info))
+            .collect();
+        members.sort_by_key(|info| (info.batch.is_some(), info.order));
+
+        members
+    }
+
+    /// Each tool the batch of `info` calls, with its count; `info`'s own
+    /// call once the request has left
+    fn calls(&self, info: &ApprovalInfo) -> Vec<(String, usize)> {
+        let batch = self.batch(&info.id);
+        if batch.is_empty() {
+            return vec![(info.waiting_for(), 1)];
+        }
+
+        tool_counts(&batch)
+    }
+
+    /// Closes the batch of `info` to later requests, as when it is shown on
+    /// the page, so approving it covers only the calls shown
+    pub fn close_batch(&self, info: &ApprovalInfo) {
+        let mut state = self.state();
+        if state.forming.get(&info.execution_id).map(String::as_str) == Some(info.batch_id()) {
+            state.forming.remove(&info.execution_id);
+        }
     }
 
     /// The first pending request of an execution, for the `pending` answer
@@ -1162,32 +1281,47 @@ impl Approvals {
                 pending.info.kind == ApprovalKind::ToolCall
                     && pending.info.execution_id == execution_id
             })
-            .min_by_key(|pending| pending.info.expires_ms)
+            // the batch's first request, whose page and prompt name the rest
+            .min_by_key(|pending| (pending.info.expires_ms, pending.info.batch.is_some()))
             .map(|pending| Arc::clone(&pending.info))
     }
 
     /// Applies the owner's choice to a pending request
     ///
-    /// A client or session grant also answers the other pending requests of
-    /// that client or session for grantable tools of the same server
+    /// Approving once or denying answers the request's whole batch. A client
+    /// or session grant also answers the other pending requests of that
+    /// client or session for grantable tools of the same server
     pub fn decide(&self, id: &str, choice: Choice) -> Result<(), DecideError> {
         let info = self.info(id).ok_or(DecideError::NotFound)?;
+        self.close_batch(&info);
+        let others: Vec<String> = self
+            .batch(id)
+            .into_iter()
+            .map(|member| member.id.clone())
+            .filter(|member| member != id)
+            .collect();
 
         match choice {
             Choice::Deny => {
                 let verdict = Verdict::Denied {
                     reason: DENIED.to_owned(),
                 };
-                if !self.settle(id, Some(verdict), "denied", None) {
+                if !self.settle(id, Some(verdict.clone()), "denied", None) {
                     return Err(DecideError::NotFound);
+                }
+                for other in others {
+                    self.settle(&other, Some(verdict.clone()), "denied", None);
                 }
             }
             Choice::Once => {
                 let verdict = Verdict::Approved {
                     approval_id: id.to_owned(),
                 };
-                if !self.settle(id, Some(verdict), "approved", None) {
+                if !self.settle(id, Some(verdict.clone()), "approved", None) {
                     return Err(DecideError::NotFound);
+                }
+                for other in others {
+                    self.settle(&other, Some(verdict.clone()), "approved", None);
                 }
             }
             Choice::Client(length) => {
@@ -1330,6 +1464,7 @@ impl Approvals {
             let mut state = self.state();
             state.unnotified.remove(id);
             state.on_mac.remove(id);
+            state.forming.retain(|_, first| first != id);
 
             state.pending.remove(id)
         };
@@ -1355,12 +1490,12 @@ impl Approvals {
     }
 }
 
-/// Text of the Touch ID prompt: the call, what a fingerprint grants, and
-/// who asks and why
+/// Text of the Touch ID prompt: the calls of the batch, what a fingerprint
+/// grants, and who asks and why
 ///
 /// Unlike the phone notification, which crosses the ntfy server, the prompt
 /// stays on the Mac, so it may carry the agent's thread title and reason
-fn touch_id_reason(info: &ApprovalInfo) -> String {
+fn touch_id_reason(info: &ApprovalInfo, calls: &[(String, usize)]) -> String {
     let client = info.caller.client_label();
     let grant = match info.fingerprint_choice() {
         Choice::Session(length) => {
@@ -1379,7 +1514,7 @@ fn touch_id_reason(info: &ApprovalInfo) -> String {
     };
 
     prompt_text(
-        &info.waiting_for(),
+        calls,
         &grant,
         Asker {
             client,
@@ -1387,6 +1522,29 @@ fn touch_id_reason(info: &ApprovalInfo) -> String {
             reason: info.caller.reason.as_deref(),
         },
     )
+}
+
+/// Id of the batch request `id` belongs to, or `id` when it is not pending
+fn batch_of<'a>(state: &'a State, id: &'a str) -> &'a str {
+    state
+        .pending
+        .get(id)
+        .map_or(id, |pending| pending.info.batch_id())
+}
+
+/// Each tool of a batch with how many of its calls it holds, in the order
+/// they were made
+pub fn tool_counts(batch: &[Arc<ApprovalInfo>]) -> Vec<(String, usize)> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for info in batch {
+        let tool = info.waiting_for();
+        match counts.iter_mut().find(|(seen, _)| *seen == tool) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((tool, 1)),
+        }
+    }
+
+    counts
 }
 
 /// What a script reads when its request ran out of time

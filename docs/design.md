@@ -95,6 +95,16 @@ idempotent. `tools/list_changed` refreshes the catalog
   a direct local caller: a request from a non-loopback peer, or carrying any proxy header, never matches a client
   grant and cannot create one. A caller that sent no client name cannot get a client grant. `per_call` tools ask
   on every call and refuse both kinds of grant
+- Batches: a `per_call` request waits 250 ms before it is announced, and the `per_call` requests of the same
+  execution made meanwhile (the calls of one `asyncio.gather`) join it. The batch is announced once: one push
+  titled with every tool and its count (`fixture.add ×2, fixture.json_text`), one Touch ID prompt, one page.
+  Approving once or denying answers every request in it; each keeps its own row, with the first request as
+  `approved_by`. A batch closes when it is announced, its page renders or it is decided, so a decision never
+  covers a call the owner was not shown; a later call starts a new batch. Calls awaited one after another ask
+  one by one. Membership is stored in each request's payload, so restored requests still share one page, but
+  batches are not reopened after a restart. Agents learn this from the docstring `describe_tools` shows for
+  each `ask` tool: it says the tool needs approval, and for `per_call` tools, to start several calls together
+  with `asyncio.gather`. The note stays out of search text. The server instructions say the same in general
 - An `ask` call needs a notifier and at least one enrolled passkey; otherwise it is refused at once
   (`no passkey enrolled; run \`codemode-mcp passkey enroll --label NAME\``)
 - On an `ask` call the gateway creates a pending request (random 128-bit id) and sends an ntfy notification:
@@ -120,7 +130,8 @@ idempotent. `tools/list_changed` refreshes the catalog
   approval still takes a fingerprint or a passkey assertion. Admin requests never offer Touch ID; on the Mac
   they show the notification and the push goes out at once. `notify.mac.enabled = false` asks on the phone only
 - `GET /approve/{id}` (server-rendered, mobile layout, all agent-supplied text escaped, strict CSP) shows the
-  client, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
+  client, `server.tool`, pretty-printed arguments, the script and the time left; for a batch, each call's
+  arguments under `<n> of <total>: server.tool`, with "Approve all <total>" and "Deny all <total>". Buttons: Approve once;
   "Approve this session for 15 / 60 min" (only for `session` tools; every MCP call has a session) and, for a
   call that did not pass a valid session from a named, direct local client, also "Approve <client title or name>
   for 15 / 60 min" with a line saying the grant covers every running session of that client; a proxied or remote

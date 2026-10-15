@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use super::harness::{
-    DEFAULT_CLIENT, Harness, ORIGIN, Setup, TestResult, approval_id, execute, text_of,
+    DEFAULT_CLIENT, Harness, ORIGIN, Setup, TestResult, approval_id, call, execute, text_of,
 };
 
 /// `add` asks with session grants; `json_text` asks on every call
@@ -440,5 +440,134 @@ async fn proxied_requests_cannot_create_client_grants() -> TestResult {
     assert_eq!(next["status"], "pending", "{next}");
 
     proxied.cancel().await?;
+    harness.stop().await
+}
+
+/// Per-call calls a script starts together reach the owner as one request:
+/// one notification naming them all, one page listing every call's
+/// arguments, and one decision for the set. Awaiting them one by one still
+/// asks for each
+#[tokio::test(flavor = "multi_thread")]
+async fn calls_started_together_are_approved_as_one_batch() -> TestResult {
+    let Some(harness) = Harness::with(Setup {
+        server: "tools.add.policy = \"ask\"\n\
+                 tools.add.grant = \"per_call\"\n\
+                 tools.json_text.policy = \"ask\"\n\
+                 tools.json_text.grant = \"per_call\"",
+        notify: true,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut passkey = harness.enroll_passkey().await?;
+    let approvals = harness.app.approvals();
+
+    // the agent learns from the tool's docs to start such calls together
+    let described = text_of(
+        &call(
+            &harness.client,
+            "describe_tools",
+            json!({ "names": ["fixture_add"] }),
+        )
+        .await?,
+    );
+    assert!(
+        described.contains("Needs the user's approval for every call")
+            && described.contains("asyncio.gather"),
+        "{described}"
+    );
+
+    let together = "import asyncio\n\
+                    first, second, text = await asyncio.gather(\n\
+                        fixture_add(a=1, b=2),\n\
+                        fixture_add(a=30, b=40),\n\
+                        fixture_json_text(),\n\
+                    )\n\
+                    [int(first), int(second), text]";
+
+    let pending = harness.execute_body(together).await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let message = pending["message"].as_str().unwrap_or_default();
+    assert!(message.contains("and 2 other calls together"), "{message}");
+    let sent = harness.notifier.tool_requests();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0]
+            .title
+            .ends_with(" wants fixture.add ×2, fixture.json_text"),
+        "{}",
+        sent[0].title
+    );
+
+    let id = approval_id(&pending)?;
+    let html = harness
+        .http
+        .get(format!("{}/approve/{id}", harness.base()))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(html.contains("Approve all 3"), "{html}");
+    assert!(html.contains("Deny all 3"), "{html}");
+    assert!(html.contains("<h3>2 of 3: fixture.add</h3>"), "{html}");
+    assert!(
+        html.contains("<h3>3 of 3: fixture.json_text</h3>"),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<span class="key">&quot;a&quot;</span>: <span class="num">30</span>"#),
+        "{html}"
+    );
+
+    let (status, body) = harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let done = harness.wait_done(&execution_id(&pending)).await?;
+    let done: Value = serde_json::from_str(&text_of(&done))?;
+    assert_eq!(done["result"], json!([3, 70, [1, 2, {"k": "v"}]]), "{done}");
+
+    // denying the batch refuses every call in it
+    let pending = harness.execute_body(together).await?;
+    approvals.decide(&approval_id(&pending)?, Choice::Deny)?;
+    let done = harness.wait_done(&execution_id(&pending)).await?;
+    assert_eq!(done.is_error, Some(true), "{}", text_of(&done));
+    assert!(
+        approvals
+            .pending_for_execution(&execution_id(&pending))
+            .is_none()
+    );
+
+    // a loop of awaits asks for each call on its own
+    let pending = harness
+        .execute_body(
+            "first = int(await fixture_add(a=1, b=2))\n\
+             second = int(await fixture_add(a=3, b=4))\n\
+             [first, second]",
+        )
+        .await?;
+    let first = approval_id(&pending)?;
+    assert_eq!(approvals.batch(&first).len(), 1);
+    approvals.decide(&first, Choice::Once)?;
+    let execution = execution_id(&pending);
+    let mut second = None;
+    for _ in 0..50 {
+        second = approvals
+            .pending_for_execution(&execution)
+            .map(|info| info.id.clone());
+        if second.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let second = second.ok_or("the second call never asked")?;
+    assert_ne!(second, first);
+    approvals.decide(&second, Choice::Once)?;
+    let done = harness.wait_done(&execution).await?;
+    let done: Value = serde_json::from_str(&text_of(&done))?;
+    assert_eq!(done["result"], json!([3, 7]), "{done}");
+
     harness.stop().await
 }
