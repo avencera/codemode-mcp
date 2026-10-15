@@ -23,6 +23,11 @@ pub use wire::{CompanionErrorCode, CompanionFault, CompanionRequest, CompanionRe
 
 use std::time::Duration;
 
+use crate::{
+    config::{MAX_MAC_NAME_CHARS, is_mac_name},
+    prompt,
+};
+
 use iroh::{
     Endpoint,
     endpoint::{Connection, presets},
@@ -87,16 +92,19 @@ async fn bind_endpoint(
 }
 
 /// This host's name up to the first dot, which names the Mac in tickets and
-/// in the companion's own config
+/// in the companion's own config; anything the config would refuse as a
+/// Mac name is replaced, so pairing never fails on an odd host name
 pub fn short_hostname() -> String {
     let full = rustix::system::uname()
         .nodename()
         .to_string_lossy()
         .into_owned();
+    let short = full.split('.').next().unwrap_or_default();
+    let name = prompt::one_line(short, MAX_MAC_NAME_CHARS);
 
-    full.split('.')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("main")
-        .to_owned()
+    if is_mac_name(&name) {
+        name
+    } else {
+        "main".to_owned()
+    }
 }

@@ -517,6 +517,11 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   120 s deadline (a gateway that stops the stream or never gives up loses the prompt), and only after its own Touch ID prompt naming
   the reference and the gateway (its other button says Deny). 1Password's prompt does not name the item and one approval lets `op` read
   anything for about ten minutes, so without these a compromised gateway could read any item
+- The prompt shows the gateway name and reference as the ticket gave them, so config loading refuses names over
+  63 characters, references over 256, and either with line breaks or control, invisible or direction-changing
+  characters; a crafted ticket cannot make the prompt say something else. Host names are cleaned the same way
+  before they go into a ticket or the printed `[[secrets.companions]]` block, which renders the name as a TOML
+  string
 - Identity: each role's Ed25519 key is a generic password in the login keychain (service
   `dev.praveen.codemode-mcp.iroh`, account `gateway` or `companion`), created by the signed binary, so other
   programs get a keychain prompt. Creation is add-only (a duplicate re-reads, never overwrites), so two first

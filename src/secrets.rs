@@ -30,6 +30,8 @@ const MAX_ERROR_TEXT: usize = 2000;
 const REDACTED: &str = "[redacted]";
 /// Shorter secrets would redact ordinary words
 const MIN_SECRET_LEN: usize = 6;
+/// Longest `op://` reference accepted
+const MAX_REFERENCE_CHARS: usize = 256;
 
 /// The daemon's one 1Password reader and the companions it may ask, shared
 /// by upstream connections and OAuth logins so they keep one cache and one
@@ -143,6 +145,14 @@ fn pieces(value: &str) -> Result<Vec<Piece<'_>>, SecretError> {
 /// `op://vault/item/field` or `op://vault/item/section/field`; names may
 /// hold spaces, and `op` itself rejects anything else it cannot find
 pub fn is_reference(text: &str) -> bool {
+    // a companion's Touch ID prompt shows the reference, so it must read as
+    // stored and stay short enough to be seen whole
+    if text.chars().count() > MAX_REFERENCE_CHARS
+        || crate::prompt::one_line(text, usize::MAX) != text
+    {
+        return false;
+    }
+
     text.strip_prefix("op://").is_some_and(|path| {
         let segments: Vec<&str> = path.split('/').collect();
 

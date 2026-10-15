@@ -196,3 +196,30 @@ fn from_keychain(role: Role) -> Result<SecretKey, IdentityError> {
 fn from_keychain(_role: Role) -> Result<SecretKey, IdentityError> {
     Err(IdentityError::NoKeychain)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{IdentityError, Role, load_or_create};
+
+    #[test]
+    fn a_key_file_other_users_can_read_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("codemode-identity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join("companion.key");
+        load_or_create(Role::Companion, Some(&path))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        let loaded = load_or_create(Role::Companion, Some(&path));
+        assert!(
+            matches!(loaded, Err(IdentityError::Permissions(_))),
+            "{loaded:?}"
+        );
+
+        std::fs::remove_dir_all(&directory)?;
+
+        Ok(())
+    }
+}

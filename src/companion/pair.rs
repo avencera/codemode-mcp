@@ -62,9 +62,10 @@ impl Pairing {
     /// line is commented out because it is only needed without discovery
     pub fn gateway_entry(&self) -> String {
         format!(
-            "[[secrets.companions]]\nname = \"{}\"\nid = \"{}\"\n\
+            "[[secrets.companions]]\nname = {}\nid = \"{}\"\n\
              # addrs = [\"<tailnet ip>:7678\"]   # required when discovery = false",
-            self.name, self.id
+            toml::Value::String(self.name.clone()),
+            self.id
         )
     }
 }
@@ -180,4 +181,31 @@ fn absolute_identity(file: Option<&Path>) -> Result<Option<PathBuf>, IdentityErr
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::Pairing;
+    use crate::config::Config;
+
+    #[test]
+    fn the_gateway_entry_keeps_an_odd_host_name_inside_its_string() {
+        let id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let pairing = Pairing {
+            section: String::new(),
+            id,
+            name: "mba\" ] [[secrets.companions]] name = \"x".to_owned(),
+        };
+
+        let config = Config::parse(&pairing.gateway_entry(), Path::new("gateway.toml"));
+        let companions = config.map(|config| config.secrets.companions);
+        let names: Vec<String> = companions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peer| peer.name)
+            .collect();
+        assert_eq!(names, [pairing.name]);
+    }
 }

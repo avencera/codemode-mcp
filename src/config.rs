@@ -308,16 +308,28 @@ impl Default for SecretsConfig {
     }
 }
 
+/// Longest name of a Mac, as `gateway_name` and `secrets.companions` give it
+pub const MAX_MAC_NAME_CHARS: usize = 63;
+
+/// Whether `name` can name a Mac in a Touch ID prompt or an error: short,
+/// and on one line without control, invisible or direction-changing
+/// characters, so a pairing ticket cannot make the prompt say something else
+pub fn is_mac_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.chars().count() <= MAX_MAC_NAME_CHARS
+        && crate::prompt::one_line(name, usize::MAX) == name
+}
+
 impl SecretsConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         require_absolute_identity("secrets", self.identity_file.as_deref())?;
 
         let mut names = std::collections::BTreeSet::new();
         for companion in &self.companions {
-            if companion.name.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "secrets.companions names must not be empty".into(),
-                ));
+            if !is_mac_name(&companion.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.companions names must be 1 to {MAX_MAC_NAME_CHARS} characters on one line"
+                )));
             }
             if !names.insert(companion.name.as_str()) {
                 return Err(ConfigError::Invalid(format!(
@@ -382,6 +394,11 @@ impl CompanionConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         require_absolute_identity("companion", self.identity_file.as_deref())?;
 
+        if !is_mac_name(&self.gateway_name) {
+            return Err(ConfigError::Invalid(format!(
+                "companion.gateway_name must be 1 to {MAX_MAC_NAME_CHARS} characters on one line"
+            )));
+        }
         for reference in &self.allow {
             if !crate::secrets::is_reference(reference.trim()) {
                 return Err(ConfigError::Invalid(
@@ -1199,5 +1216,21 @@ mod tests {
         assert!(companion("\"op://Dev/Context7/credential\"").is_ok());
         assert!(companion("\"op://Dev/Context7\"").is_err());
         assert!(companion("\"sk-live-123\"").is_err());
+
+        // names and references from a ticket reach the companion's Touch ID
+        // prompt, so none may pass for the prompt's own wording
+        let named = |name: &str| {
+            parse(&format!(
+                "[companion]\ngateway = \"{id}\"\ngateway_name = \"{name}\""
+            ))
+        };
+        assert!(named("Praveens-Mac-mini").is_ok());
+        assert!(named("main\\napprove to continue").is_err());
+        assert!(named("main\\u202e").is_err());
+        assert!(named("").is_err());
+        assert!(named(&"m".repeat(64)).is_err());
+        assert!(secrets(&[peer("mba\\nok")], "").is_err());
+        assert!(companion("\"op://Dev/Context7\\u202e/credential\"").is_err());
+        assert!(companion(&format!("\"op://Dev/{}/credential\"", "x".repeat(300))).is_err());
     }
 }
