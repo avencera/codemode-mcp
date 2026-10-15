@@ -14,7 +14,7 @@ binary under a shorter name. Times in logs are UTC.
    codemode-mcp config init --print    # or look first
    ```
 
-   It configures 1Password, the OpenAI docs, Exa (OAuth), homebased, Calendar, Reminders and Xcode. Approval notifications use the
+   It configures 1Password, the OpenAI docs, homebased, Calendar, Reminders and Xcode. Approval notifications use the
    `[notify.ntfy]` section of `~/.config/homebased/config.toml` unless you add one here.
 3. Preview, then install the LaunchAgent from the repository root:
 
@@ -142,12 +142,12 @@ client. Until it is approved every tool fails with "This agent isn't approved to
 ## OAuth sign-in
 
 ```sh
-codemode-mcp oauth login exa       # prints the link and opens the browser
-codemode-mcp oauth status          # logged in, expiry, refresh token, scopes, connection state
-codemode-mcp oauth logout exa      # forget the tokens; the server reconnects anonymously
+codemode-mcp oauth login <server>    # prints the link and opens the browser
+codemode-mcp oauth status            # logged in, expiry, refresh token, scopes, connection state
+codemode-mcp oauth logout <server>   # forget the tokens; the server reconnects anonymously
 ```
 
-The browser returns to `http://127.0.0.1:7682/oauth/callback/exa` on the admin listener, so sign in from a
+For a `url` server with `oauth = true`. The browser returns to `http://127.0.0.1:7682/oauth/callback/<server>` on the admin listener, so sign in from a
 browser on this Mac. Tokens refresh automatically. A server that refuses anonymous clients shows
 `needs_login` in `/healthz` and `codemode-mcp tools` until you sign in.
 

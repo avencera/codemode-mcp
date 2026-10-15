@@ -735,7 +735,6 @@ mod tests {
             crate::policy::GrantMode::PerCall
         );
         assert!(onepassword.warm.is_some());
-        assert!(config.servers["exa"].oauth);
         assert!(config.notify.ntfy.is_none());
 
         let homebased = &config.servers["homebased"];

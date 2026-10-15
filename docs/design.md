@@ -44,7 +44,7 @@ rmcp 3.x clients, one long-lived connection per configured server
 |---|---|---|
 | stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter homebased`, `calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
 | HTTP | `openaiDeveloperDocs` | plain Streamable HTTP |
-| HTTP + OAuth | Exa | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
+| HTTP + OAuth | any `url` server with `oauth = true` | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
 
 Upstream calls use `PeerRequestOptions::with_timeout` so a timeout sends
@@ -54,7 +54,7 @@ idempotent. `tools/list_changed` refreshes the catalog
 
 ### Catalog
 
-- Tools are namespaced by server: `exa.web_search`, `onepassword.list_environments`
+- Tools are namespaced by server: `openai_docs.search_openai_docs`, `onepassword.list_environments`
 - Each server becomes a Python host module with a generated `.pyi` stub:
   JSON Schema → `TypedDict` inputs and results, `async def` functions, docstrings from tool descriptions. No
   function returns `Any`: a tool with an output schema returns the generated type, any other returns `JsonValue`
@@ -428,7 +428,7 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 ### OAuth
 
 - A `url` server with `oauth = true` (optional `scopes`, `client_name`) is tried anonymously until someone signs
-  in. A server that answers anonymous `initialize` (Exa does) keeps working; one that answers 401 is reported as
+  in. A server that answers anonymous `initialize` keeps working; one that answers 401 is reported as
   `needs_login` in `/healthz` and `codemode-mcp tools`, its tools leave the catalog, and it is retried every
   30 minutes or at once after a login
 - `codemode-mcp oauth login <server>` calls `POST /admin/oauth/login` on the admin listener, which runs rmcp's
@@ -686,7 +686,7 @@ in-flight work runs only in the daemon, never in a CLI run, so `exec` does not t
   `service uninstall` boots out and removes the plist, keeping state and installed files; `service status` and
   `service restart` (`kickstart -k`). Every one takes `--dry-run`
 - With `worker_path` unset the daemon uses `~/.local/share/codemode-mcp/monty`, then `monty` on `PATH`
-- `codemode-mcp config init` writes a starter config (1Password, OpenAI docs, Exa with OAuth, homebased) to the
+- `codemode-mcp config init` writes a starter config (1Password, OpenAI docs, homebased) to the
   config path and refuses to overwrite; `--print` writes it to stdout
 - HTTPS for the passkey page through `tailscale serve` on a dedicated port (`/` on 443 is already taken)
 - Admin API (`/admin/enroll`, `/admin/passkey/remove`, `/admin/warm`, `/admin/oauth/{login,status,logout}`, and
@@ -763,5 +763,3 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - Whether a sensitive execution could be resumed after a restart without writing its dump to disk (it would need a key held outside the daemon)
 - 1Password session lifetime across app lock
 - OS-user separation for the daemon and its state, which would extend the threat model to same-user code
-- Whether Exa's authorization server accepts the loopback redirect at sign-in (discovery, registration and the
-  authorization URL work; the browser step has not been run)

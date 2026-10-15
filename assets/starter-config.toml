@@ -27,14 +27,25 @@ output_schema = { type = "object", required = ["account_id"], properties = { acc
 [servers.onepassword.tools.list_environments]
 output_schema = { type = "object", required = ["environments"], properties = { environments = { type = "array", items = { type = "object", properties = { id = { type = "string" }, name = { type = "string" } } } } } }
 
+# shapes from the response structs in the 1password-mcp binary; the three
+# tools without one answer with prose, kept as text
+[servers.onepassword.tools.list_variables]
+output_schema = { type = "object", required = ["variableNames"], properties = { variableNames = { type = "array", items = { type = "string" } } } }
+[servers.onepassword.tools.list_local_env_files]
+output_schema = { type = "object", required = ["localEnvFiles"], properties = { localEnvFiles = { type = "array", items = { type = "object", required = ["id", "mountPath", "isEnabled"], properties = { id = { type = "string" }, mountPath = { type = "string" }, isEnabled = { type = "boolean" } } } } } }
+
 [servers.onepassword.tools.create_environment]
 grant = "per_call"
+output_schema = { type = "object", required = ["environmentId"], properties = { environmentId = { type = "string" } } }
 [servers.onepassword.tools.rename_environment]
 grant = "per_call"
+output = "text"
 [servers.onepassword.tools.append_variables]
 grant = "per_call"
+output = "text"
 [servers.onepassword.tools.create_local_env_file]
 grant = "per_call"
+output = "text"
 
 # `codemode-mcp op warm` runs these on the Mac so the 1Password app's own
 # prompts appear there first
@@ -63,19 +74,6 @@ output_schema = { type = "object", required = ["hits", "nbHits", "page"], proper
 
 [servers.openai_docs.tools.list_api_endpoints]
 output_schema = { type = "object", required = ["baseUrls", "paths", "total", "urls"], properties = { baseUrls = { type = "array", items = { type = "string" } }, paths = { type = "array", items = { type = "string" } }, urls = { type = "array", items = { type = "string" } }, total = { type = "integer" } } }
-
-# works anonymously; `codemode-mcp oauth login exa` signs in for higher limits.
-# Search and fetch answer with prose and markdown, not JSON
-[servers.exa]
-url = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,web_fetch_exa"
-oauth = true
-
-[servers.exa.tools.web_search_exa]
-output = "text"
-[servers.exa.tools.web_search_advanced_exa]
-output = "text"
-[servers.exa.tools.web_fetch_exa]
-output = "text"
 
 # homebased through the built-in adapter. Submitting arbitrary commands,
 # cancelling tasks and messaging other sessions ask on the phone, with a
