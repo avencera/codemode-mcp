@@ -9,16 +9,19 @@ use std::{
 };
 
 use rmcp::{
-    ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{
         router::tool::{ToolRoute, ToolRouter},
         tool::ToolCallContext,
         wrapper::{Json, Parameters},
     },
     model::{
-        CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities, ServerConfig, Tool,
+        CallToolResponse, CallToolResult, ContentBlock, ErrorCode, InitializeRequestParams,
+        InitializeResult, ServerCapabilities, ServerConfig, Tool,
     },
-    schemars, tool, tool_handler, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
@@ -364,6 +367,25 @@ impl ServerHandler for Fixture {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("Call fixture_add before anything else.\nThen any tool.")
+    }
+
+    /// Refuses an `initialize` naming a version that has no handshake, as
+    /// Google's Workspace MCP servers do
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        if !request.protocol_version.has_initialize() {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "Method not supported",
+                None,
+            ));
+        }
+
+        context.peer.set_peer_info(request.clone());
+        self.negotiate_initialize(&request)
     }
 }
 
