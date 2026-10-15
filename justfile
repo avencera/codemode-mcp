@@ -14,9 +14,53 @@ build:
 build-release:
     cargo build --release
 
+# commits and pushes the bump because `release github` tags HEAD and needs it on
+# origin, so `just bump minor && just release` works in one go
+
+# Bump the Cargo.toml version, commit it as "Release X.Y.Z" and push. Part: major | minor | patch
+[group('build')]
+[script('bash')]
+bump part:
+    set -euo pipefail
+
+    if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock; then
+        echo "Cargo.toml or Cargo.lock has uncommitted changes; commit or stash them before bump" >&2
+        exit 1
+    fi
+
+    current="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "codemode-mcp") | .version')"
+    IFS=. read -r major minor patch <<< "${current%%[-+]*}"
+
+    case "{{part}}" in
+        major) next="$((major + 1)).0.0" ;;
+        minor) next="$major.$((minor + 1)).0" ;;
+        patch) next="$major.$minor.$((patch + 1))" ;;
+        *)
+            echo "unknown part '{{part}}'; use major, minor or patch" >&2
+            exit 1
+            ;;
+    esac
+
+    # only the first `version` line under [package], not dependency tables
+    awk -v next_version="$next" '
+        /^\[/ { in_package = ($0 == "[package]") }
+        in_package && !done && /^version = / { print "version = \"" next_version "\""; done = 1; next }
+        { print }
+    ' Cargo.toml > Cargo.toml.tmp
+    mv Cargo.toml.tmp Cargo.toml
+
+    # refreshes the root package entry in Cargo.lock without touching dependencies
+    cargo metadata --format-version 1 > /dev/null
+
+    git add Cargo.toml Cargo.lock
+    git commit --quiet -m "Release $next"
+    git push --quiet origin HEAD
+
+    echo "Bumped $current -> $next and pushed"
+
 # github tags the Cargo.toml version and pushes it to run the Release workflow
-# (bump `version` and commit first); local builds, then `service install` signs
-# and loads the binary and the Monty worker
+# (run `just bump` first); local builds, then `service install` signs and loads
+# the binary and the Monty worker
 
 # Release via GitHub Actions (default) or install a signed build here. Place: github | gh | public | local
 [group('build')]
