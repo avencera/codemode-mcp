@@ -129,7 +129,7 @@ impl App {
         let store = Store::open(&state_dir)?;
         let log = UsageLog::start(&state_dir, config.log_retention(), config.session_idle())?;
         let sealer = Sealer::load_or_create(&state_dir).map_err(ExecutorError::from)?;
-        let passkeys = Arc::new(Passkeys::new(&config.public_origin, store.clone())?);
+        let passkeys = Arc::new(Passkeys::new(&config.public_origin(), store.clone())?);
         let session_store = store.clone();
         let oauth = OAuth::new(&config, store.clone());
         let on_mac = mac.filter(|_| config.notify.mac.enabled).map(|mac| OnMac {
@@ -137,7 +137,7 @@ impl App {
             config: config.notify.mac.clone(),
         });
         let approvals = Approvals::new(
-            config.public_base(),
+            &config.public_base(),
             config.approvals.timeout(),
             notifier,
             on_mac,

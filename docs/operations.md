@@ -42,7 +42,10 @@ binary under a shorter name. Times in logs are UTC.
 
 4. Check it: `codemode-mcp service status` (plist, launchd state, `/healthz`).
 5. Expose the approval pages to the phone: `tailscale serve --bg --https=8443 http://127.0.0.1:7681`.
-   `public_origin` (default `https://mac.tailnet-name.ts.net:8443`) must match.
+   Set `public_origin` in the config to that address, such as `https://mac.tailnet-name.ts.net:8443`
+   (`tailscale status --json | jq -r .Self.DNSName` prints the name). Unset, links point at
+   `http://localhost:7681` and open only on the Mac. Its host is the passkeys' relying party id, so changing it
+   later means enrolling them again.
 
 ## Releases
 

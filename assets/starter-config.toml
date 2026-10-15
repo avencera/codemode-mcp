@@ -7,6 +7,12 @@
 # shows a Touch ID prompt there first and reaches the phone only if it is
 # still waiting a minute later; [notify.mac] tunes or turns this off
 
+# Where the phone reaches the approval pages, usually a `tailscale serve`
+# address (`tailscale status --json | jq -r .Self.DNSName` prints the name).
+# Unset, links point at http://localhost:7681 and open only on this Mac. Its
+# host is the passkeys' relying party id, so changing it orphans them
+# public_origin = "https://mac.tailnet-name.ts.net:8443"
+
 # 1Password Environments: every call needs approval, with Touch ID at the Mac
 # or a passkey on the phone. Read tools accept a 15 or 60 minute session
 # grant; writes ask on every call

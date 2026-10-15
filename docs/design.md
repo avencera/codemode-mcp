@@ -141,7 +141,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   server-side ceremony (random id, 5 min TTL, stored in the database and bound to the approval id and the choice, never sent to the browser), then `POST /approve/{id}/confirm`
   verifies the assertion and applies that choice. Deny (`POST /approve/{id}/deny`) needs no passkey. All POSTs
   take JSON bodies, which keeps cross-site form posts out. `assets/webauthn.js` is the only script (no build step)
-- The relying party id is the host of `public_origin` (default `https://mac.tailnet-name.ts.net:8443`); `Passkey`
+- The relying party id is the host of `public_origin` (when unset, `http://localhost:<listen port>`); `Passkey`
   JSON is stored in SQLite and its counter updated after each assertion
 - Pending requests are denied automatically after `approvals.timeout_secs` (600). Deny and expiry raise
   `PermissionError` at the call site; the agent directions tell scripts to catch it as `except OSError`, because

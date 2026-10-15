@@ -567,6 +567,12 @@ async fn serve_command(config: Config) -> Result<()> {
     // running ones
     let _lock = store::DaemonLock::acquire(&config.state_dir()?)?;
     warn_on_short_exit_timeout(&config);
+    if config.public_origin.is_none() {
+        tracing::warn!(
+            origin = %config.public_origin(),
+            "public_origin is unset, so approval and enrollment links only open on this machine"
+        );
+    }
 
     // a taken port fails here, before any state is settled
     let listeners = Listeners::bind(&config)

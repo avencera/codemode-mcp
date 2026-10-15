@@ -142,7 +142,7 @@ pub fn router(app: &App) -> Router {
         passkeys: Arc::clone(app.passkeys()),
         approvals: Arc::clone(app.approvals()),
         gateway: Arc::clone(app.gateway()),
-        public_base: app.config().public_base().to_owned(),
+        public_base: app.config().public_base(),
     };
 
     Router::new()

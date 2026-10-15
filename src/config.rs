@@ -14,9 +14,6 @@ use crate::{
     stubs::is_brand_name,
 };
 
-/// Origin the approval and enrollment pages are reached through; its host is
-/// the WebAuthn relying party id
-const DEFAULT_PUBLIC_ORIGIN: &str = "https://mac.tailnet-name.ts.net:8443";
 /// ntfy server used when a notify section names none
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 
@@ -76,9 +73,11 @@ pub struct Config {
     /// `$XDG_STATE_HOME/codemode-mcp` or `~/.local/state/codemode-mcp`
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
-    /// HTTPS origin phones use to reach the approval pages
-    #[serde(default = "default_public_origin")]
-    pub public_origin: String,
+    /// HTTPS origin phones use to reach the approval and enrollment pages,
+    /// such as the `tailscale serve` address; its host is the WebAuthn
+    /// relying party id. Unset, the pages are only reachable on this machine
+    #[serde(default)]
+    pub public_origin: Option<String>,
     /// Days of usage records kept before they are purged
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u64,
@@ -108,7 +107,7 @@ impl Default for Config {
             tool_timeout_secs: default_tool_timeout_secs(),
             admin_listen: default_admin_listen(),
             state_dir: None,
-            public_origin: default_public_origin(),
+            public_origin: None,
             log_retention_days: default_log_retention_days(),
             session_idle_hours: default_session_idle_hours(),
             approvals: ApprovalsConfig::default(),
@@ -166,9 +165,19 @@ impl Config {
         Ok(PathBuf::from(home).join(".local/state/codemode-mcp"))
     }
 
-    /// Public origin without a trailing slash, for building page links
-    pub fn public_base(&self) -> &str {
-        self.public_origin.trim_end_matches('/')
+    /// Origin of the approval and enrollment pages: `public_origin`, else
+    /// `http://localhost:<listen port>`, which WebAuthn accepts without TLS
+    pub fn public_origin(&self) -> String {
+        match &self.public_origin {
+            Some(origin) => origin.clone(),
+            None => format!("http://localhost:{}", self.listen.port()),
+        }
+    }
+
+    /// [`Config::public_origin`] without a trailing slash, for building page
+    /// links
+    pub fn public_base(&self) -> String {
+        self.public_origin().trim_end_matches('/').to_owned()
     }
 
     /// How long usage records are kept
@@ -192,8 +201,8 @@ impl Config {
                 "admin_listen must be a loopback address".into(),
             ));
         }
-        if !(self.public_origin.starts_with("https://")
-            || self.public_origin.starts_with("http://"))
+        if let Some(origin) = &self.public_origin
+            && !(origin.starts_with("https://") || origin.starts_with("http://"))
         {
             return Err(ConfigError::Invalid(
                 "public_origin must be an http(s) origin".into(),
@@ -249,10 +258,6 @@ fn default_tool_timeout_secs() -> u64 {
 
 fn default_admin_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 7682))
-}
-
-fn default_public_origin() -> String {
-    DEFAULT_PUBLIC_ORIGIN.to_owned()
 }
 
 fn default_log_retention_days() -> u64 {

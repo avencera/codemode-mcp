@@ -410,11 +410,7 @@ async fn unexpected_host_headers_are_forbidden() -> TestResult {
 
     assert!(status_for("evil.example.com").await?.contains("403"));
     assert!(status_for("100.64.1.2:7681").await?.contains("200"));
-    assert!(
-        status_for("mac.tailnet-name.ts.net")
-            .await?
-            .contains("200")
-    );
+    assert!(status_for("mac.tailnet-name.ts.net").await?.contains("200"));
 
     harness.stop().await
 }
