@@ -1,7 +1,7 @@
 //! Reading references through a companion Mac: a real iroh companion in this
 //! process, a fake `op` on each side, and a `FakeMac` for each Mac
 
-use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
+use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
 use codemode_mcp::{
     companion::{self, CompanionHandle, Paired, Role, Ticket},
@@ -44,6 +44,8 @@ struct Options<'a> {
     present: bool,
     /// `notify.mac.enabled` on the gateway
     mac_notifications: bool,
+    /// Whether the gateway's own `op` hangs instead of answering
+    local_hangs: bool,
 }
 
 impl Default for Options<'_> {
@@ -54,6 +56,7 @@ impl Default for Options<'_> {
             touch: Some(TouchId::Approved),
             present: false,
             mac_notifications: true,
+            local_hangs: false,
         }
     }
 }
@@ -66,6 +69,7 @@ impl Rig {
             touch,
             present,
             mac_notifications,
+            local_hangs,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -108,7 +112,11 @@ impl Rig {
             .find(|address| address.is_ipv4())
             .ok_or("the companion bound no IPv4 socket")?;
 
-        let (local_op, local_log) = fake_op()?;
+        let (local_op, local_log) = if local_hangs {
+            hanging_op()?
+        } else {
+            fake_op()?
+        };
         let gateway_mac = Arc::new(FakeMac::default());
         gateway_mac.set_present(present);
         let extra = format!(
@@ -169,6 +177,28 @@ impl Rig {
 
         self.harness.stop().await
     }
+}
+
+/// An `op` that logs the read and its pid beside the log, then never answers
+fn hanging_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let directory = temp_state_dir();
+    std::fs::create_dir_all(&directory)?;
+    let log = directory.join("reads.log");
+    let program = directory.join("op");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n\
+             echo $$ > '{pid}'\n\
+             echo \"$3\" >> '{log}'\n\
+             exec sleep 60\n",
+            pid = directory.join("pid").display(),
+            log = log.display(),
+        ),
+    )?;
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+
+    Ok((program, log))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -404,6 +434,50 @@ async fn an_owner_at_the_gateway_still_gets_the_value() -> TestResult {
         .await?;
     assert_eq!(body["result"], VALUE, "{body}");
     assert_eq!(reads(&rig.local_log, REFERENCE), 1);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_companion_wins_while_the_gateway_looks_in_use() -> TestResult {
+    // remote desktop input makes the gateway look in use while nobody can
+    // answer its 1Password prompt, so its `op` hangs
+    let Some(rig) = Rig::start(Options {
+        present: true,
+        local_hangs: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let body = rig
+        .harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], VALUE, "{body}");
+    assert_eq!(
+        reads(&rig.local_log, REFERENCE),
+        1,
+        "the local read started"
+    );
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 1);
+
+    // the losing `op` is killed, not left waiting on the screen
+    let pid = std::fs::read_to_string(rig.local_log.with_file_name("pid"))?;
+    let mut alive = true;
+    for _ in 0..40 {
+        alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()?
+            .success();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!alive, "the local op {} still runs", pid.trim());
 
     rig.stop().await
 }

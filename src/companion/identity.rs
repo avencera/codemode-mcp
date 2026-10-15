@@ -101,6 +101,13 @@ fn from_file(path: &Path) -> Result<SecretKey, IdentityError> {
         source,
     };
 
+    // an existing key is only read, so its directory need not be writable
+    match std::fs::metadata(path) {
+        Ok(_) => return read_file(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(file_error(error)),
+    }
+
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -138,24 +145,31 @@ fn from_file(path: &Path) -> Result<SecretKey, IdentityError> {
 
     match linked {
         Ok(()) => Ok(key),
-        // another run created it first, or it was there already
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let mode = std::fs::metadata(path)
-                .map_err(file_error)?
-                .permissions()
-                .mode();
-            if mode & 0o077 != 0 {
-                return Err(IdentityError::Permissions(path.to_owned()));
-            }
-
-            decode(&std::fs::read_to_string(path).map_err(file_error)?).map_err(|error| match error
-            {
-                IdentityError::Malformed => IdentityError::MalformedFile(path.to_owned()),
-                other => other,
-            })
-        }
+        // another run created it first
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => read_file(path),
         Err(error) => Err(file_error(error)),
     }
+}
+
+/// The key in an existing file, refused when other users can read it
+fn read_file(path: &Path) -> Result<SecretKey, IdentityError> {
+    let file_error = |source| IdentityError::File {
+        path: path.to_owned(),
+        source,
+    };
+
+    let mode = std::fs::metadata(path)
+        .map_err(file_error)?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(IdentityError::Permissions(path.to_owned()));
+    }
+
+    decode(&std::fs::read_to_string(path).map_err(file_error)?).map_err(|error| match error {
+        IdentityError::Malformed => IdentityError::MalformedFile(path.to_owned()),
+        other => other,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -204,7 +218,7 @@ mod tests {
     use super::{IdentityError, Role, load_or_create};
 
     #[test]
-    fn a_key_file_other_users_can_read_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    fn an_existing_key_file_is_read_only_when_private() -> Result<(), Box<dyn std::error::Error>> {
         let directory =
             std::env::temp_dir().join(format!("codemode-identity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory)?;
@@ -217,6 +231,14 @@ mod tests {
             matches!(loaded, Err(IdentityError::Permissions(_))),
             "{loaded:?}"
         );
+
+        // an existing key loads from a directory this process cannot write
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let created = load_or_create(Role::Companion, Some(&path))?;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))?;
+        let loaded = load_or_create(Role::Companion, Some(&path));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        assert_eq!(loaded?.public(), created.public());
 
         std::fs::remove_dir_all(&directory)?;
 
