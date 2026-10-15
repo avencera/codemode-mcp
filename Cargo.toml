@@ -1,6 +1,6 @@
 [package]
 name = "codemode-mcp"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -75,6 +75,7 @@ webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialis
 # pull in AppKit, MapKit and CoreLocation bindings nothing here uses
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
+libc = "0.2.190"
 objc2 = "0.6.5"
 objc2-event-kit = { version = "0.3.2", default-features = false, features = [
     "std",
