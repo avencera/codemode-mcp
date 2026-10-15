@@ -68,7 +68,14 @@ idempotent. `tools/list_changed` refreshes the catalog
 - Type checking with the bundled `ty` against the generated stubs; type errors are returned to the agent as-is
 - Limits per execution: memory, wall-clock budget excluding time spent waiting for approval, max suspensions
 - Tool calls inside a script run concurrently through `asyncio.gather`
-- Scripts that use `Any`, `cast` or a `# type: ignore` / `# ty: ignore` comment are refused before `ty` runs (see Type strictness)
+- Scripts that use `Any`, `cast`, `json.loads` or a `# type: ignore` / `# ty: ignore` comment are refused before `ty` runs (see Type strictness)
+- Every session is fed the JSON accessors (`src/json_access.rs`) as its own snippet, type check skipped, before the
+  script, so the script's line numbers stay its own. They are Python rather than host functions: a host call is a
+  suspension and a worker round trip, and a loop over a few hundred rows would spend `max_suspensions` (1000). No
+  tool may take an accessor's name; one that would is renamed like any other collision
+- `from typing import JsonValue` is blanked before the check (`src/script_fixes.rs`): the name is predefined, and the
+  import otherwise failed both the checker and the sandbox. Blanking keeps lines, columns and continuation
+  backslashes, a statement left empty becomes `pass`, and approval pages and the log keep the agent's own text
 - A tool result is validated against the tool's effective output schema before the script sees it; a mismatch
   raises `RuntimeError` naming the tool, the JSON path and the expected and actual type, and the upstream call is
   logged as `output_mismatch`
@@ -266,12 +273,22 @@ return type is `Any`.
   unknown type accept `object`, results of unknown type are `JsonValue`; the header has no `Any`. The
   `**kwargs` fallback for parameter names that are not identifiers is `**kwargs: Unpack[<TypedDict>]` using the
   functional `TypedDict` syntax, which ty accepts
+- JSON accessors. `isinstance(r, dict)` on the covariant alias narrows to an intersection with `Unknown` in it
+  (`(Sequence[JsonValue] & dict[Unknown, Unknown]) | dict[str, …]`), which reads badly in a diagnostic and stops
+  checking what it touches; the invariant `list`/`dict` alias narrows cleanly but brings back the helper return
+  error above. So scripts read a `JsonValue` through predefined accessors instead: `json_str`, `json_int`,
+  `json_float` (an int is converted), `json_bool`, `json_list` (`list[JsonValue]`), `json_dict`
+  (`dict[str, JsonValue]`), each `(value: object, path: str = "$")`, raising `TypeError`, `KeyError` or `IndexError`
+  as `at $.hits[0]: expected str, got int`; `json_get` returns `None` for a missing step; `json_parse(text)` is the
+  typed `json.loads`. A path is `$` and `.key`, `[index]` or `["odd key"]` steps; the leading `$` is optional.
+  `describe_tools` documents them whenever a described tool uses `JsonValue`. They are for third-party data only:
+  a tool we write, and every other interface we control, declares its full shape instead
 - Per-tool overrides (`[servers.<s>.tools.<t>]`): `output_schema` is an inline TOML table holding a JSON Schema;
   `output = "text"` returns the joined text as `str`, never parsed. Precedence: `output = "text"` wins over any
   upstream schema; an upstream-declared schema wins over `output_schema`, so a schema written for a server that
   later documents its own stops applying without an edit; `force_output_schema = true` makes the configured schema
   win. `output` and `output_schema` cannot be combined. The starter config types the OpenAI docs search, list and
-  endpoint tools and marks Exa and `fetch_openai_doc` as text
+  endpoint tools and marks `fetch_openai_doc` as text
 - Server-level helpers (`[servers.<s>]`): `arguments` is a table the gateway passes to every tool that declares
   one of its keys, and those parameters are dropped from the stubs, so a script cannot guess them (1Password's
   `accountId`). `setup` lists calls made once per connection, lazily, before the first other call on it, inside
@@ -297,10 +314,11 @@ return type is `Any`.
   keywords such as `pattern`, `minimum` and `format` pass. A text result for a `str` tool always passes. Sensitive
   servers log only the expected type of a mismatch: the path can hold keys from the data
 - Bans before `ty` runs (`src/bans.rs`, `ruff_python_parser` pinned to the version Monty uses): a use of `Any` or
-  `cast` imported under any alias, `<typing alias>.Any` and `<typing alias>.cast`, and `# type: ignore` /
-  `# ty: ignore` comment tokens (text inside a string is not a comment). An unused import is allowed: it switches
-  nothing off, and the first smoke run showed agents add one out of habit, which cost a retry for no gain. They come back as a `type_error` with rule ids
-  `ban:any`, `ban:cast`, `ban:type-ignore` and a one-line hint
+  `cast` imported under any alias, `<typing alias>.Any` and `<typing alias>.cast`, `json.loads` reached the same
+  ways (it returns `Any`; `json_parse` is the typed replacement), and `# type: ignore` / `# ty: ignore` comment
+  tokens (text inside a string is not a comment). An unused import is allowed: it switches nothing off, and the
+  first smoke run showed agents add one out of habit, which cost a retry for no gain. They come back as a
+  `type_error` with rule ids `ban:any`, `ban:cast`, `ban:json-loads`, `ban:type-ignore` and a one-line hint
 
 **Deliberately skipped.** A second checker (mypy, basedpyright), required annotations on `def`s, and bans on bare
 `list` or `dict`. They cost agents turns, and the review below says whether they would pay off.
@@ -314,7 +332,8 @@ return type is `Any`.
   a message naming a tool result); probe executes (a script that is, ignoring imports, one awaited tool call or a
   gather of bare tool calls returned as is, optionally through a variable); calls to tools still returning
   `JsonValue`, ranked, which are the next schemas to write (`upstream_calls.output` records `schema`, `text` or
-  `untyped` per call); scripts using `json.loads`
+  `untyped` per call); scripts parsing JSON text (`json_parse`, or `json.loads` before it was refused). An accessor's
+  `TypeError` or `KeyError` counts as a runtime error typing should have caught: a schema for the tool would have caught it at the call
 - One verdict line from named constants in `src/usage/report/strictness.rs`:
 
 | Constant | Value | Meaning |
@@ -326,7 +345,7 @@ return type is `Any`.
 | `MISMATCH_LIMIT` | 3 | `output_mismatch` calls of one tool that mark its schema wrong |
 | `PROBE_LIMIT` | 5 | probe executes from which typing looks too loose |
 | `RUNTIME_ERROR_LIMIT` | 5 | typed-catchable runtime errors from which typing looks too loose |
-| `JSON_LOADS_LIMIT` | 5 | `json.loads` scripts from which typing looks too loose |
+| `JSON_TEXT_LIMIT` | 5 | scripts parsing JSON text from which typing looks too loose |
 
 The verdict is `Looks too strict`, `Looks too loose`, `Mixed` or `Looks balanced`, summed over clients.
 

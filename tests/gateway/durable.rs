@@ -29,7 +29,8 @@ use super::harness::{
 /// `add` asks and the server is not sensitive, so a parked script waiting on
 /// it is stored and can resume
 const PLAIN_ASK: &str = "sensitive = false\ntools.add.policy = \"ask\"";
-const ADD: &str = "int(await fixture_add(a=1, b=2))";
+// the accessor runs after the restore, so the prelude must survive the dump
+const ADD: &str = "int(json_str(await fixture_add(a=1, b=2)))";
 
 async fn harness_with(
     server: &str,

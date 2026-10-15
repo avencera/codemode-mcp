@@ -35,6 +35,7 @@ use crate::{
     convert::{ConvertLimits, monty_to_argument, monty_to_json},
     durable::Sensitivity,
     gateway::{CallContext, Gateway, Plan, PreparedCall, ToolCallError},
+    json_access, script_fixes,
     snapshot::{Sealed, Sealer},
     store::Store,
     usage::{Caller, Classification, Outcome},
@@ -587,6 +588,8 @@ impl Executor {
         };
 
         let inputs = tool_inputs(&catalog);
+        // the agent's own text stays what approval pages and the log show
+        let fed = script_fixes::apply(&code).into_owned();
         let mut driver = Driver {
             executor: self,
             gateway: Arc::clone(gateway),
@@ -613,7 +616,7 @@ impl Executor {
             resumed: false,
         };
         let finished = tokio::select! {
-            result = driver.run(code, inputs) => Some(result),
+            result = driver.run(fed, inputs) => Some(result),
             () = budget.expired() => None,
         };
 
@@ -915,6 +918,23 @@ impl Driver<'_> {
     ) -> Result<MontyObject, PoolError> {
         let sink = self.output.clone();
         let mut print = on_print_sync(move |_, text| sink.push(text));
+
+        // its own feed, so the script's line numbers stay its own
+        let prelude = self
+            .session()?
+            .feed(
+                json_access::PRELUDE,
+                Vec::<(String, MontyObject)>::new(),
+                vec![],
+                true,
+                &mut print,
+            )
+            .await?;
+        if !matches!(prelude, TurnEvent::Complete(_)) {
+            return Err(PoolError::Protocol(
+                "the JSON accessor prelude suspended".into(),
+            ));
+        }
 
         let event = self
             .session()?

@@ -3,11 +3,12 @@
 //! Tool results and parameters are typed so a script's mistakes surface
 //! before it runs. `Any`, `cast` and `# type: ignore` each switch that off
 //! for a value, and an agent that is cornered by a type error reaches for
-//! them first, so they are refused before the checker runs. The script is
+//! them first, so they are refused before the checker runs. `json.loads` is
+//! refused too: it returns `Any`, and `json_parse` does the same job typed. The script is
 //! read with the parser Monty uses, which tells real comments from text in
 //! strings and sees through import aliases.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ruff_python_ast::{
     Expr, ExprContext, Stmt,
@@ -25,8 +26,39 @@ use ruff_text_size::{Ranged, TextRange};
 /// committed as a deep script touches them
 const PARSER_STACK_BYTES: usize = 256 * 1024 * 1024;
 
-/// Modules that export `Any` and `cast`
-const TYPING_MODULES: [&str; 2] = ["typing", "typing_extensions"];
+/// A module whose members include a banned one
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Module {
+    /// `typing` or `typing_extensions`, which export `Any` and `cast`
+    Typing,
+    /// `json`, whose `loads` returns `Any`
+    Json,
+}
+
+impl Module {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "typing" | "typing_extensions" => Some(Self::Typing),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    /// The banned members, which a star import binds under their own names
+    fn banned(self) -> &'static [(&'static str, BanKind)] {
+        match self {
+            Self::Typing => &[("Any", BanKind::Any), ("cast", BanKind::Cast)],
+            Self::Json => &[("loads", BanKind::JsonLoads)],
+        }
+    }
+
+    fn member(self, name: &str) -> Option<BanKind> {
+        self.banned()
+            .iter()
+            .find(|(member, _)| *member == name)
+            .map(|(_, kind)| *kind)
+    }
+}
 
 /// Which escape hatch a script used
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +69,8 @@ pub enum BanKind {
     Cast,
     /// A `# type: ignore` or `# ty: ignore` comment
     TypeIgnore,
+    /// A use of `json.loads`, imported or reached through a `json` alias
+    JsonLoads,
 }
 
 impl BanKind {
@@ -46,6 +80,7 @@ impl BanKind {
             Self::Any => "ban:any",
             Self::Cast => "ban:cast",
             Self::TypeIgnore => "ban:type-ignore",
+            Self::JsonLoads => "ban:json-loads",
         }
     }
 
@@ -55,6 +90,9 @@ impl BanKind {
             Self::Any => "`Any` is not allowed in scripts",
             Self::Cast => "`cast` is not allowed in scripts",
             Self::TypeIgnore => "`type: ignore` comments are not allowed in scripts",
+            Self::JsonLoads => {
+                "`json.loads` returns an untyped value and is not allowed in scripts"
+            }
         }
     }
 }
@@ -194,22 +232,14 @@ fn suppresses_types(comment: &str) -> bool {
     })
 }
 
-fn banned_name(name: &str) -> Option<BanKind> {
-    match name {
-        "Any" => Some(BanKind::Any),
-        "cast" => Some(BanKind::Cast),
-        _ => None,
-    }
-}
-
-/// First pass: the names `Any` and `cast` are bound to, and the names
-/// `typing` is imported under
+/// First pass: the names banned members are bound to, and the names their
+/// modules are imported under
 ///
 /// Only bindings are collected: an import nobody uses switches nothing off,
 /// and refusing it would cost the agent a retry for no gain
 #[derive(Default)]
 struct Imports {
-    modules: HashSet<String>,
+    modules: HashMap<String, Module>,
     names: HashMap<String, BanKind>,
 }
 
@@ -226,25 +256,26 @@ impl<'a> Visitor<'a> for Imports {
         match stmt {
             Stmt::Import(import) => {
                 for alias in &import.names {
-                    if TYPING_MODULES.contains(&alias.name.as_str()) {
+                    if let Some(module) = Module::named(alias.name.as_str()) {
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name);
-                        self.modules.insert(bound.as_str().to_owned());
+                        self.modules.insert(bound.as_str().to_owned(), module);
                     }
                 }
             }
-            Stmt::ImportFrom(import)
-                if import.level == 0
-                    && import
-                        .module
-                        .as_ref()
-                        .is_some_and(|module| TYPING_MODULES.contains(&module.as_str())) =>
-            {
+            Stmt::ImportFrom(import) if import.level == 0 => {
+                let Some(module) = import
+                    .module
+                    .as_ref()
+                    .and_then(|module| Module::named(module.as_str()))
+                else {
+                    return walk_stmt(self, stmt);
+                };
                 for alias in &import.names {
-                    // a star import binds both under their own names
                     if alias.name.as_str() == "*" {
-                        self.names.insert("Any".to_owned(), BanKind::Any);
-                        self.names.insert("cast".to_owned(), BanKind::Cast);
-                    } else if let Some(kind) = banned_name(alias.name.as_str()) {
+                        for (member, kind) in module.banned() {
+                            self.names.insert((*member).to_owned(), *kind);
+                        }
+                    } else if let Some(kind) = module.member(alias.name.as_str()) {
                         let bound = alias.asname.as_ref().unwrap_or(&alias.name);
                         self.names.insert(bound.as_str().to_owned(), kind);
                     }
@@ -256,10 +287,10 @@ impl<'a> Visitor<'a> for Imports {
     }
 }
 
-/// Second pass: uses of those bindings, and `<typing alias>.Any` or
-/// `<typing alias>.cast`
+/// Second pass: uses of those bindings, and banned members reached through
+/// a module alias, such as `<typing alias>.Any`
 struct Uses {
-    modules: HashSet<String>,
+    modules: HashMap<String, Module>,
     names: HashMap<String, BanKind>,
     found: Vec<(BanKind, TextRange)>,
 }
@@ -282,8 +313,8 @@ impl<'a> Visitor<'a> for Uses {
             }
             Expr::Attribute(attribute) => {
                 if let Expr::Name(name) = attribute.value.as_ref()
-                    && self.modules.contains(name.id.as_str())
-                    && let Some(kind) = banned_name(attribute.attr.as_str())
+                    && let Some(module) = self.modules.get(name.id.as_str())
+                    && let Some(kind) = module.member(attribute.attr.as_str())
                 {
                     self.found.push((kind, attribute.range()));
                 }

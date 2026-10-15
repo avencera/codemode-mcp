@@ -1,5 +1,5 @@
 //! Typed tool results: stubs without `Any`, narrowing of untyped results,
-//! output overrides, the runtime schema check, the escape-hatch bans, the
+//! the JSON accessors, output overrides, the runtime schema check, the escape-hatch bans, the
 //! homebased adapter's declared outputs and the strictness review
 
 use std::{error::Error, time::Duration};
@@ -67,6 +67,11 @@ async fn stubs_are_typed_or_json_value_and_never_any() -> TestResult {
     );
     assert!(!mentions_any(&untyped), "{untyped}");
     assert!(!mentions_any(&typed), "{typed}");
+    assert!(
+        untyped.contains("def json_str(value: object, path: str = \"$\") -> str"),
+        "a JsonValue result comes with the accessors that read it:\n{untyped}"
+    );
+    assert!(!typed.contains("def json_str("), "{typed}");
 
     harness.stop().await
 }
@@ -99,6 +104,91 @@ async fn json_value_results_narrow_with_isinstance() -> TestResult {
     .await?;
     assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
     assert!(text_of(&result).contains("error["), "{}", text_of(&result));
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn json_value_results_read_with_path_accessors() -> TestResult {
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+
+    // the habitual import is taken out instead of costing a retry
+    let body = harness
+        .execute_json(
+            "from typing import JsonValue, Literal\n\
+             data = await fixture_json_text()\n\
+             rows = json_list(data)\n\
+             first: int = json_int(data, \"$[0]\")\n\
+             key: str = json_str(data, \"[2].k\")\n\
+             missing = json_get(data, \"$[2].nope\")\n\
+             parsed = json_parse('{\"a b\": [1, true]}')\n\
+             open_args = await fixture_open_args(a=\"1\", k=\"v\")\n\
+             mode: Literal[\"x\"] = \"x\"\n\
+             {\"rows\": len(rows), \"first\": first, \"key\": key, \"missing\": missing, \
+             \"number\": json_float(parsed, '$[\"a b\"][0]'), \"flag\": json_bool(parsed, '$[\"a b\"][1]'), \
+             \"k\": json_dict(open_args)[\"k\"], \"mode\": mode}",
+        )
+        .await?;
+    assert_eq!(
+        body["result"],
+        json!({"rows": 3, "first": 1, "key": "v", "missing": null, "number": 1.0, "flag": true, "k": "v", "mode": "x"}),
+        "{body}"
+    );
+
+    // a quoted key may hold the characters that separate steps
+    let body = harness
+        .execute_json("json_int(json_parse('{\"a]b.c\": {\"d\": 4}}'), '$[\"a]b.c\"].d')")
+        .await?;
+    assert_eq!(body["result"], 4, "{body}");
+
+    // a wrong type or a missing step names the path
+    let cases = [
+        ("json_str(data, \"$[0]\")", "at $[0]: expected str, got int"),
+        (
+            "json_int(data, \"$[2].k\")",
+            "at $[2].k: expected int, got str",
+        ),
+        ("json_str(data, \"$[2].nope\")", "at $[2]: no key nope"),
+        (
+            "json_str(data, \"$[7]\")",
+            "at $: no index 7 in a list of 3",
+        ),
+        (
+            "json_dict(data, \"$[0].k\")",
+            "at $[0]: expected dict, got int",
+        ),
+        (
+            "json_bool(data, \"$[0]\")",
+            "at $[0]: expected bool, got int",
+        ),
+    ];
+    for (call, message) in cases {
+        let script = format!("data = await fixture_json_text()\n{call}");
+        let result = execute(&harness.client, &script).await?;
+        let text = text_of(&result);
+        assert_eq!(result.is_error, Some(true), "{call}: {text}");
+        assert!(text.contains(message), "{call}: {text}");
+    }
+
+    // the blanked import keeps the script's lines where they were
+    let result = execute(
+        &harness.client,
+        "from typing import JsonValue\nvalue: int = \"text\"\nvalue",
+    )
+    .await?;
+    let text = text_of(&result);
+    assert_eq!(result.is_error, Some(true), "{text}");
+    assert!(text.contains("script.py:2:"), "{text}");
+
+    // an untyped read is still refused, so the accessors are the way in
+    let result = execute(
+        &harness.client,
+        "data = await fixture_json_text()\nname: str = data[2][\"k\"]\nname",
+    )
+    .await?;
+    assert_eq!(result.is_error, Some(true), "{}", text_of(&result));
 
     harness.stop().await
 }
@@ -362,6 +452,16 @@ async fn escape_hatches_are_rejected_before_the_checker() -> TestResult {
             "ban:type-ignore",
             "type: ignore is not allowed",
         ),
+        (
+            "import json\njson.loads(\"[1]\")",
+            "ban:json-loads",
+            "json_parse(text)",
+        ),
+        (
+            "from json import loads as parse\nparse(\"[1]\")",
+            "ban:json-loads",
+            "json_parse(text)",
+        ),
     ];
     for (script, rule, hint) in cases {
         let result = execute(&harness.client, script).await?;
@@ -387,7 +487,7 @@ async fn escape_hatches_are_rejected_before_the_checker() -> TestResult {
     let connection = store::open(harness.app.state_dir())?;
     let logged: Vec<(String, String)> = connection.query_map("SELECT outcome, COALESCE(fingerprint, '') FROM executions WHERE outcome = 'type_error'", (), |row| Ok((row.get(0)?, row.get(1)?)))?.into_iter().collect();
     assert_eq!(logged.len(), cases.len(), "{logged:?}");
-    for rule in ["ban:any", "ban:cast", "ban:type-ignore"] {
+    for rule in ["ban:any", "ban:cast", "ban:type-ignore", "ban:json-loads"] {
         assert!(
             logged
                 .iter()
@@ -686,7 +786,7 @@ async fn review_counts_strictness_signals_per_client() -> TestResult {
     );
     assert!(strictness.contains("Probe executes: 1"), "{strictness}");
     assert!(
-        strictness.contains("Scripts using `json.loads`: 1"),
+        strictness.contains("Scripts parsing JSON text: 1"),
         "{strictness}"
     );
     assert!(

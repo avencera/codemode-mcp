@@ -17,7 +17,7 @@ use crate::{
 mod strictness;
 
 pub use strictness::{
-    ABANDONED_SHARE_LIMIT, ClientStrictness, JSON_LOADS_LIMIT, MIN_ERROR_RUNS, MIN_RULE_ERRORS,
+    ABANDONED_SHARE_LIMIT, ClientStrictness, JSON_TEXT_LIMIT, MIN_ERROR_RUNS, MIN_RULE_ERRORS,
     MISMATCH_LIMIT, PROBE_LIMIT, RUNTIME_ERROR_LIMIT, RuleStats, Strictness,
     UNRESOLVED_SHARE_LIMIT,
 };

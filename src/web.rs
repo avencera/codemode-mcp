@@ -664,7 +664,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
                 top(&client.mismatches),
                 client.typed_runtime_errors,
                 client.probes,
-                client.json_loads,
+                client.json_text,
                 top(&client.untyped_calls),
             )
         })
@@ -682,7 +682,7 @@ fn stats_html(stats: &Stats, window: Duration) -> String {
 <table><tr><th>Tool</th><th>Mean</th><th>Max</th><th>Calls</th></tr>{slow}</table>
 <h2>Type strictness</h2>
 <p>{verdict}</p>
-<table><tr><th>Client</th><th>Type errors by rule</th><th>Runs abandoned after one / runs with one</th><th>Top output mismatch</th><th>Typed runtime errors</th><th>Probe executes</th><th>json.loads</th><th>Top untyped tool</th></tr>{strictness}</table>
+<table><tr><th>Client</th><th>Type errors by rule</th><th>Runs abandoned after one / runs with one</th><th>Top output mismatch</th><th>Typed runtime errors</th><th>Probe executes</th><th>JSON text parsed</th><th>Top untyped tool</th></tr>{strictness}</table>
 <h2>Approvals</h2>
 <p>{requested} requested, {approved} approved, {denied} denied, {expired} expired; median wait {wait}</p>"#,
         window = escape(&human_duration(window.as_millis() as i64)),

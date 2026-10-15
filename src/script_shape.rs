@@ -2,7 +2,7 @@
 //!
 //! Both answer a "was the typing loose enough to send the agent exploring"
 //! signal: a probe execute exists only to look at a tool's result, and
-//! `json.loads` is how an agent turns text into an untyped value of its own
+//! parsing JSON text means a tool handed back text a schema could have typed
 
 use std::collections::HashSet;
 
@@ -19,7 +19,7 @@ use crate::bans::on_parser_stack;
 /// Imports and blank lines do not count. The body must be a single awaited
 /// tool call, or a gather of bare tool calls, returned as is: either as the
 /// last expression, or assigned and then returned by name. `tools` are the
-/// Python names of the tools, such as `exa_web_search_exa`
+/// Python names of the tools, such as `openai_docs_search_openai_docs`
 pub fn is_probe(source: &str, tools: &HashSet<String>) -> bool {
     on_parser_stack(|| is_probe_here(source, tools)).unwrap_or(false)
 }
@@ -48,12 +48,13 @@ fn is_probe_here(source: &str, tools: &HashSet<String>) -> bool {
     }
 }
 
-/// Whether the script calls `json.loads`, however `json` was imported
-pub fn uses_json_loads(source: &str) -> bool {
-    on_parser_stack(|| uses_json_loads_here(source)).unwrap_or(false)
+/// Whether the script parses JSON text: `json.loads`, however `json` was
+/// imported (refused now, but logged before the ban), or `json_parse`
+pub fn parses_json_text(source: &str) -> bool {
+    on_parser_stack(|| parses_json_text_here(source)).unwrap_or(false)
 }
 
-fn uses_json_loads_here(source: &str) -> bool {
+fn parses_json_text_here(source: &str) -> bool {
     let Ok(parsed) = parse_module(source) else {
         return false;
     };
@@ -155,7 +156,9 @@ impl<'a> Visitor<'a> for JsonLoads {
                             Expr::Name(name) if self.modules.contains(name.id.as_str())
                         )
                 }
-                Expr::Name(name) => self.functions.contains(name.id.as_str()),
+                Expr::Name(name) => {
+                    self.functions.contains(name.id.as_str()) || name.id.as_str() == "json_parse"
+                }
                 _ => false,
             };
         }
@@ -168,14 +171,14 @@ mod tests {
     use super::*;
 
     fn tools() -> HashSet<String> {
-        ["exa_search", "hb_list"].map(str::to_owned).into()
+        ["docs_search", "hb_list"].map(str::to_owned).into()
     }
 
     #[test]
     fn probes_are_a_lone_call_or_a_bare_gather() {
         for script in [
-            "await exa_search(query=\"x\")",
-            "import asyncio\nimport json\nawait asyncio.gather(exa_search(query=\"x\"), hb_list())",
+            "await docs_search(query=\"x\")",
+            "import asyncio\nimport json\nawait asyncio.gather(docs_search(query=\"x\"), hb_list())",
             "r = await hb_list()\nr",
             "a, b = await asyncio.gather(hb_list(), hb_list())\n(a, b)",
         ] {
@@ -194,14 +197,15 @@ mod tests {
     }
 
     #[test]
-    fn json_loads_is_found_under_any_import_form() {
+    fn json_parsing_is_found_under_any_import_form() {
         for script in [
             "import json\njson.loads(x)",
             "import json as j\nj.loads(x)",
             "from json import loads\nloads(x)",
             "from json import loads as parse\nparse(x)",
+            "json_parse(x)",
         ] {
-            assert!(uses_json_loads(script), "{script}");
+            assert!(parses_json_text(script), "{script}");
         }
         for script in [
             "import json\njson.dumps(x)",
@@ -209,7 +213,7 @@ mod tests {
             "# json.loads(y)\n1",
             "loads(x)",
         ] {
-            assert!(!uses_json_loads(script), "{script}");
+            assert!(!parses_json_text(script), "{script}");
         }
     }
 }

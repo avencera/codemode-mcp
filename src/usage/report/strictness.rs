@@ -3,8 +3,8 @@
 //! Strictness exists so agents make fewer mistakes with fewer wasted turns.
 //! Two families of signals say when it misses: type errors that agents do
 //! not get past and schemas that reject real data say the rules are too
-//! strict; runtime errors, probe executes and `json.loads` say they are too
-//! loose. The verdict compares both against the thresholds below, which
+//! strict; runtime errors, probe executes and parsing JSON text say they are
+//! too loose. The verdict compares both against the thresholds below, which
 //! `docs/design.md` explains
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,7 +15,7 @@ use turso::params;
 
 use super::{Attempt, Reporter, TOP_ROWS, cell, inline, percent};
 use crate::{
-    script_shape::{is_probe, uses_json_loads},
+    script_shape::{is_probe, parses_json_text},
     usage::EXEC_CLIENT,
 };
 
@@ -35,8 +35,8 @@ pub const MISMATCH_LIMIT: i64 = 3;
 pub const PROBE_LIMIT: i64 = 5;
 /// Runtime errors typing should have caught, from which typing looks too loose
 pub const RUNTIME_ERROR_LIMIT: i64 = 5;
-/// Scripts using `json.loads`, from which typing looks too loose
-pub const JSON_LOADS_LIMIT: i64 = 5;
+/// Scripts parsing JSON text, from which typing looks too loose
+pub const JSON_TEXT_LIMIT: i64 = 5;
 /// Untyped tools named in the verdict
 const VERDICT_TOOLS: usize = 3;
 
@@ -85,8 +85,8 @@ pub struct ClientStrictness {
     pub typed_runtime_errors: i64,
     /// Executes that only call tools and return the result as is
     pub probes: i64,
-    /// Scripts that call `json.loads`
-    pub json_loads: i64,
+    /// Scripts that parse JSON text with `json.loads` or `json_parse`
+    pub json_text: i64,
     /// Calls to tools that return a `JsonValue`, most frequent first
     pub untyped_calls: Vec<(String, i64)>,
 }
@@ -145,8 +145,8 @@ impl Reporter<'_> {
                 if attempt.outcome == "ok" && is_probe(&attempt.script, &tools) {
                     entry.probes += 1;
                 }
-                if uses_json_loads(&attempt.script) {
-                    entry.json_loads += 1;
+                if parses_json_text(&attempt.script) {
+                    entry.json_text += 1;
                 }
             }
 
@@ -351,8 +351,8 @@ fn verdict(clients: &[ClientStrictness]) -> String {
             "{runtime} runtime errors typing should have caught"
         ));
     }
-    let loads = total(|client| client.json_loads);
-    if loads >= JSON_LOADS_LIMIT {
+    let loads = total(|client| client.json_text);
+    if loads >= JSON_TEXT_LIMIT {
         loose.push(format!("{loads} scripts parse JSON themselves"));
     }
 
@@ -420,10 +420,10 @@ pub(super) fn render_section(out: &mut String, strictness: &Strictness) {
         let _ = writeln!(
             out,
             "- Runtime errors typing should have caught: {}\n- Probe executes: {}\n- \
-             Scripts using `json.loads`: {}\n- Calls to tools still returning `JsonValue`: {}\n",
+             Scripts parsing JSON text: {}\n- Calls to tools still returning `JsonValue`: {}\n",
             client.typed_runtime_errors,
             client.probes,
-            client.json_loads,
+            client.json_text,
             list(&client.untyped_calls),
         );
     }
@@ -439,12 +439,12 @@ pub(super) fn render_text(out: &mut String, strictness: &Strictness) {
         let _ = writeln!(
             out,
             "  {}: {type_errors} type errors, {} runs abandoned after one, {mismatches} output \
-             mismatches; {} typed runtime errors, {} probes, {} json.loads",
+             mismatches; {} typed runtime errors, {} probes, {} JSON text parses",
             client.client,
             client.abandoned_runs,
             client.typed_runtime_errors,
             client.probes,
-            client.json_loads,
+            client.json_text,
         );
     }
 }

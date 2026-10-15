@@ -705,15 +705,19 @@ const TYPE_ERROR_HINTS: &[(&str, &str)] = &[
     ),
     (
         "error[ban:any]",
-        "Any is not allowed: use the tool's declared return type, narrow a `JsonValue` with isinstance, or annotate with `object`",
+        "Any is not allowed: use the tool's declared return type, read a `JsonValue` with json_str(r, \"$.path\") and the other json_* accessors, or annotate with `object`",
     ),
     (
         "error[ban:cast]",
-        "cast is not allowed: narrow with isinstance, or use the tool's declared return type",
+        "cast is not allowed: read a `JsonValue` with json_str(r, \"$.path\") and the other json_* accessors, or use the tool's declared return type",
     ),
     (
         "error[ban:type-ignore]",
-        "type: ignore is not allowed: fix the mismatch, usually by narrowing with isinstance or using the tool's declared return type",
+        "type: ignore is not allowed: fix the mismatch, usually with a json_* accessor such as json_str(r, \"$.path\") or the tool's declared return type",
+    ),
+    (
+        "error[ban:json-loads]",
+        "json.loads is not allowed: json_parse(text) parses JSON text into a JsonValue, which the json_* accessors read",
     ),
 ];
 
