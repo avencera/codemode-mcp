@@ -113,7 +113,12 @@ impl Rig {
             .ok_or("the companion bound no IPv4 socket")?;
 
         let (local_op, local_log) = if local_hangs {
-            hanging_op()?
+            // the companion answers only once the local read has started, so
+            // it cannot win before there is a local `op` to kill
+            let (program, log) = hanging_op()?;
+            companion_mac.set_answer_once(log.with_file_name("pid"));
+
+            (program, log)
         } else {
             fake_op()?
         };
@@ -179,7 +184,8 @@ impl Rig {
     }
 }
 
-/// An `op` that logs the read and its pid beside the log, then never answers
+/// An `op` that logs the read, then its pid beside the log, then never
+/// answers; the pid file appears whole and only after the log line
 fn hanging_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
@@ -189,8 +195,9 @@ fn hanging_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
         &program,
         format!(
             "#!/bin/sh\n\
-             echo $$ > '{pid}'\n\
              echo \"$3\" >> '{log}'\n\
+             echo $$ > '{pid}.tmp'\n\
+             mv '{pid}.tmp' '{pid}'\n\
              exec sleep 60\n",
             pid = directory.join("pid").display(),
             log = log.display(),

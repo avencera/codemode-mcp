@@ -265,6 +265,8 @@ pub struct FakeMac {
     answer: Mutex<Option<TouchId>>,
     /// How long a prompt stays up before it answers
     answer_after: Mutex<Duration>,
+    /// A file that must exist before a prompt answers
+    answer_once: Mutex<Option<PathBuf>>,
     shown: Mutex<Vec<String>>,
     cancel_titles: Mutex<Vec<String>>,
 }
@@ -288,6 +290,14 @@ impl FakeMac {
     pub fn set_answer_after(&self, delay: Duration) {
         if let Ok(mut slot) = self.answer_after.lock() {
             *slot = delay;
+        }
+    }
+
+    /// Hold later prompts until `path` exists, for up to ten seconds, so a
+    /// test can order an answer after something else has started
+    pub fn set_answer_once(&self, path: PathBuf) {
+        if let Ok(mut slot) = self.answer_once.lock() {
+            *slot = Some(path);
         }
     }
 
@@ -342,11 +352,21 @@ impl Mac for FakeMac {
             .lock()
             .map(|delay| *delay)
             .unwrap_or_default();
+        let gate = self.answer_once.lock().ok().and_then(|path| path.clone());
 
         Box::pin(async move {
             let prompt = Prompt(self);
             match answer {
                 Some(answer) => {
+                    if let Some(gate) = gate {
+                        for _ in 0..500 {
+                            if gate.exists() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+
                     tokio::time::sleep(delay).await;
                     std::mem::forget(prompt);
 
