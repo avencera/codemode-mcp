@@ -12,6 +12,8 @@ mod service;
 mod session_less;
 mod sessions;
 mod typed_outputs;
+#[cfg(target_os = "macos")]
+mod update;
 mod usage;
 
 use std::{

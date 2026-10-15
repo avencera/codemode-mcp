@@ -49,11 +49,30 @@ binary under a shorter name. Times in logs are UTC.
 
 ## Releases
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds `aarch64-apple-darwin`, signs it with the
-same identity and identifier, and attaches `codemode-mcp-<tag>-aarch64-apple-darwin.tar.gz` and its checksum.
-It reads the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the
-`MACOS_SIGNING_IDENTITY` variable, the same names homebased uses, and fails rather than ship unsigned. The
-Monty worker is not part of the release.
+Bump `version` in `Cargo.toml`, then push a matching `v*` tag. `.github/workflows/release.yml` builds
+`aarch64-apple-darwin` and installs the `monty-runtime` worker matching the `monty-pool` version in `Cargo.lock`.
+It signs both with the same identity and identifiers as a local install and attaches
+`codemode-mcp-<tag>-aarch64-apple-darwin.tar.gz` (holding `codemode-mcp` and `monty`) and its `.sha256`. It
+reads the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the `MACOS_SIGNING_IDENTITY`
+variable, the same names homebased uses, and fails rather than ship unsigned.
+
+## Update
+
+```sh
+codemode-mcp update --dry-run   # which release would replace what
+codemode-mcp update             # latest release; --tag v0.2.0 for another
+```
+
+This downloads the release archive and checks it against the published checksum. It also requires both
+executables to be signed by team `Q8UP8C53Y8` as `com.avencera.codemode-mcp` and `com.avencera.monty`. Only then
+does it replace `~/.local/bin/codemode-mcp` and `~/.local/share/codemode-mcp/monty`, worker first, and restart the
+service if its LaunchAgent is installed. The release signatures are kept as they are, so updating needs no
+certificate in the keychain and the 1Password and EventKit grants carry over. Nothing happens when the
+installed binary already reports the tag, or reports a newer version than the latest release, as a local build
+can; `--force` reinstalls anyway. To roll back, pass the previous release with `--tag`. `cmd fleet update` runs
+it on the Mac.
+
+The LaunchAgent plist is not rewritten. When a release changes it, run `codemode-mcp service install` once.
 
 ## Enroll a passkey
 

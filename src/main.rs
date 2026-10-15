@@ -22,6 +22,7 @@ use codemode_mcp::{
     server::{Listeners, outcome_text},
     service::{self, Action, ServicePaths},
     store::{self, Store},
+    update::{self, Release, Source},
     usage::{
         Caller, EXEC_CLIENT,
         report::{Reporter, human_duration, parse_since, render_stats},
@@ -98,6 +99,19 @@ enum Command {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// Replace the installed binary and Monty worker with a GitHub release,
+    /// then restart the service if it is installed
+    Update {
+        /// Release tag such as v0.2.0; defaults to the latest release
+        #[arg(long)]
+        tag: Option<String>,
+        /// Reinstall even when the installed binary already reports the tag
+        #[arg(long)]
+        force: bool,
+        /// Print what would be installed without downloading it
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Manage the configuration file
     Config {
@@ -239,6 +253,11 @@ async fn main() -> Result<()> {
         Command::Service { command } => {
             service_command(&load_or_default(&path)?, explicit.as_deref(), command).await
         }
+        Command::Update {
+            tag,
+            force,
+            dry_run,
+        } => update_command(&load_or_default(&path)?, tag, force, dry_run).await,
         Command::Config {
             command: ConfigCommand::Init { print },
         } => config_init_command(&path, print),
@@ -518,6 +537,92 @@ async fn service_status(
     }
 
     Ok(())
+}
+
+async fn update_command(
+    config: &Config,
+    tag: Option<String>,
+    force: bool,
+    dry_run: bool,
+) -> Result<()> {
+    update::check_platform()?;
+    let source = Source::from_env();
+    // a stalled download must not hang `cmd fleet update`
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()?;
+    let requested = tag.is_some();
+    let tag = match tag {
+        Some(tag) => tag,
+        None => source.latest_tag(&client).await?,
+    };
+    let paths = ServicePaths::from_env(&config.state_dir()?)?;
+    let installed = update::installed_tag(&paths.binary);
+
+    // `cmd fleet update` runs this every time, and a restart drains the
+    // running executions, so a current install is left alone; a missing
+    // worker is always replaced
+    if !force && paths.worker.is_file() {
+        if installed.as_deref() == Some(tag.as_str()) {
+            println!("{} is already {tag}", paths.binary.display());
+
+            return Ok(());
+        }
+        // a local build ahead of the latest release is not downgraded
+        let newer = installed
+            .as_deref()
+            .and_then(update::version)
+            .zip(update::version(&tag))
+            .is_some_and(|(installed, latest)| installed > latest);
+        if newer && !requested {
+            println!(
+                "{} is {}, newer than the latest release {tag}; `--tag {tag}` installs it anyway",
+                paths.binary.display(),
+                installed.as_deref().unwrap_or_default(),
+            );
+
+            return Ok(());
+        }
+    }
+    if dry_run {
+        println!(
+            "Dry run; would replace {} ({}) and {} with {tag} from {}",
+            paths.binary.display(),
+            installed.as_deref().unwrap_or("not installed"),
+            paths.worker.display(),
+            source.base_url,
+        );
+
+        return Ok(());
+    }
+
+    let release = Release::fetch(&source, &tag, &client).await?;
+    release.install(&paths)?;
+    println!(
+        "Installed {} to {} and {}",
+        release.tag,
+        paths.binary.display(),
+        paths.worker.display()
+    );
+    if let Some(worker) = &config.worker_path {
+        eprintln!(
+            "note: `worker_path` is set, so the service keeps using {}",
+            expand_home(worker).display()
+        );
+    }
+
+    // the plist is checked first, so a run under another home never asks
+    // launchd about the real service
+    let loaded = paths.plist.is_file()
+        && service::run_command(&service::status_command(service::current_uid()?)).is_ok();
+    if !loaded {
+        println!("The service is not installed; `codemode-mcp service install` starts it.");
+
+        return Ok(());
+    }
+
+    service_command(config, None, ServiceCommand::Restart { dry_run: false }).await
 }
 
 fn config_init_command(path: &std::path::Path, print: bool) -> Result<()> {

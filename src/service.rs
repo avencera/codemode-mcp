@@ -26,6 +26,8 @@ pub const ALIAS: &str = "cmcp";
 /// macOS and the 1Password app key their grants to an ad-hoc binary by its
 /// hash, so every rebuild prompted again; a stable certificate keeps them
 pub const SIGNING_IDENTITY: &str = "Developer ID Application: InfraOps LLC (Q8UP8C53Y8)";
+/// Apple team of [`SIGNING_IDENTITY`], which `update` requires of a release
+pub const TEAM_ID: &str = "Q8UP8C53Y8";
 /// Prefix of each signed binary's identifier, as in `com.avencera.codemode-mcp`
 const SIGNING_PREFIX: &str = "com.avencera.";
 /// Starter configuration; `{{HOME}}` is replaced with the home directory
@@ -297,7 +299,7 @@ fn install_file(from: &Path, to: &Path) -> Result<(), ServiceError> {
 
 /// Identifier `to` is signed under; named after the destination, since the
 /// file codesign sees is a temporary copy
-fn signing_identifier(to: &Path) -> String {
+pub fn signing_identifier(to: &Path) -> String {
     let name = to
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())

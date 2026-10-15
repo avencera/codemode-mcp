@@ -3,8 +3,9 @@
 #   git tag v0.1.0
 #   git push origin v0.1.0
 #
-# Asset name: codemode-mcp-<tag>-<target>.tar.gz. Only Apple silicon is built,
-# since the service is a launchd agent and this Mac is the only host
+# Asset name: codemode-mcp-<tag>-<target>.tar.gz, holding `codemode-mcp` and the
+# Monty worker it pins, both signed, for `codemode-mcp update`. Only Apple
+# silicon is built, since the service is a launchd agent
 
 name: Release
 
@@ -27,7 +28,17 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # `update` compares the tag with what the installed binary reports, so
+      # a tag ahead of Cargo.toml would reinstall and restart on every run
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "codemode-mcp") | .version')"
+          test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      # a draft until the archive is attached: `update` follows
+      # releases/latest, which would otherwise point at a release with no assets
       - uses: taiki-e/create-gh-release-action@v1
+        with:
+          draft: true
 
   upload-assets:
     needs: create-release
@@ -59,6 +70,16 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning "$keychain" | grep -F "\"$IDENTITY\""
+      # the worker speaks the protocol of the monty-pool version in the lock
+      # file, and monty-runtime is released in step with it
+      - name: Build and sign the Monty worker
+        env:
+          IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          version="$(awk '/^name = "monty-pool"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
+          : "${version:?monty-pool is not in Cargo.lock}"
+          cargo install monty-runtime --version "=$version" --locked --root "$RUNNER_TEMP/monty"
+          codesign --force --sign "$IDENTITY" --identifier com.avencera.monty "$RUNNER_TEMP/monty/bin/monty"
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: codemode-mcp
@@ -72,3 +93,15 @@ jobs:
           # what `service install` signs a local build as
           codesign: ${{ vars.MACOS_SIGNING_IDENTITY }}
           codesign-prefix: com.avencera.
+          include: ${{ runner.temp }}/monty/bin/monty
+
+  publish-release:
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

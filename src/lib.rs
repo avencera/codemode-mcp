@@ -32,6 +32,7 @@ pub mod service;
 pub mod snapshot;
 pub mod store;
 pub mod stubs;
+pub mod update;
 pub mod upstream;
 pub mod usage;
 pub mod web;
