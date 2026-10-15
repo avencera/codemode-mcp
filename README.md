@@ -58,7 +58,7 @@ before the script sees them.
 ## Install
 
 ```sh
-curl -LSfs https://github.com/praveenperera/codemode-mcp/releases/latest/download/install.sh | sh
+curl -LSfs https://github.com/avencera/codemode-mcp/releases/latest/download/install.sh | sh
 codemode-mcp config init        # writes ~/.config/codemode-mcp/config.toml
 codemode-mcp service install    # loads the launchd agent
 codemode-mcp service status

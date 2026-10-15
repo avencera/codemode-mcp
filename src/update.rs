@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::service::{self, ServiceError, ServicePaths};
 
 /// GitHub repository that publishes the releases
-pub const REPOSITORY: &str = "praveenperera/codemode-mcp";
+pub const REPOSITORY: &str = "avencera/codemode-mcp";
 /// The only target releases are built for, since the service is a launchd
 /// agent
 const TARGET: &str = "aarch64-apple-darwin";
