@@ -47,6 +47,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # monty 1.1.0 needs a newer std than the runner image's toolchain
+      - name: Update Rust
+        run: rustup update stable --no-self-update && rustup default stable
       # macOS and the 1Password app key their grants to an ad-hoc binary by its
       # hash, so each build re-prompted; a stable certificate lets a grant
       # survive updates. A missing secret fails the release instead of shipping
