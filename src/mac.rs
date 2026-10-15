@@ -52,9 +52,9 @@ pub trait Mac: Send + Sync + 'static {
     /// keyboard or mouse input within `idle`
     fn present(&self, idle: Duration) -> BoxFuture<'_, bool>;
 
-    /// Asks for a fingerprint, showing `reason`; dropping the future takes
-    /// the prompt down
-    fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId>;
+    /// Asks for a fingerprint, showing `reason` and `cancel` as the title of
+    /// the cancel button; dropping the future takes the prompt down
+    fn touch_id<'a>(&'a self, reason: &'a str, cancel: &'a str) -> BoxFuture<'a, TouchId>;
 
     /// Shows `notification` in Notification Center
     fn notify<'a>(

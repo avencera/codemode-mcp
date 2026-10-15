@@ -8,6 +8,7 @@ pub mod approvals;
 pub mod bans;
 pub mod budget;
 pub mod catalog;
+pub mod companion;
 pub mod config;
 pub mod convert;
 pub mod durable;

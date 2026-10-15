@@ -140,7 +140,7 @@ impl App {
             &config.public_base(),
             config.approvals.timeout(),
             notifier,
-            on_mac,
+            on_mac.clone(),
             unavailable,
             store.clone(),
         );
@@ -153,6 +153,7 @@ impl App {
             log.clone(),
             oauth,
             &session_store,
+            on_mac,
         );
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),

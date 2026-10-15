@@ -12,11 +12,14 @@ use clap::{Parser, Subcommand};
 use codemode_mcp::{
     adapters::apple::Entity,
     admin::{
-        EnrollRequest, EnrollResponse, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
-        OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
+        CompanionCheckRequest, CompanionCheckResponse, CompanionCheckResult, EnrollRequest,
+        EnrollResponse, InviteResponse, OAuthLoginResponse, OAuthLogoutResponse,
+        OAuthServerRequest, OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest,
+        WarmResponse,
     },
     app::App,
     catalog::function_prefix,
+    companion::{self, Paired, Ticket},
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
     server::{Listeners, outcome_text},
@@ -113,6 +116,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read 1Password references on another Mac, where the owner is
+    Companion {
+        #[command(subcommand)]
+        command: CompanionCommand,
+    },
     /// Manage the configuration file
     Config {
         #[command(subcommand)]
@@ -170,6 +178,50 @@ enum ServiceCommand {
         /// Print what would be done
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CompanionCommand {
+    /// On the gateway Mac: print a ticket for pairing another Mac; needs the
+    /// daemon running
+    Invite,
+    /// On the companion Mac: add a `[companion]` section from a ticket to the
+    /// config and print the line the gateway needs
+    Pair {
+        /// Ticket from `companion invite`
+        ticket: String,
+        /// Keep this Mac's key in a file (mode 0600) instead of the login
+        /// keychain
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+    },
+    /// On the companion Mac: answer the gateway's reads, in the foreground
+    Serve,
+    /// On the companion Mac: copy the binary, sign it and load a LaunchAgent
+    /// that runs `companion serve`
+    Install {
+        /// Print what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// On the companion Mac: unload and remove the LaunchAgent
+    Uninstall {
+        /// Print what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// On the gateway Mac: ask the companions, and only them, to read a
+    /// reference, and report whether each could; the value is never shown
+    Check {
+        /// An op://vault/item/field reference
+        reference: String,
+    },
+    /// Print this Mac's companion endpoint id, creating its key if needed
+    Id {
+        /// Read the key from this file instead of the login keychain
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
     },
 }
 
@@ -252,6 +304,9 @@ async fn main() -> Result<()> {
         Command::OAuth { command } => oauth_command(&Config::load(&path)?, command).await,
         Command::Service { command } => {
             service_command(&load_or_default(&path)?, explicit.as_deref(), command).await
+        }
+        Command::Companion { command } => {
+            companion_command(&path, explicit.as_deref(), command).await
         }
         Command::Update {
             tag,
@@ -415,7 +470,9 @@ async fn service_command(
             )
         }
         ServiceCommand::Uninstall { dry_run } => (service::uninstall_plan(&paths, uid), dry_run),
-        ServiceCommand::Restart { dry_run } => (service::restart_plan(uid), dry_run),
+        ServiceCommand::Restart { dry_run } => {
+            (service::restart_plan(uid, service::Agent::Daemon), dry_run)
+        }
         ServiceCommand::Status { dry_run } => {
             return service_status(config, &paths, uid, dry_run).await;
         }
@@ -438,6 +495,164 @@ async fn service_command(
     if starts_daemon {
         wait_until_serving(config, uid, previous_pid).await?;
     }
+
+    Ok(())
+}
+
+async fn companion_command(
+    path: &std::path::Path,
+    explicit_config: Option<&std::path::Path>,
+    command: CompanionCommand,
+) -> Result<()> {
+    match command {
+        CompanionCommand::Invite => {
+            let config = load_or_default(path)?;
+            let response: InviteResponse =
+                admin_post(&config, "/admin/companion/invite", &()).await?;
+            let name = response.gateway_name.clone();
+            let ticket = response.ticket().encode()?;
+            println!("On the other Mac (the one that has 1Password and the owner), run:");
+            println!("  codemode-mcp companion pair {ticket}");
+            println!("It prints a block to append to the config on this Mac ({name}).");
+        }
+        CompanionCommand::Pair {
+            ticket,
+            identity_file,
+        } => {
+            let ticket = Ticket::decode(&ticket)?;
+            match companion::pair(&ticket, path, identity_file.as_deref())? {
+                Paired::Written(pairing) => {
+                    println!("Added a [companion] section to {}:", path.display());
+                    println!("\n{}", pairing.section);
+                    println!(
+                        "On the gateway Mac ({}), append this to the end of the config:",
+                        ticket.gateway_name
+                    );
+                    println!("\n{}\n", pairing.gateway_entry());
+                    println!("then run `codemode-mcp service restart` there.");
+                    println!("Here, `codemode-mcp companion install` keeps the companion running.");
+                }
+                Paired::AlreadyConfigured { section } => {
+                    println!(
+                        "{} already has a [companion] section, so it was not changed. \
+                         Replace it with this one if the gateway changed:",
+                        path.display()
+                    );
+                    println!("\n{section}");
+                }
+            }
+        }
+        CompanionCommand::Serve => companion_serve_command(Config::load(path)?).await?,
+        CompanionCommand::Install { dry_run } => {
+            let config = load_or_default(path)?;
+            let binary = std::env::current_exe().wrap_err("cannot locate this binary")?;
+            let paths = ServicePaths::from_env(&config.state_dir()?)?;
+            if !dry_run {
+                if config.companion.is_none() {
+                    bail!(
+                        "{} has no [companion] section; run `codemode-mcp companion pair <ticket>` \
+                         first",
+                        path.display()
+                    );
+                }
+                service::check_signing_identity()?;
+            }
+            let pinned = match explicit_config {
+                Some(path) => Some(std::path::absolute(path)?),
+                None => None,
+            };
+            let plan = service::companion_install_plan(
+                &paths,
+                service::current_uid()?,
+                &binary,
+                pinned.as_deref(),
+            );
+            run_plan(&plan, dry_run)?;
+        }
+        CompanionCommand::Uninstall { dry_run } => {
+            let config = load_or_default(path)?;
+            let paths = ServicePaths::from_env(&config.state_dir()?)?;
+            let plan = service::companion_uninstall_plan(&paths, service::current_uid()?);
+            run_plan(&plan, dry_run)?;
+        }
+        CompanionCommand::Check { reference } => {
+            let config = load_or_default(path)?;
+            println!(
+                "Asking the companions to read the reference. Touch ID is asked on their Macs; \
+                 approve there."
+            );
+            let response: CompanionCheckResponse = admin_post(
+                &config,
+                "/admin/companion/check",
+                &CompanionCheckRequest { reference },
+            )
+            .await?;
+
+            let mut failed = false;
+            for entry in response.companions {
+                match entry.result {
+                    CompanionCheckResult::Ok { bytes } => {
+                        println!("{}: ok ({bytes} bytes)", entry.name);
+                    }
+                    CompanionCheckResult::Error { message } => {
+                        failed = true;
+                        println!("{}: FAILED ({message})", entry.name);
+                    }
+                }
+            }
+            if failed {
+                std::process::exit(1);
+            }
+        }
+        CompanionCommand::Id { identity_file } => {
+            let file = match identity_file {
+                Some(file) => Some(file),
+                None => load_or_default(path)?
+                    .companion
+                    .and_then(|companion| companion.identity_file),
+            };
+            println!("{}", companion::companion_id(file.as_deref())?);
+        }
+    }
+
+    Ok(())
+}
+
+/// Prints `plan` for a dry run, otherwise carries it out
+fn run_plan(plan: &[Action], dry_run: bool) -> Result<()> {
+    if dry_run {
+        print_plan(plan);
+
+        return Ok(());
+    }
+    for action in plan {
+        println!("{}", action.describe());
+        action.apply()?;
+    }
+
+    Ok(())
+}
+
+/// Runs the companion until a stop signal
+async fn companion_serve_command(config: Config) -> Result<()> {
+    let companion_config = config.companion.ok_or_else(|| {
+        eyre!("the config has no [companion] section; run `codemode-mcp companion pair <ticket>`")
+    })?;
+    if companion_config.allow.is_empty() {
+        tracing::warn!("[companion] allow is empty, so every request will be refused");
+    }
+
+    #[cfg(target_os = "macos")]
+    let mac: Option<Arc<dyn codemode_mcp::mac::Mac>> =
+        Some(Arc::new(codemode_mcp::mac::MacOs::new()));
+    #[cfg(not(target_os = "macos"))]
+    let mac: Option<Arc<dyn codemode_mcp::mac::Mac>> = None;
+
+    let handle = companion::serve(companion_config, mac).await?;
+    tracing::info!(id = %handle.id(), addrs = ?handle.bound_addrs(), "companion is serving");
+
+    shutdown_signal().await;
+    handle.shutdown().await;
 
     Ok(())
 }
@@ -495,7 +710,7 @@ async fn service_status(
     uid: u32,
     dry_run: bool,
 ) -> Result<()> {
-    let launchctl = service::status_command(uid);
+    let launchctl = service::status_command(uid, service::Agent::Daemon);
     let health = format!("http://127.0.0.1:{}/healthz", config.listen.port());
     if dry_run {
         println!("Dry run; would check:");
@@ -560,10 +775,13 @@ async fn update_command(
     let paths = ServicePaths::from_env(&config.state_dir()?)?;
     let installed = update::installed_tag(&paths.binary);
 
+    // a Mac with only the companion agent never had a Monty worker
+    let companion_only = paths.companion_plist.is_file() && !paths.plist.is_file();
+
     // `cmd fleet update` runs this every time, and a restart drains the
     // running executions, so a current install is left alone; a missing
-    // worker is always replaced
-    if !force && paths.worker.is_file() {
+    // worker is always replaced, except where only the companion runs
+    if !force && (paths.worker.is_file() || companion_only) {
         if installed.as_deref() == Some(tag.as_str()) {
             println!("{} is already {tag}", paths.binary.display());
 
@@ -614,15 +832,31 @@ async fn update_command(
 
     // the plist is checked first, so a run under another home never asks
     // launchd about the real service
-    let loaded = paths.plist.is_file()
-        && service::run_command(&service::status_command(service::current_uid()?)).is_ok();
-    if !loaded {
+    let uid = service::current_uid()?;
+    let is_loaded = |plist: &std::path::Path, agent| {
+        plist.is_file() && service::run_command(&service::status_command(uid, agent)).is_ok()
+    };
+    let daemon_loaded = is_loaded(&paths.plist, service::Agent::Daemon);
+    let companion_loaded = is_loaded(&paths.companion_plist, service::Agent::Companion);
+    if !daemon_loaded && !companion_loaded {
         println!("The service is not installed; `codemode-mcp service install` starts it.");
 
         return Ok(());
     }
 
-    service_command(config, None, ServiceCommand::Restart { dry_run: false }).await
+    // the companion holds no executions, so it restarts at once; the daemon
+    // keeps its drain
+    if companion_loaded {
+        run_plan(
+            &service::restart_plan(uid, service::Agent::Companion),
+            false,
+        )?;
+    }
+    if daemon_loaded {
+        service_command(config, None, ServiceCommand::Restart { dry_run: false }).await?;
+    }
+
+    Ok(())
 }
 
 fn config_init_command(path: &std::path::Path, print: bool) -> Result<()> {

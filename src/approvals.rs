@@ -47,6 +47,8 @@ pub const NO_APPROVAL_PAGE: &str = "`codemode-mcp exec` cannot ask for approval;
 const CLIENT_GRANT: &str = "client";
 /// Stored kind of a grant that covers one app session
 const SESSION_GRANT: &str = "session";
+/// Cancel button of the Touch ID prompt; pressing it opens the approval page
+const APPROVAL_CANCEL_TITLE: &str = "Open Page";
 /// Shown to a script whose request was refused on the page
 const DENIED: &str = "denied on the approval page";
 /// Shown to a script whose request is no longer there
@@ -883,7 +885,7 @@ impl Approvals {
                     let reason = touch_id_reason(&info, &calls);
                     // dropping the prompt's future takes it off the screen
                     tokio::select! {
-                        answer = on_mac.mac.touch_id(&reason) => answer,
+                        answer = on_mac.mac.touch_id(&reason, APPROVAL_CANCEL_TITLE) => answer,
                         () = settled.cancelled() => return,
                     }
                 } else {

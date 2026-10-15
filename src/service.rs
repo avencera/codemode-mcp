@@ -15,6 +15,8 @@ use std::{
 
 /// launchd label and plist name
 pub const LABEL: &str = "dev.praveen.codemode-mcp";
+/// launchd label and plist name of the companion agent
+pub const COMPANION_LABEL: &str = "dev.praveen.codemode-mcp.companion";
 /// Time launchd gives the daemon beyond the drain before it sends SIGKILL:
 /// parking, flushing the usage log and tearing down the workers
 const EXIT_GRACE: Duration = Duration::from_secs(30);
@@ -94,6 +96,8 @@ pub struct ServicePaths {
     pub worker: PathBuf,
     /// LaunchAgent plist
     pub plist: PathBuf,
+    /// LaunchAgent plist of `companion serve`
+    pub companion_plist: PathBuf,
     /// launchd stdout and stderr files
     pub logs: PathBuf,
 }
@@ -107,6 +111,7 @@ impl ServicePaths {
             alias: home.join(".local/bin").join(ALIAS),
             worker: default_worker_path(home),
             plist: home.join(format!("Library/LaunchAgents/{LABEL}.plist")),
+            companion_plist: home.join(format!("Library/LaunchAgents/{COMPANION_LABEL}.plist")),
             logs: state_dir.join("logs"),
         }
     }
@@ -440,18 +445,65 @@ fn xml_escape(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The LaunchAgent plist; `config` is passed to `serve` when given
+/// A LaunchAgent this binary installs
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    /// The gateway daemon, `serve`
+    Daemon,
+    /// The companion on another Mac, `companion serve`
+    Companion,
+}
+
+impl Agent {
+    /// launchd label
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Daemon => LABEL,
+            Self::Companion => COMPANION_LABEL,
+        }
+    }
+
+    /// Arguments after the binary and `--config`
+    fn subcommand(self) -> &'static [&'static str] {
+        match self {
+            Self::Daemon => &["serve"],
+            Self::Companion => &["companion", "serve"],
+        }
+    }
+
+    /// Start of the launchd log file names
+    fn log_stem(self) -> &'static str {
+        match self {
+            Self::Daemon => "codemode-mcp",
+            Self::Companion => "codemode-mcp-companion",
+        }
+    }
+
+    fn plist(self, paths: &ServicePaths) -> &Path {
+        match self {
+            Self::Daemon => &paths.plist,
+            Self::Companion => &paths.companion_plist,
+        }
+    }
+}
+
+/// The LaunchAgent plist of `agent`; `config` is passed to it when given
 ///
 /// `ExitTimeOut` is the configured `drain` plus a grace period: launchd's
 /// default of 20 seconds would kill the daemon in the middle of its drain
-pub fn render_plist(paths: &ServicePaths, config: Option<&Path>, drain: Duration) -> String {
+pub fn render_plist(
+    agent: Agent,
+    paths: &ServicePaths,
+    config: Option<&Path>,
+    drain: Duration,
+) -> String {
     let exit_timeout = (drain + EXIT_GRACE).as_secs();
     let mut arguments = vec![paths.binary.display().to_string()];
     if let Some(config) = config {
         arguments.push("--config".to_owned());
         arguments.push(config.display().to_string());
     }
-    arguments.push("serve".to_owned());
+    arguments.extend(agent.subcommand().iter().map(|word| (*word).to_owned()));
     let arguments: String = arguments
         .iter()
         .map(|argument| format!("    <string>{}</string>\n", xml_escape(argument)))
@@ -469,7 +521,7 @@ pub fn render_plist(paths: &ServicePaths, config: Option<&Path>, drain: Duration
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>{LABEL}</string>
+  <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
 {arguments}  </array>
@@ -495,19 +547,20 @@ pub fn render_plist(paths: &ServicePaths, config: Option<&Path>, drain: Duration
 </dict>
 </plist>
 "#,
+        label = agent.label(),
         home = xml_escape(&paths.home.display().to_string()),
         path = xml_escape(&path),
         stdout = xml_escape(
             &paths
                 .logs
-                .join("codemode-mcp.out.log")
+                .join(format!("{}.out.log", agent.log_stem()))
                 .display()
                 .to_string()
         ),
         stderr = xml_escape(
             &paths
                 .logs
-                .join("codemode-mcp.err.log")
+                .join(format!("{}.err.log", agent.log_stem()))
                 .display()
                 .to_string()
         ),
@@ -537,8 +590,8 @@ fn link_alias(target: &Path, link: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
-fn target(uid: u32) -> String {
-    format!("gui/{uid}/{LABEL}")
+fn target(uid: u32, agent: Agent) -> String {
+    format!("gui/{uid}/{}", agent.label())
 }
 
 /// Steps of `service install`
@@ -550,12 +603,49 @@ pub fn install_plan(
     config: Option<&Path>,
     drain: Duration,
 ) -> Vec<Action> {
-    let parent = |path: &Path| path.parent().map(Path::to_owned).unwrap_or_default();
-    let plist = paths.plist.display().to_string();
-    // the new plist is linted before it replaces a working one, and before
-    // the running service is booted out
-    let staged = paths.plist.with_extension("plist.new");
+    let mut plan = binary_steps(paths, binary);
+    plan.extend([
+        Action::CreateDir(parent(&paths.worker)),
+        Action::Install {
+            from: worker.to_owned(),
+            to: paths.worker.clone(),
+        },
+    ]);
+    plan.extend(agent_steps(paths, uid, Agent::Daemon, config, drain));
 
+    plan
+}
+
+/// Steps of `companion install`: the signed binary and its own LaunchAgent,
+/// without the Monty worker
+///
+/// The binary is installed the same way as for the daemon, so the keychain
+/// item holding the identity stays tied to the signed copy
+pub fn companion_install_plan(
+    paths: &ServicePaths,
+    uid: u32,
+    binary: &Path,
+    config: Option<&Path>,
+) -> Vec<Action> {
+    let mut plan = binary_steps(paths, binary);
+    // nothing to drain: the companion holds no executions
+    plan.extend(agent_steps(
+        paths,
+        uid,
+        Agent::Companion,
+        config,
+        Duration::ZERO,
+    ));
+
+    plan
+}
+
+fn parent(path: &Path) -> PathBuf {
+    path.parent().map(Path::to_owned).unwrap_or_default()
+}
+
+/// The signed binary at its stable path and the short-name link
+fn binary_steps(paths: &ServicePaths, binary: &Path) -> Vec<Action> {
     vec![
         Action::CreateDir(parent(&paths.binary)),
         Action::Install {
@@ -571,24 +661,37 @@ pub fn install_plan(
                 .unwrap_or_default(),
             link: paths.alias.clone(),
         },
-        Action::CreateDir(parent(&paths.worker)),
-        Action::Install {
-            from: worker.to_owned(),
-            to: paths.worker.clone(),
-        },
+    ]
+}
+
+/// Writes `agent`'s plist and loads it, replacing a loaded copy
+fn agent_steps(
+    paths: &ServicePaths,
+    uid: u32,
+    agent: Agent,
+    config: Option<&Path>,
+    drain: Duration,
+) -> Vec<Action> {
+    let plist_path = agent.plist(paths);
+    let plist = plist_path.display().to_string();
+    // the new plist is linted before it replaces a working one, and before
+    // the running service is booted out
+    let staged = plist_path.with_extension("plist.new");
+
+    vec![
         Action::CreateDir(paths.logs.clone()),
-        Action::CreateDir(parent(&paths.plist)),
+        Action::CreateDir(parent(plist_path)),
         Action::Write {
             path: staged.clone(),
-            contents: render_plist(paths, config, drain),
+            contents: render_plist(agent, paths, config, drain),
         },
         Action::run(&["plutil", "-lint", &staged.display().to_string()]),
         Action::Rename {
             from: staged,
-            to: paths.plist.clone(),
+            to: plist_path.to_owned(),
         },
         Action::Run {
-            argv: vec!["launchctl".into(), "bootout".into(), target(uid)],
+            argv: vec!["launchctl".into(), "bootout".into(), target(uid, agent)],
             tolerate_failure: true,
             retry_for: None,
         },
@@ -608,29 +711,43 @@ pub fn install_plan(
 /// Steps of `service uninstall`; state and installed files, including the
 /// `cmcp` link, stay
 pub fn uninstall_plan(paths: &ServicePaths, uid: u32) -> Vec<Action> {
+    removal_steps(paths, uid, Agent::Daemon)
+}
+
+/// Steps of `companion uninstall`; the installed binary stays
+pub fn companion_uninstall_plan(paths: &ServicePaths, uid: u32) -> Vec<Action> {
+    removal_steps(paths, uid, Agent::Companion)
+}
+
+fn removal_steps(paths: &ServicePaths, uid: u32, agent: Agent) -> Vec<Action> {
     vec![
         Action::Run {
-            argv: vec!["launchctl".into(), "bootout".into(), target(uid)],
+            argv: vec!["launchctl".into(), "bootout".into(), target(uid, agent)],
             tolerate_failure: true,
             retry_for: None,
         },
-        Action::Remove(paths.plist.clone()),
+        Action::Remove(agent.plist(paths).to_owned()),
     ]
 }
 
-/// Steps of `service restart`
-pub fn restart_plan(uid: u32) -> Vec<Action> {
-    vec![Action::run(&["launchctl", "kickstart", "-k", &target(uid)])]
+/// Steps of `service restart`, or of restarting the companion after an update
+pub fn restart_plan(uid: u32, agent: Agent) -> Vec<Action> {
+    vec![Action::run(&[
+        "launchctl",
+        "kickstart",
+        "-k",
+        &target(uid, agent),
+    ])]
 }
 
-/// The read-only command `service status` runs
-pub fn status_command(uid: u32) -> Vec<String> {
-    vec!["launchctl".into(), "print".into(), target(uid)]
+/// The read-only command that asks launchd about `agent`
+pub fn status_command(uid: u32, agent: Agent) -> Vec<String> {
+    vec!["launchctl".into(), "print".into(), target(uid, agent)]
 }
 
 /// The pid launchd reports for the running service, if it is running
 pub fn running_pid(uid: u32) -> Option<u32> {
-    let output = run_command(&status_command(uid)).ok()?;
+    let output = run_command(&status_command(uid, Agent::Daemon)).ok()?;
 
     output
         .lines()
@@ -681,6 +798,7 @@ mod tests {
     fn plist_escapes_paths_and_runs_serve() {
         let paths = ServicePaths::new(Path::new("/Users/a&b"), Path::new("/Users/a&b/state"));
         let plist = render_plist(
+            Agent::Daemon,
             &paths,
             Some(Path::new("/tmp/<c>.toml")),
             Duration::from_secs(20),
@@ -733,7 +851,7 @@ mod tests {
         let paths = ServicePaths::new(Path::new("/Users/a"), Path::new("/Users/a/state"));
         let drain = Duration::from_secs(20);
 
-        let current = render_plist(&paths, None, drain);
+        let current = render_plist(Agent::Daemon, &paths, None, drain);
         assert_eq!(exit_timeout_warning(&current, drain), None);
 
         // a plist from before the drain existed has no ExitTimeOut at all

@@ -5,7 +5,7 @@ use std::{path::Path, process::Command};
 
 use super::harness::{TestResult, temp_state_dir};
 
-fn codemode(
+pub(super) fn codemode(
     home: &Path,
     args: &[&str],
 ) -> Result<(bool, String, String), Box<dyn std::error::Error>> {
@@ -23,7 +23,7 @@ fn codemode(
 }
 
 /// Every file under `directory`, relative to it
-fn files(directory: &Path) -> Vec<String> {
+pub(super) fn files(directory: &Path) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![directory.to_owned()];
     while let Some(next) = pending.pop() {

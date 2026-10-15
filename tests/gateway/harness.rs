@@ -266,6 +266,7 @@ pub struct FakeMac {
     /// How long a prompt stays up before it answers
     answer_after: Mutex<Duration>,
     shown: Mutex<Vec<String>>,
+    cancel_titles: Mutex<Vec<String>>,
 }
 
 impl FakeMac {
@@ -299,6 +300,14 @@ impl FakeMac {
             .unwrap_or_default()
     }
 
+    /// The cancel button title of each Touch ID prompt, in order
+    pub fn cancel_titles(&self) -> Vec<String> {
+        self.cancel_titles
+            .lock()
+            .map(|titles| titles.clone())
+            .unwrap_or_default()
+    }
+
     fn record(&self, entry: String) {
         if let Ok(mut shown) = self.shown.lock() {
             shown.push(entry);
@@ -322,8 +331,11 @@ impl Mac for FakeMac {
         Box::pin(std::future::ready(present))
     }
 
-    fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId> {
+    fn touch_id<'a>(&'a self, reason: &'a str, cancel: &'a str) -> BoxFuture<'a, TouchId> {
         self.record(format!("touch_id {reason}"));
+        if let Ok(mut titles) = self.cancel_titles.lock() {
+            titles.push(cancel.to_owned());
+        }
         let answer = self.answer.lock().ok().and_then(|answer| *answer);
         let delay = self
             .answer_after
@@ -666,9 +678,7 @@ impl Harness {
     }
 
     /// Enrolls the first software passkey through the admin and enrollment routes
-    pub async fn enroll_passkey(
-        &self,
-    ) -> Result<SoftPasskey, Box<dyn Error>> {
+    pub async fn enroll_passkey(&self) -> Result<SoftPasskey, Box<dyn Error>> {
         let (path, enrolled) = self.request_enrollment("test <phone>").await?;
         assert!(enrolled["approval_url"].is_null(), "{enrolled}");
 
@@ -676,10 +686,7 @@ impl Harness {
     }
 
     /// Registers a new software passkey on an enrollment page that is ready
-    pub async fn register_at(
-        &self,
-        path: &str,
-    ) -> Result<SoftPasskey, Box<dyn Error>> {
+    pub async fn register_at(&self, path: &str) -> Result<SoftPasskey, Box<dyn Error>> {
         let page = self
             .http
             .get(format!("{}{path}", self.base()))
