@@ -38,7 +38,7 @@ binary under a shorter name. Times in logs are UTC.
    ```
 
    The first signing may ask whether codesign can use the key; choose Always Allow. Check an installed binary
-   with `codesign -dv ~/.local/bin/codemode-mcp`, which should show `TeamIdentifier=Q8UP8C53Y8`.
+   with `codesign -dv ~/.local/bin/codemode-mcp`, which should show `TeamIdentifier=Q8UP8C53Y8` and `flags=0x10000(runtime)`.
 
 4. Check it: `codemode-mcp service status` (plist, launchd state, `/healthz`).
 5. Expose the approval pages to the phone: `tailscale serve --bg --https=8443 http://127.0.0.1:7681`.

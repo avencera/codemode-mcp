@@ -82,21 +82,30 @@ jobs:
           version="$(awk '/^name = "monty-pool"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
           : "${version:?monty-pool is not in Cargo.lock}"
           cargo install monty-runtime --version "=$version" --locked --root "$RUNNER_TEMP/monty"
-          codesign --force --sign "$IDENTITY" --identifier com.avencera.monty "$RUNNER_TEMP/monty/bin/monty"
-      - uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: codemode-mcp
-          package: codemode-mcp
-          target: aarch64-apple-darwin
-          archive: $bin-$tag-$target
-          tar: unix
-          checksum: sha256
-          locked: true
-          # the prefix makes the identifier com.avencera.codemode-mcp, matching
-          # what `service install` signs a local build as
-          codesign: ${{ vars.MACOS_SIGNING_IDENTITY }}
-          codesign-prefix: com.avencera.
-          include: ${{ runner.temp }}/monty/bin/monty
+          codesign --force --options runtime --sign "$IDENTITY" --identifier com.avencera.monty "$RUNNER_TEMP/monty/bin/monty"
+      # signed here rather than by upload-rust-binary-action, which cannot pass
+      # entitlements; flags and identifier match what `service install` uses
+      - name: Build and sign codemode-mcp
+        env:
+          IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin --bin codemode-mcp
+          codesign --force --options runtime --entitlements assets/codemode-mcp.entitlements \
+            --sign "$IDENTITY" --identifier com.avencera.codemode-mcp \
+            target/aarch64-apple-darwin/release/codemode-mcp
+      # `update` downloads <archive>.tar.gz and checks it against the
+      # `sha256sum`-style line in <archive>.sha256
+      - name: Upload the archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="codemode-mcp-$GITHUB_REF_NAME-aarch64-apple-darwin"
+          staging="$RUNNER_TEMP/staging"
+          mkdir "$staging"
+          cp target/aarch64-apple-darwin/release/codemode-mcp "$RUNNER_TEMP/monty/bin/monty" "$staging/"
+          tar -C "$staging" -czf "$archive.tar.gz" codemode-mcp monty
+          shasum -a 256 "$archive.tar.gz" > "$archive.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$archive.tar.gz" "$archive.sha256" --repo "$GITHUB_REPOSITORY" --clobber
 
   publish-release:
     needs: upload-assets

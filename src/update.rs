@@ -215,7 +215,7 @@ impl Release {
         let sums_url = source.download_url(tag, &Source::checksums(tag));
         let sums = read(get(client, &sums_url).await?, &sums_url).await?;
 
-        // `sha256sum` lines, `<hex>  <file>`, as upload-rust-binary-action writes them
+        // `sha256sum` lines, `<hex>  <file>`, as the release workflow's `shasum -a 256` writes them
         let expected = String::from_utf8_lossy(&sums)
             .lines()
             .find_map(|line| {

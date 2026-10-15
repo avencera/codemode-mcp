@@ -30,6 +30,9 @@ pub const SIGNING_IDENTITY: &str = "Developer ID Application: InfraOps LLC (Q8UP
 pub const TEAM_ID: &str = "Q8UP8C53Y8";
 /// Prefix of each signed binary's identifier, as in `com.avencera.codemode-mcp`
 const SIGNING_PREFIX: &str = "com.avencera.";
+/// Entitlements signed into the daemon; the hardened runtime denies EventKit
+/// without the calendars one, which covers reminders too
+const DAEMON_ENTITLEMENTS: &str = include_str!("../assets/codemode-mcp.entitlements");
 /// Starter configuration; `{{HOME}}` is replaced with the home directory
 const STARTER_CONFIG: &str = include_str!("../assets/starter-config.toml");
 
@@ -185,7 +188,7 @@ impl Action {
         match self {
             Self::CreateDir(path) => format!("mkdir -p {}", path.display()),
             Self::Install { from, to } => format!(
-                "install -m 755 {} {}  # signed as {}",
+                "install -m 755 {} {}  # signed as {}, hardened runtime",
                 from.display(),
                 to.display(),
                 signing_identifier(to)
@@ -309,17 +312,36 @@ pub fn signing_identifier(to: &Path) -> String {
 }
 
 fn sign(path: &Path, identifier: &str) -> Result<(), ServiceError> {
-    // --force replaces the linker's ad-hoc signature
-    run_command(&[
+    // --force replaces the linker's ad-hoc signature. The hardened runtime
+    // refuses DYLD_* variables (the LaunchAgent plist is user-writable) and
+    // libraries signed by anyone but Apple or this team
+    let mut argv: Vec<String> = vec![
         "codesign".into(),
         "--force".into(),
+        "--options".into(),
+        "runtime".into(),
         "--sign".into(),
         SIGNING_IDENTITY.into(),
         "--identifier".into(),
         identifier.into(),
-        path.display().to_string(),
-    ])
-    .map(drop)
+    ];
+
+    // only the daemon gets EventKit; the worker runs agent scripts
+    let entitlements = path.with_extension("entitlements");
+    let daemon = identifier == format!("{SIGNING_PREFIX}codemode-mcp");
+    if daemon {
+        std::fs::write(&entitlements, DAEMON_ENTITLEMENTS)
+            .map_err(io(format!("write {}", entitlements.display())))?;
+        argv.extend(["--entitlements".into(), entitlements.display().to_string()]);
+    }
+    argv.push(path.display().to_string());
+
+    let signed = run_command(&argv).map(drop);
+    if daemon {
+        let _ = std::fs::remove_file(&entitlements);
+    }
+
+    signed
 }
 
 /// Fails unless [`SIGNING_IDENTITY`] can sign, so an install stops before it
