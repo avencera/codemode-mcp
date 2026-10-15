@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use iroh::EndpointId;
 use serde::Deserialize;
 
 use crate::{
@@ -108,6 +109,10 @@ pub struct Config {
     /// How `{{ op://... }}` references in server `headers` and `env` are read
     #[serde(default)]
     pub secrets: SecretsConfig,
+    /// Reading 1Password references for another Mac; only set on the
+    /// companion Mac
+    #[serde(default)]
+    pub companion: Option<CompanionConfig>,
     /// Upstream MCP servers by name
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
@@ -129,6 +134,7 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             limits: Limits::default(),
             secrets: SecretsConfig::default(),
+            companion: None,
             servers: BTreeMap::new(),
         }
     }
@@ -250,6 +256,10 @@ impl Config {
             ));
         }
         self.limits.validate()?;
+        self.secrets.validate()?;
+        if let Some(companion) = &self.companion {
+            companion.validate()?;
+        }
 
         for (name, server) in &self.servers {
             if name.is_empty() {
@@ -265,7 +275,8 @@ impl Config {
 }
 
 /// The 1Password CLI that reads `{{ op://vault/item/field }}` references in
-/// server `headers` and `env` when a server first connects
+/// server `headers` and `env` when a server first connects, and the
+/// companion Macs that can read them when the owner is elsewhere
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
@@ -273,12 +284,146 @@ pub struct SecretsConfig {
     /// the Mac
     #[serde(default = "default_op")]
     pub op: String,
+    /// Whether the iroh endpoint uses n0's relays and DNS discovery; off, it
+    /// dials only the companions' `addrs`
+    #[serde(default = "default_discovery")]
+    pub discovery: bool,
+    /// File holding this gateway's iroh secret key (hex, mode 0600), created
+    /// when missing; unset, the login keychain holds it
+    #[serde(default)]
+    pub identity_file: Option<PathBuf>,
+    /// Other Macs that can read references for this one
+    #[serde(default)]
+    pub companions: Vec<CompanionPeer>,
 }
 
 impl Default for SecretsConfig {
     fn default() -> Self {
-        Self { op: default_op() }
+        Self {
+            op: default_op(),
+            discovery: default_discovery(),
+            identity_file: None,
+            companions: Vec::new(),
+        }
     }
+}
+
+/// Longest name of a Mac, as `gateway_name` and `secrets.companions` give it
+pub const MAX_MAC_NAME_CHARS: usize = 63;
+
+/// Whether `name` can name a Mac in a Touch ID prompt or an error: short,
+/// and on one line without control, invisible or direction-changing
+/// characters, so a pairing ticket cannot make the prompt say something else
+pub fn is_mac_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.chars().count() <= MAX_MAC_NAME_CHARS
+        && crate::prompt::one_line(name, usize::MAX) == name
+}
+
+impl SecretsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        require_absolute_identity("secrets", self.identity_file.as_deref())?;
+
+        let mut names = std::collections::BTreeSet::new();
+        for companion in &self.companions {
+            if !is_mac_name(&companion.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.companions names must be 1 to {MAX_MAC_NAME_CHARS} characters on one line"
+                )));
+            }
+            if !names.insert(companion.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.companions has the name \"{}\" twice",
+                    companion.name
+                )));
+            }
+            if !self.discovery && companion.addrs.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.companions \"{}\" needs `addrs` because secrets.discovery is off",
+                    companion.name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A companion Mac the gateway asks to read references
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionPeer {
+    /// Name shown in logs and errors
+    pub name: String,
+    /// The companion's iroh endpoint id, from `codemode-mcp companion id`
+    pub id: EndpointId,
+    /// Direct addresses to dial before discovery, e.g. `100.64.0.5:7678`
+    #[serde(default)]
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// The companion role of this Mac: reads references for one gateway after a
+/// Touch ID prompt on this Mac
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompanionConfig {
+    /// The only endpoint id this companion answers
+    pub gateway: EndpointId,
+    /// Name of the gateway Mac, shown in the Touch ID prompt
+    #[serde(default = "default_gateway_name")]
+    pub gateway_name: String,
+    /// The references this companion may read, matched exactly
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Fixed address to bind instead of a random port
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// Whether the iroh endpoint publishes to n0's DNS and uses its relays
+    #[serde(default = "default_discovery")]
+    pub discovery: bool,
+    /// File holding this companion's iroh secret key (hex, mode 0600),
+    /// created when missing; unset, the login keychain holds it
+    #[serde(default)]
+    pub identity_file: Option<PathBuf>,
+    /// `op` executable
+    #[serde(default = "default_op")]
+    pub op: String,
+}
+
+impl CompanionConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        require_absolute_identity("companion", self.identity_file.as_deref())?;
+
+        if !is_mac_name(&self.gateway_name) {
+            return Err(ConfigError::Invalid(format!(
+                "companion.gateway_name must be 1 to {MAX_MAC_NAME_CHARS} characters on one line"
+            )));
+        }
+        for reference in &self.allow {
+            if !crate::secrets::is_reference(reference.trim()) {
+                return Err(ConfigError::Invalid(
+                    "companion.allow entries must be op://vault/item/field references".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Whether `reference` is on the allow list; both sides are trimmed
+    pub fn allows(&self, reference: &str) -> bool {
+        let reference = reference.trim();
+
+        self.allow.iter().any(|allowed| allowed.trim() == reference)
+    }
+}
+
+fn default_discovery() -> bool {
+    true
+}
+
+fn default_gateway_name() -> String {
+    "main".to_owned()
 }
 
 fn default_idle_secs() -> u64 {
@@ -307,6 +452,18 @@ fn default_log_retention_days() -> u64 {
 
 fn default_session_idle_hours() -> u64 {
     24
+}
+
+/// Rejects a relative `identity_file`: a LaunchAgent runs elsewhere than the
+/// shell that wrote the path, so it would find or create a different key
+fn require_absolute_identity(section: &str, file: Option<&Path>) -> Result<(), ConfigError> {
+    match file {
+        Some(file) if !expand_home(file).is_absolute() => Err(ConfigError::Invalid(format!(
+            "{section}.identity_file must be an absolute path (or start with ~/), got {}",
+            file.display()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Expands a leading `~/` to `$HOME`
@@ -1030,5 +1187,50 @@ mod tests {
             parse("[servers.a]\nurl = \"https://y\"\noauth = true\nheaders = { Authorization = \"Bearer abcdef\" }")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn companion_settings_are_checked_when_the_config_loads() {
+        // ids must be points on the curve, so a made-up hex string will not do
+        let id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let peer = |name: &str| format!("{{ name = \"{name}\", id = \"{id}\" }}");
+        let secrets = |entries: &[String], extra: &str| {
+            parse(&format!(
+                "[secrets]\n{extra}\ncompanions = [{}]",
+                entries.join(", ")
+            ))
+        };
+
+        assert!(secrets(&[peer("mba")], "").is_ok());
+        assert!(secrets(&[peer("mba"), peer("mba")], "").is_err());
+        assert!(secrets(&[peer(" ")], "").is_err());
+        // with discovery off a companion can only be reached at known addresses
+        assert!(secrets(&[peer("mba")], "discovery = false").is_err());
+        assert!(parse("[secrets]\ncompanions = [{ name = \"mba\", id = \"not-an-id\" }]").is_err());
+
+        let companion = |allow: &str| {
+            parse(&format!(
+                "[companion]\ngateway = \"{id}\"\nallow = [{allow}]"
+            ))
+        };
+        assert!(companion("\"op://Dev/Context7/credential\"").is_ok());
+        assert!(companion("\"op://Dev/Context7\"").is_err());
+        assert!(companion("\"sk-live-123\"").is_err());
+
+        // names and references from a ticket reach the companion's Touch ID
+        // prompt, so none may pass for the prompt's own wording
+        let named = |name: &str| {
+            parse(&format!(
+                "[companion]\ngateway = \"{id}\"\ngateway_name = \"{name}\""
+            ))
+        };
+        assert!(named("Praveens-Mac-mini").is_ok());
+        assert!(named("main\\napprove to continue").is_err());
+        assert!(named("main\\u202e").is_err());
+        assert!(named("").is_err());
+        assert!(named(&"m".repeat(64)).is_err());
+        assert!(secrets(&[peer("mba\\nok")], "").is_err());
+        assert!(companion("\"op://Dev/Context7\\u202e/credential\"").is_err());
+        assert!(companion(&format!("\"op://Dev/{}/credential\"", "x".repeat(300))).is_err());
     }
 }

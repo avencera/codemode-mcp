@@ -133,6 +133,60 @@ codemode-mcp op warm
 Runs the configured warm calls on the daemon so the 1Password app's prompts appear on the Mac now. Accept them
 there; agent calls then only need the phone approval. Results are never printed.
 
+## Read 1Password references from another Mac
+
+When you work from another Mac, such as a MacBook Air, the gateway Mac's 1Password prompt for `{{ op://… }}`
+references cannot be answered, even over remote desktop, because Touch ID is on the gateway Mac. A companion
+fixes that: the same `codemode-mcp` binary on the other Mac reads the reference through that Mac's own
+1Password and `op`, after a Touch ID prompt there that names the reference, and sends the value back over iroh.
+The 1Password Environments server is not covered; it only signs in through the gateway Mac's app.
+
+1. On the other Mac, install the binary (`install.sh`, or `service install` from a checkout) and import the
+   InfraOps signing identity as in [Install](#install): `companion install` signs its copy with it, and the
+   keychain item holding that Mac's key is tied to the signed binary.
+2. On the gateway Mac, with the daemon running:
+
+   ```sh
+   codemode-mcp companion invite
+   ```
+
+   It prints a `companion pair` command holding this gateway's id and the references its servers use.
+3. Run that command on the other Mac with the installed binary (`~/.local/bin/codemode-mcp`), so its key is
+   created by the signed copy. It appends a `[companion]` section to its config, with the references as the
+   allow list, and prints a `[[secrets.companions]]` block. Then keep the companion running:
+
+   ```sh
+   codemode-mcp companion install
+   ```
+
+4. Append the printed block to the end of the gateway Mac's config, then `codemode-mcp service restart`.
+5. Check it from the gateway Mac; approve the Touch ID prompt on the other Mac:
+
+   ```sh
+   codemode-mcp companion check op://Dev/Context7/credential
+   ```
+
+   It prints each companion's answer and the value's length, never the value.
+
+How reads work with a companion configured:
+
+- The gateway runs its own `op read` only while you are at the gateway Mac (input within `notify.mac.idle_secs`),
+  and asks every companion at the same time. The first value wins and the other reads are cancelled, so working
+  over remote desktop, which makes the gateway Mac look in use, still reaches the companion.
+- A companion answers only the gateway it was paired with, and only references on its `allow` list. 1Password's
+  own prompt does not name the item, and one approval lets `op` read anything for about ten minutes, so the
+  companion asks Touch ID itself, naming the reference, on every request. Edit `allow` in its `[companion]`
+  section to change what the gateway may read, then `codemode-mcp companion install` again to restart it.
+- Each Mac's iroh key is created on first use and kept in its login keychain. The binary that creates it reads it
+  without a prompt, and so does any build signed with the same identity; any other program gets a keychain
+  prompt. That is why pairing and the gateway's first `invite` should run from the installed, signed binary. A
+  keychain prompt asking for `dev.praveen.codemode-mcp.iroh` from any other program is worth denying.
+- By default both sides use n0's relays and DNS discovery to find each other, which publishes each Mac's
+  endpoint id and current addresses to n0's DNS. Traffic stays end-to-end encrypted, but to keep it and the
+  addresses on your network, set `discovery = false` on both, give the companion a fixed
+  `listen = "0.0.0.0:7678"`, and uncomment `addrs = ["<tailnet ip>:7678"]` in its `[[secrets.companions]]`
+  block.
+
 ## Calendar and Reminders access
 
 The `calendar` and `reminders` servers read the Mac's Calendar and Reminders apps through EventKit, across every

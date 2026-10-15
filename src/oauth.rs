@@ -254,8 +254,9 @@ pub struct OAuth {
 }
 
 impl OAuth {
-    /// The OAuth servers of `config`, with logins kept in `store`
-    pub fn new(config: &Config, store: Store) -> Arc<Self> {
+    /// The OAuth servers of `config`, with logins kept in `store` and client
+    /// secrets read through `onepassword`
+    pub fn new(config: &Config, store: Store, onepassword: OnePassword) -> Arc<Self> {
         let servers = config
             .servers
             .iter()
@@ -288,7 +289,7 @@ impl OAuth {
 
         Arc::new(Self {
             store,
-            onepassword: OnePassword::new(config.secrets.op.clone()),
+            onepassword,
             servers,
             configured: config.servers.keys().cloned().collect(),
             callback_base: RwLock::new(None),

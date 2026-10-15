@@ -2,7 +2,7 @@
 # Install codemode-mcp from GitHub Releases.
 #
 # One-liner (macOS on Apple silicon):
-#   curl -LSfs https://github.com/praveenperera/codemode-mcp/releases/latest/download/install.sh | sh
+#   curl -LSfs https://github.com/avencera/codemode-mcp/releases/latest/download/install.sh | sh
 #
 # The archive is checked against the release checksum and the Developer ID
 # signature before anything in it runs. The downloaded binary then installs
@@ -11,7 +11,7 @@
 
 set -eu
 
-REPO="praveenperera/codemode-mcp"
+REPO="avencera/codemode-mcp"
 TARGET="aarch64-apple-darwin"
 # the team and identifier `service install` and the release workflow sign with
 REQUIREMENT='anchor apple generic and certificate leaf[subject.OU] = "Q8UP8C53Y8" and identifier "com.avencera.codemode-mcp"'

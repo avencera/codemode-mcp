@@ -4,6 +4,7 @@
 mod admin_gate;
 mod apple;
 mod approvals;
+mod companion;
 mod durable;
 mod harness;
 mod lazy;

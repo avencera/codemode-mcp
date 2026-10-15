@@ -491,6 +491,52 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   and userinfo from upstream error text before a script sees it, and from stdio servers' stderr before it is
   logged
 
+### Companions (`src/companion.rs`)
+
+- A companion is the same binary on another Mac (`companion serve`, its own LaunchAgent
+  `dev.praveen.codemode-mcp.companion`) that reads references through that Mac's 1Password. It exists because
+  the gateway Mac's 1Password prompt needs its Touch ID sensor, which remote desktop cannot reach
+- With `[secrets] companions` set, `OnePassword::read` races sources: local `op` only while `Mac::present` says the
+  owner is at the gateway Mac (so no 1Password prompt waits on an unattended screen), and every companion
+  always. The first value wins; dropping the rest kills the local `op` child and hangs up on companions, which
+  takes down their Touch ID prompts. Presence is not used to pick one source, since remote desktop input makes
+  the gateway Mac look in use. Presence is checked even with `notify.mac.enabled = false`, which only stops
+  approvals asking at the Mac. All failing gives one error listing each source's reason. Without companions the
+  read path is unchanged
+- Upstream connections and OAuth logins share one `Secrets` (the reader, its cache and the one `Companions`
+  endpoint), so an OAuth `client_secret` reaches companions too, and `companion invite` lists its references
+  with those in `headers` and `env`
+- Transport: iroh 1.3 (`tls-aws-lc-rs`, no portmapper), ALPN `codemode-mcp/companion/1`, one bidirectional
+  stream per request carrying typed JSON (`{"reference"}` → `{"value"}` or `{"error": {code, message}}`, codes
+  `not_allowed`, `denied`, `read_failed`), bodies capped at 64 KiB both ways (a larger value is refused as
+  `read_failed`). Only the companion advertises the ALPN; the gateway only dials, so it accepts nothing.
+  `discovery = true` uses n0's relays and DNS, publishing each endpoint's addresses there; `false` dials only
+  configured `addrs`
+- The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
+  only references on its own `allow` list, one request at a time, each request no longer than the gateway's
+  120 s deadline (a gateway that stops the stream or never gives up loses the prompt), and only after its own Touch ID prompt naming
+  the reference and the gateway (its other button says Deny). 1Password's prompt does not name the item and one approval lets `op` read
+  anything for about ten minutes, so without these a compromised gateway could read any item
+- The prompt shows the gateway name and reference as the ticket gave them, so config loading refuses names over
+  63 characters, references over 256, and either with line breaks or control, invisible or direction-changing
+  characters; a crafted ticket cannot make the prompt say something else. Host names are cleaned the same way
+  before they go into a ticket or the printed `[[secrets.companions]]` block, which renders the name as a TOML
+  string
+- Identity: each role's Ed25519 key is a generic password in the login keychain (service
+  `dev.praveen.codemode-mcp.iroh`, account `gateway` or `companion`), created by the signed binary, so other
+  programs get a keychain prompt. Creation is add-only (a duplicate re-reads, never overwrites), so two first
+  runs cannot replace each other's key. `identity_file` (absolute path, hex, mode 0600, linked into place) replaces
+  it for tests. Not a Secure Enclave
+  key: binding one to a code signature needs a keychain access group and provisioning profile a command-line
+  tool does not have, and enclave key blobs are usable by any process of the same user
+- The CLI never loads the gateway key: `companion invite` and `companion check` go through the admin listener,
+  so the daemon is the only process using the gateway identity. `update` restarts the companion agent too when
+  it is installed. `check` asks companions only, skips the cache
+  and returns the value's length, never the value
+- Values read stay in daemon memory only, as with local `op`; hardened runtime keeps other processes from
+  injecting code to read them. A live compromise of the gateway Mac during a run still sees them; keeping keys
+  off the Mac entirely is the credential broker's job (research note, `agent-credential-broker`)
+
 ### T3 Code (deferred)
 
 T3 Code mints a bearer token per thread and passes it inline in its own MCP entry, and its tools (preview,

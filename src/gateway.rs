@@ -19,6 +19,7 @@ use crate::{
     approvals::{Approvals, Gate, GateRequest, Waiting},
     budget::Budget,
     catalog::{Catalog, ServerSnapshot, ToolEntry},
+    companion::Companions,
     config::Config,
     convert::json_to_monty,
     durable::Sensitivity,
@@ -26,7 +27,7 @@ use crate::{
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
     policy::Policy,
-    secrets::{OnePassword, Redactor},
+    secrets::{Redactor, Secrets},
     store::Store,
     upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
@@ -218,6 +219,7 @@ pub struct Gateway {
     log: UsageLog,
     oauth: Arc<OAuth>,
     redactor: Arc<Redactor>,
+    companions: Arc<Companions>,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
 }
@@ -237,18 +239,24 @@ impl Gateway {
         log: UsageLog,
         oauth: Arc<OAuth>,
         store: &Store,
+        secrets: Secrets,
     ) -> Arc<Self> {
         let redactor = Arc::new(Redactor::new(&config));
+        let Secrets {
+            onepassword,
+            companions,
+        } = secrets;
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
             Some(Arc::clone(&oauth)),
             store,
-            &OnePassword::new(config.secrets.op.clone()),
+            &onepassword,
             &redactor,
         );
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {
+            companions,
             redactor,
             max_tool_result_bytes: config.limits.max_tool_result_bytes,
             config,
@@ -343,6 +351,12 @@ impl Gateway {
     /// The approval service
     pub fn approvals(&self) -> &Arc<Approvals> {
         &self.approvals
+    }
+
+    /// The companion Macs that can read references, and this gateway's
+    /// identity toward them
+    pub fn companions(&self) -> &Arc<Companions> {
+        &self.companions
     }
 
     /// OAuth logins of remote upstreams

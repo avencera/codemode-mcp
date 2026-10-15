@@ -16,17 +16,21 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
     app::App,
     approvals::{AdminAction, AdminRequest, Approvals, Verdict, Waiting, confirmation_code},
+    companion::{self, Ticket},
+    config::Config,
     gateway::{Gateway, WarmResult},
     host::is_direct_local,
     notify::{Notification, Priority},
     oauth::{Callback, LoginStatus, OAuthError},
     passkeys::{PasskeyError, Passkeys},
+    secrets,
     upstream::UpstreamStatus,
     web::escape,
 };
@@ -40,6 +44,7 @@ struct AdminState {
     passkeys: Arc<Passkeys>,
     approvals: Arc<Approvals>,
     gateway: Arc<Gateway>,
+    config: Arc<Config>,
     public_base: String,
 }
 
@@ -136,12 +141,75 @@ pub struct WarmResponse {
     pub results: Vec<WarmResult>,
 }
 
+/// Answer of `POST /admin/companion/invite`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteResponse {
+    /// This gateway's endpoint id
+    pub gateway: EndpointId,
+    /// Short host name of this Mac
+    pub gateway_name: String,
+    /// Sorted, deduplicated references in the configured servers' `headers`
+    /// and `env`
+    pub references: Vec<String>,
+}
+
+impl InviteResponse {
+    /// The ticket that carries this answer to the companion Mac
+    pub fn ticket(self) -> Ticket {
+        Ticket {
+            gateway: self.gateway,
+            gateway_name: self.gateway_name,
+            references: self.references,
+        }
+    }
+}
+
+/// Body of `POST /admin/companion/check`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionCheckRequest {
+    /// The reference to ask the companions for
+    pub reference: String,
+}
+
+/// What one companion did with a check; never the value
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionCheckResult {
+    /// The companion read it
+    Ok {
+        /// Length of the value in bytes
+        bytes: usize,
+    },
+    /// The companion did not
+    Error {
+        /// Why, from the companion or the connection
+        message: String,
+    },
+}
+
+/// One companion in the answer of `POST /admin/companion/check`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionCheckEntry {
+    /// Name from `secrets.companions`
+    pub name: String,
+    /// How it answered
+    pub result: CompanionCheckResult,
+}
+
+/// Answer of `POST /admin/companion/check`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionCheckResponse {
+    /// One entry per configured companion
+    pub companions: Vec<CompanionCheckEntry>,
+}
+
 /// Admin routes; serve them with connect info so the peer can be checked
 pub fn router(app: &App) -> Router {
     let state = AdminState {
         passkeys: Arc::clone(app.passkeys()),
         approvals: Arc::clone(app.approvals()),
         gateway: Arc::clone(app.gateway()),
+        config: Arc::clone(app.config()),
         public_base: app.config().public_base(),
     };
 
@@ -149,6 +217,8 @@ pub fn router(app: &App) -> Router {
         .route("/admin/enroll", post(enroll))
         .route("/admin/passkey/remove", post(remove_passkey))
         .route("/admin/warm", post(warm))
+        .route("/admin/companion/invite", post(companion_invite))
+        .route("/admin/companion/check", post(companion_check))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
         .route("/admin/oauth/logout", post(oauth_logout))
@@ -490,4 +560,75 @@ async fn warm(State(state): State<AdminState>, Json(request): Json<WarmRequest>)
         Ok(results) => Json(WarmResponse { results }).into_response(),
         Err(message) => error(StatusCode::BAD_REQUEST, &message),
     }
+}
+
+/// This gateway's id and the references its servers use, in `headers`,
+/// `env` and OAuth `client_secret`, for a companion Mac to pair with
+async fn companion_invite(State(state): State<AdminState>) -> Response {
+    let gateway = match state.gateway.companions().id().await {
+        Ok(id) => id,
+        Err(failure) => {
+            tracing::warn!(error = %failure, "could not load the gateway identity");
+
+            return error(StatusCode::INTERNAL_SERVER_ERROR, &failure.to_string());
+        }
+    };
+
+    let mut references = std::collections::BTreeSet::new();
+    for server in state.config.servers.values() {
+        let values = server.headers.values().chain(server.env.values());
+        for value in values.chain(server.client_secret.as_ref()) {
+            // validated at load, so a malformed value cannot be here
+            for reference in secrets::references(value).unwrap_or_default() {
+                references.insert(reference.to_owned());
+            }
+        }
+    }
+
+    Json(InviteResponse {
+        gateway,
+        gateway_name: companion::short_hostname(),
+        references: references.into_iter().collect(),
+    })
+    .into_response()
+}
+
+/// Asks the companions, and only them, to read a reference; local `op` and
+/// the cache are skipped, and the value never leaves the daemon
+async fn companion_check(
+    State(state): State<AdminState>,
+    Json(request): Json<CompanionCheckRequest>,
+) -> Response {
+    let reference = request.reference.trim();
+    if !secrets::is_reference(reference) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "the reference must look like op://vault/item/field",
+        );
+    }
+    if state.gateway.companions().peers().is_empty() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "no companions are configured under [secrets]",
+        );
+    }
+
+    let companions = state
+        .gateway
+        .companions()
+        .check(reference)
+        .await
+        .into_iter()
+        .map(|outcome| CompanionCheckEntry {
+            name: outcome.name,
+            result: match outcome.result {
+                Ok(bytes) => CompanionCheckResult::Ok { bytes },
+                Err(failure) => CompanionCheckResult::Error {
+                    message: failure.to_string(),
+                },
+            },
+        })
+        .collect();
+
+    Json(CompanionCheckResponse { companions }).into_response()
 }

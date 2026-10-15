@@ -13,9 +13,13 @@ use std::{
     time::Duration,
 };
 
-use tokio::{process::Command, sync::Mutex};
+use tokio::{process::Command, sync::Mutex, task::JoinSet};
 
-use crate::config::Config;
+use crate::{
+    companion::Companions,
+    config::{Config, SecretsConfig},
+    mac::OnMac,
+};
 
 /// How long one `op read` may take; long enough for the 1Password app's
 /// unlock or Touch ID prompt on the Mac
@@ -26,6 +30,36 @@ const MAX_ERROR_TEXT: usize = 2000;
 const REDACTED: &str = "[redacted]";
 /// Shorter secrets would redact ordinary words
 const MIN_SECRET_LEN: usize = 6;
+/// Longest `op://` reference accepted
+const MAX_REFERENCE_CHARS: usize = 256;
+
+/// The daemon's one 1Password reader and the companions it may ask, shared
+/// by upstream connections and OAuth logins so they keep one cache and one
+/// iroh endpoint
+#[derive(Clone)]
+pub struct Secrets {
+    /// Reads references, also through the companions when any are paired
+    pub onepassword: OnePassword,
+    /// Always built, since `companion invite` pairs the first one
+    pub companions: Arc<Companions>,
+}
+
+impl Secrets {
+    /// Readers for `config`; `presence` tells whether the owner is at this
+    /// Mac, which decides whether a read also runs the local `op`
+    pub fn new(config: &SecretsConfig, presence: Option<OnMac>) -> Self {
+        let companions = Arc::new(Companions::new(config));
+        let mut onepassword = OnePassword::new(config.op.clone());
+        if !companions.peers().is_empty() {
+            onepassword = onepassword.with_companions(Arc::clone(&companions), presence);
+        }
+
+        Self {
+            onepassword,
+            companions,
+        }
+    }
+}
 
 /// Failures turning references into values; none of them carries a value
 /// that was read
@@ -64,6 +98,18 @@ pub enum SecretError {
     },
 }
 
+impl SecretError {
+    /// Why a read failed, without the reference, for joining the answers
+    /// of several sources
+    fn reason(&self) -> String {
+        match self {
+            Self::Read { reason, .. } => reason.clone(),
+            Self::TimedOut { timeout, .. } => format!("took longer than {timeout:?}"),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// One piece of a configured value
 #[derive(Debug, PartialEq, Eq)]
 enum Piece<'a> {
@@ -98,7 +144,15 @@ fn pieces(value: &str) -> Result<Vec<Piece<'_>>, SecretError> {
 
 /// `op://vault/item/field` or `op://vault/item/section/field`; names may
 /// hold spaces, and `op` itself rejects anything else it cannot find
-fn is_reference(text: &str) -> bool {
+pub fn is_reference(text: &str) -> bool {
+    // a companion's Touch ID prompt shows the reference, so it must read as
+    // stored and stay short enough to be seen whole
+    if text.chars().count() > MAX_REFERENCE_CHARS
+        || crate::prompt::one_line(text, usize::MAX) != text
+    {
+        return false;
+    }
+
     text.strip_prefix("op://").is_some_and(|path| {
         let segments: Vec<&str> = path.split('/').collect();
 
@@ -110,6 +164,17 @@ fn is_reference(text: &str) -> bool {
 /// Checks a configured value's references without reading them
 pub fn check(value: &str) -> Result<(), SecretError> {
     pieces(value).map(|_| ())
+}
+
+/// The references in a configured value, in order
+pub fn references(value: &str) -> Result<Vec<&str>, SecretError> {
+    Ok(pieces(value)?
+        .into_iter()
+        .filter_map(|piece| match piece {
+            Piece::Reference(reference) => Some(reference),
+            Piece::Text(_) => None,
+        })
+        .collect())
 }
 
 /// Values with their references replaced, and the secrets that were read
@@ -127,10 +192,14 @@ pub struct Resolved {
 /// Clones share one cache: each reference is read once per process, and
 /// reads run one at a time, so servers that connect together or reconnect
 /// later never put a second prompt on the Mac for the same reference
+///
+/// With companions, a read also asks them; see [`OnePassword::with_companions`]
 #[derive(Clone)]
 pub struct OnePassword {
     program: String,
     known: Arc<Mutex<HashMap<String, String>>>,
+    companions: Option<Arc<Companions>>,
+    on_mac: Option<OnMac>,
 }
 
 impl std::fmt::Debug for OnePassword {
@@ -148,7 +217,23 @@ impl OnePassword {
         Self {
             program: program.into(),
             known: Arc::default(),
+            companions: None,
+            on_mac: None,
         }
+    }
+
+    /// Also asks `companions` for every read, and reads locally only while
+    /// the owner is at this Mac (always when `on_mac` is `None`)
+    ///
+    /// The first answer wins and the others are dropped; the local `op`
+    /// child dies with its future. Skipping the local read while the owner
+    /// is away keeps a 1Password prompt from waiting on an unattended screen
+    #[must_use]
+    pub fn with_companions(mut self, companions: Arc<Companions>, on_mac: Option<OnMac>) -> Self {
+        self.companions = Some(companions);
+        self.on_mac = on_mac;
+
+        self
     }
 
     /// `values` with every reference replaced by what 1Password holds; a
@@ -194,6 +279,81 @@ impl OnePassword {
     }
 
     async fn read(&self, reference: &str) -> Result<String, SecretError> {
+        let Some(companions) = &self.companions else {
+            return self.read_local(reference).await;
+        };
+
+        let local = match &self.on_mac {
+            Some(on_mac) => on_mac.mac.present(on_mac.config.idle()).await,
+            None => true,
+        };
+        let mut sources: JoinSet<(String, Result<String, String>)> = JoinSet::new();
+        if local {
+            let onepassword = self.clone();
+            let reference = reference.to_owned();
+            sources.spawn(async move {
+                let value = onepassword
+                    .read_local(&reference)
+                    .await
+                    .map_err(|error| error.reason());
+
+                ("local".to_owned(), value)
+            });
+        }
+        for peer in companions.peers() {
+            let companions = Arc::clone(companions);
+            let name = peer.name.clone();
+            let reference = reference.to_owned();
+            sources.spawn(async move {
+                let value = companions
+                    .read(&name, &reference)
+                    .await
+                    .map_err(|error| error.to_string());
+
+                (name, value)
+            });
+        }
+
+        // dropping the set on any exit aborts what is still running, which
+        // kills the local `op` child and hangs up on the companions
+        let first_success = async {
+            // named, so a failure with the owner away says why `op` never ran
+            let mut failures = Vec::new();
+            if !local {
+                failures.push("local: skipped, the owner is away from this Mac".to_owned());
+            }
+            while let Some(finished) = sources.join_next().await {
+                match finished {
+                    Ok((_, Ok(value))) => return Ok(value),
+                    Ok((source, Err(reason))) => failures.push(format!("{source}: {reason}")),
+                    Err(error) => failures.push(format!("a read stopped unexpectedly: {error}")),
+                }
+            }
+
+            Err(failures)
+        };
+
+        match tokio::time::timeout(READ_TIMEOUT, first_success).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(failures)) if failures.is_empty() => Err(SecretError::Read {
+                reference: reference.to_owned(),
+                reason: "no source could read it".to_owned(),
+            }),
+            Ok(Err(failures)) => Err(SecretError::Read {
+                reference: reference.to_owned(),
+                reason: failures.join("; "),
+            }),
+            Err(_) => Err(SecretError::TimedOut {
+                reference: reference.to_owned(),
+                timeout: READ_TIMEOUT,
+            }),
+        }
+    }
+
+    /// Runs `op read` on this Mac, with no cache and no companions
+    ///
+    /// The companion side answers with this: every request asks anew
+    pub async fn read_local(&self, reference: &str) -> Result<String, SecretError> {
         let mut command = Command::new(&self.program);
         command
             .args(["read", "--no-newline", reference])

@@ -6,10 +6,10 @@ use serde_json::Value;
 
 use super::harness::{Harness, Setup, TestResult, execute, temp_state_dir, text_of};
 
-const VALUE: &str = "value-from-1password";
+pub(super) const VALUE: &str = "value-from-1password";
 
 /// A stand-in for the 1Password CLI that knows one item and logs each read
-fn fake_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+pub(super) fn fake_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
     let log = directory.join("reads.log");
@@ -22,6 +22,7 @@ fn fake_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
              [ \"$1 $2\" = 'read --no-newline' ] || exit 2\n\
              case \"$3\" in\n\
                op://Dev/fixture/credential) printf '{VALUE}' ;;\n\
+               op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
             log = log.display(),
@@ -32,7 +33,7 @@ fn fake_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     Ok((program, log))
 }
 
-fn reads(log: &PathBuf, reference: &str) -> usize {
+pub(super) fn reads(log: &PathBuf, reference: &str) -> usize {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()

@@ -265,7 +265,10 @@ pub struct FakeMac {
     answer: Mutex<Option<TouchId>>,
     /// How long a prompt stays up before it answers
     answer_after: Mutex<Duration>,
+    /// A file that must exist before a prompt answers
+    answer_once: Mutex<Option<PathBuf>>,
     shown: Mutex<Vec<String>>,
+    cancel_titles: Mutex<Vec<String>>,
 }
 
 impl FakeMac {
@@ -290,12 +293,28 @@ impl FakeMac {
         }
     }
 
+    /// Hold later prompts until `path` exists, for up to ten seconds, so a
+    /// test can order an answer after something else has started
+    pub fn set_answer_once(&self, path: PathBuf) {
+        if let Ok(mut slot) = self.answer_once.lock() {
+            *slot = Some(path);
+        }
+    }
+
     /// What was shown, in order: `touch_id <reason>`, `dismissed`,
     /// `notify <title>`, `open <url>`
     pub fn shown(&self) -> Vec<String> {
         self.shown
             .lock()
             .map(|shown| shown.clone())
+            .unwrap_or_default()
+    }
+
+    /// The cancel button title of each Touch ID prompt, in order
+    pub fn cancel_titles(&self) -> Vec<String> {
+        self.cancel_titles
+            .lock()
+            .map(|titles| titles.clone())
             .unwrap_or_default()
     }
 
@@ -322,19 +341,32 @@ impl Mac for FakeMac {
         Box::pin(std::future::ready(present))
     }
 
-    fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId> {
+    fn touch_id<'a>(&'a self, reason: &'a str, cancel: &'a str) -> BoxFuture<'a, TouchId> {
         self.record(format!("touch_id {reason}"));
+        if let Ok(mut titles) = self.cancel_titles.lock() {
+            titles.push(cancel.to_owned());
+        }
         let answer = self.answer.lock().ok().and_then(|answer| *answer);
         let delay = self
             .answer_after
             .lock()
             .map(|delay| *delay)
             .unwrap_or_default();
+        let gate = self.answer_once.lock().ok().and_then(|path| path.clone());
 
         Box::pin(async move {
             let prompt = Prompt(self);
             match answer {
                 Some(answer) => {
+                    if let Some(gate) = gate {
+                        for _ in 0..500 {
+                            if gate.exists() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+
                     tokio::time::sleep(delay).await;
                     std::mem::forget(prompt);
 
@@ -666,9 +698,7 @@ impl Harness {
     }
 
     /// Enrolls the first software passkey through the admin and enrollment routes
-    pub async fn enroll_passkey(
-        &self,
-    ) -> Result<SoftPasskey, Box<dyn Error>> {
+    pub async fn enroll_passkey(&self) -> Result<SoftPasskey, Box<dyn Error>> {
         let (path, enrolled) = self.request_enrollment("test <phone>").await?;
         assert!(enrolled["approval_url"].is_null(), "{enrolled}");
 
@@ -676,10 +706,7 @@ impl Harness {
     }
 
     /// Registers a new software passkey on an enrollment page that is ready
-    pub async fn register_at(
-        &self,
-        path: &str,
-    ) -> Result<SoftPasskey, Box<dyn Error>> {
+    pub async fn register_at(&self, path: &str) -> Result<SoftPasskey, Box<dyn Error>> {
         let page = self
             .http
             .get(format!("{}{path}", self.base()))

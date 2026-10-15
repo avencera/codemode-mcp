@@ -29,8 +29,6 @@ const TERMINAL_NOTIFIER: [&str; 2] = [
 ];
 /// `kCGAnyInputEventType`: the most recent input of any kind
 const ANY_INPUT: CGEventType = CGEventType(u32::MAX);
-/// Cancel button of the Touch ID prompt; pressing it opens the approval page
-const REVIEW_TITLE: &str = "Open Page";
 /// Pause after a prompt closes before the next queued one may show
 const PROMPT_GAP: Duration = Duration::from_secs(1);
 
@@ -122,7 +120,7 @@ impl Drop for Context {
 /// How an evaluation ended
 type Reply = Result<(), LAError>;
 
-fn evaluate(reason: &str) -> Result<(Context, oneshot::Receiver<Reply>), TouchId> {
+fn evaluate(reason: &str, cancel: &str) -> Result<(Context, oneshot::Receiver<Reply>), TouchId> {
     let context = Context(unsafe { LAContext::new() });
     let policy = LAPolicy::DeviceOwnerAuthenticationWithBiometrics;
     // biometrics only: a password field could be typed into by anything that
@@ -133,7 +131,7 @@ fn evaluate(reason: &str) -> Result<(Context, oneshot::Receiver<Reply>), TouchId
             .setLocalizedFallbackTitle(Some(&NSString::from_str("")));
         context
             .0
-            .setLocalizedCancelTitle(Some(&NSString::from_str(REVIEW_TITLE)));
+            .setLocalizedCancelTitle(Some(&NSString::from_str(cancel)));
     }
     if let Err(error) = unsafe { context.0.canEvaluatePolicy_error(policy) } {
         tracing::info!(code = error.code(), "Touch ID is not available");
@@ -188,10 +186,10 @@ impl Mac for MacOs {
         Box::pin(async move { !screen_locked() && idle() < idle_limit })
     }
 
-    fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId> {
+    fn touch_id<'a>(&'a self, reason: &'a str, cancel: &'a str) -> BoxFuture<'a, TouchId> {
         Box::pin(async move {
             let _turn = self.prompts.turn().await;
-            let (context, receiver) = match evaluate(reason) {
+            let (context, receiver) = match evaluate(reason, cancel) {
                 Ok(started) => started,
                 Err(answer) => return answer,
             };
