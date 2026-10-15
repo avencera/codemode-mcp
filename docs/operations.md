@@ -52,7 +52,8 @@ binary under a shorter name. Times in logs are UTC.
 Bump `version` in `Cargo.toml`, then push a matching `v*` tag. `.github/workflows/release.yml` builds
 `aarch64-apple-darwin` and installs the `monty-runtime` worker matching the `monty-pool` version in `Cargo.lock`.
 It signs both with the same identity and identifiers as a local install and attaches
-`codemode-mcp-<tag>-aarch64-apple-darwin.tar.gz` (holding `codemode-mcp` and `monty`) and its `.sha256`. It
+`codemode-mcp-<tag>-aarch64-apple-darwin.tar.gz` (holding `codemode-mcp` and `monty`), its `.sha256` and
+`install.sh`. It
 reads the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the `MACOS_SIGNING_IDENTITY`
 variable, the same names homebased uses, and fails rather than ship unsigned.
 

@@ -57,18 +57,16 @@ before the script sees them.
 
 ## Install
 
-From a release, with `~/.local/bin` on your `PATH`:
-
 ```sh
-repo=https://github.com/praveenperera/codemode-mcp
-tag=$(curl -fsSLo /dev/null -w '%{url_effective}' "$repo/releases/latest" | sed 's#.*/##')
-curl -fsSL "$repo/releases/download/$tag/codemode-mcp-$tag-aarch64-apple-darwin.tar.gz" | tar -xz -C /tmp
-
-/tmp/codemode-mcp update        # installs ~/.local/bin/codemode-mcp and the Monty worker
+curl -LSfs https://github.com/praveenperera/codemode-mcp/releases/latest/download/install.sh | sh
 codemode-mcp config init        # writes ~/.config/codemode-mcp/config.toml
 codemode-mcp service install    # loads the launchd agent
 codemode-mcp service status
 ```
+
+The script checks the release against its checksum and Developer ID signature, then installs
+`~/.local/bin/codemode-mcp` and the Monty worker. Add `~/.local/bin` to your `PATH` if it is not there. Pass
+`--tag v0.1.0` after `sh -s --` for a specific release.
 
 `codemode-mcp update` installs later releases. To build from source instead, see
 [Operations](docs/operations.md#install).

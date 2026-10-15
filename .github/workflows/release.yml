@@ -104,6 +104,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      # attached to every release, so releases/latest/download/install.sh works
+      - name: Upload install.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" install.sh --repo "$GITHUB_REPOSITORY" --clobber
       - name: Publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
