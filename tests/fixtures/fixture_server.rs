@@ -30,6 +30,12 @@ struct WhoamiParams {
     account: String,
 }
 
+#[derive(Serialize, schemars::JsonSchema)]
+struct Pid {
+    /// This server's process id
+    pid: u32,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 struct EnvParams {
     /// Variable to read
@@ -271,6 +277,13 @@ impl Fixture {
         } else {
             Err("Missing required scope. Call the login tool first.".to_owned())
         }
+    }
+
+    #[tool(description = "This server's process id")]
+    fn pid(&self) -> Json<Pid> {
+        Json(Pid {
+            pid: std::process::id(),
+        })
     }
 
     #[tool(description = "Read one of this server's environment variables")]

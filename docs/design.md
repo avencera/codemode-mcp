@@ -47,6 +47,20 @@ rmcp 3.x clients, one long-lived connection per configured server
 | HTTP + OAuth | any `url` server with `oauth = true` | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
 
+A stdio server with `lazy = true` is for tools used now and then (Blender, video, diagrams): no process runs
+until a script calls one of its tools, and after `idle_secs` (default 600) with no call in flight the daemon
+closes the connection, which kills the process, and shows it as `idle`. Its tools stay in the catalog from the
+cached tool list, so search and describe work while it sleeps, and the approval check lets calls through. The
+first call wakes it and waits up to 3 minutes for the connect (including any 1Password prompt); a failed start
+fails that call, and the next call tries again, with no background retries. Without a cached tool list (the very
+first boot) it connects at once to learn its tools, then idles like any other quiet spell. Instructions the
+server sends are learned on its first connect of each daemon run. A lazy server runs in its own process group,
+and when its connection ends the daemon kills the group, so children a launcher such as `uvx` or `npx` left
+behind go too; other servers stay in the daemon's group, which launchd ends with it. The idle stop takes the
+connection under the same lock calls use to register, so a call either keeps the server up or waits for a fresh
+start, never a connection that is shutting down. If the daemon itself is killed, a lazy server's group is not
+in launchd's reach and relies on stdin closing to exit
+
 Upstream calls use `PeerRequestOptions::with_timeout` so a timeout sends
 `notifications/cancelled`; an outer `tokio::time::timeout` would not.
 Calls are never retried automatically, since upstream tools may not be
@@ -597,7 +611,7 @@ refused (`SchemaTooNew`).
   exists for server-side storage); the state never reaches the browser and stays bound to its approval id and
   choice
 - Each upstream's last tool list (`tool_cache`). A server that is down at boot shows as `unavailable` with its
-  cached tools, as when it drops mid-run
+  cached tools, as when it drops mid-run; a `lazy` one shows as `idle` with them and does not start
 
 **Derived and rebuilt**: the catalog and stubs (from live upstreams, with the cache standing in for a missing
 one), the worker pool, the in-flight upstream connections, OAuth access in memory, and the usage log buffer.

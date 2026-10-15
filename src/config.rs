@@ -270,6 +270,10 @@ impl Default for SecretsConfig {
     }
 }
 
+fn default_idle_secs() -> u64 {
+    10 * 60
+}
+
 fn default_op() -> String {
     "op".to_owned()
 }
@@ -638,6 +642,13 @@ pub struct ServerConfig {
     /// Working directory for a stdio server
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Start a stdio server on its first call instead of at boot, and stop
+    /// it after `idle_secs` without calls, for servers that are rarely used
+    #[serde(default)]
+    pub lazy: bool,
+    /// Seconds a `lazy` server may go without calls before it is stopped
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u64,
     /// Endpoint of a Streamable HTTP server
     #[serde(default)]
     pub url: Option<String>,
@@ -859,6 +870,12 @@ impl ServerConfig {
             }
             (Some(_), None) if self.oauth => Err(ConfigError::Invalid(format!(
                 "servers.{name}: `oauth` only applies to `url` servers"
+            ))),
+            (None, Some(_)) if self.lazy => Err(ConfigError::Invalid(format!(
+                "servers.{name}: `lazy` only applies to `command` servers"
+            ))),
+            _ if self.idle_secs == 0 => Err(ConfigError::Invalid(format!(
+                "servers.{name}: `idle_secs` must be positive"
             ))),
             _ if !self.oauth && (!self.scopes.is_empty() || self.client_name.is_some()) => {
                 Err(ConfigError::Invalid(format!(

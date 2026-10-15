@@ -6,6 +6,7 @@ mod apple;
 mod approvals;
 mod durable;
 mod harness;
+mod lazy;
 mod mac;
 mod oauth;
 mod secrets;

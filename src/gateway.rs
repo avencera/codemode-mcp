@@ -609,7 +609,7 @@ impl Gateway {
                 name: upstream.name().to_owned(),
                 tools: upstream.tools(),
                 instructions: upstream.instructions(),
-                available: upstream.status() == UpstreamStatus::Connected,
+                available: upstream.callable(),
             })
             .collect();
 

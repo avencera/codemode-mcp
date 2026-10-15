@@ -18,7 +18,8 @@ use rmcp::{
         CancelledNotificationParam, ClientRequest, RequestId, ServerResult, Tool,
     },
     service::{
-        NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
+        NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService,
+        RunningServiceCancellationToken, ServiceError,
     },
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
@@ -51,6 +52,9 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// How often a server waiting for an OAuth login is retried anyway, in case
 /// it starts accepting anonymous clients
 const NEEDS_LOGIN_RETRY: Duration = Duration::from_secs(30 * 60);
+/// How long a call to a sleeping lazy server waits for it to start: a
+/// connect plus a possible 1Password prompt
+const WAKE_TIMEOUT: Duration = Duration::from_secs(180);
 /// How often a server whose 1Password references could not be read is
 /// retried; each try can put a prompt on the Mac, so not on the usual backoff
 const SECRET_RETRY: Duration = Duration::from_secs(10 * 60);
@@ -242,7 +246,10 @@ pub enum UpstreamStatus {
     Connected,
     /// Refused anonymous access; waits for `codemode-mcp oauth login`
     NeedsLogin,
-    /// Not connected; a retry is scheduled
+    /// A `lazy` server that is not running; the next call starts it
+    Idle,
+    /// Not connected; a retry is scheduled, or for a `lazy` server, the
+    /// next call tries again
     Unavailable {
         /// Why the last attempt or connection failed; may hold URLs, paths
         /// or commands, so it is for local logs and the CLI only
@@ -253,12 +260,13 @@ pub enum UpstreamStatus {
 }
 
 impl UpstreamStatus {
-    /// `connecting`, `connected`, `needs_login` or `unavailable`
+    /// `connecting`, `connected`, `needs_login`, `idle` or `unavailable`
     pub fn state(&self) -> &'static str {
         match self {
             Self::Connecting => "connecting",
             Self::Connected => "connected",
             Self::NeedsLogin => "needs_login",
+            Self::Idle => "idle",
             Self::Unavailable { .. } => "unavailable",
         }
     }
@@ -323,6 +331,34 @@ pub struct Upstream {
     onepassword: OnePassword,
     /// Learns the values read, so upstream text never shows them
     redactor: Arc<Redactor>,
+    /// Counts calls that want a sleeping `lazy` server started
+    wake: watch::Sender<u64>,
+    /// Counts finished connect attempts, so a woken call knows when to look
+    attempts: watch::Sender<u64>,
+    /// Calls in flight and the last activity, which the idle stop reads and
+    /// acts on under one lock
+    usage: std::sync::Mutex<Usage>,
+    /// Process group of a running `lazy` server, ended whole when its
+    /// connection does, so whatever a launcher such as `uvx` started goes too
+    group: std::sync::Mutex<Option<u32>>,
+}
+
+/// Calls running now and when one last started or ended, or the server
+/// last connected; a `lazy` server is never stopped under a call
+struct Usage {
+    in_flight: usize,
+    last_used: Instant,
+}
+
+/// Marks a call in flight for the idle stop, until dropped
+struct InUse<'a>(&'a Upstream);
+
+impl Drop for InUse<'_> {
+    fn drop(&mut self) {
+        let mut usage = self.0.usage();
+        usage.in_flight -= 1;
+        usage.last_used = Instant::now();
+    }
 }
 
 impl Upstream {
@@ -357,12 +393,105 @@ impl Upstream {
             .await;
     }
 
-    /// Fails unless the server is connected right now
+    /// Fails unless the server is connected right now, or is `lazy` and
+    /// so starts on the call
     ///
     /// Checked before asking for approval so nobody is bothered about a call
     /// that cannot run
     pub fn ensure_available(&self) -> Result<(), UpstreamError> {
+        if self.config.lazy {
+            return Ok(());
+        }
+
         self.connected_peer().map(|_| ())
+    }
+
+    /// Whether the catalog offers this server's tools as callable
+    pub fn callable(&self) -> bool {
+        self.config.lazy || self.status() == UpstreamStatus::Connected
+    }
+
+    /// The live peer, starting a sleeping `lazy` server first
+    async fn awake_peer(&self) -> Result<(Peer<RoleClient>, u64), UpstreamError> {
+        if !self.config.lazy {
+            return self.connected_peer();
+        }
+        if let Ok(found) = self.connected_peer() {
+            return Ok(found);
+        }
+
+        // subscribed before looking again, so an attempt that finishes in
+        // between still wakes this call
+        let mut attempts = self.attempts.subscribe();
+        if let Ok(found) = self.connected_peer() {
+            return Ok(found);
+        }
+        self.wake.send_modify(|count| *count += 1);
+        // the attempt that answers may also be one already under way
+        let _ = tokio::time::timeout(WAKE_TIMEOUT, attempts.changed()).await;
+
+        self.connected_peer()
+    }
+
+    fn usage(&self) -> std::sync::MutexGuard<'_, Usage> {
+        self.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin_use(&self) -> InUse<'_> {
+        let mut usage = self.usage();
+        usage.in_flight += 1;
+        usage.last_used = Instant::now();
+
+        InUse(self)
+    }
+
+    fn touch(&self) {
+        self.usage().last_used = Instant::now();
+    }
+
+    /// Takes a `lazy` server's peer away if it has gone `limit` without a
+    /// call, returning how long to wait before looking again otherwise
+    ///
+    /// Under the usage lock, so a call either started first and keeps the
+    /// server up, or finds no peer and waits for a fresh start rather than
+    /// getting one that is shutting down
+    fn claim_idle(&self, limit: Duration) -> Option<Duration> {
+        let usage = self.usage();
+        if usage.in_flight > 0 {
+            return Some(limit);
+        }
+        let idle = usage.last_used.elapsed();
+        if idle < limit {
+            return Some(limit - idle);
+        }
+        self.write().peer = None;
+
+        None
+    }
+
+    /// Ends what is left of a `lazy` server's process group once its
+    /// connection is gone; the group's leader may have exited on its own
+    /// and left children behind
+    fn end_group(&self) {
+        let group = self
+            .group
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(pid) = group
+            .and_then(|group| i32::try_from(group).ok())
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            return;
+        };
+        // an empty group is the usual case and not worth a word
+        if let Err(error) = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
+            && error != rustix::io::Errno::SRCH
+        {
+            tracing::warn!(server = %self.name, %error, "could not end the server's process group");
+        }
     }
 
     /// The live peer and the connection epoch it belongs to, read together
@@ -391,7 +520,8 @@ impl Upstream {
         tool: &str,
         arguments: Map<String, Value>,
     ) -> Result<CallToolResult, UpstreamError> {
-        let (peer, epoch) = self.connected_peer()?;
+        let _in_use = self.begin_use();
+        let (peer, epoch) = self.awake_peer().await?;
         self.ensure_setup(&peer, epoch, tool).await?;
 
         self.send_call(&peer, tool, self.with_fixed_arguments(tool, arguments))
@@ -537,6 +667,16 @@ impl Upstream {
         self.changed.notify_one();
     }
 
+    /// A `lazy` server that stopped, or has not started, keeps its tools
+    /// callable; only tools restored at boot need the catalog to learn of them
+    fn mark_idle(&self) {
+        self.write().peer = None;
+        self.status.send_replace(UpstreamStatus::Idle);
+        if self.cache_unshown.swap(false, Ordering::SeqCst) {
+            self.changed.notify_one();
+        }
+    }
+
     fn mark_unavailable(&self, error: String, category: ErrorCategory) {
         // only a connected server turning unavailable changes what the
         // catalog shows; repeated failed reconnects do not
@@ -619,49 +759,65 @@ impl Upstream {
     async fn supervise(self: Arc<Self>) {
         let mut backoff = BACKOFF_START;
         let mut requests = self.reconnect.subscribe();
+        let mut wakes = self.wake.subscribe();
+        // a lazy server whose tools are already known waits for its first call
+        let mut asleep = self.sleeps();
+        if asleep {
+            self.mark_idle();
+        }
 
         loop {
+            if asleep {
+                // a call or reconnect request made since the last attempt
+                // wakes it at once
+                let pending =
+                    wakes.has_changed().unwrap_or(false) || requests.has_changed().unwrap_or(false);
+                if !pending {
+                    tokio::select! {
+                        _ = wakes.changed() => {}
+                        _ = requests.changed() => {}
+                    }
+                }
+                asleep = false;
+                self.status.send_replace(UpstreamStatus::Connecting);
+            }
+
             // a request made before this attempt is answered by it; a
             // counter, unlike a Notify permit, cannot fire twice for one
             requests.borrow_and_update();
             let mut delay = backoff;
-            match self.connect().await {
+            let attempt = self.connect().await;
+            // every call that asked for a start so far is answered by this
+            // attempt; one that asks later wakes the server again
+            wakes.borrow_and_update();
+            match attempt {
                 Ok(service) => {
-                    let connected_at = Instant::now();
-                    tracing::info!(server = %self.name, "connected");
-                    let token = service.cancellation_token();
-                    let mut watched = requests.clone();
-                    let watcher = tokio::spawn(async move {
-                        if watched.changed().await.is_ok() {
-                            token.cancel();
-                        }
-                    });
-                    let reason = service.waiting().await;
-                    watcher.abort();
-                    let error = format!("connection closed ({reason:?})");
-                    tracing::warn!(server = %self.name, %error, "upstream disconnected");
-                    self.mark_unavailable(error, ErrorCategory::ConnectionClosed);
+                    self.attempts.send_modify(|count| *count += 1);
+                    if Arc::clone(&self)
+                        .serve_until_closed(service, &requests, &mut backoff)
+                        .await
+                    {
+                        asleep = true;
 
-                    // only a connection that stayed up counts as recovery, so
-                    // a server that accepts and immediately drops us still backs off
-                    if connected_at.elapsed() >= HEALTHY_AFTER {
-                        backoff = BACKOFF_START;
+                        continue;
                     }
                 }
-                Err(UpstreamError::NeedsLogin(_)) => {
-                    tracing::warn!(server = %self.name, "upstream needs an OAuth login");
-                    self.mark_needs_login();
-                    delay = NEEDS_LOGIN_RETRY;
-                }
-                Err(error @ UpstreamError::Secret(_)) => {
-                    tracing::warn!(server = %self.name, %error, "upstream secret unavailable");
-                    self.mark_unavailable(error.to_string(), error.category());
-                    delay = SECRET_RETRY;
-                }
                 Err(error) => {
-                    tracing::warn!(server = %self.name, %error, "upstream connection failed");
-                    self.mark_unavailable(error.to_string(), error.category());
+                    // a start that failed after spawning leaves no strays either
+                    self.end_group();
+                    if let Some(retry) = self.mark_failed(error) {
+                        delay = retry;
+                    }
+                    self.attempts.send_modify(|count| *count += 1);
                 }
+            }
+
+            // a lazy server with a known tool list starts again only when a
+            // call needs it, so a broken one stays quiet
+            if self.sleeps() {
+                asleep = true;
+
+                continue;
             }
 
             let requested = if requests.has_changed().unwrap_or(false) {
@@ -685,6 +841,107 @@ impl Upstream {
                 self.status.send_replace(UpstreamStatus::Connecting);
             }
         }
+    }
+
+    /// Serves one connection until it closes, a reconnect is requested, or
+    /// a lazy server goes idle; returns true for the idle stop
+    async fn serve_until_closed(
+        self: Arc<Self>,
+        service: RunningService<RoleClient, UpstreamHandler>,
+        requests: &watch::Receiver<u64>,
+        backoff: &mut Duration,
+    ) -> bool {
+        let connected_at = Instant::now();
+        tracing::info!(server = %self.name, "connected");
+        self.touch();
+
+        let token = service.cancellation_token();
+        let mut watched = requests.clone();
+        let watcher = tokio::spawn(async move {
+            if watched.changed().await.is_ok() {
+                token.cancel();
+            }
+        });
+        let idled = Arc::new(AtomicBool::new(false));
+        let idler = self.config.lazy.then(|| {
+            tokio::spawn(
+                Arc::clone(&self).stop_when_idle(service.cancellation_token(), Arc::clone(&idled)),
+            )
+        });
+
+        let reason = service.waiting().await;
+        watcher.abort();
+        if let Some(idler) = idler {
+            idler.abort();
+        }
+        self.end_group();
+
+        if idled.load(Ordering::SeqCst) {
+            tracing::info!(server = %self.name, "stopped after going idle");
+            self.mark_idle();
+            *backoff = BACKOFF_START;
+
+            return true;
+        }
+
+        let error = format!("connection closed ({reason:?})");
+        tracing::warn!(server = %self.name, %error, "upstream disconnected");
+        self.mark_unavailable(error, ErrorCategory::ConnectionClosed);
+
+        // only a connection that stayed up counts as recovery, so a server
+        // that accepts and immediately drops us still backs off
+        if connected_at.elapsed() >= HEALTHY_AFTER {
+            *backoff = BACKOFF_START;
+        }
+
+        false
+    }
+
+    /// Records a failed connect; returns the retry delay when it differs
+    /// from the usual backoff
+    fn mark_failed(&self, error: UpstreamError) -> Option<Duration> {
+        match error {
+            UpstreamError::NeedsLogin(_) => {
+                tracing::warn!(server = %self.name, "upstream needs an OAuth login");
+                self.mark_needs_login();
+
+                Some(NEEDS_LOGIN_RETRY)
+            }
+            error @ UpstreamError::Secret(_) => {
+                tracing::warn!(server = %self.name, %error, "upstream secret unavailable");
+                self.mark_unavailable(error.to_string(), error.category());
+
+                Some(SECRET_RETRY)
+            }
+            error => {
+                tracing::warn!(server = %self.name, %error, "upstream connection failed");
+                self.mark_unavailable(error.to_string(), error.category());
+
+                None
+            }
+        }
+    }
+
+    /// Cancels a lazy server's connection once it has gone `idle_secs`
+    /// without a call in flight
+    async fn stop_when_idle(
+        self: Arc<Self>,
+        token: RunningServiceCancellationToken,
+        idled: Arc<AtomicBool>,
+    ) {
+        let limit = Duration::from_secs(self.config.idle_secs);
+        while let Some(wait) = self.claim_idle(limit) {
+            tokio::time::sleep(wait).await;
+        }
+        idled.store(true, Ordering::SeqCst);
+        token.cancel();
+    }
+
+    /// Whether this server waits for a call instead of connecting: lazy, and
+    /// with a tool list to show meanwhile. Without one it connects like any
+    /// other server, since nothing could call it
+    fn sleeps(&self) -> bool {
+        self.config.lazy && !self.read().tools.is_empty()
     }
 
     async fn connect(
@@ -805,6 +1062,11 @@ impl Upstream {
         if let Some(directory) = &self.config.cwd {
             process.current_dir(directory);
         }
+        // its own group, so an idle stop ends what a launcher started too;
+        // other servers stay in the daemon's, which launchd ends with it
+        if self.config.lazy {
+            process.process_group(0);
+        }
 
         // stderr is captured so a chatty server cannot scribble over our own logs
         let (transport, stderr) = TokioChildProcess::builder(process)
@@ -814,6 +1076,12 @@ impl Upstream {
                 command: command.to_owned(),
                 source,
             })?;
+        if self.config.lazy {
+            *self
+                .group
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = transport.id();
+        }
 
         if let Some(stderr) = stderr {
             let server = self.name.clone();
@@ -983,6 +1251,13 @@ impl Upstreams {
                 reconnect: watch::channel(0).0,
                 onepassword: onepassword.clone(),
                 redactor: Arc::clone(redactor),
+                wake: watch::channel(0).0,
+                attempts: watch::channel(0).0,
+                usage: std::sync::Mutex::new(Usage {
+                    in_flight: 0,
+                    last_used: Instant::now(),
+                }),
+                group: std::sync::Mutex::new(None),
             });
             tasks.push(tokio::spawn(Arc::clone(&upstream).supervise()));
             upstreams.push(upstream);
