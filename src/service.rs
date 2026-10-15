@@ -70,9 +70,9 @@ pub enum ServiceError {
     ConfigExists(PathBuf),
     /// The signing certificate is not in any keychain
     #[error(
-        "the signing identity \"{SIGNING_IDENTITY}\" is not in your keychain; import the InfraOps \
-         Developer ID .p12 (the one in the homebased release secrets) into the login keychain, then \
-         install again"
+        "the signing identity \"{SIGNING_IDENTITY}\" is not in your keychain, and this binary is \
+         not a signed release; install a release with install.sh, or import the InfraOps Developer \
+         ID .p12 (the one in the homebased release secrets) into the login keychain and install again"
     )]
     NoSigningIdentity,
 }
@@ -276,8 +276,7 @@ impl Action {
 /// Copies through a temporary file and renames, so a running daemon keeps
 /// its old inode and a crash never leaves a half-written binary
 fn install_file(from: &Path, to: &Path) -> Result<(), ServiceError> {
-    let same = std::fs::canonicalize(from).ok() == std::fs::canonicalize(to).ok();
-    if same {
+    if same_file(from, to) {
         return Ok(());
     }
 
@@ -293,8 +292,15 @@ fn install_file(from: &Path, to: &Path) -> Result<(), ServiceError> {
                 .map_err(io(format!("chmod {}", temporary.display())))
         })
         // signed before the rename, so the path never holds an unsigned binary
-        // and a running daemon's file is never rewritten in place
-        .and_then(|()| sign(&temporary, &signing_identifier(to)))
+        // and a running daemon's file is never rewritten in place. A release
+        // binary already carries the team's signature, and copying keeps it
+        .and_then(|()| {
+            if needs_signing(from, to) {
+                sign(&temporary, &signing_identifier(to))
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|()| {
             std::fs::rename(&temporary, to).map_err(io(format!("rename to {}", to.display())))
         });
@@ -349,9 +355,51 @@ fn sign(path: &Path, identifier: &str) -> Result<(), ServiceError> {
     signed
 }
 
-/// Fails unless [`SIGNING_IDENTITY`] can sign, so an install stops before it
-/// changes anything rather than halfway through
-pub fn check_signing_identity() -> Result<(), ServiceError> {
+/// Code signing requirement anchored to [`TEAM_ID`], before an identifier
+/// is added
+pub fn team_anchor() -> String {
+    format!("anchor apple generic and certificate leaf[subject.OU] = \"{TEAM_ID}\"")
+}
+
+/// Whether installing `from` at `to` has to sign it here: false when it is
+/// already there, or already signed by [`TEAM_ID`] under the identifier `to`
+/// gets, as release binaries are in CI
+fn needs_signing(from: &Path, to: &Path) -> bool {
+    if same_file(from, to) {
+        return false;
+    }
+
+    let requirement = format!(
+        "={} and identifier \"{}\"",
+        team_anchor(),
+        signing_identifier(to)
+    );
+    let signed = Command::new("codesign")
+        .args(["--verify", "--strict", "-R"])
+        .arg(requirement)
+        .arg(from)
+        .output()
+        .is_ok_and(|output| output.status.success());
+
+    !signed
+}
+
+fn same_file(from: &Path, to: &Path) -> bool {
+    std::fs::canonicalize(from).ok() == std::fs::canonicalize(to).ok()
+}
+
+/// Fails unless [`SIGNING_IDENTITY`] can sign, when some step of `plan` has
+/// to sign, so an install stops before it changes anything rather than
+/// halfway through. Installing a release needs no certificate
+pub fn check_signing_identity(plan: &[Action]) -> Result<(), ServiceError> {
+    let signs = plan.iter().any(|action| match action {
+        Action::Install { from, to } => needs_signing(from, to),
+        _ => false,
+    });
+    if !signs {
+        return Ok(());
+    }
+
     let identities = run_command(&[
         "security".into(),
         "find-identity".into(),

@@ -108,10 +108,7 @@ impl Source {
     pub fn github() -> Self {
         Self {
             base_url: format!("https://github.com/{REPOSITORY}"),
-            anchor: format!(
-                "anchor apple generic and certificate leaf[subject.OU] = \"{}\"",
-                service::TEAM_ID
-            ),
+            anchor: service::team_anchor(),
         }
     }
 

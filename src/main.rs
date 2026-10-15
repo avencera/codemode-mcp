@@ -444,9 +444,6 @@ async fn service_command(
             if !worker.is_file() {
                 return Err(service::ServiceError::NoWorker(worker).into());
             }
-            if !dry_run {
-                service::check_signing_identity()?;
-            }
             if config.worker_path.is_some() {
                 eprintln!(
                     "note: `worker_path` is set, so the service keeps using {} rather than the \
@@ -462,17 +459,19 @@ async fn service_command(
                 None => None,
             };
 
-            (
-                service::install_plan(
-                    &paths,
-                    uid,
-                    &binary,
-                    &worker,
-                    pinned.as_deref(),
-                    config.limits.drain(),
-                ),
-                dry_run,
-            )
+            let plan = service::install_plan(
+                &paths,
+                uid,
+                &binary,
+                &worker,
+                pinned.as_deref(),
+                config.limits.drain(),
+            );
+            if !dry_run {
+                service::check_signing_identity(&plan)?;
+            }
+
+            (plan, dry_run)
         }
         ServiceCommand::Uninstall { dry_run } => (service::uninstall_plan(&paths, uid), dry_run),
         ServiceCommand::Restart { dry_run } => {
@@ -552,15 +551,12 @@ async fn companion_command(
             let config = load_or_default(path)?;
             let binary = std::env::current_exe().wrap_err("cannot locate this binary")?;
             let paths = ServicePaths::from_env(&config.state_dir()?)?;
-            if !dry_run {
-                if config.companion.is_none() {
-                    bail!(
-                        "{} has no [companion] section; run `codemode-mcp companion pair <ticket>` \
-                         first",
-                        path.display()
-                    );
-                }
-                service::check_signing_identity()?;
+            if !dry_run && config.companion.is_none() {
+                bail!(
+                    "{} has no [companion] section; run `codemode-mcp companion pair <ticket>` \
+                     first",
+                    path.display()
+                );
             }
             let pinned = match explicit_config {
                 Some(path) => Some(std::path::absolute(path)?),
@@ -572,6 +568,9 @@ async fn companion_command(
                 &binary,
                 pinned.as_deref(),
             );
+            if !dry_run {
+                service::check_signing_identity(&plan)?;
+            }
             run_plan(&plan, dry_run)?;
         }
         CompanionCommand::Uninstall { dry_run } => {
