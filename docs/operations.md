@@ -228,6 +228,75 @@ For a `url` server with `oauth = true`. The browser returns to `http://127.0.0.1
 browser on this Mac. Tokens refresh automatically. A server that refuses anonymous clients shows
 `needs_login` in `/healthz` and `codemode-mcp tools` until you sign in.
 
+An authorization server without dynamic client registration needs a client you create there yourself: set
+`client_id`, and `client_secret` for a confidential client. The secret can be an `op://` reference; it is read
+at login and stored with the tokens. `authorization_params` adds query parameters to the sign-in URL.
+
+### Gmail and Google Calendar
+
+Google's Workspace MCP servers (developer preview) take a client from your own Google Cloud project:
+
+1. In a Google Cloud project, enable the Gmail API, Google Calendar API, `gmailmcp.googleapis.com` and
+   `calendarmcp.googleapis.com`.
+2. Under Google Auth Platform, set up the consent screen (audience Internal for a Workspace account; External
+   needs you added as a test user).
+3. Create an OAuth client of type Web application, tick "Use this client for an AI-powered agent", and add the
+   redirect URIs `http://127.0.0.1:7682/oauth/callback/gmail` and
+   `http://127.0.0.1:7682/oauth/callback/google_calendar`.
+4. Save the client secret in 1Password, add the tables below, restart, and run `codemode-mcp oauth login gmail`
+   and `codemode-mcp oauth login google_calendar`.
+
+```toml
+# every Gmail call asks on the phone; reads accept a 15 or 60 minute session
+# grant, and every change asks each time. There is no send tool: drafts are
+# as far as it goes
+[servers.gmail]
+url = "https://gmailmcp.googleapis.com/mcp/v1"
+oauth = true
+client_id = "<id>.apps.googleusercontent.com"
+client_secret = "{{ op://Private/Google Workspace MCP/credential }}"
+# without these Google issues no refresh token and the login lasts an hour
+authorization_params = { access_type = "offline", prompt = "consent" }
+scopes = [
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.compose",
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/gmail.labels",
+]
+policy = "ask"
+aliases = ["email", "mail"]
+
+[servers.gmail.tools.create_draft]
+grant = "per_call"
+# ...and the same for every other tool that is not a read
+
+[servers.google_calendar]
+url = "https://calendarmcp.googleapis.com/mcp/v1"
+oauth = true
+client_id = "<id>.apps.googleusercontent.com"
+client_secret = "{{ op://Private/Google Workspace MCP/credential }}"
+authorization_params = { access_type = "offline", prompt = "consent" }
+scopes = [
+  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+  "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/calendar.events.freebusy",
+]
+aliases = ["gcal"]
+
+[servers.google_calendar.tools.create_event]
+policy = "ask"
+[servers.google_calendar.tools.update_event]
+policy = "ask"
+[servers.google_calendar.tools.respond_to_event]
+policy = "ask"
+[servers.google_calendar.tools.delete_event]
+policy = "ask"
+grant = "per_call"
+```
+
+Both servers list their tools without a login, so they appear in the catalog at once; calls fail until you
+sign in.
+
 ## Add a server
 
 Add a table under `servers` and restart (`codemode-mcp service restart`):
@@ -245,7 +314,7 @@ policy = "ask"                 # every call needs a phone approval; logs keep to
 policy = "deny"
 ```
 
-- `oauth = true` on a `url` server enables `oauth login` (optional `scopes`, `client_name`).
+- `oauth = true` on a `url` server enables `oauth login` (optional `scopes`, `client_name`, or `client_id` and `client_secret` for a client registered ahead of time, and `authorization_params`).
 - Rarely used stdio servers: `lazy = true` starts the process on the first call and stops it after `idle_secs` (default 600) without calls; `/healthz` shows it as `idle` meanwhile and its tools stay searchable. A failed start fails that call only, and the next call tries again.
 - Keys stay in 1Password: a `headers` or `env` value can hold `{{ op://vault/item/field }}` references, as in `op inject`, e.g. `headers = { authorization = "Bearer {{ op://Dev/Context7/credential }}" }`. The daemon runs `op read` the first time the server connects and keeps the value in memory until it exits; to pick up a rotated key, run `codemode-mcp service restart`. With the 1Password app integration the Mac asks once when the daemon starts (a locked or unanswered prompt shows `secret_unavailable` in `/healthz` and retries every 10 minutes). `[secrets] op` names the `op` binary (default `op` on `PATH`).
 - Per tool: `policy` (`allow`, `ask`, `deny`) and, for `ask`, `grant` (`session` or `per_call`). A `session` grant is given to the calling client, not to one MCP session: it covers every running session of that client name for 15 or 60 minutes.

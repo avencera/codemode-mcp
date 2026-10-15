@@ -1,7 +1,8 @@
 //! OAuth sign-in for remote upstreams, on top of rmcp's authorization client
 //!
-//! A login runs discovery, dynamic client registration and an authorization
-//! code flow with PKCE. The browser is sent back to the loopback admin
+//! A login runs discovery, dynamic client registration (unless the config
+//! names a client registered ahead of time) and an authorization code flow
+//! with PKCE. The browser is sent back to the loopback admin
 //! listener (`/oauth/callback/<server>`), so the flow completes on the Mac.
 //!
 //! rmcp keeps the client registration in memory and stores only the client
@@ -29,6 +30,7 @@ use serde_json::Value;
 
 use crate::{
     config::Config,
+    secrets::{OnePassword, SecretError},
     store::{Store, StoreError},
 };
 
@@ -61,6 +63,9 @@ pub enum OAuthError {
     /// The authorization server took too long
     #[error("the authorization server did not answer in time")]
     TimedOut,
+    /// The configured client secret could not be read from 1Password
+    #[error(transparent)]
+    Secret(#[from] SecretError),
     /// rmcp's OAuth client failed
     #[error("{0}")]
     Auth(#[from] AuthError),
@@ -187,12 +192,23 @@ impl StateStore for SqliteStateStore {
     }
 }
 
+/// How a server's login obtains its client
+#[derive(Debug, Clone)]
+enum ClientSource {
+    /// Dynamic client registration under this client name
+    Register(String),
+    /// A client registered ahead of time; the secret may hold `op://`
+    /// references
+    Known { id: String, secret: Option<String> },
+}
+
 /// OAuth settings of one configured server
 #[derive(Debug, Clone)]
 struct OAuthServer {
     url: String,
     scopes: Vec<String>,
-    client_name: String,
+    client: ClientSource,
+    authorization_params: BTreeMap<String, String>,
 }
 
 /// Login state of one server, safe to print
@@ -228,6 +244,8 @@ pub struct Callback {
 /// Logins of every `oauth = true` server
 pub struct OAuth {
     store: Store,
+    /// Reads client secrets at login
+    onepassword: OnePassword,
     servers: BTreeMap<String, OAuthServer>,
     /// Every configured server, to tell unknown names from non-OAuth ones
     configured: BTreeSet<String>,
@@ -243,15 +261,26 @@ impl OAuth {
             .iter()
             .filter(|(_, server)| server.oauth)
             .filter_map(|(name, server)| {
+                let client = match &server.client_id {
+                    Some(id) => ClientSource::Known {
+                        id: id.clone(),
+                        secret: server.client_secret.clone(),
+                    },
+                    None => ClientSource::Register(
+                        server
+                            .client_name
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_CLIENT_NAME.to_owned()),
+                    ),
+                };
+
                 Some((
                     name.clone(),
                     OAuthServer {
                         url: server.url.clone()?,
                         scopes: server.scopes.clone(),
-                        client_name: server
-                            .client_name
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_CLIENT_NAME.to_owned()),
+                        client,
+                        authorization_params: server.authorization_params.clone(),
                     },
                 ))
             })
@@ -259,6 +288,7 @@ impl OAuth {
 
         Arc::new(Self {
             store,
+            onepassword: OnePassword::new(config.secrets.op.clone()),
             servers,
             configured: config.servers.keys().cloned().collect(),
             callback_base: RwLock::new(None),
@@ -327,10 +357,25 @@ impl OAuth {
         let defaults: Vec<&str> = server.scopes.iter().map(String::as_str).collect();
         let scopes = manager.select_scopes(None, &defaults);
         let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let registered = manager
-            .register_client(&server.client_name, &redirect_uri, &scopes)
-            .await?;
+        let registered = match &server.client {
+            ClientSource::Register(client_name) => {
+                manager
+                    .register_client(client_name, &redirect_uri, &scopes)
+                    .await?
+            }
+            ClientSource::Known { id, secret } => {
+                let mut config = OAuthClientConfig::new(id, &redirect_uri)
+                    .with_scopes(scopes.iter().map(|scope| (*scope).to_owned()).collect());
+                if let Some(secret) = secret {
+                    config = config.with_client_secret(self.read_secret(secret).await?);
+                }
+                manager.configure_client(config.clone())?;
+
+                config
+            }
+        };
         let url = manager.get_authorization_url(&scopes).await?;
+        let url = with_params(&url, &server.authorization_params)?;
 
         // the state store row exists now; attach the registration to it so
         // the callback can rebuild the client
@@ -350,6 +395,17 @@ impl OAuth {
         }
 
         Ok(url)
+    }
+
+    /// `secret` with its `op://` references read from 1Password
+    async fn read_secret(&self, secret: &str) -> Result<String, OAuthError> {
+        let values = BTreeMap::from([(String::new(), secret.to_owned())]);
+        let mut resolved = self.onepassword.resolve(&values).await?;
+
+        resolved
+            .values
+            .remove("")
+            .ok_or_else(|| OAuthError::Corrupt("the client secret was not resolved".into()))
     }
 
     /// Completes a login from the browser's callback and stores the
@@ -475,4 +531,25 @@ impl OAuth {
 
         Ok(self.store.remove_oauth_login(name)?)
     }
+}
+
+/// `url` with `params` added to its query, replacing any of the same name
+fn with_params(url: &str, params: &BTreeMap<String, String>) -> Result<String, OAuthError> {
+    if params.is_empty() {
+        return Ok(url.to_owned());
+    }
+    let mut parsed =
+        reqwest::Url::parse(url).map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| !params.contains_key(key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    parsed
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(kept)
+        .extend_pairs(params);
+
+    Ok(parsed.into())
 }

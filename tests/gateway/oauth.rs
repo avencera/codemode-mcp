@@ -1,6 +1,6 @@
 //! OAuth against a small local authorization server and an MCP endpoint
-//! that refuses anonymous clients: discovery, registration, PKCE, the
-//! loopback callback, refresh and logout
+//! that refuses anonymous clients: discovery, registration or a client
+//! registered ahead of time, PKCE, the loopback callback, refresh and logout
 
 use std::{
     collections::HashMap,
@@ -14,7 +14,7 @@ use std::{
 use axum::{
     Form, Json, Router,
     extract::{Request, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -59,9 +59,30 @@ struct Issued {
     refreshes: AtomicUsize,
 }
 
+/// The client the mock's token endpoint accepts
+#[derive(Clone, Copy)]
+enum Client {
+    /// A public client registered dynamically as `mock-client`
+    Registered,
+    /// `known-client`, registered ahead of time with a secret it sends with
+    /// HTTP Basic auth, as Google's clients do; the mock offers no
+    /// registration endpoint, as Google's authorization server does not
+    Known,
+}
+
+impl Client {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Registered => "mock-client",
+            Self::Known => "known-client",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Mock {
     base: String,
+    client: Client,
     issued: Arc<Issued>,
 }
 
@@ -97,16 +118,20 @@ async fn protected_resource(State(mock): State<Mock>) -> Json<Value> {
 }
 
 async fn authorization_server(State(mock): State<Mock>) -> Json<Value> {
-    Json(json!({
+    let mut metadata = json!({
         "issuer": mock.base,
         "authorization_endpoint": format!("{}/authorize", mock.base),
         "token_endpoint": format!("{}/token", mock.base),
-        "registration_endpoint": format!("{}/register", mock.base),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["mcp:tools"],
-    }))
+    });
+    if let Client::Registered = mock.client {
+        metadata["registration_endpoint"] = json!(format!("{}/register", mock.base));
+    }
+
+    Json(metadata)
 }
 
 async fn register(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
@@ -120,7 +145,11 @@ async fn register(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     )
 }
 
-async fn token(State(mock): State<Mock>, Form(form): Form<HashMap<String, String>>) -> Response {
+async fn token(
+    State(mock): State<Mock>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
     let grant = form.get("grant_type").map(String::as_str);
     let valid = match grant {
         Some("authorization_code") => form
@@ -134,7 +163,17 @@ async fn token(State(mock): State<Mock>, Form(form): Form<HashMap<String, String
         }
         _ => false,
     };
-    if !valid || form.get("client_id").map(String::as_str) != Some("mock-client") {
+    let client_valid = match mock.client {
+        Client::Registered => form.get("client_id").map(String::as_str) == Some("mock-client"),
+        // base64 of `known-client:known-secret`
+        Client::Known => {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                == Some("Basic a25vd24tY2xpZW50Omtub3duLXNlY3JldA==")
+        }
+    };
+    if !valid || !client_valid {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_grant" })),
@@ -161,10 +200,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Starts the mock and returns its base URL
-async fn start_mock() -> Result<Mock, Box<dyn std::error::Error>> {
+async fn start_mock(client: Client) -> Result<Mock, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let mock = Mock {
         base: format!("http://127.0.0.1:{}", listener.local_addr()?.port()),
+        client,
         issued: Arc::new(Issued::default()),
     };
 
@@ -239,13 +279,15 @@ fn query_value(url: &str, key: &str) -> Option<String> {
 }
 
 /// Starts a login and plays the authorization server's part of the
-/// browser redirect: issues a code for the PKCE challenge
+/// browser redirect: issues a code for the PKCE challenge. Returns the
+/// callback URL and the authorization URL
 async fn begin_login(
     harness: &Harness,
     mock: &Mock,
+    server: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     let (status, body) = harness
-        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .admin_json("/admin/oauth/login", &json!({ "server": server }))
         .await?;
     assert_eq!(status, 200, "{body}");
     let url = body["authorization_url"].as_str().ok_or("no url")?;
@@ -255,7 +297,7 @@ async fn begin_login(
     );
     assert_eq!(
         query_value(url, "client_id").as_deref(),
-        Some("mock-client")
+        Some(mock.client.id())
     );
     assert_eq!(
         query_value(url, "code_challenge_method").as_deref(),
@@ -265,19 +307,22 @@ async fn begin_login(
     let redirect = query_value(url, "redirect_uri").ok_or("no redirect")?;
     assert_eq!(
         redirect,
-        format!("{}/oauth/callback/locked", harness.admin_base())
+        format!("{}/oauth/callback/{server}", harness.admin_base())
     );
     let state = query_value(url, "state").ok_or("no state")?;
 
     let code = format!("code-{}", uuid::Uuid::new_v4().simple());
     lock(&mock.issued.codes).insert(code.clone(), challenge);
 
-    Ok((format!("{redirect}?code={code}&state={state}"), state))
+    Ok((
+        format!("{redirect}?code={code}&state={state}"),
+        url.to_owned(),
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn oauth_login_unlocks_a_server_that_refuses_anonymous_clients() -> TestResult {
-    let mock = start_mock().await?;
+    let mock = start_mock(Client::Registered).await?;
     let extra = format!(
         "[servers.locked]\nurl = \"{}/mcp\"\noauth = true\nclient_name = \"codemode test\"",
         mock.base
@@ -315,7 +360,7 @@ async fn oauth_login_unlocks_a_server_that_refuses_anonymous_clients() -> TestRe
         .await?;
     assert_eq!(forged.status().as_u16(), 400);
 
-    let (callback, _) = begin_login(&harness, &mock).await?;
+    let (callback, _) = begin_login(&harness, &mock, "locked").await?;
     let page = harness.http.get(&callback).send().await?;
     assert_eq!(page.status().as_u16(), 200);
     assert!(page.text().await?.contains("You can close this tab"));
@@ -348,7 +393,7 @@ async fn oauth_login_unlocks_a_server_that_refuses_anonymous_clients() -> TestRe
     );
 
     // an abandoned second login leaves the working one alone
-    let (_abandoned, _) = begin_login(&harness, &mock).await?;
+    let (_abandoned, _) = begin_login(&harness, &mock, "locked").await?;
     let (_, again) = harness
         .admin_json("/admin/oauth/status", &json!(null))
         .await?;
@@ -366,6 +411,44 @@ async fn oauth_login_unlocks_a_server_that_refuses_anonymous_clients() -> TestRe
         .admin_json("/admin/oauth/login", &json!({ "server": "fixture" }))
         .await?;
     assert_eq!(status, 404);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_uses_a_client_registered_ahead_of_time() -> TestResult {
+    let mock = start_mock(Client::Known).await?;
+    let extra = format!(
+        "[servers.known]\n\
+         url = \"{}/mcp\"\n\
+         oauth = true\n\
+         client_id = \"known-client\"\n\
+         client_secret = \"known-secret\"\n\
+         authorization_params = {{ access_type = \"offline\", prompt = \"consent\" }}",
+        mock.base
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&harness, "known", "needs_login").await?;
+
+    let (callback, url) = begin_login(&harness, &mock, "known").await?;
+    assert_eq!(query_value(&url, "access_type").as_deref(), Some("offline"));
+    assert_eq!(query_value(&url, "prompt").as_deref(), Some("consent"));
+    let page = harness.http.get(&callback).send().await?;
+    assert_eq!(page.status().as_u16(), 200);
+
+    // the token endpoint takes only the secret, so a working refresh shows
+    // the stored login kept it
+    wait_for_state(&harness, "known", "connected").await?;
+    let called = harness.execute_json("await known_hello()").await?;
+    assert_eq!(called["result"], "hello", "{called}");
+    assert!(mock.issued.refreshes.load(Ordering::SeqCst) > 0);
 
     harness.stop().await
 }

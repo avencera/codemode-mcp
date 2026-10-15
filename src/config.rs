@@ -17,6 +17,18 @@ use crate::{
 
 /// ntfy server used when a notify section names none
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
+/// Authorization URL parameters rmcp sets; overriding one would break
+/// PKCE, the CSRF check or the token exchange
+const RESERVED_AUTHORIZATION_PARAMS: [&str; 8] = [
+    "response_type",
+    "client_id",
+    "redirect_uri",
+    "scope",
+    "state",
+    "code_challenge",
+    "code_challenge_method",
+    "resource",
+];
 
 /// Reasons a configuration file could not be loaded
 #[derive(Debug, thiserror::Error)]
@@ -805,6 +817,18 @@ pub struct ServerConfig {
     /// Client name sent during dynamic client registration
     #[serde(default)]
     pub client_name: Option<String>,
+    /// Id of a client registered ahead of time, for authorization servers
+    /// without dynamic client registration, such as Google's
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Secret of the `client_id` client; may hold `{{ op://... }}`
+    /// references, read at login and stored with the tokens
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Extra query parameters for the authorization URL, such as Google's
+    /// `access_type = "offline"`, without which it issues no refresh token
+    #[serde(default)]
+    pub authorization_params: BTreeMap<String, String>,
     /// Default policy for every tool of this server
     #[serde(default)]
     pub policy: Policy,
@@ -989,6 +1013,11 @@ impl ServerConfig {
                 })?;
             }
         }
+        if let Some(secret) = &self.client_secret {
+            crate::secrets::check(secret).map_err(|error| {
+                ConfigError::Invalid(format!("servers.{name}.client_secret: {error}"))
+            })?;
+        }
 
         match (&self.command, &self.url) {
             (Some(_), Some(_)) => Err(ConfigError::Invalid(format!(
@@ -1016,9 +1045,34 @@ impl ServerConfig {
             _ if self.idle_secs == 0 => Err(ConfigError::Invalid(format!(
                 "servers.{name}: `idle_secs` must be positive"
             ))),
-            _ if !self.oauth && (!self.scopes.is_empty() || self.client_name.is_some()) => {
+            _ if !self.oauth
+                && (!self.scopes.is_empty()
+                    || self.client_name.is_some()
+                    || self.client_id.is_some()
+                    || self.client_secret.is_some()
+                    || !self.authorization_params.is_empty()) =>
+            {
                 Err(ConfigError::Invalid(format!(
-                    "servers.{name}: `scopes` and `client_name` need `oauth = true`"
+                    "servers.{name}: `scopes`, `client_name`, `client_id`, `client_secret` and `authorization_params` need `oauth = true`"
+                )))
+            }
+            _ if self.client_secret.is_some() && self.client_id.is_none() => Err(
+                ConfigError::Invalid(format!("servers.{name}: `client_secret` needs `client_id`")),
+            ),
+            // the name is only sent when registering, which a known id skips
+            _ if self.client_name.is_some() && self.client_id.is_some() => {
+                Err(ConfigError::Invalid(format!(
+                    "servers.{name}: `client_name` only applies without `client_id`"
+                )))
+            }
+            _ if self
+                .authorization_params
+                .keys()
+                .any(|key| RESERVED_AUTHORIZATION_PARAMS.contains(&key.as_str())) =>
+            {
+                Err(ConfigError::Invalid(format!(
+                    "servers.{name}: `authorization_params` cannot set {}, which the OAuth flow sets itself",
+                    RESERVED_AUTHORIZATION_PARAMS.join(", ")
                 )))
             }
             // the OAuth client owns the authorization header
@@ -1100,6 +1154,18 @@ mod tests {
         assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
         assert!(parse("[servers.a]\ncommand = \"x\"\noauth = true").is_err());
         assert!(parse("[servers.a]\nurl = \"https://y\"\nscopes = [\"s\"]").is_err());
+        assert!(parse("[servers.a]\nurl = \"https://y\"\nclient_id = \"c\"").is_err());
+        assert!(
+            parse("[servers.a]\nurl = \"https://y\"\noauth = true\nclient_secret = \"s\"").is_err()
+        );
+        assert!(
+            parse("[servers.a]\nurl = \"https://y\"\noauth = true\nclient_id = \"c\"\nclient_name = \"n\"")
+                .is_err()
+        );
+        assert!(
+            parse("[servers.a]\nurl = \"https://y\"\noauth = true\nauthorization_params = { state = \"x\" }")
+                .is_err()
+        );
         assert!(
             parse("[servers.a]\nurl = \"https://y\"\noauth = true\nheaders = { Authorization = \"Bearer abcdef\" }")
                 .is_err()
