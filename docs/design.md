@@ -475,8 +475,9 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   is read once per process and kept in memory, shared by every server that names it, and reads run one at a
   time, so servers starting together share one prompt and reconnects never prompt again; a rotated key needs a
   restart. A literal `{{` cannot be escaped, so a value that needs one cannot go in `headers` or `env`
-- `op` picks the sign-in: the 1Password app integration (the Mac prompts) or `OP_SERVICE_ACCOUNT_TOKEN` in the
-  daemon's environment (a service account scoped to one vault; no prompts, works unattended)
+- Reads go through the 1Password app integration, so the Mac prompts. A service account token
+  (`OP_SERVICE_ACCOUNT_TOKEN`) would read without prompting, but it is a reusable credential on the Mac that
+  supply-chain malware could copy, so the daemon is not set up with one
 - A failed read leaves the server `unavailable` with category `secret_unavailable` and retries every 10 minutes
   rather than on the usual backoff, since each try can put a prompt on the Mac. The local error names the
   reference and `op`'s first error line, never a value

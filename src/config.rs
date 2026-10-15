@@ -257,9 +257,8 @@ impl Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
-    /// `op` executable; with `OP_SERVICE_ACCOUNT_TOKEN` in the daemon's
-    /// environment it reads without prompting, else the 1Password app on
-    /// the Mac asks
+    /// `op` executable; it reads through the 1Password app, which asks on
+    /// the Mac
     #[serde(default = "default_op")]
     pub op: String,
 }
