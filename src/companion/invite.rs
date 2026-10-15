@@ -83,6 +83,10 @@ pub enum InviteStatus {
         already_listed: bool,
         /// How the check went; `None` when it never asked for one
         check: Option<PairCheck>,
+        /// Whether the daemon reads through it now; a new companion is used
+        /// only once the check reaches it, so one whose setup failed is not
+        /// asked in place of the local `op`
+        in_use: bool,
     },
     /// A Mac used the invite but could not be listed
     Failed {
@@ -367,7 +371,8 @@ impl Companions {
             return;
         };
 
-        let (invite, registered, references) = match self.register(registration).await {
+        let (invite, registered, references, mut pending) = match self.register(registration).await
+        {
             Ok(registration) => registration,
             Err(message) => {
                 tracing::info!(%message, "refused a companion registration");
@@ -378,8 +383,8 @@ impl Companions {
         };
         let name = registered.name.clone();
         let id_status = self.invite_status(&invite);
-        if !answer(&mut send, &PairResponse::Registered(registered)).await {
-            self.finish(&invite, id_status, None);
+        if !answer_within(&mut send, &PairResponse::Registered(registered)).await {
+            self.finish(&invite, id_status, None, pending.is_none());
 
             return;
         }
@@ -390,8 +395,13 @@ impl Companions {
             Ok(Ok((mut send, mut receive))) => {
                 match tokio::time::timeout(REQUEST_WINDOW, read_request(&mut receive)).await {
                     Ok(Some(PairRequest::Check)) => {
-                        let check = self.check_new(&name, &references).await;
-                        if answer(&mut send, &PairResponse::Checked(check.clone())).await {
+                        let (check, reached) =
+                            self.check_new(&name, pending.as_ref(), &references).await;
+                        if reached && let Some(peer) = pending.take() {
+                            tracing::info!(name = %peer.name, "companion in use");
+                            self.add_peer(peer);
+                        }
+                        if answer_within(&mut send, &PairResponse::Checked(check.clone())).await {
                             // the companion hangs up once it has the answer
                             let _ = tokio::time::timeout(LINGER, connection.0.closed()).await;
                         }
@@ -407,11 +417,17 @@ impl Companions {
             }
             _ => None,
         };
-        self.finish(&invite, id_status, check);
+        self.finish(&invite, id_status, check, pending.is_none());
     }
 
     /// Marks the invite done, keeping who registered with it
-    fn finish(&self, invite: &str, status: Option<InviteStatus>, check: Option<PairCheck>) {
+    fn finish(
+        &self,
+        invite: &str,
+        status: Option<InviteStatus>,
+        check: Option<PairCheck>,
+        in_use: bool,
+    ) {
         if let Some(InviteStatus::Registered {
             name,
             id,
@@ -425,25 +441,27 @@ impl Companions {
                     id,
                     already_listed,
                     check,
+                    in_use,
                 },
             );
         }
     }
 
     /// Uses up the invite the registration's secret belongs to and lists the
-    /// companion; answers the invite's id, what the companion needs and the
-    /// references to check
+    /// companion; answers the invite's id, what the companion needs, the
+    /// references to check and the peer to start using once the check
+    /// reaches it (`None` when the daemon uses it already)
     async fn register(
         &self,
         registration: Registration,
-    ) -> Result<(String, Registered, Vec<String>), String> {
+    ) -> Result<(String, Registered, Vec<String>, Option<CompanionPeer>), String> {
         let secret = InviteSecret::from_hex(&registration.secret)
             .ok_or_else(|| "the invite secret is malformed".to_owned())?;
         let invite = self.invites.redeem(&secret)?;
         self.refresh_alpns();
 
         match self.list(&registration, &invite).await {
-            Ok(registered) => {
+            Ok((registered, pending)) => {
                 tracing::info!(
                     name = %registered.name,
                     id = %registration.id,
@@ -458,7 +476,7 @@ impl Companions {
                     },
                 );
 
-                Ok((invite.id, registered, invite.references))
+                Ok((invite.id, registered, invite.references, pending))
             }
             Err(message) => {
                 self.invites.set(
@@ -473,13 +491,13 @@ impl Companions {
         }
     }
 
-    /// Appends the companion to the config file and starts using it; a
-    /// companion already listed by id is left as it is
+    /// Appends the companion to the config file; a companion already listed
+    /// by id is left as it is. Answers the peer the daemon does not use yet
     async fn list(
         &self,
         registration: &Registration,
         invite: &Redeemed,
-    ) -> Result<Registered, String> {
+    ) -> Result<(Registered, Option<CompanionPeer>), String> {
         let _turn = self.registering.lock().await;
         let peers = self.peers();
         let registered = |name: &str, already_listed| Registered {
@@ -490,7 +508,7 @@ impl Companions {
         };
 
         if let Some(peer) = peers.iter().find(|peer| peer.id == registration.id) {
-            return Ok(registered(&peer.name, true));
+            return Ok((registered(&peer.name, true), None));
         }
         // addresses matter only to a gateway that dials them; capped so a
         // registration cannot write much into the config
@@ -515,10 +533,9 @@ impl Companions {
             .map_err(|error| error.to_string())?
             .secrets
             .companions;
+        // listed by an earlier pairing whose check never reached it
         if let Some(peer) = in_file.iter().find(|peer| peer.id == registration.id) {
-            self.add_peer(peer.clone());
-
-            return Ok(registered(&peer.name, true));
+            return Ok((registered(&peer.name, true), Some(peer.clone())));
         }
 
         let taken: Vec<&str> = peers
@@ -535,30 +552,42 @@ impl Companions {
                 path.display()
             )
         })?;
-        self.add_peer(CompanionPeer {
+        let peer = CompanionPeer {
             name: name.clone(),
             id: registration.id,
             addrs,
-        });
+        };
 
-        Ok(registered(&name, false))
+        Ok((registered(&name, false), Some(peer)))
     }
 
-    /// Reads the first reference through the companion `name`, retrying
-    /// while its agent comes up; the value is dropped at once
-    async fn check_new(&self, name: &str, references: &[String]) -> PairCheck {
+    /// Reads the first reference through the companion `name` (or `pending`,
+    /// which is not listed yet), retrying while its agent comes up; the value
+    /// is dropped at once. Also answers whether the companion was reached
+    async fn check_new(
+        &self,
+        name: &str,
+        pending: Option<&CompanionPeer>,
+        references: &[String],
+    ) -> (PairCheck, bool) {
         let Some(reference) = references.first() else {
-            return PairCheck::Skipped;
+            return (PairCheck::Skipped, true);
         };
 
         let started = Instant::now();
         loop {
-            match self.read(name, reference).await {
+            let read = match pending {
+                Some(peer) => self.read_from(peer, reference).await,
+                None => self.read(name, reference).await,
+            };
+            match read {
                 Ok(value) => {
-                    return PairCheck::Read {
+                    let check = PairCheck::Read {
                         reference: reference.clone(),
                         bytes: value.len(),
                     };
+
+                    return (check, true);
                 }
                 Err(CompanionFailure::Connect { .. })
                     if started.elapsed() < CHECK_CONNECT_WINDOW =>
@@ -566,10 +595,18 @@ impl Companions {
                     tokio::time::sleep(CHECK_RETRY).await;
                 }
                 Err(failure) => {
-                    return PairCheck::Failed {
+                    // a refusal or a denied Touch ID still came from the
+                    // companion, so it answers reads
+                    let reached = !matches!(
+                        failure,
+                        CompanionFailure::Connect { .. } | CompanionFailure::TimedOut { .. }
+                    );
+                    let check = PairCheck::Failed {
                         reference: reference.clone(),
                         message: failure.to_string(),
                     };
+
+                    return (check, reached);
                 }
             }
         }
@@ -582,9 +619,17 @@ async fn refuse(connection: &Hangup, send: &mut iroh::endpoint::SendStream, mess
     let refusal = PairResponse::Refused {
         message: message.to_owned(),
     };
-    if answer(send, &refusal).await {
+    if answer_within(send, &refusal).await {
         let _ = tokio::time::timeout(LINGER, connection.0.closed()).await;
     }
+}
+
+/// [`answer`], given up after [`REQUEST_WINDOW`]: a peer that never reads
+/// would otherwise hold its pairing slot for good
+async fn answer_within(send: &mut iroh::endpoint::SendStream, response: &PairResponse) -> bool {
+    tokio::time::timeout(REQUEST_WINDOW, answer(send, response))
+        .await
+        .unwrap_or(false)
 }
 
 /// `wanted`, or with a `-2`, `-3`... suffix when another companion has it;

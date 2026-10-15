@@ -183,11 +183,20 @@ impl Companions {
             .find(|peer| peer.name == name)
             .ok_or_else(|| CompanionFailure::Unknown(name.to_owned()))?;
 
-        tokio::time::timeout(ASK_TIMEOUT, self.exchange(&peer, reference))
+        self.read_from(&peer, reference).await
+    }
+
+    /// Asks `peer`, listed or not, to read `reference`
+    pub(super) async fn read_from(
+        &self,
+        peer: &CompanionPeer,
+        reference: &str,
+    ) -> Result<String, CompanionFailure> {
+        tokio::time::timeout(ASK_TIMEOUT, self.exchange(peer, reference))
             .await
             .unwrap_or_else(|_| {
                 Err(CompanionFailure::TimedOut {
-                    name: name.to_owned(),
+                    name: peer.name.clone(),
                     timeout: ASK_TIMEOUT,
                 })
             })

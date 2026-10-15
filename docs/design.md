@@ -512,26 +512,31 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   `read_failed`). Only the companion advertises the ALPN; the gateway dials it, and accepts only pairing, only
   while an invite is open. `discovery = true` uses n0's relays and DNS, publishing each endpoint's addresses
   there; `false` dials only configured `addrs`
-- Pairing (`src/companion/invite.rs`, `join.rs`): `companion invite` asks the daemon to open an invite, a random
-  16-byte secret (only its SHA-256 is kept) valid once for at most 10 minutes. The daemon then advertises ALPN
-  `codemode-mcp/pair/1` (`Endpoint::set_alpns`) until no invite is open. The ticket (`cmcp2` + base64url of the
-  gateway id, the secret and, with discovery off, the gateway's addresses) leaves the references out, which the
-  gateway sends at registration, so with discovery on the `install.sh --pair` one-liner fits a version 8 QR code
-  (57 terminal columns); each address adds about 9 characters (IPv4) or 25 (IPv6). On one connection the companion sends `register` (secret, its companion id, name, and with discovery
-  off its addresses at port 7678); the gateway appends a `[[secrets.companions]]` entry to the config file the
-  daemon loaded, after checking the result still loads, and adds the peer to the live list, so no restart. The
-  companion writes `[companion]`, installs its agent, then sends `check`; the gateway reads the first reference
-  through the new peer, retrying the dial for a minute while the agent comes up, and answers the length only.
-  The companion dials from a throwaway key, since its own key belongs to the agent, which runs by then, and two
-  endpoints with one id would contend for relay traffic. The secret authorizes the registration; the id is not
-  proven then, and the entry is written before any check, but the gateway can only use it with a Mac holding
-  that key, since every read dials it over TLS. A failed or skipped check leaves the entry listed. Pairing
-  connections are capped at 8 at once, each request must arrive within 30 s, a registration's addresses are
-  capped at 8 and ignored with discovery on, and expiry is checked on both the uptime and wall clocks, since
-  `Instant` stops while the Mac sleeps. `companion invite` polls the
-  invite's status through the admin listener and prints who registered and the check. `invite --manual` keeps
-  the older `cmcp1` JSON ticket that carries the references, for a gateway the companion cannot reach; the
-  gateway's entry is then added by hand
+- Pairing (`src/companion/invite.rs`, `join.rs`): `companion invite` asks the daemon to open an invite (the
+  invite routes also need the owner token, `admin.token`, mode 0600 in the state directory, since the loopback
+  check admits every account on the Mac), a random 16-byte secret (only its SHA-256 is kept) valid once for at
+  most 10 minutes. The daemon then advertises ALPN `codemode-mcp/pair/1` (`Endpoint::set_alpns`) until no invite
+  is open. The ticket (`cmcp2` + base64url of the gateway id, the secret and, with discovery off, the gateway's
+  addresses) leaves the references out, which the gateway sends at registration, so with discovery on the
+  `install.sh --pair` one-liner fits a version 8 QR code (57 terminal columns); each address adds about 9
+  characters (IPv4) or 25 (IPv6). On one connection the companion sends `register` (secret, its companion id,
+  name, and with discovery off its IPv4 addresses at port 7678, since `listen` fixes only the IPv4 socket's
+  port); the gateway appends a `[[secrets.companions]]` entry to the config file the daemon loaded, after
+  checking the result still loads. The companion writes `[companion]`, installs its agent, then sends `check`;
+  the gateway reads the first reference through the new peer, retrying the dial for a minute while the agent
+  comes up, answers the length only, and adds the peer to the live list once the check reached it (a value, a
+  refusal or a denied Touch ID), so no restart. Until then the daemon does not ask it: with the owner away a
+  listed companion replaces the local `op`, so one whose setup failed would break reads. A pairing that ends
+  before that leaves the entry in the file and `invite` exits with an error saying so. The companion dials
+  from a throwaway key, since its own key belongs to the agent, which runs by then, and two endpoints with one id
+  would contend for relay traffic. The secret authorizes the registration; the id is not proven then, and the
+  entry is written before any check, but the gateway can only use it with a Mac holding that key, since every
+  read dials it over TLS. A failed or skipped check leaves the entry listed. Pairing connections are capped at 8
+  at once, each request must arrive and each answer be taken within 30 s, a registration's addresses are capped
+  at 8 and ignored with discovery on, and expiry is checked on both the uptime and wall clocks, since `Instant`
+  stops while the Mac sleeps. `companion invite` polls the invite's status through the admin listener and prints
+  who registered and the check. `invite --manual` keeps the older `cmcp1` JSON ticket that carries the
+  references, for a gateway the companion cannot reach; the gateway's entry is then added by hand
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   only references on its own `allow` list, one request at a time, each request no longer than the gateway's
   120 s deadline (a gateway that stops the stream or never gives up loses the prompt), and only after its own Touch ID prompt naming

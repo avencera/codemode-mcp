@@ -679,12 +679,17 @@ impl Harness {
         path: &str,
         body: &Value,
     ) -> Result<(u16, Value), Box<dyn Error>> {
-        let response = self
+        let mut request = self
             .http
             .post(format!("{}{path}", self.admin_base()))
-            .json(body)
-            .send()
-            .await?;
+            .json(body);
+        // as the CLI does, run by the daemon's own user
+        if let Ok(token) =
+            std::fs::read_to_string(self.state_dir.join(codemode_mcp::admin::OWNER_TOKEN_FILE))
+        {
+            request = request.header(codemode_mcp::admin::OWNER_TOKEN_HEADER, token.trim());
+        }
+        let response = request.send().await?;
         let status = response.status().as_u16();
 
         Ok((status, response.json().await.unwrap_or(Value::Null)))

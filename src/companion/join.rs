@@ -7,8 +7,8 @@ use std::{net::SocketAddr, time::Duration};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 
 use super::{
-    ASK_TIMEOUT, DIRECT_PORT, Hangup, InviteTicket, PAIR_ALPN, PairCheck, PairRequest,
-    PairResponse, Registered, Registration, Role, ask, bind_endpoint,
+    ASK_TIMEOUT, Hangup, InviteTicket, PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registered,
+    Registration, Role, ask, bind_endpoint,
 };
 
 /// How long to look for the gateway
@@ -41,8 +41,10 @@ pub struct Joining<'a> {
     /// This Mac's short host name
     pub name: String,
     /// Where the agent listens, for a gateway with discovery off; empty
-    /// means this Mac's addresses at [`DIRECT_PORT`]
+    /// means this Mac's IPv4 addresses at `port`
     pub addrs: Vec<SocketAddr>,
+    /// The agent's fixed port, usually [`super::DIRECT_PORT`]
+    pub port: u16,
 }
 
 /// A registration the gateway accepted, with the connection kept open for
@@ -101,10 +103,13 @@ pub async fn join(joining: Joining<'_>) -> Result<Joined, JoinError> {
     let addrs = if discovery || !joining.addrs.is_empty() {
         joining.addrs
     } else {
+        // IPv4 only: the agent's `listen` fixes the port of its IPv4 socket,
+        // while its IPv6 socket keeps a random one
         endpoint
             .addr()
             .ip_addrs()
-            .map(|addr| SocketAddr::new(addr.ip(), DIRECT_PORT))
+            .filter(|addr| addr.is_ipv4())
+            .map(|addr| SocketAddr::new(addr.ip(), joining.port))
             .collect()
     };
 

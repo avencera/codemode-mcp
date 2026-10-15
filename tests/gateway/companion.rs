@@ -897,6 +897,7 @@ async fn an_invite_lists_a_companion_once_and_checks_it_with_touch_id() -> TestR
         id: agent.id(),
         name: "mba".to_owned(),
         addrs: vec![agent_addr],
+        port: companion::DIRECT_PORT,
     };
     let joined = companion::join(joining()).await?;
     let registered = joined.registered().clone();
@@ -904,11 +905,10 @@ async fn an_invite_lists_a_companion_once_and_checks_it_with_touch_id() -> TestR
     assert_eq!(registered.references, [REFERENCE]);
     assert!(!registered.already_listed);
 
-    // listed in the config file and used by the running daemon
+    // listed in the config file, but not read through until the check
+    // reaches it, so a Mac whose setup fails is never asked instead of `op`
     assert_eq!(listed(&harness)?, [("mba".to_owned(), agent.id())]);
-    let peers = harness.app.gateway().companions().peers();
-    assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].addrs, [agent_addr]);
+    assert!(harness.app.gateway().companions().peers().is_empty());
     assert_eq!(
         invite_status(&harness, &invite).await?["state"],
         "registered"
@@ -924,6 +924,9 @@ async fn an_invite_lists_a_companion_once_and_checks_it_with_touch_id() -> TestR
         }
     );
     assert_eq!(reads(&companion_log, REFERENCE), 1);
+    let peers = harness.app.gateway().companions().peers();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].addrs, [agent_addr]);
     assert_eq!(
         companion_mac.shown(),
         [format!(
@@ -940,6 +943,7 @@ async fn an_invite_lists_a_companion_once_and_checks_it_with_touch_id() -> TestR
     }
     assert_eq!(done["name"], "mba", "{done}");
     assert_eq!(done["check"]["read"]["bytes"], VALUE.len(), "{done}");
+    assert_eq!(done["in_use"], true, "{done}");
     assert!(!done.to_string().contains(VALUE), "{done}");
 
     // the secret works once, even with another invite keeping pairing open
@@ -968,7 +972,33 @@ async fn an_expired_or_unknown_invite_lists_nothing() -> TestResult {
         id,
         name: "mba".to_owned(),
         addrs: vec![([127, 0, 0, 1], 7678).into()],
+        port: companion::DIRECT_PORT,
     };
+
+    // the loopback check alone admits every account on the Mac, so opening
+    // an invite also needs the token only the daemon's user can read
+    let mode = std::fs::metadata(
+        harness
+            .app
+            .state_dir()
+            .join(codemode_mcp::admin::OWNER_TOKEN_FILE),
+    )?
+    .permissions()
+    .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    for token in [None, Some("not-the-token")] {
+        let mut request = harness
+            .http
+            .post(format!(
+                "{}/admin/companion/invite/open",
+                harness.admin_base()
+            ))
+            .json(&json!({}));
+        if let Some(token) = token {
+            request = request.header(codemode_mcp::admin::OWNER_TOKEN_HEADER, token);
+        }
+        assert_eq!(request.send().await?.status().as_u16(), 403);
+    }
 
     let (expired, short) = open_invite(&harness, 1).await?;
     tokio::time::sleep(Duration::from_millis(1500)).await;

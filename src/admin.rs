@@ -6,11 +6,17 @@
 //! still check the socket peer (never the `Host` header) and refuse
 //! anything that looks proxied
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    io::Write,
+    net::SocketAddr,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
+    http::HeaderMap,
     http::StatusCode,
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -46,6 +52,84 @@ struct AdminState {
     gateway: Arc<Gateway>,
     config: Arc<Config>,
     public_base: String,
+    /// What the invite routes require; `None` when the file could not be
+    /// set up, and then they refuse
+    owner_token: Option<Arc<str>>,
+}
+
+/// File in the state directory holding the token the invite routes require
+pub const OWNER_TOKEN_FILE: &str = "admin.token";
+
+/// Header that carries it
+pub const OWNER_TOKEN_HEADER: &str = "x-codemode-owner-token";
+
+/// The token in `state_dir`, created when missing
+///
+/// The admin listener only checks that a caller is on this Mac, which any
+/// account is. An invite adds a source of secret values, so its routes also
+/// need this token, which only the owner's account can read (mode 0600)
+pub fn owner_token(state_dir: &std::path::Path) -> std::io::Result<String> {
+    let path = state_dir.join(OWNER_TOKEN_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(token) => {
+            // a copy restored with wider permissions is narrowed again
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+
+            return Ok(token.trim().to_owned());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let token = hex::encode(rand::random::<[u8; 32]>());
+    // written whole beside it, then linked into place: two daemons starting
+    // together keep one token, and neither reads a half-written file
+    let temp = state_dir.join(format!(
+        ".{OWNER_TOKEN_FILE}.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    ));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(token.as_bytes()))
+        .and_then(|()| std::fs::hard_link(&temp, &path));
+    let _ = std::fs::remove_file(&temp);
+    match written {
+        Ok(()) => Ok(token),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(std::fs::read_to_string(&path)?.trim().to_owned())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+impl AdminState {
+    /// The refusal for a request without the owner's token
+    fn not_owner(&self, headers: &HeaderMap) -> Option<Response> {
+        let Some(expected) = &self.owner_token else {
+            return Some(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the daemon could not set up its owner token; see its log",
+            ));
+        };
+        let given = headers
+            .get(OWNER_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        // compared as digests, so the time taken says nothing about the token
+        let digest = |text: &str| <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes());
+        if digest(given) != digest(expected) {
+            return Some(error(
+                StatusCode::FORBIDDEN,
+                "this needs the owner token from the daemon's state directory; run the CLI as the \
+                 user that runs the daemon",
+            ));
+        }
+
+        None
+    }
 }
 
 /// Body of `POST /admin/enroll`
@@ -239,6 +323,14 @@ pub fn router(app: &App) -> Router {
         gateway: Arc::clone(app.gateway()),
         config: Arc::clone(app.config()),
         public_base: app.config().public_base(),
+        owner_token: match owner_token(app.state_dir()) {
+            Ok(token) => Some(token.into()),
+            Err(failure) => {
+                tracing::error!(error = %failure, "could not set up the owner token");
+
+                None
+            }
+        },
     };
 
     Router::new()
@@ -597,7 +689,11 @@ async fn warm(State(state): State<AdminState>, Json(request): Json<WarmRequest>)
 
 /// This gateway's id and the references its servers use, in `headers`,
 /// `env` and OAuth `client_secret`, for a companion Mac to pair with
-async fn companion_invite(State(state): State<AdminState>) -> Response {
+async fn companion_invite(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    // the ticket lists every reference the servers use
+    if let Some(refused) = state.not_owner(&headers) {
+        return refused;
+    }
     let gateway = match state.gateway.companions().id().await {
         Ok(id) => id,
         Err(failure) => {
@@ -618,14 +714,24 @@ async fn companion_invite(State(state): State<AdminState>) -> Response {
 /// Opens an invite that one Mac can register with over iroh
 async fn companion_invite_open(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(request): Json<InviteOpenRequest>,
 ) -> Response {
+    if let Some(refused) = state.not_owner(&headers) {
+        return refused;
+    }
     let lifetime = request.valid_secs.map_or(
         companion::MAX_INVITE_LIFETIME,
         std::time::Duration::from_secs,
     );
-    if lifetime.is_zero() {
-        return error(StatusCode::BAD_REQUEST, "valid_secs must be positive");
+    if lifetime.is_zero() || lifetime > companion::MAX_INVITE_LIFETIME {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "valid_secs must be 1 to {}",
+                companion::MAX_INVITE_LIFETIME.as_secs()
+            ),
+        );
     }
     let gateway_name = companion::short_hostname();
     let opened = state
@@ -656,8 +762,12 @@ async fn companion_invite_open(
 
 async fn companion_invite_status(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(request): Json<InviteStatusRequest>,
 ) -> Response {
+    if let Some(refused) = state.not_owner(&headers) {
+        return refused;
+    }
     match state.gateway.companions().invite_status(&request.invite) {
         Some(status) => Json(status).into_response(),
         None => error(StatusCode::NOT_FOUND, "no such invite"),

@@ -151,14 +151,17 @@ The 1Password Environments server is not covered; it only signs in through the g
    a single-use invite that expires after ten minutes (`--valid-for <seconds>` shortens it). Until it is used,
    treat it like a password: whoever runs it first is registered, so check that the name and id `invite` prints
    are the other Mac's. Stopping `invite` with Ctrl-C does not cancel the invite; it stays valid until it is
-   used or expires. Once a Mac has used it, it is spent even if that Mac's setup then fails; run `invite` again,
+   used or expires. Only the user that runs the daemon can open an invite: the CLI sends a token from
+   `admin.token` in the daemon's state directory (mode 0600), which other accounts on the Mac cannot read. Once a Mac has used it, it is spent even if that Mac's setup then fails; run `invite` again,
    and the Mac keeps its existing entry.
 2. Paste the command into a terminal on the other Mac. To get it there, scan the QR code with a phone's camera,
    copy the text it shows, and paste it on the Mac through Universal Clipboard. The command installs the signed
    release through `install.sh`. A release install needs no InfraOps .p12: since 0.2.1 the install keeps the
    release's own signatures. Then it runs `codemode-mcp companion pair`, which:
    - registers the Mac with the gateway over iroh. The gateway appends a `[[secrets.companions]]` entry to the
-     end of its config, and the running daemon uses it at once, with no restart.
+     end of its config. The running daemon starts reading through it once the check below reaches it, with
+     no restart, so a Mac whose setup fails is never asked in place of the gateway's own `op`; `invite` then
+     says so and exits with an error.
    - writes a `[companion]` section to this Mac's config, with the references the gateway's servers use as the
      allow list.
    - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
@@ -180,7 +183,9 @@ The 1Password Environments server is not covered; it only signs in through the g
 If the other Mac cannot reach the gateway, pair by hand. `codemode-mcp companion invite --manual` prints a ticket
 holding the gateway's id and references. `codemode-mcp companion pair <ticket>` on the other Mac writes its
 `[companion]` section, starts the agent and prints a `[[secrets.companions]]` block. Append that block to the end
-of the gateway Mac's config, then run `codemode-mcp service restart` there.
+of the gateway Mac's config, then run `codemode-mcp service restart` there. The block is printed before the
+agent is installed; if the install fails, fix the cause and run the same `pair` command again, which installs
+again and prints the block again.
 
 A companion built from a checkout instead of a release is signed by `companion install`, which needs the InfraOps
 signing identity as in [Install](#install).
@@ -205,8 +210,8 @@ How reads work with a companion configured:
   endpoint id and current addresses to n0's DNS. Traffic stays end-to-end encrypted. To keep it and the
   addresses on your network, set `discovery = false` under `[secrets]` on the gateway before inviting. The
   invite then carries the gateway's current addresses. Pairing gives the companion `discovery = false` and
-  `listen = "0.0.0.0:7678"`, and lists that Mac's addresses in its `[[secrets.companions]]` entry, so the two
-  Macs must reach each other directly, for example over the tailnet.
+  `listen = "0.0.0.0:7678"`, and lists that Mac's IPv4 addresses in its `[[secrets.companions]]` entry, so
+  the two Macs must reach each other directly over IPv4, for example over the tailnet.
 
 ## Calendar and Reminders access
 

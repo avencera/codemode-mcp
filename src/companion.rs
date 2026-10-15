@@ -113,9 +113,10 @@ async fn answer(send: &mut SendStream, response: &impl Serialize) -> bool {
     send.write_all(&bytes).await.is_ok() && send.finish().is_ok()
 }
 
-/// An iroh endpoint as `secret_key`; the companion answers [`ALPN`], the
-/// gateway only dials, so it advertises none and incoming connections to it
-/// are refused during the handshake instead of queueing unaccepted
+/// An iroh endpoint as `secret_key`; the companion answers [`ALPN`]. The
+/// gateway advertises none, so incoming connections to it are refused during
+/// the handshake instead of queueing unaccepted, except [`PAIR_ALPN`] while
+/// an invite is open
 ///
 /// With `discovery` it uses n0's relays and DNS lookup, so peers find each
 /// other by id alone. Without, it has neither and peers must dial known

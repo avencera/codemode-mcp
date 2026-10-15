@@ -12,14 +12,16 @@ use clap::{Parser, Subcommand};
 use codemode_mcp::{
     adapters::apple::Entity,
     admin::{
-        CompanionCheckRequest, CompanionCheckResponse, CompanionCheckResult, EnrollRequest,
+        self, CompanionCheckRequest, CompanionCheckResponse, CompanionCheckResult, EnrollRequest,
         EnrollResponse, InviteOpenRequest, InviteOpenResponse, InviteResponse, InviteStatusRequest,
         OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest, OAuthStatusResponse,
         RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
     },
     app::App,
     catalog::function_prefix,
-    companion::{self, AnyTicket, InviteStatus, InviteTicket, Joining, PairCheck, Paired, Ticket},
+    companion::{
+        self, AnyTicket, InviteStatus, InviteTicket, Joining, PairCheck, Paired, Pairing, Ticket,
+    },
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
     server::{Listeners, outcome_text},
@@ -684,9 +686,19 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
                 id,
                 already_listed,
                 check,
+                in_use,
             } => {
                 if !announced {
                     announce_registration(&name, id, already_listed);
+                }
+                if !in_use {
+                    bail!(
+                        "{name} is in this Mac's config, but the daemon does not read through it: \
+                         its setup ended before the check reached it. Finish it with a new \
+                         `codemode-mcp companion invite` and the pair command on {name}, or \
+                         remove its [[secrets.companions]] entry; a restart would start using it \
+                         as it is."
+                    );
                 }
 
                 return match check {
@@ -729,8 +741,8 @@ fn announce_registration(name: &str, id: iroh::EndpointId, already_listed: bool)
         println!("{name} ({id}) registered; it was already in this Mac's config.");
     } else {
         println!(
-            "{name} ({id}) registered. It was added to [secrets.companions] in this Mac's config, \
-             and the running daemon uses it already."
+            "{name} ({id}) registered and was added to [secrets.companions] in this Mac's \
+             config. The daemon starts reading through it once the check reaches it."
         );
     }
 }
@@ -772,8 +784,9 @@ async fn pair_with_invite(
     ticket: &InviteTicket,
     identity_file: Option<&std::path::Path>,
 ) -> Result<()> {
-    // refused before the invite is used up
-    if let Some(section) = load_or_default(path)?.companion
+    // everything below is refused before the invite is used up
+    let existing = load_or_default(path)?.companion;
+    if let Some(section) = &existing
         && section.gateway != ticket.gateway
     {
         bail!(
@@ -783,13 +796,35 @@ async fn pair_with_invite(
             section.gateway_name
         );
     }
+    // an existing section is kept as it is, so the gateway must list the key
+    // and port its agent uses, not ones this run would pick
+    let identity_file = match (&existing, identity_file) {
+        (Some(section), Some(asked)) => {
+            let asked = std::path::absolute(expand_home(asked))?;
+            if section.identity_file.as_deref() != Some(asked.as_path()) {
+                bail!(
+                    "{} already has a [companion] section with another identity; drop \
+                     --identity-file, or remove the section to pair with this key",
+                    path.display()
+                );
+            }
+
+            Some(asked)
+        }
+        (Some(section), None) => section.identity_file.clone(),
+        (None, asked) => asked.map(std::path::Path::to_owned),
+    };
+    let port = existing
+        .as_ref()
+        .and_then(|section| section.listen)
+        .map_or(companion::DIRECT_PORT, |listen| listen.port());
 
     // the signing identity is the one thing the agent install can lack;
     // asked now, it fails before the gateway lists this Mac
     let (_, plan) = companion_plan(path, explicit_config)?;
     service::check_signing_identity(&plan)?;
 
-    let id = companion::companion_id(identity_file)?;
+    let id = companion::companion_id(identity_file.as_deref())?;
     let name = companion::short_hostname();
     println!("Registering {name} with the gateway...");
     let joined = companion::join(Joining {
@@ -797,6 +832,7 @@ async fn pair_with_invite(
         id,
         name,
         addrs: Vec::new(),
+        port,
     })
     .await
     .map_err(|error| {
@@ -813,19 +849,19 @@ async fn pair_with_invite(
     if registered.already_listed {
         println!("{gateway} already listed this Mac, as {listed_as}.");
     } else {
-        println!("Registered with {gateway} as {listed_as}; it uses this Mac from now on.");
+        println!("Registered with {gateway} as {listed_as}.");
     }
 
     // without discovery the gateway dials the address this Mac sent, so the
     // agent must listen on that port
-    let listen = (!ticket.addrs.is_empty())
-        .then(|| std::net::SocketAddr::from(([0, 0, 0, 0], companion::DIRECT_PORT)));
+    let listen =
+        (!ticket.addrs.is_empty()).then(|| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
     let section = Ticket {
         gateway: ticket.gateway,
         gateway_name: registered.gateway_name.clone(),
         references: registered.references.clone(),
     };
-    let set_up = companion::pair(&section, path, identity_file, listen)
+    let set_up = companion::pair(&section, path, identity_file.as_deref(), listen)
         .map_err(color_eyre::Report::from)
         .and_then(|paired| {
             match paired {
@@ -873,40 +909,64 @@ async fn pair_with_invite(
     Ok(())
 }
 
-/// Writes the `[companion]` section from a manual ticket, starts the agent
-/// and prints the block the gateway's config needs
+/// Writes the `[companion]` section from a manual ticket, prints the block
+/// the gateway's config needs and starts the agent
+///
+/// Running it again with the same gateway's ticket prints the block and
+/// installs again, so a failed install can be retried
 fn pair_by_hand(
     path: &std::path::Path,
     explicit_config: Option<&std::path::Path>,
     ticket: &Ticket,
     identity_file: Option<&std::path::Path>,
 ) -> Result<()> {
-    match companion::pair(ticket, path, identity_file, None)? {
+    let pairing = match companion::pair(ticket, path, identity_file, None)? {
         Paired::Written(pairing) => {
             println!("Added a [companion] section to {}:", path.display());
             println!("\n{}", pairing.section);
-            install_companion(path, explicit_config, false)?;
-            println!(
-                "\nOn the gateway Mac ({}), append this to the end of the config:",
-                ticket.gateway_name
-            );
-            println!("\n{}\n", pairing.gateway_entry());
-            println!(
-                "then run `codemode-mcp service restart` there, and `codemode-mcp companion \
-                 check <reference>` to try it."
-            );
+
+            pairing
         }
         Paired::AlreadyConfigured { section } => {
+            let existing = load_or_default(path)?.companion;
+            let Some(existing) = existing.filter(|existing| existing.gateway == ticket.gateway)
+            else {
+                println!(
+                    "{} already has a [companion] section for another gateway, so it was not \
+                     changed. Replace it with this one to pair with {}:",
+                    path.display(),
+                    ticket.gateway_name
+                );
+                println!("\n{section}");
+
+                return Ok(());
+            };
             println!(
-                "{} already has a [companion] section, so it was not changed. \
-                 Replace it with this one if the gateway changed:",
+                "{} already has a [companion] section for this gateway; installing its agent \
+                 again.",
                 path.display()
             );
-            println!("\n{section}");
-        }
-    }
 
-    Ok(())
+            Pairing {
+                id: companion::companion_id(existing.identity_file.as_deref())?,
+                name: companion::short_hostname(),
+                section,
+            }
+        }
+    };
+
+    // before the install, so a failed install does not hide it
+    println!(
+        "\nOn the gateway Mac ({}), append this to the end of the config:",
+        ticket.gateway_name
+    );
+    println!("\n{}\n", pairing.gateway_entry());
+    println!(
+        "then run `codemode-mcp service restart` there, and `codemode-mcp companion check \
+         <reference>` to try it.\n"
+    );
+
+    install_companion(path, explicit_config, false)
 }
 
 /// Copies and signs the binary and loads the companion's LaunchAgent, as
@@ -1539,18 +1599,20 @@ async fn admin_post<T: serde::de::DeserializeOwned>(
     body: &impl serde::Serialize,
 ) -> Result<T> {
     let url = format!("http://{}{path}", config.admin_listen);
-    let response = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(&url)
         .timeout(ADMIN_TIMEOUT)
-        .json(body)
-        .send()
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "could not reach the daemon's admin listener at {}; is `codemode-mcp serve` running?",
-                config.admin_listen
-            )
-        })?;
+        .json(body);
+    // only the daemon's own user can read it; routes that need it say so
+    if let Ok(token) = std::fs::read_to_string(config.state_dir()?.join(admin::OWNER_TOKEN_FILE)) {
+        request = request.header(admin::OWNER_TOKEN_HEADER, token.trim());
+    }
+    let response = request.send().await.wrap_err_with(|| {
+        format!(
+            "could not reach the daemon's admin listener at {}; is `codemode-mcp serve` running?",
+            config.admin_listen
+        )
+    })?;
     let status = response.status();
     let text = response.text().await?;
     if !status.is_success() {
