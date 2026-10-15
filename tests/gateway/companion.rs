@@ -986,18 +986,32 @@ async fn an_expired_or_unknown_invite_lists_nothing() -> TestResult {
     .permissions()
     .mode();
     assert_eq!(mode & 0o777, 0o600);
-    for token in [None, Some("not-the-token")] {
-        let mut request = harness
+    let open_path = "/admin/companion/invite/open";
+    let open = |proof: Option<&str>| {
+        let request = harness
             .http
-            .post(format!(
-                "{}/admin/companion/invite/open",
-                harness.admin_base()
-            ))
-            .json(&json!({}));
-        if let Some(token) = token {
-            request = request.header(codemode_mcp::admin::OWNER_TOKEN_HEADER, token);
+            .post(format!("{}{open_path}", harness.admin_base()))
+            // expires with the invite below, so pairing closes with it
+            .json(&json!({ "valid_secs": 1 }));
+        match proof {
+            Some(proof) => request.header(codemode_mcp::admin::OWNER_PROOF_HEADER, proof),
+            None => request,
         }
-        assert_eq!(request.send().await?.status().as_u16(), 403);
+    };
+    let proof = harness.owner_proof(open_path).await?;
+    assert_eq!(open(Some(&proof)).send().await?.status().as_u16(), 200);
+    let token = std::fs::read_to_string(
+        harness
+            .app
+            .state_dir()
+            .join(codemode_mcp::admin::OWNER_TOKEN_FILE),
+    )?;
+    let other_route = harness.owner_proof("/admin/companion/invite").await?;
+    // no proof, the token itself (which the CLI never sends), a proof made
+    // for another route, and the used proof again
+    for refused in [None, Some(token.trim()), Some(&other_route), Some(&proof)] {
+        let status = open(refused).send().await?.status().as_u16();
+        assert_eq!(status, 403, "{refused:?}");
     }
 
     let (expired, short) = open_invite(&harness, 1).await?;

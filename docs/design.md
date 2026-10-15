@@ -514,7 +514,9 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   there; `false` dials only configured `addrs`
 - Pairing (`src/companion/invite.rs`, `join.rs`): `companion invite` asks the daemon to open an invite (the
   invite routes also need the owner token, `admin.token`, mode 0600 in the state directory, since the loopback
-  check admits every account on the Mac), a random 16-byte secret (only its SHA-256 is kept) valid once for at
+  check admits every account on the Mac. The token never crosses the socket: `/admin/owner/challenge` answers a
+  client nonce with a single-use server nonce and an HMAC of both, which the CLI checks before trusting the
+  listener, and the request carries an HMAC of that nonce and its route), a random 16-byte secret (only its SHA-256 is kept) valid once for at
   most 10 minutes. The daemon then advertises ALPN `codemode-mcp/pair/1` (`Endpoint::set_alpns`) until no invite
   is open. The ticket (`cmcp2` + base64url of the gateway id, the secret and, with discovery off, the gateway's
   addresses) leaves the references out, which the gateway sends at registration, so with discovery on the

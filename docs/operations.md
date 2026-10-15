@@ -151,8 +151,10 @@ The 1Password Environments server is not covered; it only signs in through the g
    a single-use invite that expires after ten minutes (`--valid-for <seconds>` shortens it). Until it is used,
    treat it like a password: whoever runs it first is registered, so check that the name and id `invite` prints
    are the other Mac's. Stopping `invite` with Ctrl-C does not cancel the invite; it stays valid until it is
-   used or expires. Only the user that runs the daemon can open an invite: the CLI sends a token from
-   `admin.token` in the daemon's state directory (mode 0600), which other accounts on the Mac cannot read. Once a Mac has used it, it is spent even if that Mac's setup then fails; run `invite` again,
+   used or expires. Only the user that runs the daemon can open an invite: it takes the token in `admin.token`
+   in the daemon's state directory (mode 0600), which other accounts on the Mac cannot read. The token is
+   never sent; the CLI and the daemon each prove they hold it, so a program that took the admin port while the
+   daemon was down can neither learn it nor hand out its own ticket. Once a Mac has used it, it is spent even if that Mac's setup then fails; run `invite` again,
    and the Mac keeps its existing entry.
 2. Paste the command into a terminal on the other Mac. To get it there, scan the QR code with a phone's camera,
    copy the text it shows, and paste it on the Mac through Universal Clipboard. The command installs the signed

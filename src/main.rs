@@ -603,7 +603,7 @@ async fn companion_command(
 /// Opens an invite on the daemon, prints the command that uses it, and
 /// reports the Mac that registers with it
 async fn invite(config: &Config, valid_for: Option<u64>) -> Result<()> {
-    let opened: InviteOpenResponse = admin_post(
+    let opened: InviteOpenResponse = admin_post_as_owner(
         config,
         "/admin/companion/invite/open",
         &InviteOpenRequest {
@@ -657,7 +657,7 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
     let mut announced = false;
     loop {
         let status: InviteStatus =
-            admin_post(config, "/admin/companion/invite/status", &request).await?;
+            admin_post_as_owner(config, "/admin/companion/invite/status", &request).await?;
         match status {
             InviteStatus::Open { .. } | InviteStatus::Registering => {}
             InviteStatus::Expired => bail!(
@@ -765,7 +765,8 @@ fn terminal_qr(text: &str) -> Result<String> {
 /// Prints a ticket that carries everything the companion's config needs,
 /// for pairing without reaching this Mac
 async fn manual_invite(config: &Config) -> Result<()> {
-    let response: InviteResponse = admin_post(config, "/admin/companion/invite", &()).await?;
+    let response: InviteResponse =
+        admin_post_as_owner(config, "/admin/companion/invite", &()).await?;
     let name = response.gateway_name.clone();
     let ticket = response.ticket().encode()?;
     println!("On the other Mac (the one that has 1Password and the owner), run:");
@@ -1598,14 +1599,71 @@ async fn admin_post<T: serde::de::DeserializeOwned>(
     path: &str,
     body: &impl serde::Serialize,
 ) -> Result<T> {
+    admin_request(config, path, body, None).await
+}
+
+/// [`admin_post`] for the routes only the daemon's user may call
+///
+/// The token never crosses the socket: whatever holds the admin port first
+/// proves it holds the token too, so a program that took the port while the
+/// daemon was down learns nothing and cannot pass for it, and the request
+/// carries a single-use proof bound to its route
+async fn admin_post_as_owner<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    path: &str,
+    body: &impl serde::Serialize,
+) -> Result<T> {
+    let file = config.state_dir()?.join(admin::OWNER_TOKEN_FILE);
+    let token = std::fs::read_to_string(&file).wrap_err_with(|| {
+        format!(
+            "cannot read {}; run this as the user that runs the daemon, once it has started",
+            file.display()
+        )
+    })?;
+    let token = token.trim();
+
+    let client_nonce = hex::encode(rand::random::<[u8; 16]>());
+    let challenge: admin::ChallengeResponse = admin_post(
+        config,
+        "/admin/owner/challenge",
+        &admin::ChallengeRequest {
+            client_nonce: client_nonce.clone(),
+        },
+    )
+    .await?;
+    if !admin::daemon_proof_matches(
+        token,
+        &client_nonce,
+        &challenge.server_nonce,
+        &challenge.proof,
+    ) {
+        bail!(
+            "the program at {} could not prove it is this user's daemon; check what holds that port",
+            config.admin_listen
+        );
+    }
+    let proof = format!(
+        "{}:{}",
+        challenge.server_nonce,
+        admin::request_proof(token, &challenge.server_nonce, path)
+    );
+
+    admin_request(config, path, body, Some(&proof)).await
+}
+
+async fn admin_request<T: serde::de::DeserializeOwned>(
+    config: &Config,
+    path: &str,
+    body: &impl serde::Serialize,
+    owner_proof: Option<&str>,
+) -> Result<T> {
     let url = format!("http://{}{path}", config.admin_listen);
     let mut request = reqwest::Client::new()
         .post(&url)
         .timeout(ADMIN_TIMEOUT)
         .json(body);
-    // only the daemon's own user can read it; routes that need it say so
-    if let Ok(token) = std::fs::read_to_string(config.state_dir()?.join(admin::OWNER_TOKEN_FILE)) {
-        request = request.header(admin::OWNER_TOKEN_HEADER, token.trim());
+    if let Some(proof) = owner_proof {
+        request = request.header(admin::OWNER_PROOF_HEADER, proof);
     }
     let response = request.send().await.wrap_err_with(|| {
         format!(

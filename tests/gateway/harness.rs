@@ -683,16 +683,48 @@ impl Harness {
             .http
             .post(format!("{}{path}", self.admin_base()))
             .json(body);
-        // as the CLI does, run by the daemon's own user
-        if let Ok(token) =
-            std::fs::read_to_string(self.state_dir.join(codemode_mcp::admin::OWNER_TOKEN_FILE))
-        {
-            request = request.header(codemode_mcp::admin::OWNER_TOKEN_HEADER, token.trim());
+        // the invite routes need the owner's proof, as the CLI makes it
+        if path.starts_with("/admin/companion/invite") {
+            request = request.header(
+                codemode_mcp::admin::OWNER_PROOF_HEADER,
+                self.owner_proof(path).await?,
+            );
         }
         let response = request.send().await?;
         let status = response.status().as_u16();
 
         Ok((status, response.json().await.unwrap_or(Value::Null)))
+    }
+
+    /// A single-use proof for one owner request to `path`, made as the CLI
+    /// makes it, after checking the daemon's own proof
+    pub async fn owner_proof(&self, path: &str) -> Result<String, Box<dyn Error>> {
+        use codemode_mcp::admin::{OWNER_TOKEN_FILE, daemon_proof_matches, request_proof};
+
+        let token = std::fs::read_to_string(self.state_dir.join(OWNER_TOKEN_FILE))?;
+        let token = token.trim();
+        let client_nonce = uuid::Uuid::new_v4().simple().to_string();
+        let challenge: Value = self
+            .http
+            .post(format!("{}/admin/owner/challenge", self.admin_base()))
+            .json(&json!({ "client_nonce": client_nonce }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let server_nonce = challenge["server_nonce"]
+            .as_str()
+            .ok_or("no server nonce")?;
+        let proof = challenge["proof"].as_str().ok_or("no daemon proof")?;
+        assert!(
+            daemon_proof_matches(token, &client_nonce, server_nonce, proof),
+            "the daemon's proof does not match the token"
+        );
+
+        Ok(format!(
+            "{server_nonce}:{}",
+            request_proof(token, server_nonce, path)
+        ))
     }
 
     /// Asks the admin listener for an enrollment link; returns the link's
