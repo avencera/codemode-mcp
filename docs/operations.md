@@ -14,7 +14,7 @@ binary under a shorter name. Times in logs are UTC.
    codemode-mcp config init --print    # or look first
    ```
 
-   It configures 1Password, the OpenAI docs, homebased, Calendar, Reminders and Xcode. Approval notifications use the
+   It configures 1Password, the OpenAI docs, Calendar, Reminders and Xcode. Approval notifications use the
    `[notify.ntfy]` section of `~/.config/homebased/config.toml` unless you add one here.
 3. Preview, then install the LaunchAgent from the repository root:
 
@@ -203,7 +203,6 @@ What a restart does:
 - Only one daemon can run on a state directory: a second `codemode-mcp serve` exits at once with "another
   daemon owns <dir>" and changes nothing. A CLI command (`exec`, `stats`, `review`, `passkey list`) works beside
   the running daemon.
-- On start the daemon removes `codemode-homebased-*` temp dirs older than 10 minutes left by a crash.
 - A kill with SIGKILL, or a power loss, also drops the last usage-log lines that were not yet flushed.
 
 ## Read the usage review
@@ -241,8 +240,6 @@ The "Type strictness" section ends with a verdict line:
 - Requests go to the phone while you are at the Mac: the log says why (`Touch ID is not available`,
   `Mac notification failed`). The daemon must run as a LaunchAgent in your login session to see the screen.
 - Monty worker not found: `service install` again, or set `worker_path`.
-- The homebased adapter answers `homebased error <code>`: the code is homebased's own (see its skill's
-  `errors.md`). `unknown_thread` means the `thread` argument is not a live session on this Mac.
 - A calendar or reminders tool says macOS denied access, or is asking: see Calendar and Reminders access.
 - An Xcode tool says the agent isn't approved: see Xcode access.
 

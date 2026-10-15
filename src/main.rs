@@ -10,7 +10,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use codemode_mcp::{
-    adapters::{apple::Entity, homebased::HomebasedAdapter},
+    adapters::apple::Entity,
     admin::{
         EnrollRequest, EnrollResponse, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
         OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
@@ -19,7 +19,6 @@ use codemode_mcp::{
     catalog::function_prefix,
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
-    notify::{Notifier, Ntfy},
     server::{Listeners, outcome_text},
     service::{self, Action, ServicePaths},
     store::{self, Store},
@@ -172,12 +171,6 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum AdapterCommand {
-    /// The homebased CLI as MCP tools
-    Homebased {
-        /// homebased executable; `$CODEMODE_HOMEBASED_BIN`, else `homebased` on PATH
-        #[arg(long)]
-        homebased_bin: Option<PathBuf>,
-    },
     /// The Calendar app's events as MCP tools, through EventKit (macOS)
     Calendar,
     /// The Reminders app as MCP tools, through EventKit (macOS)
@@ -249,9 +242,6 @@ async fn main() -> Result<()> {
         Command::Config {
             command: ConfigCommand::Init { print },
         } => config_init_command(&path, print),
-        Command::Adapter {
-            command: AdapterCommand::Homebased { homebased_bin },
-        } => adapter_command(&load_or_default(&path)?, homebased_bin).await,
         Command::Adapter {
             command: AdapterCommand::Calendar,
         } => eventkit_adapter_command(Entity::Events).await,
@@ -542,24 +532,6 @@ fn config_init_command(path: &std::path::Path, print: bool) -> Result<()> {
     println!("Wrote {}", path.display());
 
     Ok(())
-}
-
-async fn adapter_command(config: &Config, homebased_bin: Option<PathBuf>) -> Result<()> {
-    let notifier: Option<Arc<dyn Notifier>> = match config.notify.resolve_ntfy() {
-        Ok(Some(ntfy)) => Some(Arc::new(Ntfy::new(ntfy))),
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(%error, "notify tool unavailable");
-
-            None
-        }
-    };
-    let program = homebased_bin.unwrap_or_else(HomebasedAdapter::program_from_env);
-
-    HomebasedAdapter::new(program, notifier)
-        .serve_stdio()
-        .await
-        .map_err(|error| eyre!(error))
 }
 
 /// Serves the calendar or reminders adapter over EventKit

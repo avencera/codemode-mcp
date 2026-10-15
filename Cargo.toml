@@ -132,11 +132,6 @@ path = "tests/fixtures/fixture_server.rs"
 name = "codemode-fake-eventkit"
 path = "tests/fixtures/fake_eventkit.rs"
 
-# fake homebased CLI for the adapter tests
-[[bin]]
-name = "codemode-fake-homebased"
-path = "tests/fixtures/fake_homebased.rs"
-
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"

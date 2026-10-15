@@ -1,9 +1,8 @@
 //! Wires configuration, state, approvals, gateway and executions into one handle
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    adapters::homebased::remove_stale_private_dirs,
     admin::attach_action,
     approvals::{Approvals, NO_APPROVAL_PAGE, NO_NOTIFIER},
     config::{Config, ConfigError},
@@ -18,9 +17,6 @@ use crate::{
     store::{Store, StoreError},
     usage::UsageLog,
 };
-
-/// How old a homebased temp dir must be before boot treats it as a crash leftover
-const STALE_TEMP_DIR_AGE: Duration = Duration::from_secs(600);
 
 /// Failures starting the app
 #[derive(Debug, thiserror::Error)]
@@ -191,11 +187,6 @@ impl App {
     /// The daemon calls this once at boot, before it serves; one-off CLI
     /// runs do not, because they share the database with a running daemon
     pub fn recover(&self) {
-        let removed = remove_stale_private_dirs(STALE_TEMP_DIR_AGE);
-        if removed > 0 {
-            tracing::info!(removed, "removed temp dirs a crashed adapter left behind");
-        }
-
         self.executions.recover();
         self.executions.start_housekeeping();
 

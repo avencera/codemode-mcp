@@ -42,7 +42,7 @@ rmcp 3.x clients, one long-lived connection per configured server
 
 | Kind | Example | Notes |
 |---|---|---|
-| stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter homebased`, `calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
+| stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
 | HTTP | `openaiDeveloperDocs` | plain Streamable HTTP |
 | HTTP + OAuth | any `url` server with `oauth = true` | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
@@ -461,43 +461,6 @@ sessions already have the tools. Seam for later: an upstream kind `caller_auth` 
 lazily per caller (the server is session-less, so keyed by token header rather than a session id; the token comes
 from a header the agent's entry sets), dropped when idle, and excluded from the shared catalog build
 
-### Our own MCPs: homebased adapter
-
-- `codemode-mcp adapter homebased` is a stdio MCP server in the same binary (`src/adapters/homebased.rs`;
-  more adapters go next to it). Each tool runs `homebased --json ...` with an argv array, never a shell, under a
-  timeout (30 s reads, 60 s cancel and message, 150 s submits, since a local submit retries a busy daemon for
-  about 90 s)
-- Tools: `daemon_status`, `task_list`, `task_show`, `task_log` (tail 200), `task_usage`, `fleet_machines`,
-  `task_submit_agent`, `task_submit_command`, `task_followup`, `task_cancel`, `message_send`, `notify`. Left out:
-  daemon stop, restart and update, config, fleet mutations, the resource and GPU queue, `t3`, `task report` and
-  container submits
-- Submits build the spec (`homebased task schema`) and pass it on stdin; `thread` is required and the docstring
-  tells the agent to pass its own session id and not to poll, since results arrive as `HOMEBASED_EVENT`
-  messages. The prompt (and the follow-up message) is written to a 0600 file in a private 0700 temp dir that is
-  removed after the command; homebased inlines prompt files at submit. A `request_id` (and `message_id` for
-  messages) is generated when none is given and returned, so a retry is safe
-- Option values are passed as `--flag=value` and ids must be UUIDs, so agent text cannot become another option.
-  The adapter strips `HOMEBASED_TASK_ID`, `CODEX_THREAD_ID`, `CODEX_SESSION_ID` and `CLAUDE_CODE_SESSION_ID`
-  from homebased's environment: it acts for many sessions and must not pass its own caller identity on
-- `notify` posts through the shared ntfy module (blocked = urgent, important = high, done = default), because
-  `homebased notify` only sends a test message
-- Every tool declares an `outputSchema` and returns `structured_content` (serde structs with schemars in
-  `src/adapters/homebased/outputs.rs`), read from real `homebased --json` output and cut to the fields an agent
-  acts on: statuses are enums (stubs: `Literal`), fields homebased leaves out are `NotRequired`, and mutating tools
-  return small acks (`request_id`/`id`/`status`, `message_id`, `{ok}`). A dry run submit returns
-  `{request_id, dry_run: true, argv}`. `task_list` drops the CLI's extra fields, which shrinks a long history
-- homebased errors (`{"error": {code, message, retryable}}` on stderr) become tool errors:
-  `homebased error <code> (exit <n>, retryable: <bool>): <message>`
-- Starter policies: `task_submit_command`, `task_cancel` and `message_send` are `ask` with session grants, the
-  rest `allow`, and the server is not `sensitive`. Caveat: homebased starts agent workers with their sandbox and
-  approvals bypassed (`--dangerously-bypass-approvals-and-sandbox`, `--permission-mode`), so an allowed
-  `task_submit_agent` is as powerful as `task_submit_command`: the prompt alone can run anything. Filtering
-  `extra_args` alone does not change that. Decision: `task_submit_agent` stays `allow`, because delegation is
-  routine and every current agent has a shell that can run `homebased` directly, so `ask` would add taps
-  without adding protection. `extra_args` is still limited to reasoning-effort flags (`--effort LEVEL`,
-  `-c model_reasoning_effort=LEVEL`) as a cheap extra layer, and the prompt is logged, so misuse shows up in
-  `review`. Revisit if MCP-only agents (no shell) start using the adapter
-
 ### Our own MCPs: Calendar and Reminders adapters
 
 - `codemode-mcp adapter calendar` and `codemode-mcp adapter reminders` are stdio servers over EventKit
@@ -666,8 +629,7 @@ stubs are stored only to restore the session. A restored dump is also run by wha
 then, which may be a newer version than the one that wrote it.
 
 **Housekeeping.** Stored results past `result_ttl_secs`, and the oldest ones beyond the byte cap, lose their
-payload at boot and then every minute, whether or not anyone calls; the audit row stays. At boot, homebased `PrivateDir` temp dirs a crash left behind (`codemode-homebased-` plus 32 hex
-digits in the temp dir, a real directory owned by this user, older than 10 minutes) are removed.
+payload at boot and then every minute, whether or not anyone calls; the audit row stays.
 
 **The CLI** (`stats`, `review`, `exec`, `passkey list`) opens the same file beside the running daemon through
 turso's `experimental_multiprocess_wal`, which every open uses (turso refuses a mix of modes). Recovery of
@@ -686,7 +648,7 @@ in-flight work runs only in the daemon, never in a CLI run, so `exec` does not t
   `service uninstall` boots out and removes the plist, keeping state and installed files; `service status` and
   `service restart` (`kickstart -k`). Every one takes `--dry-run`
 - With `worker_path` unset the daemon uses `~/.local/share/codemode-mcp/monty`, then `monty` on `PATH`
-- `codemode-mcp config init` writes a starter config (1Password, OpenAI docs, homebased) to the
+- `codemode-mcp config init` writes a starter config (1Password, OpenAI docs, Calendar, Reminders, Xcode) to the
   config path and refuses to overwrite; `--print` writes it to stdout
 - HTTPS for the passkey page through `tailscale serve` on a dedicated port (`/` on 443 is already taken)
 - Admin API (`/admin/enroll`, `/admin/passkey/remove`, `/admin/warm`, `/admin/oauth/{login,status,logout}`, and
@@ -737,7 +699,9 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
   announced; hostile same-user code is out of scope (see Threat model)
 - OAuth registrations and tokens are committed together at the end of a login, in SQLite
 - T3 Code stays outside the gateway for now
-- The homebased adapter ships in the main binary; submit is split by workload (`agent` allowed, `task` asks)
+- No homebased adapter: agents drove homebased through its CLI about 3,800 times against 8 through the gateway.
+  It holds no secret the agent shouldn't see, its flow is submit then wait for the callback with little to chain,
+  and `ask` on submits held nothing back while the CLI sits in the same shell. Revisit for agents without a shell
 - Xcode goes through Apple's `mcpbridge` unchanged rather than an adapter: its tools already declare output
   schemas, and Xcode owns the agent and folder approvals
 - Calendar and Reminders go through EventKit rather than CalDAV: no password to store, every account the Mac

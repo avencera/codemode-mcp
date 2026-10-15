@@ -2,4 +2,3 @@
 //! (`codemode-mcp adapter <name>`)
 
 pub mod apple;
-pub mod homebased;

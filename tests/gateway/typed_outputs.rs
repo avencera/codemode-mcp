@@ -1,6 +1,6 @@
 //! Typed tool results: stubs without `Any`, narrowing of untyped results,
-//! the JSON accessors, output overrides, the runtime schema check, the escape-hatch bans, the
-//! homebased adapter's declared outputs and the strictness review
+//! the JSON accessors, output overrides, the runtime schema check, the escape-hatch bans and
+//! the strictness review
 
 use std::{error::Error, time::Duration};
 
@@ -11,11 +11,6 @@ use codemode_mcp::{
         CallRecord, Caller, Classification, ExecutionRecord, Outcome, UpstreamRecord,
         report::Reporter,
     },
-};
-use rmcp::{
-    ServiceExt,
-    model::CallToolRequestParams,
-    transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde_json::{Value, json};
 
@@ -497,101 +492,6 @@ async fn escape_hatches_are_rejected_before_the_checker() -> TestResult {
     }
 
     harness.stop().await
-}
-
-/// The twelve tools the homebased adapter offers, with arguments that make
-/// the fake homebased answer
-fn adapter_calls() -> Vec<(&'static str, Value)> {
-    let task = "01a10000-0000-7000-8000-000000000001";
-    let thread = "11111111-2222-4333-8444-555555555555";
-
-    vec![
-        ("daemon_status", json!({})),
-        ("task_list", json!({})),
-        ("task_show", json!({ "id": task })),
-        ("task_log", json!({ "id": task })),
-        ("task_usage", json!({})),
-        ("fleet_machines", json!({})),
-        (
-            "task_submit_agent",
-            json!({
-                "thread": thread, "name": "review", "cwd": "/tmp",
-                "agent": "claude", "prompt": "Review the diff.",
-            }),
-        ),
-        (
-            "task_submit_agent",
-            json!({
-                "thread": thread, "name": "review", "cwd": "/tmp",
-                "agent": "claude", "prompt": "Review the diff.", "dry_run": true,
-            }),
-        ),
-        (
-            "task_submit_command",
-            json!({ "thread": thread, "name": "build", "cwd": "/tmp", "command": ["true"] }),
-        ),
-        (
-            "task_followup",
-            json!({ "id": task, "message": "Continue." }),
-        ),
-        ("task_cancel", json!({ "id": task })),
-        ("message_send", json!({ "task": task, "message": "hi" })),
-    ]
-}
-
-/// What the homebased adapter answers is what it declared: every tool has an
-/// output schema, and the answers built from real `homebased --json` captures
-/// pass the same check the gateway applies before a script sees them
-#[tokio::test(flavor = "multi_thread")]
-async fn homebased_outputs_follow_their_declared_schemas() -> TestResult {
-    let command =
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp")).configure(|command| {
-            command.args([
-                "--config",
-                "/nonexistent/codemode.toml",
-                "adapter",
-                "homebased",
-                "--homebased-bin",
-                env!("CARGO_BIN_EXE_codemode-fake-homebased"),
-            ]);
-        });
-    let client = ().serve(TokioChildProcess::new(command)?).await?;
-
-    let tools = client.list_all_tools().await?;
-    assert_eq!(tools.len(), 12, "{tools:?}");
-    for tool in &tools {
-        assert!(
-            tool.output_schema.is_some(),
-            "{} declares no output schema",
-            tool.name
-        );
-    }
-
-    for (name, arguments) in adapter_calls() {
-        let schema = tools
-            .iter()
-            .find(|tool| tool.name == name)
-            .and_then(|tool| tool.output_schema.clone())
-            .ok_or_else(|| format!("no schema for {name}"))?;
-        let Value::Object(arguments) = arguments else {
-            return Err("arguments must be an object".into());
-        };
-        let result = tokio::time::timeout(
-            Duration::from_secs(30),
-            client.call_tool(CallToolRequestParams::new(name).with_arguments(arguments)),
-        )
-        .await??;
-        assert_eq!(result.is_error, Some(false), "{name}: {}", text_of(&result));
-
-        let structured = result
-            .structured_content
-            .ok_or_else(|| format!("{name} returned no structured content"))?;
-        validate(&schema, &structured)
-            .map_err(|mismatch| format!("{name}: {mismatch} in {structured}"))?;
-    }
-    client.cancel().await?;
-
-    Ok(())
 }
 
 fn claude(session: &str) -> Caller {

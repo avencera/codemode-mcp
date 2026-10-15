@@ -432,8 +432,8 @@ pub fn render_plist(paths: &ServicePaths, config: Option<&Path>, drain: Duration
         .iter()
         .map(|argument| format!("    <string>{}</string>\n", xml_escape(argument)))
         .collect();
-    // launchd starts agents with a minimal PATH; upstream commands and the
-    // homebased adapter need Homebrew and ~/.local/bin
+    // launchd starts agents with a minimal PATH; upstream commands need
+    // Homebrew and ~/.local/bin
     let path = format!(
         "{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         paths.home.display()
@@ -737,18 +737,10 @@ mod tests {
         assert!(onepassword.warm.is_some());
         assert!(config.notify.ntfy.is_none());
 
-        let homebased = &config.servers["homebased"];
         assert_eq!(
-            homebased.command.as_deref(),
+            config.servers["calendar"].command.as_deref(),
             Some("/Users/someone/.local/bin/codemode-mcp")
         );
-        assert!(!homebased.is_sensitive());
-        for tool in ["task_submit_command", "task_cancel", "message_send"] {
-            assert_eq!(homebased.policy_for(tool), Policy::Ask, "{tool}");
-        }
-        for tool in ["task_submit_agent", "task_list", "notify"] {
-            assert_eq!(homebased.policy_for(tool), Policy::Allow, "{tool}");
-        }
 
         // EventKit adapters: reads free, every write asks
         for (server, reads, writes) in [

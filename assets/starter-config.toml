@@ -75,24 +75,6 @@ output_schema = { type = "object", required = ["hits", "nbHits", "page"], proper
 [servers.openai_docs.tools.list_api_endpoints]
 output_schema = { type = "object", required = ["baseUrls", "paths", "total", "urls"], properties = { baseUrls = { type = "array", items = { type = "string" } }, paths = { type = "array", items = { type = "string" } }, urls = { type = "array", items = { type = "string" } }, total = { type = "integer" } } }
 
-# homebased through the built-in adapter. Submitting arbitrary commands,
-# cancelling tasks and messaging other sessions ask on the phone, with a
-# client grant. task_submit_agent stays `allow`, yet homebased runs workers
-# with their sandbox and approvals bypassed, so a submitted worker can run
-# anything its prompt asks for; add a policy = "ask" table for it to require
-# a phone approval
-[servers.homebased]
-command = "{{HOME}}/.local/bin/codemode-mcp"
-args = ["adapter", "homebased"]
-sensitive = false
-
-[servers.homebased.tools.task_submit_command]
-policy = "ask"
-[servers.homebased.tools.task_cancel]
-policy = "ask"
-[servers.homebased.tools.message_send]
-policy = "ask"
-
 # Calendar and Reminders through EventKit, covering every account the Mac's
 # apps show. macOS asks once for each, on the Mac, the first time the daemon
 # starts the adapter. Reads run freely; every change asks on the phone, and a
