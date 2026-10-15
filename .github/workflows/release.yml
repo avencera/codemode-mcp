@@ -23,11 +23,11 @@ env:
 
 jobs:
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `update` compares the tag with what the installed binary reports, so
       # a tag ahead of Cargo.toml would reinstall and restart on every run
       - name: Check the tag matches Cargo.toml
@@ -46,7 +46,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # monty 1.1.0 needs a newer std than the runner image's toolchain
       - name: Update Rust
         run: rustup update stable --no-self-update && rustup default stable
@@ -109,11 +109,11 @@ jobs:
 
   publish-release:
     needs: upload-assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # attached to every release, so releases/latest/download/install.sh works
       - name: Upload install.sh
         env:
