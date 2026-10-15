@@ -4,7 +4,10 @@
 use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc, time::Duration};
 
 use codemode_mcp::{
-    companion::{self, CompanionHandle, Paired, Role, Ticket},
+    companion::{
+        self, CompanionHandle, InviteSecret, InviteTicket, JoinError, Joining, PairCheck, Paired,
+        Role, Ticket,
+    },
     config::Config,
     mac::{Mac, TouchId},
 };
@@ -595,7 +598,7 @@ async fn an_invite_carries_the_gateway_and_its_references_to_a_pairing() -> Test
     let ticket = Ticket::decode(&ticket.encode()?)?;
     let config = directory.join("config.toml");
     let identity = directory.join("companion.key");
-    let Paired::Written(pairing) = companion::pair(&ticket, &config, Some(&identity))? else {
+    let Paired::Written(pairing) = companion::pair(&ticket, &config, Some(&identity), None)? else {
         return Err("a new config should be paired".into());
     };
     let paired = Config::load(&config)?
@@ -610,7 +613,7 @@ async fn an_invite_carries_the_gateway_and_its_references_to_a_pairing() -> Test
         "the id printed for the gateway is the key that was stored"
     );
     assert!(matches!(
-        companion::pair(&ticket, &config, Some(&identity))?,
+        companion::pair(&ticket, &config, Some(&identity), None)?,
         Paired::AlreadyConfigured { .. }
     ));
 
@@ -655,7 +658,7 @@ fn a_relative_identity_file_is_stored_as_an_absolute_path() -> TestResult {
     };
     let config = directory.join("config.toml");
 
-    let Paired::Written(pairing) = companion::pair(&ticket, &config, Some(&relative))? else {
+    let Paired::Written(pairing) = companion::pair(&ticket, &config, Some(&relative), None)? else {
         return Err("a new config should be paired".into());
     };
     let stored = Config::load(&config)?
@@ -755,4 +758,249 @@ fn companion_install_dry_run_shows_the_agent_and_changes_nothing() -> TestResult
     let _ = std::fs::remove_dir_all(&home);
 
     Ok(())
+}
+
+/// A gateway with no companions yet whose `twin` server uses [`REFERENCE`],
+/// and the key file of its iroh identity
+async fn inviting_gateway() -> Result<Option<(Harness, PathBuf)>, Box<dyn Error>> {
+    let directory = temp_state_dir();
+    std::fs::create_dir_all(&directory)?;
+    let key = directory.join("gateway.key");
+    let (op, _) = fake_op()?;
+    let extra = format!(
+        "[secrets]\n\
+         op = \"{op}\"\n\
+         discovery = false\n\
+         identity_file = \"{key}\"\n\n\
+         [servers.twin]\n\
+         command = \"{fixture}\"\n\
+         env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n",
+        op = op.display(),
+        key = key.display(),
+        fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
+    );
+    let gateway_mac = Arc::new(FakeMac::default());
+    gateway_mac.set_present(false);
+    let harness = Harness::with(Setup {
+        extra: &extra,
+        mac: Some(gateway_mac),
+        ..Setup::default()
+    })
+    .await?;
+
+    Ok(harness.map(|harness| (harness, key)))
+}
+
+/// Opens an invite on `harness` and returns its id and its ticket, pointed
+/// at the gateway's loopback address
+async fn open_invite(
+    harness: &Harness,
+    valid_secs: u64,
+) -> Result<(String, InviteTicket), Box<dyn Error>> {
+    let (status, opened) = harness
+        .admin_json(
+            "/admin/companion/invite/open",
+            &json!({ "valid_secs": valid_secs }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{opened}");
+    let mut ticket = InviteTicket::decode(opened["ticket"].as_str().ok_or("no ticket")?)?;
+    // discovery is off, so the ticket names this Mac's addresses; the test
+    // dials loopback instead
+    assert!(!ticket.addrs.is_empty());
+    let port = harness
+        .app
+        .gateway()
+        .companions()
+        .bound_addrs()
+        .into_iter()
+        .find(|addr| addr.is_ipv4())
+        .ok_or("the gateway bound no IPv4 socket")?
+        .port();
+    ticket.addrs = vec![([127, 0, 0, 1], port).into()];
+
+    Ok((
+        opened["invite"].as_str().ok_or("no invite id")?.to_owned(),
+        ticket,
+    ))
+}
+
+async fn invite_status(harness: &Harness, invite: &str) -> Result<Value, Box<dyn Error>> {
+    let (status, body) = harness
+        .admin_json(
+            "/admin/companion/invite/status",
+            &json!({ "invite": invite }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+
+    Ok(body)
+}
+
+/// The `[[secrets.companions]]` the gateway's config file lists
+fn listed(harness: &Harness) -> Result<Vec<(String, iroh::EndpointId)>, Box<dyn Error>> {
+    let path = harness
+        .app
+        .config()
+        .path()
+        .ok_or("the config has no file")?;
+
+    Ok(Config::load(path)?
+        .secrets
+        .companions
+        .into_iter()
+        .map(|peer| (peer.name, peer.id))
+        .collect())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_lists_a_companion_once_and_checks_it_with_touch_id() -> TestResult {
+    let Some((harness, gateway_key)) = inviting_gateway().await? else {
+        return Ok(());
+    };
+    let (invite, ticket) = open_invite(&harness, 60).await?;
+    assert_eq!(
+        ticket.gateway,
+        companion::load_or_create(Role::Gateway, Some(&gateway_key))?.public()
+    );
+
+    // the companion's agent, as `companion install` would start it
+    let directory = temp_state_dir();
+    std::fs::create_dir_all(&directory)?;
+    let (companion_op, companion_log) = fake_op()?;
+    let companion_mac = Arc::new(FakeMac::default());
+    companion_mac.set_answer(Some(TouchId::Approved));
+    let text = format!(
+        "[companion]\n\
+         gateway = \"{gateway}\"\n\
+         allow = [\"{REFERENCE}\"]\n\
+         listen = \"127.0.0.1:0\"\n\
+         discovery = false\n\
+         identity_file = \"{key}\"\n\
+         op = \"{op}\"\n",
+        gateway = ticket.gateway,
+        key = directory.join("companion.key").display(),
+        op = companion_op.display(),
+    );
+    let config = Config::parse(&text, std::path::Path::new("companion.toml"))?
+        .companion
+        .ok_or("the companion section is missing")?;
+    let agent = companion::serve(config, Some(Arc::clone(&companion_mac) as Arc<dyn Mac>)).await?;
+    let agent_addr = agent
+        .bound_addrs()
+        .into_iter()
+        .find(|address| address.is_ipv4())
+        .ok_or("the companion bound no IPv4 socket")?;
+
+    let joining = || Joining {
+        ticket: &ticket,
+        id: agent.id(),
+        name: "mba".to_owned(),
+        addrs: vec![agent_addr],
+    };
+    let joined = companion::join(joining()).await?;
+    let registered = joined.registered().clone();
+    assert_eq!(registered.name, "mba");
+    assert_eq!(registered.references, [REFERENCE]);
+    assert!(!registered.already_listed);
+
+    // listed in the config file and used by the running daemon
+    assert_eq!(listed(&harness)?, [("mba".to_owned(), agent.id())]);
+    let peers = harness.app.gateway().companions().peers();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].addrs, [agent_addr]);
+    assert_eq!(
+        invite_status(&harness, &invite).await?["state"],
+        "registered"
+    );
+
+    // the check reads through the new companion after its own Touch ID
+    let check = joined.check().await?;
+    assert_eq!(
+        check,
+        PairCheck::Read {
+            reference: REFERENCE.to_owned(),
+            bytes: VALUE.len(),
+        }
+    );
+    assert_eq!(reads(&companion_log, REFERENCE), 1);
+    assert_eq!(
+        companion_mac.shown(),
+        [format!(
+            "touch_id codemode-mcp on main wants to read {REFERENCE}"
+        )]
+    );
+    let mut done = Value::Null;
+    for _ in 0..40 {
+        done = invite_status(&harness, &invite).await?;
+        if done["state"] == "done" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(done["name"], "mba", "{done}");
+    assert_eq!(done["check"]["read"]["bytes"], VALUE.len(), "{done}");
+    assert!(!done.to_string().contains(VALUE), "{done}");
+
+    // the secret works once, even with another invite keeping pairing open
+    let _other = open_invite(&harness, 60).await?;
+    let reused = companion::join(joining()).await.err();
+    assert!(
+        matches!(&reused, Some(JoinError::Refused(message)) if message.contains("already used")),
+        "{reused:?}"
+    );
+    assert_eq!(listed(&harness)?.len(), 1);
+
+    agent.shutdown().await;
+    let _ = std::fs::remove_dir_all(&directory);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_or_unknown_invite_lists_nothing() -> TestResult {
+    let Some((harness, _)) = inviting_gateway().await? else {
+        return Ok(());
+    };
+    let id = iroh::SecretKey::generate().public();
+    let joining = |ticket| Joining {
+        ticket,
+        id,
+        name: "mba".to_owned(),
+        addrs: vec![([127, 0, 0, 1], 7678).into()],
+    };
+
+    let (expired, short) = open_invite(&harness, 1).await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(invite_status(&harness, &expired).await?["state"], "expired");
+
+    // with no invite open the gateway accepts no connection at all
+    let refused = companion::join(joining(&short)).await.err();
+    assert!(
+        matches!(refused, Some(JoinError::Unreachable(_))),
+        "{refused:?}"
+    );
+
+    // another invite reopens pairing, but not for the expired secret
+    let (_, open) = open_invite(&harness, 60).await?;
+    let late = companion::join(joining(&short)).await.err();
+    assert!(
+        matches!(&late, Some(JoinError::Refused(message)) if message.contains("expired")),
+        "{late:?}"
+    );
+
+    let forged = InviteTicket {
+        secret: InviteSecret::generate(),
+        ..open
+    };
+    let unknown = companion::join(joining(&forged)).await.err();
+    assert!(
+        matches!(&unknown, Some(JoinError::Refused(message)) if message.contains("no such invite")),
+        "{unknown:?}"
+    );
+
+    assert!(listed(&harness)?.is_empty());
+    assert!(harness.app.gateway().companions().peers().is_empty());
+
+    harness.stop().await
 }

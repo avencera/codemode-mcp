@@ -1,13 +1,13 @@
 //! The companion's side: answering the gateway's requests on this Mac
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use super::{
     ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse,
-    Hangup, IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
+    HANDSHAKE_TIMEOUT, Hangup, IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
 };
 use crate::{
     config::CompanionConfig,
@@ -17,9 +17,6 @@ use crate::{
 
 /// Cancel button of the Touch ID prompt; pressing it denies the read
 const CANCEL_TITLE: &str = "Deny";
-
-/// How long a peer may take to finish the handshake
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why the companion could not start
 #[derive(Debug, thiserror::Error)]

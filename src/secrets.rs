@@ -8,6 +8,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    path::PathBuf,
     process::Stdio,
     sync::{Arc, PoisonError, RwLock},
     time::Duration,
@@ -45,14 +46,20 @@ pub struct Secrets {
 }
 
 impl Secrets {
-    /// Readers for `config`; `presence` tells whether the owner is at this
-    /// Mac, which decides whether a read also runs the local `op`
-    pub fn new(config: &SecretsConfig, presence: Option<OnMac>) -> Self {
-        let companions = Arc::new(Companions::new(config));
-        let mut onepassword = OnePassword::new(config.op.clone());
-        if !companions.peers().is_empty() {
-            onepassword = onepassword.with_companions(Arc::clone(&companions), presence);
-        }
+    /// Readers for `config`, loaded from `config_path`; `presence` tells
+    /// whether the owner is at this Mac, which decides whether a read also
+    /// runs the local `op`
+    ///
+    /// The companions are attached even when there are none yet, since one
+    /// registering with an invite is used without a restart
+    pub fn new(
+        config: &SecretsConfig,
+        config_path: Option<PathBuf>,
+        presence: Option<OnMac>,
+    ) -> Self {
+        let companions = Arc::new(Companions::new(config, config_path));
+        let onepassword =
+            OnePassword::new(config.op.clone()).with_companions(Arc::clone(&companions), presence);
 
         Self {
             onepassword,
@@ -279,7 +286,12 @@ impl OnePassword {
     }
 
     async fn read(&self, reference: &str) -> Result<String, SecretError> {
-        let Some(companions) = &self.companions else {
+        let peers = self
+            .companions
+            .as_ref()
+            .map(|companions| companions.peers())
+            .unwrap_or_default();
+        let Some(companions) = self.companions.as_ref().filter(|_| !peers.is_empty()) else {
             return self.read_local(reference).await;
         };
 
@@ -300,7 +312,7 @@ impl OnePassword {
                 ("local".to_owned(), value)
             });
         }
-        for peer in companions.peers() {
+        for peer in peers {
             let companions = Arc::clone(companions);
             let name = peer.name.clone();
             let reference = reference.to_owned();

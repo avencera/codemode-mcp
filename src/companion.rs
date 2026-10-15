@@ -9,6 +9,8 @@
 
 mod client;
 mod identity;
+mod invite;
+mod join;
 mod pair;
 mod server;
 mod ticket;
@@ -16,10 +18,17 @@ mod wire;
 
 pub use client::{CheckOutcome, CompanionFailure, Companions};
 pub use identity::{IdentityError, Role, load_or_create};
+pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite, PAIR_ALPN};
+pub use join::{JoinError, Joined, Joining, join};
 pub use pair::{PairError, Paired, Pairing, companion_id, pair};
 pub use server::{CompanionHandle, ServeError, serve};
-pub use ticket::{TICKET_PREFIX, Ticket, TicketError};
-pub use wire::{CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse};
+pub use ticket::{
+    AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
+};
+pub use wire::{
+    CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse, PairCheck,
+    PairRequest, PairResponse, Registered, Registration,
+};
 
 use std::time::Duration;
 
@@ -30,11 +39,19 @@ use crate::{
 
 use iroh::{
     Endpoint,
-    endpoint::{Connection, presets},
+    endpoint::{Connection, RecvStream, SendStream, presets},
 };
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Protocol name of the companion exchange
 pub const ALPN: &[u8] = b"codemode-mcp/companion/1";
+
+/// Port a companion listens on when the gateway has discovery off and
+/// dials it directly
+pub const DIRECT_PORT: u16 = 7678;
+
+/// How long a peer may take to finish the handshake
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Longest request or response body; references and the values read for
 /// them are far below this
@@ -55,6 +72,45 @@ impl Drop for Hangup {
     fn drop(&mut self) {
         self.0.close(0_u32.into(), b"done");
     }
+}
+
+/// Sends `request` on a new stream of `connection` and reads the one answer
+async fn ask<R: DeserializeOwned>(
+    connection: &Connection,
+    request: &impl Serialize,
+) -> Result<R, String> {
+    let request = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .map_err(|error| error.to_string())?;
+    send.write_all(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    send.finish().map_err(|error| error.to_string())?;
+    let body = receive
+        .read_to_end(MAX_BODY_BYTES)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    serde_json::from_slice(&body).map_err(|error| format!("malformed answer: {error}"))
+}
+
+/// Reads one request from `receive`; `None` when it is unreadable, too
+/// large or not a `T`
+async fn read_request<T: DeserializeOwned>(receive: &mut RecvStream) -> Option<T> {
+    let body = receive.read_to_end(MAX_BODY_BYTES).await.ok()?;
+
+    serde_json::from_slice(&body).ok()
+}
+
+/// Writes `response` and ends the stream; `false` when the peer is gone
+async fn answer(send: &mut SendStream, response: &impl Serialize) -> bool {
+    let Ok(bytes) = serde_json::to_vec(response) else {
+        return false;
+    };
+
+    send.write_all(&bytes).await.is_ok() && send.finish().is_ok()
 }
 
 /// An iroh endpoint as `secret_key`; the companion answers [`ALPN`], the

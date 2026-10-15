@@ -23,6 +23,7 @@ Install a binary release of codemode-mcp from GitHub.
 Usage:
     curl -LSfs https://github.com/${REPO}/releases/latest/download/install.sh | sh
     curl -LSfs https://github.com/${REPO}/releases/latest/download/install.sh | sh -s -- --tag v0.1.0
+    curl -LSfs https://github.com/${REPO}/releases/latest/download/install.sh | sh -s -- --pair TICKET
 
 Installs ~/.local/bin/codemode-mcp and ~/.local/share/codemode-mcp/monty, and
 restarts the service if it is installed.
@@ -31,6 +32,8 @@ Options:
     -h, --help      Display this message
     --tag TAG       Release tag (default latest)
     -f, --force     Reinstall even when that release is already installed
+    --pair TICKET   Then set this Mac up as a companion with a ticket from
+                    \`codemode-mcp companion invite\` on the gateway Mac
 EOF
 }
 
@@ -57,6 +60,7 @@ need() {
 
 tag=""
 force=""
+pair=""
 
 while test $# -gt 0; do
     case $1 in
@@ -73,6 +77,15 @@ while test $# -gt 0; do
             ;;
         --force | -f)
             force="--force"
+            ;;
+        --pair)
+            # checked before installing, so a mangled paste fails fast
+            case ${2:-} in
+                cmcp*) ;;
+                *) err "--pair requires a ticket from \`codemode-mcp companion invite\`" ;;
+            esac
+            pair=$2
+            shift
             ;;
         *)
             err "unknown option: $1"
@@ -129,3 +142,10 @@ case ":$PATH:" in
     *:"$HOME/.local/bin":*) ;;
     *) say "warning: $HOME/.local/bin is not on PATH" ;;
 esac
+
+# the installed, signed copy, so the companion key it creates in the login
+# keychain is readable by the agent without a prompt
+if [ -n "$pair" ]; then
+    "$HOME/.local/bin/codemode-mcp" companion pair "$pair" \
+        || err "codemode-mcp is installed, but pairing failed"
+fi

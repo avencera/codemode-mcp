@@ -2,7 +2,7 @@
 //! one script against the configured upstreams
 
 use std::{
-    io::Read,
+    io::{IsTerminal, Read},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -13,13 +13,13 @@ use codemode_mcp::{
     adapters::apple::Entity,
     admin::{
         CompanionCheckRequest, CompanionCheckResponse, CompanionCheckResult, EnrollRequest,
-        EnrollResponse, InviteResponse, OAuthLoginResponse, OAuthLogoutResponse,
-        OAuthServerRequest, OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest,
-        WarmResponse,
+        EnrollResponse, InviteOpenRequest, InviteOpenResponse, InviteResponse, InviteStatusRequest,
+        OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest, OAuthStatusResponse,
+        RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
     },
     app::App,
     catalog::function_prefix,
-    companion::{self, Paired, Ticket},
+    companion::{self, AnyTicket, InviteStatus, InviteTicket, Joining, PairCheck, Paired, Ticket},
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
     server::{Listeners, outcome_text},
@@ -32,7 +32,11 @@ use codemode_mcp::{
     },
 };
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use qrcode::{EcLevel, QrCode, render::unicode::Dense1x2};
 use tracing_subscriber::EnvFilter;
+
+/// How often `companion invite` asks the daemon whether the other Mac came
+const INVITE_POLL: Duration = Duration::from_secs(1);
 
 /// How long startup waits for upstreams to finish their first connection attempt
 const SETTLE_LIMIT: Duration = Duration::from_secs(15);
@@ -188,11 +192,24 @@ enum ServiceCommand {
 
 #[derive(Subcommand)]
 enum CompanionCommand {
-    /// On the gateway Mac: print a ticket for pairing another Mac; needs the
-    /// daemon running
-    Invite,
-    /// On the companion Mac: add a `[companion]` section from a ticket to the
-    /// config and print the line the gateway needs
+    /// On the gateway Mac: print a one-line command (and its QR code) that
+    /// sets up another Mac as a companion, then wait for it to register;
+    /// needs the daemon running
+    Invite {
+        /// Print a ticket that pairs without reaching this Mac, for when the
+        /// other Mac cannot; its block is then added here by hand
+        #[arg(long)]
+        manual: bool,
+        /// Seconds the invite stays open, at most 600
+        #[arg(long, value_name = "SECONDS")]
+        valid_for: Option<u64>,
+    },
+    /// On the companion Mac: pair with a ticket from `companion invite`,
+    /// then install and start the companion
+    ///
+    /// An invite ticket registers this Mac with the gateway and ends with a
+    /// check approved by Touch ID here. A `--manual` ticket writes the
+    /// `[companion]` section and prints the block the gateway needs
     Pair {
         /// Ticket from `companion invite`
         ticket: String,
@@ -509,69 +526,28 @@ async fn companion_command(
     command: CompanionCommand,
 ) -> Result<()> {
     match command {
-        CompanionCommand::Invite => {
+        CompanionCommand::Invite { manual, valid_for } => {
             let config = load_or_default(path)?;
-            let response: InviteResponse =
-                admin_post(&config, "/admin/companion/invite", &()).await?;
-            let name = response.gateway_name.clone();
-            let ticket = response.ticket().encode()?;
-            println!("On the other Mac (the one that has 1Password and the owner), run:");
-            println!("  codemode-mcp companion pair {ticket}");
-            println!("It prints a block to append to the config on this Mac ({name}).");
+            if manual {
+                manual_invite(&config).await?;
+            } else {
+                invite(&config, valid_for).await?;
+            }
         }
         CompanionCommand::Pair {
             ticket,
             identity_file,
-        } => {
-            let ticket = Ticket::decode(&ticket)?;
-            match companion::pair(&ticket, path, identity_file.as_deref())? {
-                Paired::Written(pairing) => {
-                    println!("Added a [companion] section to {}:", path.display());
-                    println!("\n{}", pairing.section);
-                    println!(
-                        "On the gateway Mac ({}), append this to the end of the config:",
-                        ticket.gateway_name
-                    );
-                    println!("\n{}\n", pairing.gateway_entry());
-                    println!("then run `codemode-mcp service restart` there.");
-                    println!("Here, `codemode-mcp companion install` keeps the companion running.");
-                }
-                Paired::AlreadyConfigured { section } => {
-                    println!(
-                        "{} already has a [companion] section, so it was not changed. \
-                         Replace it with this one if the gateway changed:",
-                        path.display()
-                    );
-                    println!("\n{section}");
-                }
+        } => match AnyTicket::decode(&ticket)? {
+            AnyTicket::Invite(ticket) => {
+                pair_with_invite(path, explicit_config, &ticket, identity_file.as_deref()).await?;
             }
-        }
+            AnyTicket::Manual(ticket) => {
+                pair_by_hand(path, explicit_config, &ticket, identity_file.as_deref())?;
+            }
+        },
         CompanionCommand::Serve => companion_serve_command(Config::load(path)?).await?,
         CompanionCommand::Install { dry_run } => {
-            let config = load_or_default(path)?;
-            let binary = std::env::current_exe().wrap_err("cannot locate this binary")?;
-            let paths = ServicePaths::from_env(&config.state_dir()?)?;
-            if !dry_run && config.companion.is_none() {
-                bail!(
-                    "{} has no [companion] section; run `codemode-mcp companion pair <ticket>` \
-                     first",
-                    path.display()
-                );
-            }
-            let pinned = match explicit_config {
-                Some(path) => Some(std::path::absolute(path)?),
-                None => None,
-            };
-            let plan = service::companion_install_plan(
-                &paths,
-                service::current_uid()?,
-                &binary,
-                pinned.as_deref(),
-            );
-            if !dry_run {
-                service::check_signing_identity(&plan)?;
-            }
-            run_plan(&plan, dry_run)?;
+            install_companion(path, explicit_config, dry_run)?;
         }
         CompanionCommand::Uninstall { dry_run } => {
             let config = load_or_default(path)?;
@@ -620,6 +596,366 @@ async fn companion_command(
     }
 
     Ok(())
+}
+
+/// Opens an invite on the daemon, prints the command that uses it, and
+/// reports the Mac that registers with it
+async fn invite(config: &Config, valid_for: Option<u64>) -> Result<()> {
+    let opened: InviteOpenResponse = admin_post(
+        config,
+        "/admin/companion/invite/open",
+        &InviteOpenRequest {
+            valid_secs: valid_for,
+        },
+    )
+    .await?;
+    let ticket = &opened.ticket;
+    // the latest release rather than this build's version: a build from a
+    // checkout may have no release, and the pairing protocol is versioned
+    let one_liner = format!(
+        "curl -LSfs https://github.com/{}/releases/latest/download/install.sh | sh -s -- --pair {ticket}",
+        update::REPOSITORY
+    );
+
+    println!(
+        "On the other Mac (the one that has 1Password and the owner), paste this into a terminal:"
+    );
+    println!("  {one_liner}");
+    println!(
+        "It installs codemode-mcp, registers that Mac with this one ({}) and starts it as a \
+         companion. Where codemode-mcp is already installed, this does the same:",
+        opened.gateway_name
+    );
+    println!("  codemode-mcp companion pair {ticket}");
+    // piped output gets the text only; the escape codes would be noise
+    if std::io::stdout().is_terminal() {
+        println!(
+            "\nOr scan this with a phone and paste the text it copies into a terminal on the \
+             other Mac:\n"
+        );
+        // the invite is open already, so a QR failure must not end the wait
+        match terminal_qr(&one_liner) {
+            Ok(qr) => println!("{qr}"),
+            Err(error) => println!("(no QR code: {error})"),
+        }
+    }
+    println!(
+        "\nWaiting for the other Mac. The invite works once, within {}.",
+        human_duration(i64::try_from(opened.valid_secs.saturating_mul(1000)).unwrap_or(i64::MAX))
+    );
+
+    wait_for_registration(config, &opened.invite).await
+}
+
+/// Polls the invite until the Mac that used it is done, and reports it
+async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
+    let request = InviteStatusRequest {
+        invite: invite.to_owned(),
+    };
+    let mut announced = false;
+    loop {
+        let status: InviteStatus =
+            admin_post(config, "/admin/companion/invite/status", &request).await?;
+        match status {
+            InviteStatus::Open { .. } | InviteStatus::Registering => {}
+            InviteStatus::Expired => bail!(
+                "the invite expired before another Mac used it; run `codemode-mcp companion \
+                 invite` again"
+            ),
+            InviteStatus::Failed { message } => {
+                bail!("a Mac used the invite but was not added: {message}")
+            }
+            InviteStatus::Registered {
+                name,
+                id,
+                already_listed,
+            } => {
+                if !announced {
+                    announce_registration(&name, id, already_listed);
+                    println!(
+                        "Waiting for {name} to start its companion; the check needs a Touch ID \
+                         approval there."
+                    );
+                    announced = true;
+                }
+            }
+            InviteStatus::Done {
+                name,
+                id,
+                already_listed,
+                check,
+            } => {
+                if !announced {
+                    announce_registration(&name, id, already_listed);
+                }
+
+                return match check {
+                    Some(PairCheck::Read { reference, bytes }) => {
+                        println!("Check passed: {name} read {reference} ({bytes} bytes).");
+
+                        Ok(())
+                    }
+                    Some(PairCheck::Failed { reference, message }) => {
+                        // the message carries the companion's own words
+                        bail!(
+                            "{name} is paired, but reading {reference} through it failed: {}",
+                            peer_text(&message)
+                        )
+                    }
+                    Some(PairCheck::Skipped) => {
+                        println!(
+                            "No server here uses an op:// reference, so there was nothing to check."
+                        );
+
+                        Ok(())
+                    }
+                    None => {
+                        println!(
+                            "{name} hung up without a check; once its companion runs, try \
+                             `codemode-mcp companion check <reference>`."
+                        );
+
+                        Ok(())
+                    }
+                };
+            }
+        }
+        tokio::time::sleep(INVITE_POLL).await;
+    }
+}
+
+fn announce_registration(name: &str, id: iroh::EndpointId, already_listed: bool) {
+    if already_listed {
+        println!("{name} ({id}) registered; it was already in this Mac's config.");
+    } else {
+        println!(
+            "{name} ({id}) registered. It was added to [secrets.companions] in this Mac's config, \
+             and the running daemon uses it already."
+        );
+    }
+}
+
+/// `text` as a QR code of half-block characters, drawn black on white with
+/// 256-color escapes so it scans the same in dark and light terminal themes
+fn terminal_qr(text: &str) -> Result<String> {
+    // the lowest error correction keeps the code small enough for a terminal;
+    // a screen has no smudges or tears for more of it to recover from
+    let code = QrCode::with_error_correction_level(text, EcLevel::L)?;
+    let image = code.render::<Dense1x2>().build();
+
+    Ok(image
+        .lines()
+        .map(|line| format!("\x1b[38;5;16;48;5;231m{line}\x1b[0m"))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Prints a ticket that carries everything the companion's config needs,
+/// for pairing without reaching this Mac
+async fn manual_invite(config: &Config) -> Result<()> {
+    let response: InviteResponse = admin_post(config, "/admin/companion/invite", &()).await?;
+    let name = response.gateway_name.clone();
+    let ticket = response.ticket().encode()?;
+    println!("On the other Mac (the one that has 1Password and the owner), run:");
+    println!("  codemode-mcp companion pair {ticket}");
+    println!("It prints a block to append to the config on this Mac ({name}).");
+
+    Ok(())
+}
+
+/// Registers this Mac with the invite's gateway, writes its `[companion]`
+/// section, starts the agent and has the gateway read one reference
+/// through it
+async fn pair_with_invite(
+    path: &std::path::Path,
+    explicit_config: Option<&std::path::Path>,
+    ticket: &InviteTicket,
+    identity_file: Option<&std::path::Path>,
+) -> Result<()> {
+    // refused before the invite is used up
+    if let Some(section) = load_or_default(path)?.companion
+        && section.gateway != ticket.gateway
+    {
+        bail!(
+            "{} already has a [companion] section for another gateway ({}); remove it to pair \
+             with this one",
+            path.display(),
+            section.gateway_name
+        );
+    }
+
+    // the signing identity is the one thing the agent install can lack;
+    // asked now, it fails before the gateway lists this Mac
+    let (_, plan) = companion_plan(path, explicit_config)?;
+    service::check_signing_identity(&plan)?;
+
+    let id = companion::companion_id(identity_file)?;
+    let name = companion::short_hostname();
+    println!("Registering {name} with the gateway...");
+    let joined = companion::join(Joining {
+        ticket,
+        id,
+        name,
+        addrs: Vec::new(),
+    })
+    .await
+    .map_err(|error| {
+        eyre!(
+            "{}\nIf this Mac cannot reach the gateway, run `codemode-mcp companion invite \
+             --manual` there and pair with that ticket instead.",
+            peer_text(&error.to_string())
+        )
+    })?;
+    let registered = joined.registered().clone();
+    // what the gateway sent is printed before the config check sees it
+    let gateway = peer_text(&registered.gateway_name);
+    let listed_as = peer_text(&registered.name);
+    if registered.already_listed {
+        println!("{gateway} already listed this Mac, as {listed_as}.");
+    } else {
+        println!("Registered with {gateway} as {listed_as}; it uses this Mac from now on.");
+    }
+
+    // without discovery the gateway dials the address this Mac sent, so the
+    // agent must listen on that port
+    let listen = (!ticket.addrs.is_empty())
+        .then(|| std::net::SocketAddr::from(([0, 0, 0, 0], companion::DIRECT_PORT)));
+    let section = Ticket {
+        gateway: ticket.gateway,
+        gateway_name: registered.gateway_name.clone(),
+        references: registered.references.clone(),
+    };
+    let set_up = companion::pair(&section, path, identity_file, listen)
+        .map_err(color_eyre::Report::from)
+        .and_then(|paired| {
+            match paired {
+                Paired::Written(_) => {
+                    println!("Added a [companion] section to {}.", path.display())
+                }
+                Paired::AlreadyConfigured { .. } => println!(
+                    "{} already has a [companion] section for this gateway, so it was left as is.",
+                    path.display()
+                ),
+            }
+
+            install_companion(path, explicit_config, false)
+        });
+    if let Err(error) = set_up {
+        joined.close().await;
+
+        return Err(error);
+    }
+
+    println!(
+        "Checking the pairing: approve the Touch ID prompt on this Mac. 1Password may ask too \
+         the first time."
+    );
+    let check = joined
+        .check()
+        .await
+        .map_err(|error| eyre!("{}", peer_text(&error.to_string())))?;
+    match check {
+        PairCheck::Read { reference, bytes } => println!(
+            "Check passed: {gateway} read {} ({bytes} bytes) through this Mac.",
+            peer_text(&reference)
+        ),
+        PairCheck::Failed { reference, message } => bail!(
+            "paired, but reading {} through this Mac failed: {}",
+            peer_text(&reference),
+            peer_text(&message)
+        ),
+        PairCheck::Skipped => println!(
+            "Paired. No server on {gateway} uses an op:// reference yet, so there was nothing to \
+             check."
+        ),
+    }
+
+    Ok(())
+}
+
+/// Writes the `[companion]` section from a manual ticket, starts the agent
+/// and prints the block the gateway's config needs
+fn pair_by_hand(
+    path: &std::path::Path,
+    explicit_config: Option<&std::path::Path>,
+    ticket: &Ticket,
+    identity_file: Option<&std::path::Path>,
+) -> Result<()> {
+    match companion::pair(ticket, path, identity_file, None)? {
+        Paired::Written(pairing) => {
+            println!("Added a [companion] section to {}:", path.display());
+            println!("\n{}", pairing.section);
+            install_companion(path, explicit_config, false)?;
+            println!(
+                "\nOn the gateway Mac ({}), append this to the end of the config:",
+                ticket.gateway_name
+            );
+            println!("\n{}\n", pairing.gateway_entry());
+            println!(
+                "then run `codemode-mcp service restart` there, and `codemode-mcp companion \
+                 check <reference>` to try it."
+            );
+        }
+        Paired::AlreadyConfigured { section } => {
+            println!(
+                "{} already has a [companion] section, so it was not changed. \
+                 Replace it with this one if the gateway changed:",
+                path.display()
+            );
+            println!("\n{section}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Copies and signs the binary and loads the companion's LaunchAgent, as
+/// `companion install` does
+fn install_companion(
+    path: &std::path::Path,
+    explicit_config: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<()> {
+    let (config, plan) = companion_plan(path, explicit_config)?;
+    if !dry_run {
+        if config.companion.is_none() {
+            bail!(
+                "{} has no [companion] section; run `codemode-mcp companion pair <ticket>` first",
+                path.display()
+            );
+        }
+        service::check_signing_identity(&plan)?;
+    }
+
+    run_plan(&plan, dry_run)
+}
+
+/// The config at `path` and the steps that install the companion's agent
+fn companion_plan(
+    path: &std::path::Path,
+    explicit_config: Option<&std::path::Path>,
+) -> Result<(Config, Vec<Action>)> {
+    let config = load_or_default(path)?;
+    let binary = std::env::current_exe().wrap_err("cannot locate this binary")?;
+    let paths = ServicePaths::from_env(&config.state_dir()?)?;
+    let pinned = match explicit_config {
+        Some(path) => Some(std::path::absolute(path)?),
+        None => None,
+    };
+    let plan = service::companion_install_plan(
+        &paths,
+        service::current_uid()?,
+        &binary,
+        pinned.as_deref(),
+    );
+
+    Ok((config, plan))
+}
+
+/// Text another Mac sent, on one line and without escape sequences, so it
+/// cannot rewrite what this terminal shows
+fn peer_text(text: &str) -> String {
+    codemode_mcp::prompt::one_line(text, 1000)
 }
 
 /// Prints `plan` for a dry run, otherwise carries it out

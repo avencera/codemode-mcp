@@ -496,28 +496,48 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - A companion is the same binary on another Mac (`companion serve`, its own LaunchAgent
   `dev.praveen.codemode-mcp.companion`) that reads references through that Mac's 1Password. It exists because
   the gateway Mac's 1Password prompt needs its Touch ID sensor, which remote desktop cannot reach
-- With `[secrets] companions` set, `OnePassword::read` races sources: local `op` only while `Mac::present` says the
+- With any companion listed, in `[secrets] companions` or registered since the daemon started, `OnePassword::read` races sources: local `op` only while `Mac::present` says the
   owner is at the gateway Mac (so no 1Password prompt waits on an unattended screen), and every companion
   always. The first value wins; dropping the rest kills the local `op` child and hangs up on companions, which
   takes down their Touch ID prompts. Presence is not used to pick one source, since remote desktop input makes
   the gateway Mac look in use. Presence is checked even with `notify.mac.enabled = false`, which only stops
-  approvals asking at the Mac. All failing gives one error listing each source's reason. Without companions the
-  read path is unchanged
+  approvals asking at the Mac. All failing gives one error listing each source's reason. With none the read is
+  local only
 - Upstream connections and OAuth logins share one `Secrets` (the reader, its cache and the one `Companions`
   endpoint), so an OAuth `client_secret` reaches companions too, and `companion invite` lists its references
   with those in `headers` and `env`
 - Transport: iroh 1.3 (`tls-aws-lc-rs`, no portmapper), ALPN `codemode-mcp/companion/1`, one bidirectional
   stream per request carrying typed JSON (`{"reference"}` → `{"value"}` or `{"error": {code, message}}`, codes
   `not_allowed`, `denied`, `read_failed`), bodies capped at 64 KiB both ways (a larger value is refused as
-  `read_failed`). Only the companion advertises the ALPN; the gateway only dials, so it accepts nothing.
-  `discovery = true` uses n0's relays and DNS, publishing each endpoint's addresses there; `false` dials only
-  configured `addrs`
+  `read_failed`). Only the companion advertises the ALPN; the gateway dials it, and accepts only pairing, only
+  while an invite is open. `discovery = true` uses n0's relays and DNS, publishing each endpoint's addresses
+  there; `false` dials only configured `addrs`
+- Pairing (`src/companion/invite.rs`, `join.rs`): `companion invite` asks the daemon to open an invite, a random
+  16-byte secret (only its SHA-256 is kept) valid once for at most 10 minutes. The daemon then advertises ALPN
+  `codemode-mcp/pair/1` (`Endpoint::set_alpns`) until no invite is open. The ticket (`cmcp2` + base64url of the
+  gateway id, the secret and, with discovery off, the gateway's addresses) leaves the references out, which the
+  gateway sends at registration, so with discovery on the `install.sh --pair` one-liner fits a version 8 QR code
+  (57 terminal columns); each address adds about 9 characters (IPv4) or 25 (IPv6). On one connection the companion sends `register` (secret, its companion id, name, and with discovery
+  off its addresses at port 7678); the gateway appends a `[[secrets.companions]]` entry to the config file the
+  daemon loaded, after checking the result still loads, and adds the peer to the live list, so no restart. The
+  companion writes `[companion]`, installs its agent, then sends `check`; the gateway reads the first reference
+  through the new peer, retrying the dial for a minute while the agent comes up, and answers the length only.
+  The companion dials from a throwaway key, since its own key belongs to the agent, which runs by then, and two
+  endpoints with one id would contend for relay traffic. The secret authorizes the registration; the id is not
+  proven then, and the entry is written before any check, but the gateway can only use it with a Mac holding
+  that key, since every read dials it over TLS. A failed or skipped check leaves the entry listed. Pairing
+  connections are capped at 8 at once, each request must arrive within 30 s, a registration's addresses are
+  capped at 8 and ignored with discovery on, and expiry is checked on both the uptime and wall clocks, since
+  `Instant` stops while the Mac sleeps. `companion invite` polls the
+  invite's status through the admin listener and prints who registered and the check. `invite --manual` keeps
+  the older `cmcp1` JSON ticket that carries the references, for a gateway the companion cannot reach; the
+  gateway's entry is then added by hand
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   only references on its own `allow` list, one request at a time, each request no longer than the gateway's
   120 s deadline (a gateway that stops the stream or never gives up loses the prompt), and only after its own Touch ID prompt naming
   the reference and the gateway (its other button says Deny). 1Password's prompt does not name the item and one approval lets `op` read
   anything for about ten minutes, so without these a compromised gateway could read any item
-- The prompt shows the gateway name and reference as the ticket gave them, so config loading refuses names over
+- The prompt shows the gateway name and reference as the ticket or registration gave them, so config loading refuses names over
   63 characters, references over 256, and either with line breaks or control, invisible or direction-changing
   characters; a crafted ticket cannot make the prompt say something else. Host names are cleaned the same way
   before they go into a ticket or the printed `[[secrets.companions]]` block, which renders the name as a TOML

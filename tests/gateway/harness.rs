@@ -222,7 +222,13 @@ pub fn config_for(
         extra = setup.extra,
     );
 
-    Ok(Config::parse(&text, Path::new("test-config.toml"))?)
+    // loaded from a file, as the daemon is, so an invite can list a new
+    // companion in it
+    std::fs::create_dir_all(state_dir)?;
+    let path = state_dir.join("config.toml");
+    std::fs::write(&path, text)?;
+
+    Ok(Config::load(&path)?)
 }
 
 /// Remembers every notification instead of sending it

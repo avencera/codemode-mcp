@@ -1,16 +1,21 @@
 //! The gateway's side: asking companions to read a reference
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, OnceLock, PoisonError, RwLock},
+    time::Duration,
+};
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use tokio::{
     sync::{Mutex, OnceCell},
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
 };
 
 use super::{
     ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionRequest, CompanionResponse, Hangup,
-    IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
+    IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, invite::Invites, load_or_create,
 };
 use crate::config::{CompanionPeer, SecretsConfig};
 
@@ -55,6 +60,9 @@ pub enum CompanionFailure {
         /// Limit that elapsed
         timeout: Duration,
     },
+    /// An invite could not be opened
+    #[error("{0}")]
+    Invite(String),
 }
 
 /// What a companion said to `companion check`; never the value itself
@@ -70,30 +78,63 @@ pub struct CheckOutcome {
 ///
 /// The key is loaded and the endpoint bound on first use and kept, so a
 /// gateway without companions never touches the keychain unless asked for
-/// its id
+/// its id. A companion registering with an invite joins the list while the
+/// daemon runs
 pub struct Companions {
-    peers: Vec<CompanionPeer>,
-    discovery: bool,
+    peers: RwLock<Vec<CompanionPeer>>,
+    pub(super) discovery: bool,
     identity_file: Option<PathBuf>,
+    /// The config file a registered companion is appended to
+    pub(super) config_path: Option<PathBuf>,
     secret_key: Mutex<Option<SecretKey>>,
-    endpoint: OnceCell<Endpoint>,
+    pub(super) endpoint: OnceCell<Endpoint>,
+    pub(super) invites: Invites,
+    /// One registration at a time, so two cannot pick the same name
+    pub(super) registering: Mutex<()>,
+    /// Accepts the pairing protocol; started by the first invite
+    pub(super) accepting: OnceLock<JoinHandle<()>>,
 }
 
 impl Companions {
-    /// The companions named in `config`
-    pub fn new(config: &SecretsConfig) -> Self {
+    /// The companions named in `config`; a companion registering with an
+    /// invite is appended to `config_path`
+    pub fn new(config: &SecretsConfig, config_path: Option<PathBuf>) -> Self {
         Self {
-            peers: config.companions.clone(),
+            peers: RwLock::new(config.companions.clone()),
             discovery: config.discovery,
             identity_file: config.identity_file.clone(),
+            config_path,
             secret_key: Mutex::new(None),
             endpoint: OnceCell::new(),
+            invites: Invites::default(),
+            registering: Mutex::new(()),
+            accepting: OnceLock::new(),
         }
     }
 
-    /// The configured companions
-    pub fn peers(&self) -> &[CompanionPeer] {
-        &self.peers
+    /// The companions, as configured plus any registered since
+    pub fn peers(&self) -> Vec<CompanionPeer> {
+        self.peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Starts using a newly registered companion
+    pub(super) fn add_peer(&self, peer: CompanionPeer) {
+        self.peers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(peer);
+    }
+
+    /// Addresses this gateway's endpoint is bound to, once it is; empty
+    /// before the first read or invite
+    pub fn bound_addrs(&self) -> Vec<SocketAddr> {
+        self.endpoint
+            .get()
+            .map(Endpoint::bound_sockets)
+            .unwrap_or_default()
     }
 
     /// This gateway's endpoint id, creating its key when there is none
@@ -119,7 +160,7 @@ impl Companions {
         Ok(loaded)
     }
 
-    async fn endpoint(&self) -> Result<&Endpoint, CompanionFailure> {
+    pub(super) async fn endpoint(&self) -> Result<&Endpoint, CompanionFailure> {
         self.endpoint
             .get_or_try_init(|| async {
                 let key = self
@@ -137,12 +178,12 @@ impl Companions {
     /// Asks the companion called `name` to read `reference`
     pub async fn read(&self, name: &str, reference: &str) -> Result<String, CompanionFailure> {
         let peer = self
-            .peers
-            .iter()
+            .peers()
+            .into_iter()
             .find(|peer| peer.name == name)
             .ok_or_else(|| CompanionFailure::Unknown(name.to_owned()))?;
 
-        tokio::time::timeout(ASK_TIMEOUT, self.exchange(peer, reference))
+        tokio::time::timeout(ASK_TIMEOUT, self.exchange(&peer, reference))
             .await
             .unwrap_or_else(|_| {
                 Err(CompanionFailure::TimedOut {
@@ -156,7 +197,7 @@ impl Companions {
     /// order, without keeping or returning a value
     pub async fn check(self: &Arc<Self>, reference: &str) -> Vec<CheckOutcome> {
         let mut answers = JoinSet::new();
-        for (index, peer) in self.peers.iter().enumerate() {
+        for (index, peer) in self.peers().iter().enumerate() {
             let companions = Arc::clone(self);
             let name = peer.name.clone();
             let reference = reference.to_owned();
@@ -239,7 +280,7 @@ impl std::fmt::Debug for Companions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Companions")
-            .field("peers", &self.peers.len())
+            .field("peers", &self.peers().len())
             .finish_non_exhaustive()
     }
 }

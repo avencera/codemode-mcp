@@ -164,6 +164,34 @@ impl InviteResponse {
     }
 }
 
+/// Body of `POST /admin/companion/invite/open`
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct InviteOpenRequest {
+    /// Seconds the invite stays open; at most ten minutes, the default
+    #[serde(default)]
+    pub valid_secs: Option<u64>,
+}
+
+/// Answer of `POST /admin/companion/invite/open`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteOpenResponse {
+    /// Names the invite to `POST /admin/companion/invite/status`
+    pub invite: String,
+    /// The `cmcp2` ticket the other Mac pairs with
+    pub ticket: String,
+    /// Short host name of this Mac
+    pub gateway_name: String,
+    /// Seconds the invite stays open
+    pub valid_secs: u64,
+}
+
+/// Body of `POST /admin/companion/invite/status`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteStatusRequest {
+    /// From [`InviteOpenResponse::invite`]
+    pub invite: String,
+}
+
 /// Body of `POST /admin/companion/check`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompanionCheckRequest {
@@ -218,6 +246,11 @@ pub fn router(app: &App) -> Router {
         .route("/admin/passkey/remove", post(remove_passkey))
         .route("/admin/warm", post(warm))
         .route("/admin/companion/invite", post(companion_invite))
+        .route("/admin/companion/invite/open", post(companion_invite_open))
+        .route(
+            "/admin/companion/invite/status",
+            post(companion_invite_status),
+        )
         .route("/admin/companion/check", post(companion_check))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
@@ -574,8 +607,68 @@ async fn companion_invite(State(state): State<AdminState>) -> Response {
         }
     };
 
+    Json(InviteResponse {
+        gateway,
+        gateway_name: companion::short_hostname(),
+        references: config_references(&state.config),
+    })
+    .into_response()
+}
+
+/// Opens an invite that one Mac can register with over iroh
+async fn companion_invite_open(
+    State(state): State<AdminState>,
+    Json(request): Json<InviteOpenRequest>,
+) -> Response {
+    let lifetime = request.valid_secs.map_or(
+        companion::MAX_INVITE_LIFETIME,
+        std::time::Duration::from_secs,
+    );
+    if lifetime.is_zero() {
+        return error(StatusCode::BAD_REQUEST, "valid_secs must be positive");
+    }
+    let gateway_name = companion::short_hostname();
+    let opened = state
+        .gateway
+        .companions()
+        .open_invite(
+            gateway_name.clone(),
+            config_references(&state.config),
+            lifetime,
+        )
+        .await;
+
+    match opened {
+        Ok(opened) => Json(InviteOpenResponse {
+            invite: opened.id,
+            ticket: opened.ticket.encode(),
+            gateway_name,
+            valid_secs: opened.lifetime.as_secs(),
+        })
+        .into_response(),
+        Err(failure) => {
+            tracing::warn!(error = %failure, "could not open an invite");
+
+            error(StatusCode::INTERNAL_SERVER_ERROR, &failure.to_string())
+        }
+    }
+}
+
+async fn companion_invite_status(
+    State(state): State<AdminState>,
+    Json(request): Json<InviteStatusRequest>,
+) -> Response {
+    match state.gateway.companions().invite_status(&request.invite) {
+        Some(status) => Json(status).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such invite"),
+    }
+}
+
+/// Sorted, deduplicated references in the servers' `headers`, `env` and
+/// `client_secret`: what a companion is allowed to read
+fn config_references(config: &Config) -> Vec<String> {
     let mut references = std::collections::BTreeSet::new();
-    for server in state.config.servers.values() {
+    for server in config.servers.values() {
         let values = server.headers.values().chain(server.env.values());
         for value in values.chain(server.client_secret.as_ref()) {
             // validated at load, so a malformed value cannot be here
@@ -585,12 +678,7 @@ async fn companion_invite(State(state): State<AdminState>) -> Response {
         }
     }
 
-    Json(InviteResponse {
-        gateway,
-        gateway_name: companion::short_hostname(),
-        references: references.into_iter().collect(),
-    })
-    .into_response()
+    references.into_iter().collect()
 }
 
 /// Asks the companions, and only them, to read a reference; local `op` and
