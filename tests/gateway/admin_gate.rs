@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use codemode_mcp::approvals::Choice;
 use serde_json::{Value, json};
+use webauthn_authenticator_rs::WebauthnAuthenticator;
 
 use super::harness::{Harness, ORIGIN, Setup, TestResult, approval_id, text_of};
 

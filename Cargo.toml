@@ -20,11 +20,6 @@ jiff = "0.2.38"
 monty-pool = "=1.1.0"
 monty-types = "=1.1.0"
 num-bigint = "0.4"
-# not used directly: webauthn-rs needs OpenSSL, and vendored links it in
-# statically. The hardened runtime refuses Homebrew's dylib (another team's
-# signature), and a user-writable /opt/homebrew library would otherwise run
-# inside the daemon
-openssl = { version = "0.10.81", features = ["vendored"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "=3.5.1", default-features = false, features = [
@@ -65,7 +60,9 @@ uuid = { version = "1.28.0", features = ["v4"] }
 # danger-allow-state-serialisation: ceremony state is kept in the database
 # (server side, 5 minutes, bound to its approval) so a page loaded before a
 # restart still completes; the state never goes to the browser
-webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
+# 0.6 replaces OpenSSL with RustCrypto: the hardened runtime refuses
+# Homebrew's dylib, and vendoring it froze its security fixes
+webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialisation"] }
 
 # EventKit for the calendar and reminders adapters; defaults off, since they
 # pull in AppKit, MapKit and CoreLocation bindings nothing here uses
@@ -124,7 +121,7 @@ objc2-local-authentication = { version = "0.3.2", default-features = false, feat
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
-webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
+webauthn-authenticator-rs = { version = "=0.6.1-dev", features = ["softpasskey"] }
 
 # stdio MCP server used only by the integration tests; lives in tests/ so it
 # stays out of the shipped sources but still gets CARGO_BIN_EXE_ for free

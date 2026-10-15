@@ -668,7 +668,7 @@ impl Harness {
     /// Enrolls the first software passkey through the admin and enrollment routes
     pub async fn enroll_passkey(
         &self,
-    ) -> Result<WebauthnAuthenticator<SoftPasskey>, Box<dyn Error>> {
+    ) -> Result<SoftPasskey, Box<dyn Error>> {
         let (path, enrolled) = self.request_enrollment("test <phone>").await?;
         assert!(enrolled["approval_url"].is_null(), "{enrolled}");
 
@@ -679,7 +679,7 @@ impl Harness {
     pub async fn register_at(
         &self,
         path: &str,
-    ) -> Result<WebauthnAuthenticator<SoftPasskey>, Box<dyn Error>> {
+    ) -> Result<SoftPasskey, Box<dyn Error>> {
         let page = self
             .http
             .get(format!("{}{path}", self.base()))
@@ -694,7 +694,7 @@ impl Harness {
         let options: CreationChallengeResponse =
             serde_json::from_value(started["options"].clone())?;
 
-        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let mut authenticator = SoftPasskey::new(true);
         let credential = authenticator
             .do_registration(Url::parse(ORIGIN)?, options)
             .map_err(|error| format!("registration failed: {error:?}"))?;
@@ -713,7 +713,7 @@ impl Harness {
     /// assertion, then confirm
     pub async fn approve_with_passkey(
         &self,
-        authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+        authenticator: &mut SoftPasskey,
         approval_id: &str,
         choice: &str,
     ) -> Result<(u16, Value), Box<dyn Error>> {

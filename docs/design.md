@@ -151,8 +151,8 @@ idempotent. `tools/list_changed` refreshes the catalog
   for 15 / 60 min" with a line saying the grant covers every running session of that client; a proxied or remote
   request is never offered the client grant, and the page says why. The server refuses a choice the page did not
   offer (`session15`, `session60`, `client15`, `client60`); Deny
-- Approving takes a passkey assertion (webauthn-rs 0.5): `POST /approve/{id}/options` binds the choice to a
-  server-side ceremony (random id, 5 min TTL, stored in the database and bound to the approval id and the choice, never sent to the browser), then `POST /approve/{id}/confirm`
+- Approving takes a passkey assertion (webauthn-rs 0.6.1-dev, which uses RustCrypto, not
+  OpenSSL): `POST /approve/{id}/options` binds the choice to a server-side ceremony (random id, 5 min TTL, stored in the database and bound to the approval id and the choice, never sent to the browser), then `POST /approve/{id}/confirm`
   verifies the assertion and applies that choice. Deny (`POST /approve/{id}/deny`) needs no passkey. All POSTs
   take JSON bodies, which keeps cross-site form posts out. `assets/webauthn.js` is the only script (no build step)
 - The relying party id is the host of `public_origin` (when unset, `http://localhost:<listen port>`); `Passkey`

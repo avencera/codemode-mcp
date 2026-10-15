@@ -17,6 +17,7 @@ use codemode_mcp::{
     usage::{Caller, Classification, EXEC_CLIENT, ExecutionRecord},
 };
 use serde_json::{Value, json};
+use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_rs::prelude::{RequestChallengeResponse, Url};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
