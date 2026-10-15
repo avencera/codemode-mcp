@@ -6,16 +6,23 @@
 //! still check the socket peer (never the `Host` header) and refuse
 //! anything that looks proxied
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    io::Write,
+    net::SocketAddr,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
+    http::HeaderMap,
     http::StatusCode,
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use hmac::{KeyInit, Mac};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -46,6 +53,223 @@ struct AdminState {
     gateway: Arc<Gateway>,
     config: Arc<Config>,
     public_base: String,
+    /// What the invite routes require; `None` when the token file could not
+    /// be set up, and then they refuse
+    owner: Option<Arc<Owner>>,
+}
+
+/// File in the state directory holding the token the invite routes require
+pub const OWNER_TOKEN_FILE: &str = "admin.token";
+
+/// Header carrying a request's owner proof, `<server nonce>:<hex HMAC>`
+pub const OWNER_PROOF_HEADER: &str = "x-codemode-owner-proof";
+
+/// How long a challenge's nonce can be used
+const CHALLENGE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
+/// Most nonces outstanding at once; the oldest goes first
+const MAX_CHALLENGES: usize = 64;
+/// Longest client nonce accepted
+const MAX_NONCE_CHARS: usize = 128;
+
+/// Body of `POST /admin/owner/challenge`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChallengeRequest {
+    /// Random text the daemon must prove it can answer
+    pub client_nonce: String,
+}
+
+/// Answer of `POST /admin/owner/challenge`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChallengeResponse {
+    /// Single-use nonce for one owner request
+    pub server_nonce: String,
+    /// [`daemon_proof`] of both nonces
+    pub proof: String,
+}
+
+/// The daemon's proof that it holds the owner token, so the CLI never
+/// trusts another program that took the admin port while the daemon was down
+pub fn daemon_proof(token: &str, client_nonce: &str, server_nonce: &str) -> String {
+    owner_mac(token, &["daemon", client_nonce, server_nonce])
+        .map(|mac| hex::encode(mac.finalize().into_bytes()))
+        .unwrap_or_default()
+}
+
+/// Whether `proof` is [`daemon_proof`] of the nonces, compared in constant
+/// time
+pub fn daemon_proof_matches(
+    token: &str,
+    client_nonce: &str,
+    server_nonce: &str,
+    proof: &str,
+) -> bool {
+    proof_matches(token, &["daemon", client_nonce, server_nonce], proof)
+}
+
+/// A request's proof that its sender holds the owner token, bound to one
+/// server nonce and the route, so the token itself never crosses the socket
+/// and a proof cannot be replayed
+pub fn request_proof(token: &str, server_nonce: &str, path: &str) -> String {
+    owner_mac(token, &["request", server_nonce, path])
+        .map(|mac| hex::encode(mac.finalize().into_bytes()))
+        .unwrap_or_default()
+}
+
+/// HMAC-SHA256 under `token` of `parts`, each ended by a NUL so no two
+/// lists of parts read the same
+fn owner_mac(token: &str, parts: &[&str]) -> Option<hmac::Hmac<sha2::Sha256>> {
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).ok()?;
+    mac.update(b"codemode-mcp owner\0");
+    for part in parts {
+        mac.update(part.as_bytes());
+        mac.update(b"\0");
+    }
+
+    Some(mac)
+}
+
+fn proof_matches(token: &str, parts: &[&str], proof: &str) -> bool {
+    let Ok(proof) = hex::decode(proof) else {
+        return false;
+    };
+
+    // verify_slice compares in constant time
+    owner_mac(token, parts).is_some_and(|mac| mac.verify_slice(&proof).is_ok())
+}
+
+/// The owner token and the challenges handed out for it
+struct Owner {
+    token: String,
+    nonces: std::sync::Mutex<Vec<(String, std::time::Instant)>>,
+}
+
+impl Owner {
+    fn challenge(&self, client_nonce: &str) -> ChallengeResponse {
+        let server_nonce = hex::encode(rand::random::<[u8; 16]>());
+        let mut nonces = self
+            .nonces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        nonces.retain(|(_, issued)| issued.elapsed() < CHALLENGE_LIFETIME);
+        if nonces.len() >= MAX_CHALLENGES {
+            nonces.remove(0);
+        }
+        nonces.push((server_nonce.clone(), std::time::Instant::now()));
+
+        ChallengeResponse {
+            proof: daemon_proof(&self.token, client_nonce, &server_nonce),
+            server_nonce,
+        }
+    }
+
+    /// Whether `header` proves the owner sent this request to `path`; its
+    /// nonce is used up either way
+    fn verify(&self, header: &str, path: &str) -> bool {
+        let Some((server_nonce, proof)) = header.split_once(':') else {
+            return false;
+        };
+        let issued = {
+            let mut nonces = self
+                .nonces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let found = nonces.iter().position(|(nonce, _)| nonce == server_nonce);
+            found.map(|index| nonces.remove(index).1)
+        };
+
+        issued.is_some_and(|issued| issued.elapsed() < CHALLENGE_LIFETIME)
+            && proof_matches(&self.token, &["request", server_nonce, path], proof)
+    }
+}
+
+/// The token in `state_dir`, created when missing
+///
+/// The admin listener only checks that a caller is on this Mac, which any
+/// account is. An invite adds a source of secret values, so its routes also
+/// need this token, which only the owner's account can read (mode 0600)
+pub fn owner_token(state_dir: &std::path::Path) -> std::io::Result<String> {
+    let path = state_dir.join(OWNER_TOKEN_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(token) => {
+            // a copy restored with wider permissions is narrowed again
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+
+            return Ok(token.trim().to_owned());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let token = hex::encode(rand::random::<[u8; 32]>());
+    // written whole beside it, then linked into place: two daemons starting
+    // together keep one token, and neither reads a half-written file
+    let temp = state_dir.join(format!(
+        ".{OWNER_TOKEN_FILE}.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    ));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(token.as_bytes()))
+        .and_then(|()| std::fs::hard_link(&temp, &path));
+    let _ = std::fs::remove_file(&temp);
+    match written {
+        Ok(()) => Ok(token),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(std::fs::read_to_string(&path)?.trim().to_owned())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+impl AdminState {
+    /// The refusal for a request to `path` without a valid owner proof
+    fn not_owner(&self, headers: &HeaderMap, path: &str) -> Option<Response> {
+        let Some(owner) = &self.owner else {
+            return Some(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the daemon could not set up its owner token; see its log",
+            ));
+        };
+        let proof = headers
+            .get(OWNER_PROOF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !owner.verify(proof, path) {
+            return Some(error(
+                StatusCode::FORBIDDEN,
+                "this needs a proof made with the owner token in the daemon's state directory; \
+                 run the CLI as the user that runs the daemon",
+            ));
+        }
+
+        None
+    }
+}
+
+/// Hands out a single-use nonce for an owner request, with the daemon's
+/// proof that it holds the token
+async fn owner_challenge(
+    State(state): State<AdminState>,
+    Json(request): Json<ChallengeRequest>,
+) -> Response {
+    let Some(owner) = &state.owner else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the daemon could not set up its owner token; see its log",
+        );
+    };
+    let nonce = &request.client_nonce;
+    if nonce.is_empty() || nonce.len() > MAX_NONCE_CHARS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "client_nonce must be 1 to 128 characters",
+        );
+    }
+
+    Json(owner.challenge(nonce)).into_response()
 }
 
 /// Body of `POST /admin/enroll`
@@ -164,6 +388,34 @@ impl InviteResponse {
     }
 }
 
+/// Body of `POST /admin/companion/invite/open`
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct InviteOpenRequest {
+    /// Seconds the invite stays open; at most ten minutes, the default
+    #[serde(default)]
+    pub valid_secs: Option<u64>,
+}
+
+/// Answer of `POST /admin/companion/invite/open`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteOpenResponse {
+    /// Names the invite to `POST /admin/companion/invite/status`
+    pub invite: String,
+    /// The `cmcp2` ticket the other Mac pairs with
+    pub ticket: String,
+    /// Short host name of this Mac
+    pub gateway_name: String,
+    /// Seconds the invite stays open
+    pub valid_secs: u64,
+}
+
+/// Body of `POST /admin/companion/invite/status`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InviteStatusRequest {
+    /// From [`InviteOpenResponse::invite`]
+    pub invite: String,
+}
+
 /// Body of `POST /admin/companion/check`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompanionCheckRequest {
@@ -211,13 +463,30 @@ pub fn router(app: &App) -> Router {
         gateway: Arc::clone(app.gateway()),
         config: Arc::clone(app.config()),
         public_base: app.config().public_base(),
+        owner: match owner_token(app.state_dir()) {
+            Ok(token) => Some(Arc::new(Owner {
+                token,
+                nonces: std::sync::Mutex::default(),
+            })),
+            Err(failure) => {
+                tracing::error!(error = %failure, "could not set up the owner token");
+
+                None
+            }
+        },
     };
 
     Router::new()
         .route("/admin/enroll", post(enroll))
         .route("/admin/passkey/remove", post(remove_passkey))
         .route("/admin/warm", post(warm))
+        .route("/admin/owner/challenge", post(owner_challenge))
         .route("/admin/companion/invite", post(companion_invite))
+        .route("/admin/companion/invite/open", post(companion_invite_open))
+        .route(
+            "/admin/companion/invite/status",
+            post(companion_invite_status),
+        )
         .route("/admin/companion/check", post(companion_check))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
@@ -564,7 +833,11 @@ async fn warm(State(state): State<AdminState>, Json(request): Json<WarmRequest>)
 
 /// This gateway's id and the references its servers use, in `headers`,
 /// `env` and OAuth `client_secret`, for a companion Mac to pair with
-async fn companion_invite(State(state): State<AdminState>) -> Response {
+async fn companion_invite(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    // the ticket lists every reference the servers use
+    if let Some(refused) = state.not_owner(&headers, "/admin/companion/invite") {
+        return refused;
+    }
     let gateway = match state.gateway.companions().id().await {
         Ok(id) => id,
         Err(failure) => {
@@ -574,8 +847,82 @@ async fn companion_invite(State(state): State<AdminState>) -> Response {
         }
     };
 
+    Json(InviteResponse {
+        gateway,
+        gateway_name: companion::short_hostname(),
+        references: config_references(&state.config),
+    })
+    .into_response()
+}
+
+/// Opens an invite that one Mac can register with over iroh
+async fn companion_invite_open(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<InviteOpenRequest>,
+) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/companion/invite/open") {
+        return refused;
+    }
+    let lifetime = request.valid_secs.map_or(
+        companion::MAX_INVITE_LIFETIME,
+        std::time::Duration::from_secs,
+    );
+    if lifetime.is_zero() || lifetime > companion::MAX_INVITE_LIFETIME {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "valid_secs must be 1 to {}",
+                companion::MAX_INVITE_LIFETIME.as_secs()
+            ),
+        );
+    }
+    let gateway_name = companion::short_hostname();
+    let opened = state
+        .gateway
+        .companions()
+        .open_invite(
+            gateway_name.clone(),
+            config_references(&state.config),
+            lifetime,
+        )
+        .await;
+
+    match opened {
+        Ok(opened) => Json(InviteOpenResponse {
+            invite: opened.id,
+            ticket: opened.ticket.encode(),
+            gateway_name,
+            valid_secs: opened.lifetime.as_secs(),
+        })
+        .into_response(),
+        Err(failure) => {
+            tracing::warn!(error = %failure, "could not open an invite");
+
+            error(StatusCode::INTERNAL_SERVER_ERROR, &failure.to_string())
+        }
+    }
+}
+
+async fn companion_invite_status(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<InviteStatusRequest>,
+) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/companion/invite/status") {
+        return refused;
+    }
+    match state.gateway.companions().invite_status(&request.invite) {
+        Some(status) => Json(status).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such invite"),
+    }
+}
+
+/// Sorted, deduplicated references in the servers' `headers`, `env` and
+/// `client_secret`: what a companion is allowed to read
+fn config_references(config: &Config) -> Vec<String> {
     let mut references = std::collections::BTreeSet::new();
-    for server in state.config.servers.values() {
+    for server in config.servers.values() {
         let values = server.headers.values().chain(server.env.values());
         for value in values.chain(server.client_secret.as_ref()) {
             // validated at load, so a malformed value cannot be here
@@ -585,12 +932,7 @@ async fn companion_invite(State(state): State<AdminState>) -> Response {
         }
     }
 
-    Json(InviteResponse {
-        gateway,
-        gateway_name: companion::short_hostname(),
-        references: references.into_iter().collect(),
-    })
-    .into_response()
+    references.into_iter().collect()
 }
 
 /// Asks the companions, and only them, to read a reference; local `op` and

@@ -2,6 +2,7 @@
 
 use std::{
     io::Write,
+    net::SocketAddr,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -61,13 +62,28 @@ impl Pairing {
     /// The block to append at the end of the gateway's config; its `addrs`
     /// line is commented out because it is only needed without discovery
     pub fn gateway_entry(&self) -> String {
-        format!(
-            "[[secrets.companions]]\nname = {}\nid = \"{}\"\n\
-             # addrs = [\"<tailnet ip>:7678\"]   # required when discovery = false",
-            toml::Value::String(self.name.clone()),
-            self.id
-        )
+        gateway_entry(&self.name, self.id, &[])
     }
+}
+
+/// A `[[secrets.companions]]` block; without `addrs` a commented line shows
+/// where they would go
+pub(super) fn gateway_entry(name: &str, id: EndpointId, addrs: &[SocketAddr]) -> String {
+    let addrs = if addrs.is_empty() {
+        "# addrs = [\"<tailnet ip>:7678\"]   # required when discovery = false".to_owned()
+    } else {
+        let list = addrs
+            .iter()
+            .map(|addr| toml::Value::String(addr.to_string()))
+            .collect();
+
+        format!("addrs = {}", toml::Value::Array(list))
+    };
+
+    format!(
+        "[[secrets.companions]]\nname = {}\nid = \"{id}\"\n{addrs}",
+        toml::Value::String(name.to_owned()),
+    )
 }
 
 #[derive(Serialize)]
@@ -82,15 +98,25 @@ struct SectionBody<'a> {
     allow: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_file: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<bool>,
 }
 
-fn render(ticket: &Ticket, identity_file: Option<&Path>) -> Result<String, PairError> {
+fn render(
+    ticket: &Ticket,
+    identity_file: Option<&Path>,
+    listen: Option<SocketAddr>,
+) -> Result<String, PairError> {
     toml::to_string(&Section {
         companion: SectionBody {
             gateway: ticket.gateway.to_string(),
             gateway_name: &ticket.gateway_name,
             allow: &ticket.references,
             identity_file,
+            listen: listen.map(|listen| listen.to_string()),
+            discovery: listen.map(|_| false),
         },
     })
     .map_err(PairError::Render)
@@ -99,36 +125,53 @@ fn render(ticket: &Ticket, identity_file: Option<&Path>) -> Result<String, PairE
 /// Appends a `[companion]` section for `ticket` to the config at `path`,
 /// creating the file when missing, and loads or creates this Mac's key
 ///
-/// The result is parsed before anything is written, so a config that would
-/// stop loading is left as it was
+/// With `listen`, the companion binds that address and has discovery off,
+/// for a gateway that dials it directly. The result is parsed before
+/// anything is written, so a config that would stop loading is left as it
+/// was
 pub fn pair(
     ticket: &Ticket,
     path: &Path,
     identity_file: Option<&Path>,
+    listen: Option<SocketAddr>,
 ) -> Result<Paired, PairError> {
-    let io = |action: String| move |source| PairError::Io { action, source };
-
     // the config is read by a LaunchAgent started elsewhere, so a relative
     // path would name a different key there
     let identity_file = absolute_identity(identity_file)?;
     let identity_file = identity_file.as_deref();
-    let existing = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(ConfigError::Read {
-                path: path.to_owned(),
-                source,
-            }
-            .into());
-        }
-    };
-    let section = render(ticket, identity_file)?;
+    let existing = read_config(path)?;
+    let section = render(ticket, identity_file, listen)?;
     if Config::parse(&existing, path)?.companion.is_some() {
         return Ok(Paired::AlreadyConfigured { section });
     }
 
-    // a blank line apart from whatever the file ends with
+    let key = load_or_create(Role::Companion, identity_file)?;
+    append_section(path, &existing, &section)?;
+
+    Ok(Paired::Written(Pairing {
+        section,
+        id: key.public(),
+        name: short_hostname(),
+    }))
+}
+
+/// The text of the config at `path`, empty when there is no file yet
+pub(super) fn read_config(path: &Path) -> Result<String, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(source) => Err(ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// Appends `section` to the config at `path`, whose text is `existing`, a
+/// blank line apart; refused when the result would not load
+pub(super) fn append_section(path: &Path, existing: &str, section: &str) -> Result<(), PairError> {
+    let io = |action: String| move |source| PairError::Io { action, source };
+
     let separator = match existing.as_bytes() {
         [] => "",
         bytes if bytes.ends_with(b"\n\n") => "",
@@ -136,9 +179,13 @@ pub fn pair(
         _ => "\n\n",
     };
     let addition = format!("{separator}{section}");
+    // a section that ends without a newline would run into the next append
+    let addition = if addition.ends_with('\n') {
+        addition
+    } else {
+        format!("{addition}\n")
+    };
     Config::parse(&format!("{existing}{addition}"), path)?;
-
-    let key = load_or_create(Role::Companion, identity_file)?;
 
     if let Some(parent) = path
         .parent()
@@ -158,11 +205,7 @@ pub fn pair(
         .and_then(|mut file| file.write_all(addition.as_bytes()))
         .map_err(io(format!("write {}", path.display())))?;
 
-    Ok(Paired::Written(Pairing {
-        section,
-        id: key.public(),
-        name: short_hostname(),
-    }))
+    Ok(())
 }
 
 /// This Mac's companion endpoint id

@@ -141,32 +141,56 @@ fixes that: the same `codemode-mcp` binary on the other Mac reads the reference 
 1Password and `op`, after a Touch ID prompt there that names the reference, and sends the value back over iroh.
 The 1Password Environments server is not covered; it only signs in through the gateway Mac's app.
 
-1. On the other Mac, install the binary (`install.sh`, or `service install` from a checkout) and import the
-   InfraOps signing identity as in [Install](#install): `companion install` signs its copy with it, and the
-   keychain item holding that Mac's key is tied to the signed binary.
-2. On the gateway Mac, with the daemon running:
+1. On the gateway Mac, with the daemon running:
 
    ```sh
    codemode-mcp companion invite
    ```
 
-   It prints a `companion pair` command holding this gateway's id and the references its servers use.
-3. Run that command on the other Mac with the installed binary (`~/.local/bin/codemode-mcp`), so its key is
-   created by the signed copy. It appends a `[companion]` section to its config, with the references as the
-   allow list, and prints a `[[secrets.companions]]` block. Then keep the companion running:
+   It prints a command for the other Mac, also as a QR code, and waits until that Mac is done. The command holds
+   a single-use invite that expires after ten minutes (`--valid-for <seconds>` shortens it). Until it is used,
+   treat it like a password: whoever runs it first is registered, so check that the name and id `invite` prints
+   are the other Mac's. Stopping `invite` with Ctrl-C does not cancel the invite; it stays valid until it is
+   used or expires. Only the user that runs the daemon can open an invite: it takes the token in `admin.token`
+   in the daemon's state directory (mode 0600), which other accounts on the Mac cannot read. The token is
+   never sent; the CLI and the daemon each prove they hold it, so a program that took the admin port while the
+   daemon was down can neither learn it nor hand out its own ticket. Once a Mac has used it, it is spent even if that Mac's setup then fails; run `invite` again,
+   and the Mac keeps its existing entry.
+2. Paste the command into a terminal on the other Mac. To get it there, scan the QR code with a phone's camera,
+   copy the text it shows, and paste it on the Mac through Universal Clipboard. The command installs the signed
+   release through `install.sh`. A release install needs no InfraOps .p12: since 0.2.1 the install keeps the
+   release's own signatures. Then it runs `codemode-mcp companion pair`, which:
+   - registers the Mac with the gateway over iroh. The gateway appends a `[[secrets.companions]]` entry to the
+     end of its config. The running daemon starts reading through it once the check below reaches it, with
+     no restart, so a Mac whose setup fails is never asked in place of the gateway's own `op`; `invite` then
+     says so and exits with an error.
+   - writes a `[companion]` section to this Mac's config, with the references the gateway's servers use as the
+     allow list.
+   - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
+   - asks the gateway to read one of those references through this Mac. Approve the Touch ID prompt, which
+     names the reference; 1Password may also ask the first time `op` runs there. Both Macs print the value's
+     length, never the value.
 
-   ```sh
-   codemode-mcp companion install
-   ```
-
-4. Append the printed block to the end of the gateway Mac's config, then `codemode-mcp service restart`.
-5. Check it from the gateway Mac; approve the Touch ID prompt on the other Mac:
+   On a Mac that already has codemode-mcp, the second command `invite` prints, `codemode-mcp companion pair
+   <ticket>`, does the same without reinstalling. Run it with the installed binary
+   (`~/.local/bin/codemode-mcp`), so the key it creates belongs to the signed copy.
+3. Check it again later from the gateway Mac; approve the Touch ID prompt on the other Mac:
 
    ```sh
    codemode-mcp companion check op://Dev/Context7/credential
    ```
 
    It prints each companion's answer and the value's length, never the value.
+
+If the other Mac cannot reach the gateway, pair by hand. `codemode-mcp companion invite --manual` prints a ticket
+holding the gateway's id and references. `codemode-mcp companion pair <ticket>` on the other Mac writes its
+`[companion]` section, starts the agent and prints a `[[secrets.companions]]` block. Append that block to the end
+of the gateway Mac's config, then run `codemode-mcp service restart` there. The block is printed before the
+agent is installed; if the install fails, fix the cause and run the same `pair` command again, which installs
+again and prints the block again.
+
+A companion built from a checkout instead of a release is signed by `companion install`, which needs the InfraOps
+signing identity as in [Install](#install).
 
 How reads work with a companion configured:
 
@@ -177,15 +201,19 @@ How reads work with a companion configured:
   own prompt does not name the item, and one approval lets `op` read anything for about ten minutes, so the
   companion asks Touch ID itself, naming the reference, on every request. Edit `allow` in its `[companion]`
   section to change what the gateway may read, then `codemode-mcp companion install` again to restart it.
+- The gateway accepts incoming iroh connections only while an invite is open, and then only for pairing; the rest
+  of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
+  keeps its existing entry, and a different Mac with a name that is already taken is listed as `name-2`.
 - Each Mac's iroh key is created on first use and kept in its login keychain. The binary that creates it reads it
   without a prompt, and so does any build signed with the same identity; any other program gets a keychain
   prompt. That is why pairing and the gateway's first `invite` should run from the installed, signed binary. A
   keychain prompt asking for `dev.praveen.codemode-mcp.iroh` from any other program is worth denying.
 - By default both sides use n0's relays and DNS discovery to find each other, which publishes each Mac's
-  endpoint id and current addresses to n0's DNS. Traffic stays end-to-end encrypted, but to keep it and the
-  addresses on your network, set `discovery = false` on both, give the companion a fixed
-  `listen = "0.0.0.0:7678"`, and uncomment `addrs = ["<tailnet ip>:7678"]` in its `[[secrets.companions]]`
-  block.
+  endpoint id and current addresses to n0's DNS. Traffic stays end-to-end encrypted. To keep it and the
+  addresses on your network, set `discovery = false` under `[secrets]` on the gateway before inviting. The
+  invite then carries the gateway's current addresses. Pairing gives the companion `discovery = false` and
+  `listen = "0.0.0.0:7678"`, and lists that Mac's IPv4 addresses in its `[[secrets.companions]]` entry, so
+  the two Macs must reach each other directly over IPv4, for example over the tailnet.
 
 ## Calendar and Reminders access
 

@@ -116,6 +116,10 @@ pub struct Config {
     /// Upstream MCP servers by name
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
+    /// The file this was loaded from; `None` when parsed from text, and then
+    /// nothing can be written back
+    #[serde(skip)]
+    path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -136,6 +140,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             companion: None,
             servers: BTreeMap::new(),
+            path: None,
         }
     }
 }
@@ -155,7 +160,16 @@ impl Config {
             source,
         })?;
 
-        Self::parse(&text, path)
+        let mut config = Self::parse(&text, path)?;
+        config.path = Some(path.to_owned());
+
+        Ok(config)
+    }
+
+    /// The file this was loaded from, which a companion registering with an
+    /// invite is appended to
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Parses and validates configuration text; `path` is used in errors only

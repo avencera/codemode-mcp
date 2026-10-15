@@ -1,6 +1,9 @@
 //! Wires configuration, state, approvals, gateway and executions into one handle
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
     admin::attach_action,
@@ -139,7 +142,7 @@ impl App {
         // turning Mac notifications off stops approvals asking at the Mac,
         // not secret reads checking whether the owner is there
         let on_mac = presence.clone().filter(|_| config.notify.mac.enabled);
-        let secrets = Secrets::new(&config.secrets, presence);
+        let secrets = Secrets::new(&config.secrets, config.path().map(Path::to_owned), presence);
         let oauth = OAuth::new(&config, store.clone(), secrets.onepassword.clone());
         let approvals = Approvals::new(
             &config.public_base(),
