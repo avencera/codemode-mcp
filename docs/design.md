@@ -451,6 +451,25 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - `oauth status` shows login state, scopes, expiry and whether a refresh token exists, never token values;
   `oauth logout <server>` deletes the login and reconnects anonymously
 
+### Secrets in headers and env
+
+- A `headers` or `env` value can hold `{{ op://vault/item/field }}` references (`op inject`'s template syntax),
+  alone or inside text, e.g. `Bearer {{ op://Dev/Context7/credential }}`. Malformed references fail at config load,
+  and the error never quotes the text between the braces in case it is a pasted secret
+- The first connect runs `op read --no-newline <reference>` for each one (`[secrets] op`, default `op` on `PATH`),
+  outside the 30 s connect timeout with its own 120 s limit so a Touch ID prompt can be answered. Each reference
+  is read once per process and kept in memory, shared by every server that names it, and reads run one at a
+  time, so servers starting together share one prompt and reconnects never prompt again; a rotated key needs a
+  restart. A literal `{{` cannot be escaped, so a value that needs one cannot go in `headers` or `env`
+- `op` picks the sign-in: the 1Password app integration (the Mac prompts) or `OP_SERVICE_ACCOUNT_TOKEN` in the
+  daemon's environment (a service account scoped to one vault; no prompts, works unattended)
+- A failed read leaves the server `unavailable` with category `secret_unavailable` and retries every 10 minutes
+  rather than on the usual backoff, since each try can put a prompt on the Mac. The local error names the
+  reference and `op`'s first error line, never a value
+- Values read are added to the redactor that already scrubs configured header and env values, URL query strings
+  and userinfo from upstream error text before a script sees it, and from stdio servers' stderr before it is
+  logged
+
 ### T3 Code (deferred)
 
 T3 Code mints a bearer token per thread and passes it inline in its own MCP entry, and its tools (preview,

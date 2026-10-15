@@ -26,6 +26,7 @@ use crate::{
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
     policy::Policy,
+    secrets::{OnePassword, Redactor},
     store::Store,
     upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
@@ -33,10 +34,6 @@ use crate::{
 
 /// Wait before retrying a catalog rebuild whose stub validation could not run
 const REBUILD_RETRY: Duration = Duration::from_secs(5);
-/// Longest upstream error text handed to a script
-const MAX_ERROR_TEXT: usize = 2000;
-/// Replacement for configured secrets found in upstream text
-const REDACTED: &str = "[redacted]";
 
 /// What a tool call needs to know about the execution making it
 #[derive(Clone)]
@@ -194,60 +191,6 @@ pub struct WarmResult {
     pub detail: String,
 }
 
-/// Replaces configured secrets (header values, env values, URL query
-/// strings) in text that came from an upstream
-#[derive(Debug, Default)]
-struct Redactor(Vec<String>);
-
-impl Redactor {
-    fn new(config: &Config) -> Self {
-        let mut secrets = Vec::new();
-        for server in config.servers.values() {
-            for value in server.headers.values().chain(server.env.values()) {
-                secrets.push(value.clone());
-                if let Some(token) = value.strip_prefix("Bearer ") {
-                    secrets.push(token.to_owned());
-                }
-            }
-            if let Some(url) = server.url.as_deref() {
-                if let Some((_, query)) = url.split_once('?') {
-                    secrets.push(query.to_owned());
-                }
-                // `https://user:password@host/...`
-                if let Some((userinfo, _)) = url
-                    .split_once("://")
-                    .and_then(|(_, rest)| rest.split_once('@'))
-                    .filter(|(userinfo, _)| !userinfo.contains('/'))
-                {
-                    secrets.push(userinfo.to_owned());
-                }
-            }
-        }
-        // short values would redact ordinary words
-        secrets.retain(|secret| secret.len() >= 6);
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
-
-        Self(secrets)
-    }
-
-    fn apply(&self, text: &str) -> String {
-        let mut text = self.0.iter().fold(text.to_owned(), |text, secret| {
-            text.replace(secret.as_str(), REDACTED)
-        });
-        if text.len() > MAX_ERROR_TEXT {
-            let mut end = MAX_ERROR_TEXT;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            text.push_str("...[truncated]");
-        }
-
-        text
-    }
-}
-
 /// Per-server entry of the local status report
 #[derive(Debug, Clone, Serialize)]
 pub struct UpstreamReport {
@@ -274,7 +217,7 @@ pub struct Gateway {
     approvals: Arc<Approvals>,
     log: UsageLog,
     oauth: Arc<OAuth>,
-    redactor: Redactor,
+    redactor: Arc<Redactor>,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
 }
@@ -295,15 +238,18 @@ impl Gateway {
         oauth: Arc<OAuth>,
         store: &Store,
     ) -> Arc<Self> {
+        let redactor = Arc::new(Redactor::new(&config));
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
             Some(Arc::clone(&oauth)),
             store,
+            &OnePassword::new(config.secrets.op.clone()),
+            &redactor,
         );
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {
-            redactor: Redactor::new(&config),
+            redactor,
             max_tool_result_bytes: config.limits.max_tool_result_bytes,
             config,
             upstreams,

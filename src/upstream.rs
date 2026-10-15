@@ -1,7 +1,7 @@
 //! Long-lived MCP client connections to the configured upstream servers
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     process::Stdio,
     sync::{
         Arc, RwLock,
@@ -37,6 +37,7 @@ use tokio::{
 use crate::{
     config::{ServerConfig, Transport},
     oauth::OAuth,
+    secrets::{OnePassword, Redactor},
     store::Store,
 };
 
@@ -50,6 +51,9 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(30);
 /// How often a server waiting for an OAuth login is retried anyway, in case
 /// it starts accepting anonymous clients
 const NEEDS_LOGIN_RETRY: Duration = Duration::from_secs(30 * 60);
+/// How often a server whose 1Password references could not be read is
+/// retried; each try can put a prompt on the Mac, so not on the usual backoff
+const SECRET_RETRY: Duration = Duration::from_secs(10 * 60);
 
 /// Failures talking to an upstream server
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +77,9 @@ pub enum UpstreamError {
     /// A configured header is not valid HTTP
     #[error("invalid header `{0}`")]
     Header(String),
+    /// A `{{ op://... }}` reference in `headers` or `env` could not be read
+    #[error("could not read a secret from 1Password: {0}")]
+    Secret(String),
     /// The MCP handshake failed
     #[error("initialize failed: {0}")]
     Initialize(String),
@@ -130,6 +137,7 @@ impl UpstreamError {
             Self::Unavailable { category, .. } => *category,
             Self::Spawn { .. } => ErrorCategory::Spawn,
             Self::Header(_) => ErrorCategory::Configuration,
+            Self::Secret(_) => ErrorCategory::Secret,
             Self::Initialize(_) => ErrorCategory::Initialize,
             Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
             Self::Service(_) | Self::InputRequired | Self::SetupFailed { .. } => {
@@ -162,6 +170,7 @@ impl UpstreamError {
             ),
             Self::Spawn { .. }
             | Self::Header(_)
+            | Self::Secret(_)
             | Self::Initialize(_)
             | Self::OAuth(_)
             | Self::ConnectTimeout(_) => {
@@ -195,6 +204,8 @@ pub enum ErrorCategory {
     Connecting,
     /// The server needs an OAuth login
     NeedsLogin,
+    /// A 1Password reference in its config could not be read
+    Secret,
 }
 
 impl Serialize for ErrorCategory {
@@ -216,6 +227,7 @@ impl ErrorCategory {
             Self::Protocol => "protocol",
             Self::Connecting => "connecting",
             Self::NeedsLogin => "needs_login",
+            Self::Secret => "secret_unavailable",
         }
     }
 }
@@ -261,6 +273,12 @@ impl UpstreamStatus {
     }
 }
 
+/// `headers` and `env` with their 1Password references read; never logged
+struct Resolved {
+    headers: BTreeMap<String, String>,
+    env: BTreeMap<String, String>,
+}
+
 #[derive(Default)]
 struct Inner {
     peer: Option<Peer<RoleClient>>,
@@ -300,6 +318,11 @@ pub struct Upstream {
     /// Counts reconnect requests; the supervisor compares against the
     /// value it last saw
     reconnect: watch::Sender<u64>,
+    /// Reads `{{ op://... }}` references in `headers` and `env`, each once
+    /// per process
+    onepassword: OnePassword,
+    /// Learns the values read, so upstream text never shows them
+    redactor: Arc<Redactor>,
 }
 
 impl Upstream {
@@ -630,6 +653,11 @@ impl Upstream {
                     self.mark_needs_login();
                     delay = NEEDS_LOGIN_RETRY;
                 }
+                Err(error @ UpstreamError::Secret(_)) => {
+                    tracing::warn!(server = %self.name, %error, "upstream secret unavailable");
+                    self.mark_unavailable(error.to_string(), error.category());
+                    delay = SECRET_RETRY;
+                }
                 Err(error) => {
                     tracing::warn!(server = %self.name, %error, "upstream connection failed");
                     self.mark_unavailable(error.to_string(), error.category());
@@ -662,13 +690,39 @@ impl Upstream {
     async fn connect(
         self: &Arc<Self>,
     ) -> Result<RunningService<RoleClient, UpstreamHandler>, UpstreamError> {
-        tokio::time::timeout(CONNECT_TIMEOUT, self.connect_unbounded())
+        // outside the connect timeout: a read can wait on a prompt at the Mac
+        let resolved = self.resolved().await?;
+
+        tokio::time::timeout(CONNECT_TIMEOUT, self.connect_unbounded(&resolved))
             .await
             .map_err(|_| UpstreamError::ConnectTimeout(CONNECT_TIMEOUT))?
     }
 
+    /// `headers` and `env` with their references read
+    async fn resolved(&self) -> Result<Resolved, UpstreamError> {
+        let secret = |error: crate::secrets::SecretError| UpstreamError::Secret(error.to_string());
+        let headers = self
+            .onepassword
+            .resolve(&self.config.headers)
+            .await
+            .map_err(secret)?;
+        let env = self
+            .onepassword
+            .resolve(&self.config.env)
+            .await
+            .map_err(secret)?;
+        self.redactor
+            .add(headers.secrets.into_iter().chain(env.secrets));
+
+        Ok(Resolved {
+            headers: headers.values,
+            env: env.values,
+        })
+    }
+
     async fn connect_unbounded(
         self: &Arc<Self>,
+        resolved: &Resolved,
     ) -> Result<RunningService<RoleClient, UpstreamHandler>, UpstreamError> {
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let handler = UpstreamHandler {
@@ -677,7 +731,7 @@ impl Upstream {
         };
         let service = match self.config.transport() {
             Some(Transport::Stdio { command }) => {
-                let transport = self.spawn_child(command)?;
+                let transport = self.spawn_child(command, &resolved.env)?;
 
                 handler
                     .serve(transport)
@@ -685,7 +739,7 @@ impl Upstream {
                     .map_err(|error| UpstreamError::Initialize(error.to_string()))?
             }
             Some(Transport::Http { url }) => {
-                let config = self.http_config(url)?;
+                let config = self.http_config(url, &resolved.headers)?;
                 let authorized =
                     match &self.oauth {
                         Some(oauth) if self.config.oauth => oauth
@@ -741,9 +795,13 @@ impl Upstream {
         Ok(service)
     }
 
-    fn spawn_child(&self, command: &str) -> Result<TokioChildProcess, UpstreamError> {
+    fn spawn_child(
+        &self,
+        command: &str,
+        env: &BTreeMap<String, String>,
+    ) -> Result<TokioChildProcess, UpstreamError> {
         let mut process = Command::new(command);
-        process.args(&self.config.args).envs(&self.config.env);
+        process.args(&self.config.args).envs(env);
         if let Some(directory) = &self.config.cwd {
             process.current_dir(directory);
         }
@@ -759,9 +817,12 @@ impl Upstream {
 
         if let Some(stderr) = stderr {
             let server = self.name.clone();
+            let redactor = Arc::clone(&self.redactor);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    // the server's environment can hold values read from 1Password
+                    let line = redactor.apply(&line);
                     tracing::debug!(%server, "stderr: {line}");
                 }
             });
@@ -770,11 +831,15 @@ impl Upstream {
         Ok(transport)
     }
 
-    fn http_config(&self, url: &str) -> Result<StreamableHttpClientTransportConfig, UpstreamError> {
+    fn http_config(
+        &self,
+        url: &str,
+        configured: &BTreeMap<String, String>,
+    ) -> Result<StreamableHttpClientTransportConfig, UpstreamError> {
         let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
         let mut headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
 
-        for (name, value) in &self.config.headers {
+        for (name, value) in configured {
             // rmcp reserves the authorization header for its own bearer handling
             if name.eq_ignore_ascii_case("authorization") {
                 let token = value.strip_prefix("Bearer ").ok_or_else(|| {
@@ -883,6 +948,8 @@ impl Upstreams {
         call_timeout: Duration,
         oauth: Option<Arc<OAuth>>,
         store: &Store,
+        onepassword: &OnePassword,
+        redactor: &Arc<Redactor>,
     ) -> Self {
         let changed = Arc::new(Notify::new());
         let mut upstreams = Vec::new();
@@ -914,6 +981,8 @@ impl Upstreams {
                 oauth: oauth.clone(),
                 store: store.clone(),
                 reconnect: watch::channel(0).0,
+                onepassword: onepassword.clone(),
+                redactor: Arc::clone(redactor),
             });
             tasks.push(tokio::spawn(Arc::clone(&upstream).supervise()));
             upstreams.push(upstream);

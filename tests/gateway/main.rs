@@ -8,6 +8,7 @@ mod durable;
 mod harness;
 mod mac;
 mod oauth;
+mod secrets;
 mod service;
 mod session_less;
 mod sessions;

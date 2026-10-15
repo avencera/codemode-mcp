@@ -31,6 +31,15 @@ struct WhoamiParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct EnvParams {
+    /// Variable to read
+    name: String,
+    /// Answer with an error that quotes the value instead
+    #[serde(default)]
+    fail: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct AddParams {
     /// Left operand
     a: i64,
@@ -261,6 +270,19 @@ impl Fixture {
             Ok(format!("account {account}"))
         } else {
             Err("Missing required scope. Call the login tool first.".to_owned())
+        }
+    }
+
+    #[tool(description = "Read one of this server's environment variables")]
+    fn env(
+        &self,
+        Parameters(EnvParams { name, fail }): Parameters<EnvParams>,
+    ) -> Result<String, String> {
+        let value = std::env::var(&name).unwrap_or_default();
+        if fail {
+            Err(format!("refused; the value was {value}"))
+        } else {
+            Ok(value)
         }
     }
 

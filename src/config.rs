@@ -93,6 +93,9 @@ pub struct Config {
     /// Sandbox and execution limits
     #[serde(default)]
     pub limits: Limits,
+    /// How `{{ op://... }}` references in server `headers` and `env` are read
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     /// Upstream MCP servers by name
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
@@ -113,6 +116,7 @@ impl Default for Config {
             approvals: ApprovalsConfig::default(),
             notify: NotifyConfig::default(),
             limits: Limits::default(),
+            secrets: SecretsConfig::default(),
             servers: BTreeMap::new(),
         }
     }
@@ -246,6 +250,28 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// The 1Password CLI that reads `{{ op://vault/item/field }}` references in
+/// server `headers` and `env` when a server first connects
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// `op` executable; with `OP_SERVICE_ACCOUNT_TOKEN` in the daemon's
+    /// environment it reads without prompting, else the 1Password app on
+    /// the Mac asks
+    #[serde(default = "default_op")]
+    pub op: String,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self { op: default_op() }
+    }
+}
+
+fn default_op() -> String {
+    "op".to_owned()
 }
 
 fn default_listen() -> SocketAddr {
@@ -805,6 +831,13 @@ impl ServerConfig {
     fn validate(&self, name: &str) -> Result<(), ConfigError> {
         for (tool, tool_override) in &self.tools {
             tool_override.validate(name, tool)?;
+        }
+        for (table, values) in [("headers", &self.headers), ("env", &self.env)] {
+            for (key, value) in values {
+                crate::secrets::check(value).map_err(|error| {
+                    ConfigError::Invalid(format!("servers.{name}.{table}.{key}: {error}"))
+                })?;
+            }
         }
 
         match (&self.command, &self.url) {

@@ -27,6 +27,7 @@ pub mod prompt;
 pub mod script_fixes;
 pub mod script_shape;
 pub mod search;
+pub mod secrets;
 pub mod server;
 pub mod service;
 pub mod snapshot;
