@@ -17,7 +17,7 @@ build-release:
 # commits and pushes the bump because `release github` tags HEAD and needs it on
 # origin, so `just bump minor && just release` works in one go
 
-# Bump the Cargo.toml version, commit it as "Release X.Y.Z" and push. Part: major | minor | patch
+# Bump the Cargo.toml version, commit it as "Release vX.Y.Z" and push. Part: major | minor | patch
 [group('build')]
 [script('bash')]
 bump part:
@@ -53,7 +53,7 @@ bump part:
     cargo metadata --format-version 1 > /dev/null
 
     git add Cargo.toml Cargo.lock
-    git commit --quiet -m "Release $next"
+    git commit --quiet -m "Release v$next"
     git push --quiet origin HEAD
 
     echo "Bumped $current -> $next and pushed"
