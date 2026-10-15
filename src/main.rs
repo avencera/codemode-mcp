@@ -40,6 +40,11 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(15);
 /// How long a stop lets in-flight MCP requests answer after the drain
 const ANSWER_GRACE: Duration = Duration::from_secs(5);
 
+/// How long the CLI waits on an admin route; `companion check` waits up to
+/// [`companion::ASK_TIMEOUT`] for the slowest companion, so this outlasts it
+/// and the per-companion results still arrive
+const ADMIN_TIMEOUT: Duration = companion::ASK_TIMEOUT.saturating_add(Duration::from_secs(30));
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -1201,7 +1206,7 @@ async fn admin_post<T: serde::de::DeserializeOwned>(
     let url = format!("http://{}{path}", config.admin_listen);
     let response = reqwest::Client::new()
         .post(&url)
-        .timeout(Duration::from_secs(120))
+        .timeout(ADMIN_TIMEOUT)
         .json(body)
         .send()
         .await

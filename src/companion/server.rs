@@ -6,8 +6,8 @@ use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use super::{
-    ALPN, CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse, Hangup,
-    IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
+    ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse,
+    Hangup, IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
 };
 use crate::{
     config::CompanionConfig,
@@ -134,9 +134,19 @@ impl Companion {
             };
 
             // the gateway hangs up when another source won, which also takes
-            // down a Touch ID prompt that is still showing
+            // down a Touch ID prompt that is still showing; a gateway that
+            // only stops the stream, or never gives up, loses it the same way
             let response = tokio::select! {
-                response = self.answer(&body) => response,
+                response = tokio::time::timeout(ASK_TIMEOUT, self.answer(&body)) => {
+                    let Ok(response) = response else {
+                        tracing::info!("companion request was not answered in time");
+
+                        continue;
+                    };
+
+                    response
+                }
+                _ = send.stopped() => continue,
                 _ = connection.0.closed() => return,
             };
             let Ok(bytes) = serde_json::to_vec(&response) else {

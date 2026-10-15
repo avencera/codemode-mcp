@@ -562,8 +562,8 @@ async fn warm(State(state): State<AdminState>, Json(request): Json<WarmRequest>)
     }
 }
 
-/// This gateway's id and the references its servers use, for a companion
-/// Mac to pair with
+/// This gateway's id and the references its servers use, in `headers`,
+/// `env` and OAuth `client_secret`, for a companion Mac to pair with
 async fn companion_invite(State(state): State<AdminState>) -> Response {
     let gateway = match state.gateway.companions().id().await {
         Ok(id) => id,
@@ -576,7 +576,8 @@ async fn companion_invite(State(state): State<AdminState>) -> Response {
 
     let mut references = std::collections::BTreeSet::new();
     for server in state.config.servers.values() {
-        for value in server.headers.values().chain(server.env.values()) {
+        let values = server.headers.values().chain(server.env.values());
+        for value in values.chain(server.client_secret.as_ref()) {
             // validated at load, so a malformed value cannot be here
             for reference in secrets::references(value).unwrap_or_default() {
                 references.insert(reference.to_owned());

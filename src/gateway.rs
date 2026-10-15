@@ -24,11 +24,10 @@ use crate::{
     convert::json_to_monty,
     durable::Sensitivity,
     executor::Executor,
-    mac::OnMac,
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
     policy::Policy,
-    secrets::{OnePassword, Redactor},
+    secrets::{Redactor, Secrets},
     store::Store,
     upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
@@ -240,16 +239,13 @@ impl Gateway {
         log: UsageLog,
         oauth: Arc<OAuth>,
         store: &Store,
-        on_mac: Option<OnMac>,
+        secrets: Secrets,
     ) -> Arc<Self> {
         let redactor = Arc::new(Redactor::new(&config));
-        // always built, for `companion invite`; only a gateway with
-        // companions reads through them
-        let companions = Arc::new(Companions::new(&config.secrets));
-        let mut onepassword = OnePassword::new(config.secrets.op.clone());
-        if !companions.peers().is_empty() {
-            onepassword = onepassword.with_companions(Arc::clone(&companions), on_mac);
-        }
+        let Secrets {
+            onepassword,
+            companions,
+        } = secrets;
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),

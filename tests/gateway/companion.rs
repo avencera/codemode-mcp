@@ -42,6 +42,8 @@ struct Options<'a> {
     touch: Option<TouchId>,
     /// Whether the owner counts as at the gateway's Mac
     present: bool,
+    /// `notify.mac.enabled` on the gateway
+    mac_notifications: bool,
 }
 
 impl Default for Options<'_> {
@@ -51,6 +53,7 @@ impl Default for Options<'_> {
             paired: true,
             touch: Some(TouchId::Approved),
             present: false,
+            mac_notifications: true,
         }
     }
 }
@@ -62,6 +65,7 @@ impl Rig {
             paired,
             touch,
             present,
+            mac_notifications,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -115,7 +119,9 @@ impl Rig {
              companions = [{{ name = \"mba\", id = \"{id}\", addrs = [\"{address}\"] }}]\n\n\
              [servers.twin]\n\
              command = \"{fixture}\"\n\
-             env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n",
+             env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n\n\
+             [notify.mac]\n\
+             enabled = {mac_notifications}\n",
             op = local_op.display(),
             key = gateway_key.display(),
             id = companion.id(),
@@ -202,6 +208,71 @@ async fn an_owner_away_from_the_gateway_reads_through_the_companion() -> TestRes
         json!({ "name": "mba", "result": { "ok": { "bytes": VALUE.len() } } })
     );
     assert!(!checked.to_string().contains(VALUE), "{checked}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_request_asks_touch_id_again() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    let check = json!({ "reference": REFERENCE });
+
+    // the twin server reads once as it connects
+    let body = rig
+        .harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], VALUE, "{body}");
+
+    let (status, checked) = rig
+        .harness
+        .admin_json("/admin/companion/check", &check)
+        .await?;
+    assert_eq!(status, 200, "{checked}");
+    assert!(
+        checked["companions"][0]["result"]["ok"].is_object(),
+        "{checked}"
+    );
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
+
+    // the same reference straight after an approval is asked again, and a
+    // refusal then reads nothing
+    rig.companion_mac.set_answer(Some(TouchId::Review));
+    let (_, checked) = rig
+        .harness
+        .admin_json("/admin/companion/check", &check)
+        .await?;
+    let message = checked["companions"][0]["result"]["error"]["message"].as_str();
+    assert!(
+        message.is_some_and(|message| message.contains("denied")),
+        "{checked}"
+    );
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
+    assert_eq!(rig.companion_mac.cancel_titles().len(), 3);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mac_notifications_off_still_skip_the_local_read_while_the_owner_is_away() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        mac_notifications: false,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let body = rig
+        .harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], VALUE, "{body}");
+    assert_eq!(reads(&rig.local_log, REFERENCE), 0);
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 1);
 
     rig.stop().await
 }
@@ -395,7 +466,12 @@ async fn an_invite_carries_the_gateway_and_its_references_to_a_pairing() -> Test
          env = {{ X = \"{{{{ op://Dev/b/credential }}}}\", Y = \"{{{{ op://Dev/a/credential }}}}\" }}\n\n\
          [servers.c]\n\
          command = \"{fixture}\"\n\
-         env = {{ X = \"k-{{{{ op://Dev/a/credential }}}}\" }}\n",
+         env = {{ X = \"k-{{{{ op://Dev/a/credential }}}}\" }}\n\n\
+         [servers.d]\n\
+         url = \"http://127.0.0.1:9/mcp\"\n\
+         oauth = true\n\
+         client_id = \"known\"\n\
+         client_secret = \"{{{{ op://Dev/oauth/credential }}}}\"\n",
         op = op.display(),
         key = key.display(),
         fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
@@ -421,7 +497,11 @@ async fn an_invite_carries_the_gateway_and_its_references_to_a_pairing() -> Test
     );
     assert_eq!(
         invite["references"],
-        json!(["op://Dev/a/credential", "op://Dev/b/credential"])
+        json!([
+            "op://Dev/a/credential",
+            "op://Dev/b/credential",
+            "op://Dev/oauth/credential"
+        ])
     );
     harness.stop().await?;
 

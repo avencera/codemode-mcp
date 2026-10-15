@@ -13,6 +13,7 @@ use crate::{
     notify::{Notifier, Ntfy},
     oauth::OAuth,
     passkeys::{PasskeyError, Passkeys},
+    secrets::Secrets,
     snapshot::Sealer,
     store::{Store, StoreError},
     usage::UsageLog,
@@ -131,11 +132,15 @@ impl App {
         let sealer = Sealer::load_or_create(&state_dir).map_err(ExecutorError::from)?;
         let passkeys = Arc::new(Passkeys::new(&config.public_origin(), store.clone())?);
         let session_store = store.clone();
-        let oauth = OAuth::new(&config, store.clone());
-        let on_mac = mac.filter(|_| config.notify.mac.enabled).map(|mac| OnMac {
+        let presence = mac.map(|mac| OnMac {
             mac,
             config: config.notify.mac.clone(),
         });
+        // turning Mac notifications off stops approvals asking at the Mac,
+        // not secret reads checking whether the owner is there
+        let on_mac = presence.clone().filter(|_| config.notify.mac.enabled);
+        let secrets = Secrets::new(&config.secrets, presence);
+        let oauth = OAuth::new(&config, store.clone(), secrets.onepassword.clone());
         let approvals = Approvals::new(
             &config.public_base(),
             config.approvals.timeout(),
@@ -153,7 +158,7 @@ impl App {
             log.clone(),
             oauth,
             &session_store,
-            on_mac,
+            secrets,
         );
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),

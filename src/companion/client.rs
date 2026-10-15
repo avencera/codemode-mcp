@@ -9,14 +9,10 @@ use tokio::{
 };
 
 use super::{
-    ALPN, CompanionErrorCode, CompanionRequest, CompanionResponse, Hangup, IdentityError,
-    MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
+    ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionRequest, CompanionResponse, Hangup,
+    IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
 };
 use crate::config::{CompanionPeer, SecretsConfig};
-
-/// How long one companion request may take, including the owner's Touch ID
-/// answer on the other Mac
-const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why a companion did not send a value; none of the messages holds a value
 #[derive(Debug, thiserror::Error)]

@@ -21,6 +21,8 @@ pub use server::{CompanionHandle, ServeError, serve};
 pub use ticket::{TICKET_PREFIX, Ticket, TicketError};
 pub use wire::{CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse};
 
+use std::time::Duration;
+
 use iroh::{
     Endpoint,
     endpoint::{Connection, presets},
@@ -32,6 +34,10 @@ pub const ALPN: &[u8] = b"codemode-mcp/companion/1";
 /// Longest request or response body; references and the values read for
 /// them are far below this
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// How long one companion request may take, including the owner's Touch ID
+/// answer on the other Mac; the gateway gives up after it and the companion
+/// takes its prompt down
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Closes its connection when dropped
 ///

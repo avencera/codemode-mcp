@@ -15,7 +15,11 @@ use std::{
 
 use tokio::{process::Command, sync::Mutex, task::JoinSet};
 
-use crate::{companion::Companions, config::Config, mac::OnMac};
+use crate::{
+    companion::Companions,
+    config::{Config, SecretsConfig},
+    mac::OnMac,
+};
 
 /// How long one `op read` may take; long enough for the 1Password app's
 /// unlock or Touch ID prompt on the Mac
@@ -26,6 +30,34 @@ const MAX_ERROR_TEXT: usize = 2000;
 const REDACTED: &str = "[redacted]";
 /// Shorter secrets would redact ordinary words
 const MIN_SECRET_LEN: usize = 6;
+
+/// The daemon's one 1Password reader and the companions it may ask, shared
+/// by upstream connections and OAuth logins so they keep one cache and one
+/// iroh endpoint
+#[derive(Clone)]
+pub struct Secrets {
+    /// Reads references, also through the companions when any are paired
+    pub onepassword: OnePassword,
+    /// Always built, since `companion invite` pairs the first one
+    pub companions: Arc<Companions>,
+}
+
+impl Secrets {
+    /// Readers for `config`; `presence` tells whether the owner is at this
+    /// Mac, which decides whether a read also runs the local `op`
+    pub fn new(config: &SecretsConfig, presence: Option<OnMac>) -> Self {
+        let companions = Arc::new(Companions::new(config));
+        let mut onepassword = OnePassword::new(config.op.clone());
+        if !companions.peers().is_empty() {
+            onepassword = onepassword.with_companions(Arc::clone(&companions), presence);
+        }
+
+        Self {
+            onepassword,
+            companions,
+        }
+    }
+}
 
 /// Failures turning references into values; none of them carries a value
 /// that was read

@@ -500,8 +500,12 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   owner is at the gateway Mac (so no 1Password prompt waits on an unattended screen), and every companion
   always. The first value wins; dropping the rest kills the local `op` child and hangs up on companions, which
   takes down their Touch ID prompts. Presence is not used to pick one source, since remote desktop input makes
-  the gateway Mac look in use. All failing gives one error listing each source's reason. Without companions the
+  the gateway Mac look in use. Presence is checked even with `notify.mac.enabled = false`, which only stops
+  approvals asking at the Mac. All failing gives one error listing each source's reason. Without companions the
   read path is unchanged
+- Upstream connections and OAuth logins share one `Secrets` (the reader, its cache and the one `Companions`
+  endpoint), so an OAuth `client_secret` reaches companions too, and `companion invite` lists its references
+  with those in `headers` and `env`
 - Transport: iroh 1.3 (`tls-aws-lc-rs`, no portmapper), ALPN `codemode-mcp/companion/1`, one bidirectional
   stream per request carrying typed JSON (`{"reference"}` → `{"value"}` or `{"error": {code, message}}`, codes
   `not_allowed`, `denied`, `read_failed`), bodies capped at 64 KiB both ways (a larger value is refused as
@@ -509,7 +513,8 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   `discovery = true` uses n0's relays and DNS, publishing each endpoint's addresses there; `false` dials only
   configured `addrs`
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
-  only references on its own `allow` list, one request at a time, and only after its own Touch ID prompt naming
+  only references on its own `allow` list, one request at a time, each request no longer than the gateway's
+  120 s deadline (a gateway that stops the stream or never gives up loses the prompt), and only after its own Touch ID prompt naming
   the reference and the gateway (its other button says Deny). 1Password's prompt does not name the item and one approval lets `op` read
   anything for about ten minutes, so without these a compromised gateway could read any item
 - Identity: each role's Ed25519 key is a generic password in the login keychain (service
