@@ -6,14 +6,15 @@
 //! The braces follow `op inject`'s template syntax, so a value can mix text
 //! and references, e.g. `Bearer {{ op://Dev/Context7/credential }}`
 
+mod spawn;
+
 use std::{
     collections::{BTreeMap, HashMap},
-    process::Stdio,
     sync::{Arc, PoisonError, RwLock},
     time::Duration,
 };
 
-use tokio::{process::Command, sync::Mutex, task::JoinSet};
+use tokio::{sync::Mutex, task::JoinSet};
 
 use crate::{
     companion::Companions,
@@ -354,13 +355,8 @@ impl OnePassword {
     ///
     /// The companion side answers with this: every request asks anew
     pub async fn read_local(&self, reference: &str) -> Result<String, SecretError> {
-        let mut command = Command::new(&self.program);
-        command
-            .args(["read", "--no-newline", reference])
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-
-        let output = tokio::time::timeout(READ_TIMEOUT, command.output())
+        let args = ["read", "--no-newline", reference];
+        let output = tokio::time::timeout(READ_TIMEOUT, spawn::output(&self.program, &args))
             .await
             .map_err(|_| SecretError::TimedOut {
                 reference: reference.to_owned(),
