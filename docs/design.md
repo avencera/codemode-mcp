@@ -441,7 +441,8 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 
 ### OAuth
 
-- A `url` server with `oauth = true` (optional `scopes`, `client_name`) is tried anonymously until someone signs
+- A `url` server with `oauth = true` (optional `scopes`, `client_name`, `client_id`, `client_secret`,
+  `authorization_params`) is tried anonymously until someone signs
   in. A server that answers anonymous `initialize` keeps working; one that answers 401 is reported as
   `needs_login` in `/healthz` and `codemode-mcp tools`, its tools leave the catalog, and it is retried every
   30 minutes or at once after a login
@@ -450,6 +451,11 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   published metadata are refused), dynamic client registration (public client), and builds a PKCE (S256)
   authorization URL with redirect URI `http://127.0.0.1:<admin port>/oauth/callback/<server>`. The CLI prints it
   and runs `open` on macOS (`--no-open` skips that)
+- A configured `client_id` skips registration, for authorization servers that offer none, such as Google's.
+  Its `client_secret` may hold `op://` references, read through `op` at login only; the resolved secret is
+  stored with the registration, as a registered client's is, so refreshes need no 1Password prompt.
+  `authorization_params` are added to the authorization URL, replacing any rmcp set; the parameters PKCE, the
+  CSRF check and the token exchange rely on are refused at config load
 - `GET /oauth/callback/<server>` on the admin listener exchanges the code (the CSRF state must match a stored
   flow) and shows a plain "you can close this tab" page; the upstream then reconnects with
   `AuthClient` + `StreamableHttpClientTransport::with_client`
