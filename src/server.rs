@@ -44,6 +44,7 @@ use crate::{
     gateway::Gateway,
     guidance::{INSTRUCTIONS, SESSION_RULE, TOOL_CALL_RULE, script_rules, session_rule},
     host::{HostPolicy, host_guard, is_direct_local},
+    prompt::{REASON_CHARS, THREAD_CHARS, one_line},
     store::Store,
     usage::{CallRecord, Caller, Classification, Outcome, UsageLog},
     web,
@@ -82,6 +83,13 @@ pub struct ExecuteParams {
     pub code: String,
     /// Session value from your previous codemode result; omit on the first call
     pub session: Option<String>,
+    /// Short title of your current thread or task, such as "Fix login
+    /// redirect"; shown to the user when a tool needs their approval
+    pub thread: Option<String>,
+    /// One line on why this script needs its tools, such as "read the
+    /// staging env names to write .env"; shown to the user when a tool
+    /// needs their approval
+    pub reason: Option<String>,
 }
 
 /// Arguments of `wait`
@@ -190,6 +198,18 @@ fn clean_label(text: &str) -> String {
         .collect()
 }
 
+/// An agent's thread title or reason, trimmed, on one line, and kept a
+/// little past what the prompt shows so the prompt can mark it as cut;
+/// `None` when blank
+///
+/// Cleaned here rather than where it is shown, so the page cannot be made
+/// to read differently from the prompt
+fn asked(text: &str, shown: usize) -> Option<String> {
+    let text = text.trim();
+
+    (!text.is_empty()).then(|| one_line(text, shown + 1))
+}
+
 /// Shown to an agent whose `session` value was rejected and replaced
 const REPLACED_NOTE: &str = "the session you passed was not valid (unknown, expired or from another \
                              client); use this new one from now on";
@@ -258,10 +278,9 @@ pub fn pending_body(gateway: &Gateway, id: &str) -> Value {
                 )
             } else if approvals.asked_on_mac(&approval.id) {
                 format!(
-                    "Waiting for the user to approve {} on this Mac: a Touch ID prompt or a \
-                     notification is showing, and their phone is told if they do not answer \
-                     here. Tell them, give them the approval_url to review it in a browser, then \
-                     call wait with this execution_id.",
+                    "Waiting for the user to approve {} on this Mac, where they are being asked \
+                     now, and their phone is told if they do not answer there. Tell them and give \
+                     them the approval_url, then call wait with this execution_id.",
                     waiting_for
                 )
             } else {
@@ -571,6 +590,14 @@ impl CodeModeServer {
         let started = Instant::now();
         let mut caller = caller_of(&context);
         let session = self.open_session(params.session.as_deref(), &mut caller);
+        caller.thread = params
+            .thread
+            .as_deref()
+            .and_then(|text| asked(text, THREAD_CHARS));
+        caller.reason = params
+            .reason
+            .as_deref()
+            .and_then(|text| asked(text, REASON_CHARS));
         let (result, classification, id) =
             match self.executions.start(params.code.clone(), caller.clone()) {
                 Ok(id) => {

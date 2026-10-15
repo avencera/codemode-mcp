@@ -25,13 +25,13 @@ use crate::{
     mac::{MacNotification, OnMac, TouchId},
     notify::{Notification, Notifier, Priority},
     policy::GrantMode,
+    prompt::{Asker, prompt_text},
     store::{
         Store,
         approvals::{NewApproval, StoredApproval, StoredGrant},
         now_ms,
         sessions::SessionState,
     },
-    summary::{Template, prompt_text, summarize_arguments},
     usage::Caller,
 };
 
@@ -51,6 +51,9 @@ const SESSION_GRANT: &str = "session";
 const DENIED: &str = "denied on the approval page";
 /// Shown to a script whose request is no longer there
 pub const WITHDRAWN: &str = "the approval request was withdrawn";
+/// How often a request waiting on the Mac checks that the owner is still
+/// there
+const PRESENCE_CHECK: Duration = Duration::from_secs(2);
 /// Grant lengths offered on the approval page, in minutes
 pub const GRANT_MINUTES: [u64; 2] = [15, 60];
 
@@ -196,10 +199,6 @@ pub struct ApprovalInfo {
     pub script: Arc<str>,
     /// Whether a client grant may be given
     pub grant_mode: GrantMode,
-    /// The tool's `summary` template filled from the arguments, for the
-    /// Touch ID prompt; absent for tools without one
-    #[serde(default)]
-    pub summary: Option<String>,
     /// When the request is denied automatically, ms since the epoch; a wall
     /// clock time because it must mean the same to the next process
     pub expires_ms: i64,
@@ -235,6 +234,20 @@ impl ApprovalInfo {
             && self.caller.client_name.is_some()
             && self.caller.local
     }
+
+    /// What a fingerprint at the Mac approves: the longest grant of the
+    /// narrowest kind allowed, so a tool that asks on every call is
+    /// approved once
+    pub fn fingerprint_choice(&self) -> Choice {
+        let longest = Duration::from_secs(GRANT_MINUTES[GRANT_MINUTES.len() - 1] * 60);
+        if self.session_grant_allowed() {
+            Choice::Session(longest)
+        } else if self.client_grant_allowed() {
+            Choice::Client(longest)
+        } else {
+            Choice::Once
+        }
+    }
 }
 
 /// A call that needs a decision
@@ -253,8 +266,6 @@ pub struct GateRequest<'a> {
     pub script: &'a Arc<str>,
     /// The tool's grant mode
     pub grant_mode: GrantMode,
-    /// The tool's `summary` template, checked when the config was loaded
-    pub summary: Option<&'a str>,
     /// Whether the call or its execution holds data from a sensitive
     /// server, so the request must not reach the disk
     pub sensitivity: Sensitivity,
@@ -371,8 +382,8 @@ struct Pending {
     info: Arc<ApprovalInfo>,
     sender: oneshot::Sender<Verdict>,
     /// Cancels the request's token when it leaves the map in any way,
-    /// including a service dropped without settling it: a Touch ID prompt
-    /// comes down and a phone push still waiting is dropped
+    /// including a service dropped without settling it, so a phone push
+    /// still waiting is dropped
     _settled: DropGuard,
 }
 
@@ -521,10 +532,6 @@ impl Approvals {
             arguments: request.arguments.clone(),
             script: Arc::clone(request.script),
             grant_mode: request.grant_mode,
-            summary: request
-                .summary
-                .and_then(|template| Template::parse(template).ok())
-                .map(|template| template.render(request.arguments)),
             expires_ms: self.expiry(),
         };
 
@@ -594,7 +601,6 @@ impl Approvals {
             arguments: details,
             script: Arc::from(""),
             grant_mode: GrantMode::PerCall,
-            summary: None,
             expires_ms: self.expiry(),
         };
         let notifier = self.notifier.clone();
@@ -685,14 +691,16 @@ impl Approvals {
         }
     }
 
-    /// Announces a new request: while the owner is at the Mac it is asked
-    /// there first, with Touch ID for a tool call or else a notification, and
-    /// the phone is told only if it is still pending after
-    /// `escalate_after_secs`; otherwise the phone is told at once
+    /// Announces a new request: while the owner is at the Mac a tool call
+    /// shows a Touch ID prompt there, whose fingerprint approves it with
+    /// [`ApprovalInfo::fingerprint_choice`] and whose other button opens the
+    /// approval page, and the phone is told only once it has waited
+    /// `escalate_after_secs` or the owner leaves; otherwise the phone is told
+    /// at once
     ///
-    /// An admin request still reaches the phone at once, so one the owner did
-    /// not start is seen wherever they are, and never offers Touch ID, since
-    /// only a passkey may change who can approve
+    /// An admin request reaches the phone at once, so one the owner did not
+    /// start is seen wherever they are, and only shows a notification on the
+    /// Mac, since only a passkey may change who can approve
     fn ask(
         self: &Arc<Self>,
         info: &Arc<ApprovalInfo>,
@@ -707,60 +715,97 @@ impl Approvals {
         let weak = Arc::downgrade(self);
         let info = Arc::clone(info);
         tokio::spawn(async move {
-            let present = on_mac.mac.present(on_mac.config.idle()).await;
+            let idle = on_mac.config.idle();
+            let present = on_mac.mac.present(idle).await;
             let Some(approvals) = weak.upgrade() else {
                 return;
             };
             {
+                // one lock, so a request settled in between leaves no mark
                 let mut state = approvals.state();
                 if !state.pending.contains_key(&info.id) {
                     return;
                 }
-                if present {
+                if present && info.kind == ApprovalKind::ToolCall {
                     state.on_mac.insert(info.id.clone());
                 }
+            }
+            let url = approvals.url_for(&info.id);
+            let notification = approvals.notification_for(&info);
+
+            if let ApprovalKind::Admin { .. } = &info.kind {
+                approvals.notify(phone, &info);
+                drop(approvals);
+                if present {
+                    let local = MacNotification {
+                        title: notification.title,
+                        message: notification.message,
+                        click: url,
+                    };
+                    if let Err(error) = on_mac.mac.notify(&local).await {
+                        tracing::warn!(%error, "Mac notification failed");
+                    }
+                }
+
+                return;
             }
             if !present {
                 approvals.notify(phone, &info);
 
                 return;
             }
-
-            let url = approvals.url_for(&info.id);
-            let notification = approvals.notification_for(&info);
             drop(approvals);
-            let admin = matches!(info.kind, ApprovalKind::Admin { .. });
-            let touch_id = on_mac.config.touch_id && !admin;
-            let delay = if admin {
-                Duration::ZERO
-            } else {
-                on_mac.config.escalate_after()
-            };
+
             // `now` tells the phone without waiting; `restart` starts the
             // delay over, because the owner opened the page here
             let now = CancellationToken::new();
             let restart = tokio::sync::Notify::new();
 
             let phone_later = async {
+                let delay = on_mac.config.escalate_after();
+                let deadline = tokio::time::sleep(delay);
+                tokio::pin!(deadline);
+                let mut check = tokio::time::interval_at(
+                    tokio::time::Instant::now() + PRESENCE_CHECK,
+                    PRESENCE_CHECK,
+                );
                 loop {
                     tokio::select! {
                         biased;
                         () = settled.cancelled() => return,
-                        () = restart.notified() => continue,
-                        () = tokio::time::sleep(delay) => break,
                         () = now.cancelled() => break,
+                        () = restart.notified() => {
+                            deadline.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
+                        () = &mut deadline => break,
+                        _ = check.tick() => {
+                            // a locked screen or an owner who walked away
+                            // should not hold the phone back
+                            if !on_mac.mac.present(idle).await {
+                                break;
+                            }
+                        }
                     }
                 }
+
                 if let Some(approvals) = weak.upgrade() {
                     // the owner may have left, so the pending answer stops
                     // pointing the agent at the Mac
-                    approvals.state().on_mac.remove(&info.id);
-                    approvals.notify(phone, &info);
+                    let pending = {
+                        let mut state = approvals.state();
+                        state.on_mac.remove(&info.id);
+
+                        state.pending.contains_key(&info.id)
+                    };
+                    // it may have been decided while presence was checked
+                    if pending {
+                        approvals.notify(phone, &info);
+                    }
                 }
             };
 
             let ask_here = async {
-                let answer = if touch_id {
+                let answer = if on_mac.config.touch_id {
                     let reason = touch_id_reason(&info);
                     // dropping the prompt's future takes it off the screen
                     tokio::select! {
@@ -772,17 +817,15 @@ impl Approvals {
                 };
 
                 match answer {
-                    // checked again here so a change above cannot let a
-                    // fingerprint approve an admin request
-                    TouchId::Approved if !admin => {
+                    TouchId::Approved => {
                         // the page or the phone may have answered first
                         if let Some(approvals) = weak.upgrade()
-                            && let Err(error) = approvals.decide(&info.id, Choice::Once)
+                            && let Err(error) =
+                                approvals.decide(&info.id, info.fingerprint_choice())
                         {
                             tracing::debug!(%error, "Touch ID approval came too late");
                         }
                     }
-                    TouchId::Approved => now.cancel(),
                     TouchId::Review => {
                         // before opening the page, so a press just ahead of
                         // the deadline still holds the phone back
@@ -796,10 +839,7 @@ impl Approvals {
                     TouchId::Unavailable => {
                         let local = MacNotification {
                             title: notification.title,
-                            message: match &info.kind {
-                                ApprovalKind::ToolCall => "Click to review.".to_owned(),
-                                ApprovalKind::Admin { .. } => notification.message,
-                            },
+                            message: "Click to review.".to_owned(),
                             click: url.clone(),
                         };
                         if let Err(error) = on_mac.mac.notify(&local).await {
@@ -822,6 +862,14 @@ impl Approvals {
         let weak = Arc::downgrade(self);
         let id = info.id.clone();
         tokio::spawn(async move {
+            // answered while this task waited to run, as when a fingerprint
+            // lands right at the escalation deadline
+            if weak
+                .upgrade()
+                .is_none_or(|approvals| !approvals.state().pending.contains_key(&id))
+            {
+                return;
+            }
             let sent = notifier.notify(&notification).await;
             let Some(approvals) = weak.upgrade() else {
                 return;
@@ -1307,22 +1355,37 @@ impl Approvals {
     }
 }
 
-/// Text of the Touch ID prompt: the call, the client and a summary of the
-/// arguments, since a fingerprint approves without the page
+/// Text of the Touch ID prompt: the call, what a fingerprint grants, and
+/// who asks and why
 ///
 /// Unlike the phone notification, which crosses the ntfy server, the prompt
-/// stays on the Mac, so it may show arguments
+/// stays on the Mac, so it may carry the agent's thread title and reason
 fn touch_id_reason(info: &ApprovalInfo) -> String {
-    let details = match &info.summary {
-        Some(summary) => Some(summary.clone()),
-        None if info.arguments.is_empty() => None,
-        None => Some(summarize_arguments(&info.arguments)),
+    let client = info.caller.client_label();
+    let grant = match info.fingerprint_choice() {
+        Choice::Session(length) => {
+            format!(
+                "and all {} tools not marked per-call, for {} min",
+                info.server,
+                length.as_secs() / 60
+            )
+        }
+        Choice::Client(length) => format!(
+            "and all {} tools not marked per-call, for {} min in every session of this client",
+            info.server,
+            length.as_secs() / 60
+        ),
+        Choice::Once | Choice::Deny => "once".to_owned(),
     };
 
     prompt_text(
         &info.waiting_for(),
-        info.caller.client_label(),
-        details.as_deref(),
+        &grant,
+        Asker {
+            client,
+            thread: info.caller.thread.as_deref(),
+            reason: info.caller.reason.as_deref(),
+        },
     )
 }
 

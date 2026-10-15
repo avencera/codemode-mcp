@@ -73,21 +73,22 @@ codemode-mcp passkey enroll --label iPhone
 ## Approve at the Mac
 
 While you are at the Mac (screen unlocked, input in the last 5 minutes), a tool call waiting for approval shows
-a Touch ID prompt there instead of buzzing the phone:
+a Touch ID prompt there instead of buzzing the phone. It names the tool, what a touch grants, the client, and
+the thread title and reason the agent passed to `execute`; those two are the agent's own words, shown in quotes.
 
-- Touch the sensor to approve that one call. The prompt names the tool, the agent and a summary of the
-  arguments; press **Review…** to see them in full. Give a tool its own line with a `summary` template, such as
-  `tools.send_message.summary = "send to {to}: {subject}"`; arguments the template leaves out are still named
-  after it, as `(also bcc)`.
-- Press **Review…** to open the approval page in the browser, for a 15 or 60 minute grant, or to deny. The
-  page takes your passkey, which Touch ID unlocks if it syncs to this Mac through iCloud Keychain or a password
-  manager; otherwise enroll one here with `codemode-mcp passkey enroll --label mac`.
-- Leave it, and after 60 seconds the phone is told too (60 seconds after **Review…** if you opened the page).
-  Locking the screen sends it to the phone at once.
+- Touch the sensor to approve the call and every tool of that server not marked `grant = "per_call"` for 60
+  minutes in the agent's session. Mark writes you want asked every time, such as calendar deletes,
+  `per_call`. A tool with `grant = "per_call"`, such as a
+  1Password write, is approved for that one call only, and the prompt says `once`.
+- Press **Open Page** to open the approval page in the browser, for a single call, 15 minutes, or to deny. The
+  page takes your passkey.
+- Leave it, and after 60 seconds the phone is told too (60 seconds after **Open Page** if you opened the page).
+  Locking the screen or walking away (no input for 5 minutes) sends it to the phone within a couple of seconds.
 
 Passkey enrollment and removal requests never offer Touch ID: they show a Mac notification and notify the
 phone at once. On a Mac without Touch ID the prompt is replaced by a notification that opens the page, which
 needs `terminal-notifier` (`brew install terminal-notifier`); allow its notifications the first time macOS asks.
+On the phone nothing changes: the page shows everything, and you choose and confirm with the passkey.
 
 ```toml
 [notify.mac]

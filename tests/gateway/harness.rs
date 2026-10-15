@@ -263,6 +263,8 @@ pub struct FakeMac {
     present: std::sync::atomic::AtomicBool,
     /// `None` leaves the prompt up until it is taken down
     answer: Mutex<Option<TouchId>>,
+    /// How long a prompt stays up before it answers
+    answer_after: Mutex<Duration>,
     shown: Mutex<Vec<String>>,
 }
 
@@ -278,6 +280,13 @@ impl FakeMac {
     pub fn set_answer(&self, answer: Option<TouchId>) {
         if let Ok(mut slot) = self.answer.lock() {
             *slot = answer;
+        }
+    }
+
+    /// How long later prompts stay up before answering
+    pub fn set_answer_after(&self, delay: Duration) {
+        if let Ok(mut slot) = self.answer_after.lock() {
+            *slot = delay;
         }
     }
 
@@ -316,11 +325,17 @@ impl Mac for FakeMac {
     fn touch_id<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, TouchId> {
         self.record(format!("touch_id {reason}"));
         let answer = self.answer.lock().ok().and_then(|answer| *answer);
+        let delay = self
+            .answer_after
+            .lock()
+            .map(|delay| *delay)
+            .unwrap_or_default();
 
         Box::pin(async move {
             let prompt = Prompt(self);
             match answer {
                 Some(answer) => {
+                    tokio::time::sleep(delay).await;
                     std::mem::forget(prompt);
 
                     answer

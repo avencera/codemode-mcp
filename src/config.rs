@@ -12,7 +12,6 @@ use serde::Deserialize;
 use crate::{
     policy::{GrantMode, Policy},
     stubs::is_brand_name,
-    summary::Template,
 };
 
 /// Origin the approval and enrollment pages are reached through; its host is
@@ -321,10 +320,10 @@ impl Default for NotifyConfig {
 
 /// How requests reach the owner while they are at the Mac
 ///
-/// A request made while the screen is unlocked and recently used shows a
-/// notification on the Mac, and for a tool call a Touch ID prompt, before
-/// the phone is told; one made while the owner is away goes to the phone
-/// at once
+/// A tool call made while the screen is unlocked and recently used shows a
+/// Touch ID prompt on the Mac before the phone is told, and an admin
+/// request shows a notification there; one made while the owner is away
+/// goes to the phone at once
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MacConfig {
@@ -335,7 +334,9 @@ pub struct MacConfig {
     pub idle_secs: u64,
     /// Seconds a request may wait on the Mac before the phone is told too
     pub escalate_after_secs: u64,
-    /// Whether a tool call shows a Touch ID prompt that approves it once
+    /// Whether a tool call shows a Touch ID prompt, whose fingerprint
+    /// approves it for 60 minutes; off shows a notification that opens the
+    /// page
     pub touch_id: bool,
 }
 
@@ -682,11 +683,6 @@ pub struct ToolOverride {
     /// tool that produces the value
     #[serde(default)]
     pub param_types: BTreeMap<String, String>,
-    /// One line shown in the Touch ID prompt for this tool, with `{name}`
-    /// placeholders filled from the call's arguments, such as
-    /// `send to {to}: {subject}`; arguments it leaves out are still named
-    #[serde(default)]
-    pub summary: Option<String>,
 }
 
 /// How a tool's result is handed to scripts when the config overrides the default
@@ -710,11 +706,6 @@ impl ToolOverride {
             return Err(ConfigError::Invalid(format!(
                 "{at}: `force_output_schema` needs `output_schema`"
             )));
-        }
-        if let Some(summary) = &self.summary
-            && let Err(error) = Template::parse(summary)
-        {
-            return Err(ConfigError::Invalid(format!("{at}: `summary`: {error}")));
         }
         for (param, brand) in &self.param_types {
             if !is_brand_name(brand) {

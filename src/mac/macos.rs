@@ -30,7 +30,7 @@ const TERMINAL_NOTIFIER: [&str; 2] = [
 /// `kCGAnyInputEventType`: the most recent input of any kind
 const ANY_INPUT: CGEventType = CGEventType(u32::MAX);
 /// Cancel button of the Touch ID prompt; pressing it opens the approval page
-const REVIEW_TITLE: &str = "Review…";
+const REVIEW_TITLE: &str = "Open Page";
 /// Pause after a prompt closes before the next queued one may show
 const PROMPT_GAP: Duration = Duration::from_secs(1);
 

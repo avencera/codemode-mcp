@@ -95,22 +95,23 @@ idempotent. `tools/list_changed` refreshes the catalog
   Arguments never go into the notification
 - While the owner is at the Mac (screen unlocked, keyboard or mouse input within `notify.mac.idle_secs`, 300;
   read through CoreGraphics), a tool call is asked there first and the ntfy push waits
-  `notify.mac.escalate_after_secs` (60), going out only if the request is still pending. The Mac shows a Touch ID
-  prompt (LocalAuthentication, biometrics only, no password fallback) naming the call, the client and a summary of
-  the arguments built from their values (short values whole, long strings cut with their length, lists and
-  objects by size and keys; never model-written), or a tool's own `summary` template (`{name}` placeholders
-  filled the same way, then `(also …)` naming every argument it left out, passed as `null` or cut off by the
-  300-character limit, so a template cannot hide one; checked when the config loads). Agent-chosen text (client
-  label, argument names and values) is quoted with quotes escaped, and line breaks, Unicode line separators,
-  invisible and direction-changing characters are replaced, so none of it can pass for prompt text, which approves the call once; its other button, "Review…", opens the
-  approval page in the default browser for grants or Deny and starts the push delay over. A prompt the system
-  takes down (the screen locked) sends the push at once, and one still up when the request is decided elsewhere
-  is taken down. Prompts show one at a time, a second apart however the previous one ended (answered, or taken down because
-  the request was decided elsewhere), so a touch meant for one cannot land on the next. Without Touch ID (no sensor, none enrolled, `notify.mac.touch_id = false`) the
-  Mac shows a notification through `terminal-notifier` whose click opens the page. Presence only picks where the
-  request appears first: approval still takes a fingerprint or a passkey assertion. Admin requests never offer
-  Touch ID; on the Mac they show the notification and the push goes out at once. `notify.mac.enabled = false`
-  asks on the phone only
+  `notify.mac.escalate_after_secs` (60), going out only if the request is still pending. Presence is checked
+  again every 2 seconds while it waits, so a locked screen or an idle owner sends the push at once. The Mac
+  shows a Touch ID prompt (LocalAuthentication, biometrics only, no password fallback) naming the call, what a
+  fingerprint grants, the client, and the `thread` and `reason` the agent passed to `execute` (optional, cut at
+  60 and 160 characters, persisted with the request but never logged). The fingerprint approves with the
+  longest grant of the narrowest kind allowed: a 60 minute session grant, else a 60 minute client grant, else
+  once, so `per_call` tools are approved once. Agent-chosen text (client name, thread, reason) is quoted with
+  quotes escaped, and line breaks, Unicode line separators, invisible and direction-changing characters are
+  replaced, so none of it can pass for the daemon's own wording; the tool and grant come from the daemon. The
+  prompt's other button, "Open Page", opens the approval page in the default browser for other choices and
+  starts the push delay over. A prompt the system takes down (the screen locked) sends the push at once, and
+  one still up when the request is decided elsewhere is taken down. Prompts show one at a time, a second apart
+  however the previous one ended, so a touch meant for one cannot land on the next. Without Touch ID (no
+  sensor, none enrolled, `notify.mac.touch_id = false`) the Mac shows a notification through
+  `terminal-notifier` whose click opens the page. Presence only picks where the request appears first:
+  approval still takes a fingerprint or a passkey assertion. Admin requests never offer Touch ID; on the Mac
+  they show the notification and the push goes out at once. `notify.mac.enabled = false` asks on the phone only
 - `GET /approve/{id}` (server-rendered, mobile layout, all agent-supplied text escaped, strict CSP) shows the
   client, `server.tool`, pretty-printed arguments, the script and the time left. Buttons: Approve once;
   "Approve this session for 15 / 60 min" (only for `session` tools; every MCP call has a session) and, for a
@@ -238,7 +239,7 @@ notification counts as activity
 |---|---|
 | `search_tools(query, limit?)` | ranked tool paths with one-line descriptions |
 | `describe_tools(paths)` | Python stubs for the chosen tools |
-| `execute(code)` | type-check and run; waits up to a short budget, then returns `{status: "pending", execution_id, approval_url?, waiting_for?}` |
+| `execute(code, session?, thread?, reason?)` | type-check and run; `thread` and `reason` are shown when a tool needs approval; waits up to a short budget, then returns `{status: "pending", execution_id, approval_url?, waiting_for?}` |
 | `wait(execution_id)` | waits again for a pending execution and returns its result or the same pending shape |
 
 The short `execute` wait keeps calls under agent MCP timeouts. Codex
@@ -372,10 +373,11 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 
 ### Threat model
 
-- Trusted: the owner, the phone holding the passkey, the Mac's Touch ID sensor, the Mac's user account
+- Trusted: the owner, the devices holding the passkey, the Mac's Touch ID sensor, the Mac's user account
 - Defended against:
   - agents limited to MCP tools: they reach tools only through `execute`, and `ask` tools wait for a passkey
-    assertion on the phone or a fingerprint on the Mac's Touch ID sensor
+    assertion or a fingerprint on the Mac's Touch ID sensor. The thread and reason in the prompt are the
+    agent's words; a misleading one cannot change the tool or grant it names
   - confused agents with a shell: the CLI cannot approve anything. Enrolling a second passkey or removing one
     needs an existing passkey's approval, and every such request is announced on the phone. A first passkey
     can still be enrolled from the CLI while none exists

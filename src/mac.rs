@@ -26,7 +26,7 @@ pub enum TouchId {
     /// The owner's fingerprint matched
     Approved,
     /// The owner pressed the prompt's other button to read the request on
-    /// the approval page first
+    /// the approval page, for another choice
     Review,
     /// The prompt was taken down by the system, for example because the
     /// screen locked, so the owner is likely away

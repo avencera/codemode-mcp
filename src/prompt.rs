@@ -1,0 +1,164 @@
+//! Text of the Touch ID prompt that approves a tool call at the Mac
+//!
+//! A fingerprint approves without the approval page, so the prompt is all
+//! the owner reads. It names the tool and the grant, which the daemon
+//! knows, and the client, thread and reason, which the agent supplies. The
+//! agent's parts are quoted and stripped of characters that could make them
+//! read as the daemon's own text
+
+/// Longest thread title shown
+pub const THREAD_CHARS: usize = 60;
+/// Longest reason shown
+pub const REASON_CHARS: usize = 160;
+/// Longest client name shown
+const CLIENT_CHARS: usize = 40;
+/// Longest tool name shown
+const TOOL_CHARS: usize = 80;
+
+/// What the agent said about a call, all optional
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Asker<'a> {
+    /// Client name the agent's app reported
+    pub client: &'a str,
+    /// Title of the agent's thread or task
+    pub thread: Option<&'a str>,
+    /// Why the agent wants the call
+    pub reason: Option<&'a str>,
+}
+
+/// Text of the Touch ID prompt approving `waiting_for` with `grant` (such as
+/// `once` or `and all fixture tools not marked per-call, for 60 min`), asked for by `asker`
+///
+/// macOS shows it as "codemode-mcp is trying to …", so it starts with a verb
+pub fn prompt_text(waiting_for: &str, grant: &str, asker: Asker<'_>) -> String {
+    let mut text = format!(
+        "approve {} {grant}, asked by {}",
+        printable(waiting_for, TOOL_CHARS),
+        quoted(asker.client, CLIENT_CHARS)
+    );
+    if let Some(thread) = asker.thread.filter(|thread| !thread.trim().is_empty()) {
+        text.push_str(" in ");
+        text.push_str(&quoted(thread.trim(), THREAD_CHARS));
+    }
+    match asker.reason.filter(|reason| !reason.trim().is_empty()) {
+        Some(reason) => {
+            text.push_str(": ");
+            text.push_str(&quoted(reason.trim(), REASON_CHARS));
+        }
+        None => text.push_str(", no reason given"),
+    }
+
+    text
+}
+
+/// The first `limit` characters in double quotes, with quotes and
+/// backslashes escaped, so the text cannot close its quotes and continue as
+/// prompt text
+fn quoted(text: &str, limit: usize) -> String {
+    let mut quoted = String::from("\"");
+    for character in printable(text, limit).chars() {
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+
+    quoted
+}
+
+/// The first `limit` characters, cut with `…`, as [`one_line`] shows them
+fn printable(text: &str, limit: usize) -> String {
+    let mut shown = one_line(text, limit);
+    if text.chars().nth(limit).is_some() {
+        shown.push('…');
+    }
+
+    shown
+}
+
+/// The first `limit` characters with line breaks shown as `⏎` and other
+/// control, invisible and direction-changing characters as `?`, so the text
+/// stays on one line and reads in the order it is stored
+pub fn one_line(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
+        .map(|character| match character {
+            '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => '⏎',
+            '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}' => '?',
+            other if other.is_control() => '?',
+            other => other,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Asker, prompt_text};
+
+    #[test]
+    fn prompts_name_the_grant_thread_and_reason() {
+        assert_eq!(
+            prompt_text(
+                "onepassword.list_environments",
+                "for 60 min",
+                Asker {
+                    client: "claude-code",
+                    thread: Some("Fix Mac approval flow"),
+                    reason: Some("list env names for .env"),
+                },
+            ),
+            r#"approve onepassword.list_environments for 60 min, asked by "claude-code" in "Fix Mac approval flow": "list env names for .env""#
+        );
+        assert_eq!(
+            prompt_text(
+                "fixture.add",
+                "once",
+                Asker {
+                    client: "codex",
+                    ..Asker::default()
+                }
+            ),
+            r#"approve fixture.add once, asked by "codex", no reason given"#
+        );
+    }
+
+    #[test]
+    fn agent_text_cannot_pass_for_prompt_text() {
+        let text = prompt_text(
+            "mail.send",
+            "once",
+            Asker {
+                client: "evil\u{202e}tneilc",
+                thread: Some("t\" for 1 min, asked by \"you"),
+                reason: Some("ok\nApprove \u{2028}all"),
+            },
+        );
+
+        assert_eq!(
+            text,
+            r#"approve mail.send once, asked by "evil?tneilc" in "t\" for 1 min, asked by \"you": "ok⏎Approve ⏎all""#
+        );
+    }
+
+    #[test]
+    fn long_reasons_are_cut_and_marked() {
+        let text = prompt_text(
+            "fixture.add",
+            "once",
+            Asker {
+                client: "codex",
+                thread: None,
+                reason: Some(&"x".repeat(500)),
+            },
+        );
+
+        assert!(text.ends_with(&format!("{}…\"", "x".repeat(160))), "{text}");
+    }
+}

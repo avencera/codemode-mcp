@@ -230,6 +230,14 @@ pub struct Caller {
     /// (loopback peer, no proxy headers); only such callers may hold client
     /// grants, because the client name is self-asserted
     pub local: bool,
+    /// Title of the agent's thread or task, as the agent gave it to
+    /// `execute`; shown when asking for approval and not logged
+    #[serde(default)]
+    pub thread: Option<String>,
+    /// Why the agent ran the script, as it gave it to `execute`; shown when
+    /// asking for approval and not logged
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl Caller {

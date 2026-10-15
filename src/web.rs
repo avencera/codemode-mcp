@@ -96,6 +96,8 @@ body {{ margin: 0; padding: env(safe-area-inset-top) 16px 32px; max-width: 720px
 h1 {{ font-size: 1.35rem; margin: 20px 0 8px; overflow-wrap: anywhere; }}
 h2 {{ font-size: 1rem; margin: 20px 0 6px; }}
 .meta {{ color: #777; font-size: .9rem; overflow-wrap: anywhere; }}
+.asked {{ overflow-wrap: anywhere; }}
+.asked small {{ color: #777; }}
 pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 10px; overflow-x: auto; font-size: .85rem; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .buttons {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 16px; }}
 button {{ font-size: 1.1rem; padding: 14px; border-radius: 14px; border: 0; font-weight: 600; min-height: 52px; grid-column: 1 / -1; }}
@@ -255,12 +257,12 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         GrantMode::Session => {
             if info.session_grant_allowed() {
                 notes.push(
-                    "A session approval covers this server's read tools for later calls that carry the same session, and for no other session or client.",
+                    "A session approval covers every tool of this server not marked per-call, for later calls that carry the same session, and for no other session or client.",
                 );
             }
             if info.client_grant_allowed() {
                 notes.push(
-                    "A client approval covers this server's read tools for every running session of that client, because this call passed no session.",
+                    "A client approval covers every tool of this server not marked per-call, for every running session of that client, because this call passed no session.",
                 );
             } else if !info.caller.local {
                 notes.push(
@@ -284,9 +286,26 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         info.caller.client_label(),
         info.waiting_for()
     );
+    // the agent's own words, so they are labelled as such
+    let mut asked = Vec::new();
+    if let Some(thread) = &info.caller.thread {
+        asked.push(format!("Thread: {}", escape(thread)));
+    }
+    if let Some(reason) = &info.caller.reason {
+        asked.push(format!("Reason: {}", escape(reason)));
+    }
+    let asked = if asked.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="asked">{}<br><small>As the agent describes it</small></p>"#,
+            asked.join("<br>")
+        )
+    };
     let body = format!(
         r#"<main data-kind="approve" data-base="/approve/{id}">
 <h1>{title}</h1>
+{asked}
 <p class="meta">Client {client} {version}{session}<br>Execution {execution}</p>
 <p class="meta countdown">Denied automatically in <span id="left" data-seconds="{left}">{left_text}</span>.</p>
 <div class="buttons">
