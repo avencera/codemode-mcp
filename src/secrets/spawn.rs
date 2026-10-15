@@ -35,7 +35,7 @@ pub(super) async fn output(program: &str, args: &[&str]) -> io::Result<Output> {
 #[cfg(target_os = "macos")]
 mod macos {
     use std::{
-        ffi::{CString, c_char, c_int},
+        ffi::{CString, c_char, c_int, c_void},
         io,
         os::{
             fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -43,7 +43,7 @@ mod macos {
         },
         process::{ExitStatus, Output},
         ptr,
-        sync::{Arc, Mutex, PoisonError},
+        sync::{Arc, Mutex, OnceLock, PoisonError},
     };
 
     use tokio::{io::AsyncReadExt, net::unix::pipe};
@@ -79,16 +79,38 @@ mod macos {
         })
     }
 
+    /// `pipe2`'s signature
+    type Pipe2 = unsafe extern "C" fn(*mut c_int, c_int) -> c_int;
+
+    /// `pipe2`, which macOS has from 27 on; looked up at run time, since
+    /// linking it would stop the binary from loading on older releases
+    fn pipe2() -> Option<Pipe2> {
+        static PIPE2: OnceLock<Option<Pipe2>> = OnceLock::new();
+
+        *PIPE2.get_or_init(|| {
+            // SAFETY: the name is NUL-terminated
+            let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"pipe2".as_ptr()) };
+            // SAFETY: libsystem's `pipe2` has this signature
+            (!symbol.is_null())
+                .then(|| unsafe { std::mem::transmute::<*mut c_void, Pipe2>(symbol) })
+        })
+    }
+
     /// A pipe whose ends are close-on-exec and above stdio
     ///
-    /// macOS has no `pipe2`, so a child another thread starts between `pipe`
-    /// and `fcntl` can inherit an end and hold the read open past `op`'s
-    /// exit, until the read times out. std creates its own pipes the same
-    /// way, so every child the daemon starts shares that window
+    /// With `pipe2` both ends are created close-on-exec. Before macOS 27, a
+    /// child another thread starts between `pipe` and `fcntl` can inherit an
+    /// end and hold the read open past `op`'s exit, until the read times
+    /// out; std creates its own pipes the same way there, so every child
+    /// the daemon starts shares that window
     fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         let mut fds = [0; 2];
-        // SAFETY: `fds` has room for the two descriptors `pipe` writes
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        // SAFETY: `fds` has room for the two descriptors either call writes
+        let code = match pipe2() {
+            Some(pipe2) => unsafe { pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            None => unsafe { libc::pipe(fds.as_mut_ptr()) },
+        };
+        if code == -1 {
             return Err(io::Error::last_os_error());
         }
 
