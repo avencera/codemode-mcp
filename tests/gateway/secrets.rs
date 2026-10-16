@@ -532,3 +532,53 @@ async fn a_url_key_too_short_to_redact_is_refused() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_url_key_that_breaks_the_rules_is_a_configuration_error() -> TestResult {
+    let (op, _) = fake_op()?;
+    // the fake `op` answers this reference with a 15-byte value
+    let extra = format!(
+        "[secrets]\n\
+         op = \"{op}\"\n\n\
+         [servers.short]\n\
+         url = \"http://127.0.0.1:9/mcp/{{{{ op://Dev/shortkey/credential }}}}/rpc\"\n",
+        op = op.display(),
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // 1Password answered, so this is not a locked prompt to unlock
+    let mut short = Value::Null;
+    for _ in 0..40 {
+        let health: Value = harness
+            .http
+            .get(format!("{}/healthz", harness.base()))
+            .send()
+            .await?
+            .json()
+            .await?;
+        short = health["upstreams"]
+            .as_array()
+            .and_then(|upstreams| {
+                upstreams
+                    .iter()
+                    .find(|upstream| upstream["name"] == "short")
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        if short["state"] == "unavailable" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(short["state"], "unavailable", "{short}");
+    assert_eq!(short["error"], "configuration", "{short}");
+
+    harness.stop().await
+}

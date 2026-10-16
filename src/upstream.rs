@@ -87,6 +87,10 @@ pub enum UpstreamError {
     /// The `url` is not a URL once its references are read
     #[error("the url is not valid once its references are read")]
     Url,
+    /// A value read for a `url` reference is one codemode cannot keep out of
+    /// sight: too short, or with characters outside the allowed set
+    #[error("url: {0}")]
+    UrlValue(String),
     /// The MCP handshake failed
     #[error("initialize failed: {0}")]
     Initialize(String),
@@ -143,7 +147,7 @@ impl UpstreamError {
         match self {
             Self::Unavailable { category, .. } => *category,
             Self::Spawn { .. } => ErrorCategory::Spawn,
-            Self::Header(_) | Self::Url => ErrorCategory::Configuration,
+            Self::Header(_) | Self::Url | Self::UrlValue(_) => ErrorCategory::Configuration,
             Self::Secret(_) => ErrorCategory::Secret,
             Self::Initialize(_) => ErrorCategory::Initialize,
             Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
@@ -178,6 +182,7 @@ impl UpstreamError {
             Self::Spawn { .. }
             | Self::Header(_)
             | Self::Url
+            | Self::UrlValue(_)
             | Self::Secret(_)
             | Self::Initialize(_)
             | Self::OAuth(_)
@@ -971,6 +976,12 @@ impl Upstream {
     async fn resolved(&self) -> Result<Resolved, UpstreamError> {
         let secret = |error: crate::secrets::SecretError| match error {
             crate::secrets::SecretError::NotAUrl => UpstreamError::Url,
+            // 1Password answered; the value itself breaks the url rules, which
+            // no retry or unlock fixes
+            error @ (crate::secrets::SecretError::UrlValueTooShort
+            | crate::secrets::SecretError::UrlValueUnprotectable) => {
+                UpstreamError::UrlValue(error.to_string())
+            }
             error => UpstreamError::Secret(error.to_string()),
         };
         let url = match &self.config.url {
