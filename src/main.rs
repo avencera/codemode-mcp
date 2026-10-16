@@ -241,6 +241,27 @@ enum CompanionCommand {
         /// An op://vault/item/field reference
         reference: String,
     },
+    /// On the gateway Mac: have a companion Mac create a 1Password item from
+    /// the secret on stdin; it asks Touch ID there and never edits or
+    /// deletes an item
+    Create {
+        /// Vault to create the item in; the companion must list it under
+        /// `create_vaults`
+        #[arg(long)]
+        vault: String,
+        /// Title of the new item; the companion refuses a title in use
+        #[arg(long)]
+        title: String,
+        /// 1Password category
+        #[arg(long, default_value = companion::wire::DEFAULT_CATEGORY)]
+        category: String,
+        /// Label of the field that holds the secret
+        #[arg(long, default_value = companion::wire::DEFAULT_FIELD)]
+        field: String,
+        /// Companion to ask; needed when several are listed
+        #[arg(long)]
+        companion: Option<String>,
+    },
     /// Print this Mac's companion endpoint id, creating its key if needed
     Id {
         /// Read the key from this file instead of the login keychain
@@ -522,6 +543,39 @@ async fn service_command(
     Ok(())
 }
 
+/// The secret on stdin, minus one trailing newline; empty input is refused
+/// and the text of the secret appears in no message
+fn read_secret_from_stdin() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        bail!("pipe the secret in on stdin, e.g. `pbpaste | codemode-mcp companion create ...`");
+    }
+
+    // escaping only grows a value, so anything longer than the escaped limit
+    // is refused without reading the rest of an endless pipe
+    let limit = codemode_mcp::secrets::MAX_ITEM_VALUE_JSON_BYTES;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .wrap_err("cannot read the secret from stdin")?;
+    if bytes.len() > limit {
+        bail!("the secret on stdin is over {} KiB", limit / 1024);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| eyre!("the secret on stdin is not UTF-8"))?;
+    let value = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    if value.is_empty() {
+        bail!(
+            "nothing on stdin; pipe the secret in, e.g. `pbpaste | codemode-mcp companion create ...`"
+        );
+    }
+
+    Ok(value.to_owned())
+}
+
 async fn companion_command(
     path: &std::path::Path,
     explicit_config: Option<&std::path::Path>,
@@ -584,6 +638,64 @@ async fn companion_command(
             }
             if failed {
                 std::process::exit(1);
+            }
+        }
+        CompanionCommand::Create {
+            vault,
+            title,
+            category,
+            field,
+            companion,
+        } => {
+            let value = read_secret_from_stdin()?;
+            let config = load_or_default(path)?;
+            println!(
+                "Asking the companion to create \"{title}\" in {vault}. Touch ID is asked on its \
+                 Mac; approve there."
+            );
+            let response: admin::CompanionCreateResponse = admin_post_as_owner(
+                &config,
+                "/admin/companion/create",
+                &admin::CompanionCreateRequest {
+                    companion,
+                    item: companion::NewItem {
+                        vault,
+                        title,
+                        category: Some(category),
+                        field: Some(field),
+                        value,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| {
+                if may_have_reached_daemon(&error) {
+                    error.wrap_err(
+                        "the daemon did not answer, so the item may have been created; check the \
+                         vault in 1Password before trying again",
+                    )
+                } else {
+                    error
+                }
+            })?;
+
+            match response {
+                admin::CompanionCreateResponse::Created {
+                    companion,
+                    id,
+                    reference,
+                } => println!("{companion} created the item {id}\nreference: {reference}"),
+                admin::CompanionCreateResponse::Refused { message } => {
+                    eprintln!("Nothing was created: {message}");
+                    std::process::exit(1);
+                }
+                admin::CompanionCreateResponse::Unconfirmed { message } => {
+                    eprintln!(
+                        "The item may have been created: {message}\nCheck the vault in \
+                         1Password before trying again."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         CompanionCommand::Id { identity_file } => {
@@ -1676,6 +1788,17 @@ async fn admin_post_as_owner<T: serde::de::DeserializeOwned>(
     admin_request(config, path, body, Some(&proof)).await
 }
 
+/// Whether a failed admin request got far enough that the daemon may have
+/// acted on it: a timeout or a connection lost after connecting, as opposed
+/// to a refused connection
+fn may_have_reached_daemon(error: &color_eyre::Report) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| !error.is_connect() && !error.is_builder())
+    })
+}
+
 async fn admin_request<T: serde::de::DeserializeOwned>(
     config: &Config,
     path: &str,
@@ -1683,7 +1806,13 @@ async fn admin_request<T: serde::de::DeserializeOwned>(
     owner_proof: Option<&str>,
 ) -> Result<T> {
     let url = format!("http://{}{path}", config.admin_listen);
-    let mut request = reqwest::Client::new()
+    // no_proxy: the body can hold a secret and the proof is bound to this
+    // route, and the daemon is always on this machine, so an HTTP(S)_PROXY or
+    // ALL_PROXY in the environment must not see either. Every admin call
+    // goes through here
+    let mut request = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
         .post(&url)
         .timeout(ADMIN_TIMEOUT)
         .json(body);

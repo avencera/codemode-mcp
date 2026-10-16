@@ -583,6 +583,10 @@ pub struct CompanionConfig {
     /// The references this companion may read, matched exactly
     #[serde(default)]
     pub allow: Vec<String>,
+    /// The vaults this companion creates items in for the gateway; empty, it
+    /// creates none. Items are only ever created, never edited or deleted
+    #[serde(default)]
+    pub create_vaults: Vec<String>,
     /// Fixed address to bind instead of a random port
     #[serde(default)]
     pub listen: Option<SocketAddr>,
@@ -614,8 +618,22 @@ impl CompanionConfig {
                 ));
             }
         }
+        for vault in &self.create_vaults {
+            if !crate::secrets::is_item_name(vault) {
+                return Err(ConfigError::Invalid(
+                    "companion.create_vaults entries must be vault names: ASCII letters, \
+                     digits, spaces, `-`, `_` or `.`, no leading `-`, no leading or trailing space"
+                        .into(),
+                ));
+            }
+        }
 
         Ok(())
+    }
+
+    /// Whether items may be created in `vault`, matched exactly
+    pub fn allows_create(&self, vault: &str) -> bool {
+        self.create_vaults.iter().any(|allowed| allowed == vault)
     }
 
     /// Whether `reference` is on the allow list; both sides are trimmed

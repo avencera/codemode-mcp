@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::{
     harness::{FakeMac, Harness, Setup, TestResult, temp_state_dir},
-    secrets::{VALUE, fake_op, reads, signed_out_op},
+    secrets::{VALUE, fake_op, reads},
     service::{codemode, files},
 };
 
@@ -39,6 +39,8 @@ struct Rig {
 struct Options<'a> {
     /// The companion's allow list
     allow: &'a [&'a str],
+    /// The vaults the companion creates items in
+    create_vaults: &'a [&'a str],
     /// Whether the companion expects this gateway's id
     paired: bool,
     /// How the companion's Touch ID prompt ends; `None` leaves it up
@@ -57,12 +59,15 @@ struct Options<'a> {
     /// Whether another `op` on the companion's Mac is approved each time a
     /// notification shows, so its `op` is no longer signed out
     authorized_on_notify: bool,
+    /// Whether the companion's `op item create` pauses, so its answer can be lost
+    slow_create: bool,
 }
 
 impl Default for Options<'_> {
     fn default() -> Self {
         Self {
             allow: &[REFERENCE],
+            create_vaults: &["Personal"],
             paired: true,
             touch: Some(TouchId::Approved),
             present: false,
@@ -71,6 +76,7 @@ impl Default for Options<'_> {
             signed_in: true,
             notify_fails: false,
             authorized_on_notify: false,
+            slow_create: false,
         }
     }
 }
@@ -79,6 +85,7 @@ impl Rig {
     async fn start(options: Options<'_>) -> Result<Option<Self>, Box<dyn Error>> {
         let Options {
             allow,
+            create_vaults,
             paired,
             touch,
             present,
@@ -87,6 +94,7 @@ impl Rig {
             signed_in,
             notify_fails,
             authorized_on_notify,
+            slow_create,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -98,11 +106,7 @@ impl Rig {
             iroh::SecretKey::generate().public()
         };
 
-        let (companion_op, companion_log) = if signed_in {
-            fake_op()?
-        } else {
-            signed_out_op()?
-        };
+        let (companion_op, companion_log) = creating_op(signed_in, slow_create)?;
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
         companion_mac.set_notify_fails(notify_fails);
@@ -117,11 +121,13 @@ impl Rig {
              gateway = \"{expected}\"\n\
              gateway_name = \"main\"\n\
              allow = {allow}\n\
+             create_vaults = {create_vaults}\n\
              listen = \"127.0.0.1:0\"\n\
              discovery = false\n\
              identity_file = \"{key}\"\n\
              op = \"{op}\"\n",
             allow = serde_json::to_string(allow)?,
+            create_vaults = serde_json::to_string(create_vaults)?,
             key = directory.join("companion.key").display(),
             op = companion_op.display(),
         );
@@ -210,6 +216,357 @@ impl Rig {
 
         self.harness.stop().await
     }
+}
+
+/// What the fake `op` prints for a created item: like the real one, it
+/// echoes the value back
+const OP_ECHOED_VALUE: &str = "echoed-by-op-secret";
+
+/// A stand-in for `op` that serves the fixture read, lists one item titled
+/// `Existing` and creates items (answering without an id for one titled
+/// `No Id`, and killed by a signal for one titled `Killed`), logging each call's arguments and
+/// environment and the template it was given on stdin, beside `reads.log`
+///
+/// Unless `signed_in`, `whoami` fails until the first read, as if that read
+/// showed 1Password's prompt and was approved. With `slow_create`, `item
+/// create` pauses after reading its template
+fn creating_op(signed_in: bool, slow_create: bool) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let directory = temp_state_dir();
+    std::fs::create_dir_all(&directory)?;
+    let log = directory.join("reads.log");
+    let program = directory.join("op");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n\
+             d='{directory}'\n\
+             if [ \"$1\" = whoami ]; then\n\
+               [ -e \"$d/authorized\" ] && exit 0\n\
+               echo '[ERROR] account is not signed in' >&2; exit 1\n\
+             fi\n\
+             echo \"$*\" >> \"$d/argv.log\"\n\
+             env >> \"$d/env.log\"\n\
+             case \"$1 $2\" in\n\
+               'read --no-newline') echo \"$3\" >> \"$d/reads.log\"\n\
+                 touch \"$d/authorized\"\n\
+                 [ \"$3\" = {REFERENCE} ] && printf '{VALUE}' && exit 0\n\
+                 [ \"$3\" = op://Dev/big/credential ] && head -c 70000 /dev/zero | tr '\\0' a && exit 0\n\
+                 echo \"[ERROR] no item matched\" >&2; exit 1 ;;\n\
+               'item list') case \"$*\" in\n\
+                   *--include-archive*) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}},{{\"id\":\"old2\",\"title\":\"Archived\"}}]' ;;\n\
+                   *) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}}]' ;;\n\
+                 esac ;;\n\
+               'item create') cat > \"$d/stdin.log\"\n\
+                 grep -q '\"title\":\"No Id\"' \"$d/stdin.log\" && printf '{{}}' && exit 0\n\
+                 grep -q '\"title\":\"Killed\"' \"$d/stdin.log\" && kill -KILL $$\n\
+                 {pause}printf '{{\"id\":\"newid123\",\"fields\":[{{\"value\":\"{OP_ECHOED_VALUE}\"}}]}}' ;;\n\
+               *) exit 2 ;;\n\
+             esac\n",
+            directory = directory.display(),
+            pause = if slow_create { "sleep 5; " } else { "" },
+        ),
+    )?;
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+    if signed_in {
+        std::fs::write(directory.join("authorized"), "")?;
+    }
+
+    Ok((program, log))
+}
+
+/// A file the fake `op` wrote beside its read log, empty when it never ran
+fn op_file(log: &std::path::Path, name: &str) -> String {
+    std::fs::read_to_string(log.with_file_name(name)).unwrap_or_default()
+}
+
+/// Prompts the companion Mac showed for creates, apart from the read the
+/// gateway makes while booting
+fn created_prompts(rig: &Rig) -> Vec<String> {
+    rig.companion_mac
+        .shown()
+        .into_iter()
+        .filter(|prompt| prompt.contains("to create in"))
+        .collect()
+}
+
+const SECRET: &str = "zoho-mcp-url-secret-7f3a";
+
+async fn create(rig: &Rig, vault: &str, title: &str) -> Result<Value, Box<dyn Error>> {
+    let (status, body) = rig
+        .harness
+        .admin_json(
+            "/admin/companion/create",
+            &json!({ "vault": vault, "title": title, "value": SECRET }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.to_string().contains(SECRET), "{body}");
+    assert!(!body.to_string().contains(OP_ECHOED_VALUE), "{body}");
+
+    Ok(body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_companion_creates_an_item_with_the_value_only_on_stdin() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    let body = create(&rig, "Personal", "Zoho MCP infraops").await?;
+    assert_eq!(
+        body,
+        json!({ "created": {
+            "companion": "mba",
+            "id": "newid123",
+            "reference": "op://Personal/Zoho MCP infraops/credential",
+        } })
+    );
+    assert_eq!(
+        created_prompts(&rig),
+        ["touch_id codemode-mcp on main wants to create in Personal: \"Zoho MCP infraops\""]
+    );
+
+    // the template on stdin holds the value; nothing else `op` could see does
+    let template: Value = serde_json::from_str(&op_file(&rig.companion_log, "stdin.log"))?;
+    assert_eq!(template["title"], "Zoho MCP infraops");
+    assert_eq!(template["category"], "API_CREDENTIAL");
+    assert_eq!(template["fields"][0]["label"], "credential");
+    assert_eq!(template["fields"][0]["value"], SECRET);
+    let argv = op_file(&rig.companion_log, "argv.log");
+    assert!(
+        argv.contains("item create --vault Personal --format json -"),
+        "{argv}"
+    );
+    assert!(!argv.contains(SECRET), "{argv}");
+    assert!(!op_file(&rig.companion_log, "env.log").contains(SECRET));
+
+    // the gateway's own `op` was not involved: it logs only what it reads,
+    // and it never saw the item's arguments
+    assert!(
+        std::fs::read_to_string(&rig.local_log)
+            .unwrap_or_default()
+            .lines()
+            .all(|line| line == REFERENCE)
+    );
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vault_off_the_create_list_is_refused_before_anyone_is_asked() -> TestResult {
+    for create_vaults in [&[][..], &["Work"][..]] {
+        let Some(rig) = Rig::start(Options {
+            create_vaults,
+            ..Options::default()
+        })
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let body = create(&rig, "Personal", "Zoho MCP infraops").await?;
+        let message = body["refused"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("does not create items in Personal"),
+            "{body}"
+        );
+
+        assert!(created_prompts(&rig).is_empty());
+        assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
+
+        rig.stop().await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_needs_the_owner_proof() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    let response = rig
+        .harness
+        .http
+        .post(format!(
+            "{}/admin/companion/create",
+            rig.harness.admin_base()
+        ))
+        .json(&json!({ "vault": "Personal", "title": "Zoho", "value": SECRET }))
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 403);
+
+    assert!(created_prompts(&rig).is_empty());
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn names_that_are_not_plain_ascii_are_refused_before_anyone_is_asked() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    let names = [
+        "a/b",
+        "line\nbreak",
+        "-leading-dash",
+        "Bank?attribute=password",
+        "${HOME}",
+        "say \"hi\"",
+        "back\\slash",
+        " leading space",
+        "trailing space ",
+        // Cyrillic о, which looks like the Latin one
+        "Z\u{43e}ho",
+    ];
+    for name in names {
+        for (vault, title) in [("Personal", name), (name, "Zoho")] {
+            let body = create(&rig, vault, title).await?;
+            let message = body["refused"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains("ASCII letters"), "{name:?}: {body}");
+        }
+    }
+
+    assert!(created_prompts(&rig).is_empty());
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_existing_title_is_never_overwritten() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    // `Archived` is listed only when `--include-archive` is passed
+    for title in ["Existing", "existing", "Archived"] {
+        let body = create(&rig, "Personal", title).await?;
+        let message = body["refused"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("already exists"), "{body}");
+    }
+
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item create"));
+    assert!(op_file(&rig.companion_log, "stdin.log").is_empty());
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_touch_id_does_not_approve_writes_nothing() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        touch: Some(TouchId::Review),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let body = create(&rig, "Personal", "Zoho MCP infraops").await?;
+    let message = body["refused"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("not approved"), "{body}");
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_op_does_not_confirm_may_have_made_the_item() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    // `op` had the template each time, so the item may well be in the vault
+    // though no id came back
+    for (title, why) in [("No Id", "no item id"), ("Killed", "was stopped")] {
+        let body = create(&rig, "Personal", title).await?;
+        let message = body["unconfirmed"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(why), "{body}");
+        assert!(message.contains("may have been created"), "{body}");
+        assert!(body.get("refused").is_none(), "{body}");
+    }
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_too_long_to_send_is_refused_before_anyone_is_asked() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    // quotes double in JSON, so this is short as text but long once escaped
+    let value = "\"".repeat(20 * 1024);
+    let (status, body) = rig
+        .harness
+        .admin_json(
+            "/admin/companion/create",
+            &json!({ "vault": "Personal", "title": "Huge", "value": value }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let message = body["refused"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("too long"), "{body}");
+
+    assert!(created_prompts(&rig).is_empty());
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_loses_its_answer_may_have_made_the_item() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        slow_create: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let Rig {
+        harness,
+        companion,
+        companion_log: log,
+        ..
+    } = rig;
+    let asking = async {
+        let (status, body) = harness
+            .admin_json(
+                "/admin/companion/create",
+                &json!({ "vault": "Personal", "title": "Zoho MCP infraops", "value": SECRET }),
+            )
+            .await?;
+        assert_eq!(status, 200, "{body}");
+
+        Ok::<_, Box<dyn Error>>(body)
+    };
+    // the companion goes away once `op item create` has started, as a lost
+    // connection would
+    let stopping = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !op_file(&log, "argv.log").contains("item create") {
+            assert!(std::time::Instant::now() < deadline, "create never started");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // the hung-up connection is what matters; the detached create keeps
+        // the companion's accept task busy until its own deadline
+        let _ = tokio::time::timeout(Duration::from_secs(3), companion.shutdown()).await;
+    };
+    let (body, ()) = tokio::join!(asking, stopping);
+    let body = body?;
+
+    let message = body["unconfirmed"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("may have been created"), "{body}");
+    assert!(body.get("refused").is_none(), "{body}");
+
+    harness.stop().await
 }
 
 /// An `op` that logs the read, then its pid beside the log, then never

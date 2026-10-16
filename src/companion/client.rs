@@ -15,9 +15,10 @@ use tokio::{
 };
 
 use super::{
-    ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionRequest, CompanionResponse, Hangup,
-    IdentityError, MAX_BODY_BYTES, Role, apns::Apns, bind_endpoint, invite::Invites,
-    load_or_create, phone::Links,
+    ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
+    CompanionRequest, CompanionResponse, CreatedItem, Hangup, IdentityError, MALFORMED_REQUEST,
+    MAX_BODY_BYTES, NewItem, Role, apns::Apns, bind_endpoint, invite::Invites, load_or_create,
+    phone::Links,
 };
 use crate::{
     config::{CompanionPeer, PhonePeer, SecretsConfig},
@@ -65,6 +66,26 @@ pub enum CompanionFailure {
         /// Limit that elapsed
         timeout: Duration,
     },
+    /// The companion predates creating items
+    #[error("{name} does not support creating items; update codemode-mcp on that Mac")]
+    CreateUnsupported {
+        /// Companion name
+        name: String,
+    },
+    /// A create got no answer, so the item may exist
+    #[error(
+        "{name} gave no confirmation ({detail}); the item may have been created, check the vault \
+         in 1Password before trying again"
+    )]
+    CreateUnconfirmed {
+        /// Companion name
+        name: String,
+        /// What went wrong
+        detail: String,
+    },
+    /// No single companion could be picked to create an item
+    #[error("{0}")]
+    Choose(String),
     /// An invite could not be opened
     #[error("{0}")]
     Invite(String),
@@ -292,6 +313,140 @@ impl Companions {
         peer: &CompanionPeer,
         reference: &str,
     ) -> Result<String, CompanionFailure> {
+        let request = serde_json::to_vec(&CompanionRequest {
+            reference: reference.to_owned(),
+        })
+        .map_err(|error| CompanionFailure::Exchange {
+            name: peer.name.clone(),
+            detail: error.to_string(),
+        })?;
+        let body = self.send(peer, &request).await?;
+
+        match serde_json::from_slice(&body) {
+            Ok(CompanionResponse::Value(value)) => Ok(value),
+            Ok(CompanionResponse::Error(fault)) => Err(CompanionFailure::Refused {
+                code: fault.code,
+                message: fault.message,
+            }),
+            Err(error) => Err(CompanionFailure::Exchange {
+                name: peer.name.clone(),
+                detail: format!("malformed answer: {error}"),
+            }),
+        }
+    }
+
+    /// Asks the companion called `name`, or the only one when `name` is
+    /// `None`, to create `item`; returns that companion's name and the new
+    /// item, never the value
+    ///
+    /// Only Mac companions create items, and one that refuses (vault not
+    /// allowed, title taken, Touch ID not approved) leaves nothing behind.
+    /// The answer waits at most [`ASK_TIMEOUT`]
+    pub async fn create(
+        &self,
+        name: Option<&str>,
+        item: &NewItem,
+    ) -> Result<(String, CreatedItem), CompanionFailure> {
+        let peers = self.peers();
+        let peer = match (name, peers.as_slice()) {
+            (Some(name), _) => peers
+                .iter()
+                .find(|peer| peer.name == name)
+                .ok_or_else(|| CompanionFailure::Unknown(name.to_owned()))?,
+            (None, [only]) => only,
+            (None, []) => {
+                return Err(CompanionFailure::Choose(
+                    "no companion Mac is listed under [secrets]".to_owned(),
+                ));
+            }
+            (None, several) => {
+                let names: Vec<&str> = several.iter().map(|peer| peer.name.as_str()).collect();
+
+                return Err(CompanionFailure::Choose(format!(
+                    "several companions are listed ({}); name one with --companion",
+                    names.join(", ")
+                )));
+            }
+        };
+
+        let created = tokio::time::timeout(ASK_TIMEOUT, self.create_on(peer, item))
+            .await
+            .unwrap_or_else(|_| {
+                Err(CompanionFailure::TimedOut {
+                    name: peer.name.clone(),
+                    timeout: ASK_TIMEOUT,
+                })
+            })
+            // once the request is out, a timeout or a broken connection says
+            // nothing about whether the companion went on to write the item
+            .map_err(|failure| match failure {
+                CompanionFailure::TimedOut { name, timeout } => {
+                    CompanionFailure::CreateUnconfirmed {
+                        name,
+                        detail: format!("no answer within {timeout:?}"),
+                    }
+                }
+                CompanionFailure::Exchange { name, detail } => {
+                    CompanionFailure::CreateUnconfirmed { name, detail }
+                }
+                other => other,
+            })?;
+
+        Ok((peer.name.clone(), created))
+    }
+
+    async fn create_on(
+        &self,
+        peer: &CompanionPeer,
+        item: &NewItem,
+    ) -> Result<CreatedItem, CompanionFailure> {
+        let request = serde_json::to_vec(&CompanionCreateRequest {
+            create: item.clone(),
+        })
+        .map_err(|error| CompanionFailure::Exchange {
+            name: peer.name.clone(),
+            detail: error.to_string(),
+        })?;
+        let body = self.send(peer, &request).await?;
+
+        match serde_json::from_slice(&body) {
+            Ok(CompanionCreateResponse::Created(created)) => Ok(created),
+            // a companion from before creating existed cannot read the
+            // request and says so the way it says any unreadable request
+            Ok(CompanionCreateResponse::Error(fault))
+                if fault.code == CompanionErrorCode::NotAllowed
+                    && fault.message == MALFORMED_REQUEST =>
+            {
+                Err(CompanionFailure::CreateUnsupported {
+                    name: peer.name.clone(),
+                })
+            }
+            Ok(CompanionCreateResponse::Error(fault))
+                if fault.code == CompanionErrorCode::CreateUnconfirmed =>
+            {
+                Err(CompanionFailure::CreateUnconfirmed {
+                    name: peer.name.clone(),
+                    detail: fault.message,
+                })
+            }
+            Ok(CompanionCreateResponse::Error(fault)) => Err(CompanionFailure::Refused {
+                code: fault.code,
+                message: fault.message,
+            }),
+            Err(error) => Err(CompanionFailure::Exchange {
+                name: peer.name.clone(),
+                detail: format!("malformed answer: {error}"),
+            }),
+        }
+    }
+
+    /// Sends one request to `peer` on a new connection and returns the
+    /// unparsed answer
+    async fn send(
+        &self,
+        peer: &CompanionPeer,
+        request: &[u8],
+    ) -> Result<Vec<u8>, CompanionFailure> {
         let connect = |detail: String| CompanionFailure::Connect {
             name: peer.name.clone(),
             detail,
@@ -311,33 +466,20 @@ impl Companions {
                 .map_err(|error| connect(error.to_string()))?,
         );
 
-        let request = serde_json::to_vec(&CompanionRequest {
-            reference: reference.to_owned(),
-        })
-        .map_err(|error| exchange(error.to_string()))?;
         let (mut send, mut receive) = connection
             .0
             .open_bi()
             .await
             .map_err(|error| exchange(error.to_string()))?;
-        send.write_all(&request)
+        send.write_all(request)
             .await
             .map_err(|error| exchange(error.to_string()))?;
         send.finish().map_err(|error| exchange(error.to_string()))?;
 
-        let body = receive
+        receive
             .read_to_end(MAX_BODY_BYTES)
             .await
-            .map_err(|error| exchange(error.to_string()))?;
-
-        match serde_json::from_slice(&body) {
-            Ok(CompanionResponse::Value(value)) => Ok(value),
-            Ok(CompanionResponse::Error(fault)) => Err(CompanionFailure::Refused {
-                code: fault.code,
-                message: fault.message,
-            }),
-            Err(error) => Err(exchange(format!("malformed answer: {error}"))),
-        }
+            .map_err(|error| exchange(error.to_string()))
     }
 }
 
