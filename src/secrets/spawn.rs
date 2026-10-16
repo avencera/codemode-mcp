@@ -11,6 +11,27 @@
 
 use std::{io, process::Output};
 
+/// Why [`output`] has no output for a child
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RunError {
+    /// The child never started, so it did nothing
+    #[error("{0}")]
+    Start(io::Error),
+    /// The child started, but its output or exit status was lost, so what
+    /// it did is unknown
+    #[error("{0}")]
+    Collect(io::Error),
+}
+
+impl RunError {
+    /// The underlying error, for callers to whom the difference is moot
+    pub(super) fn into_io(self) -> io::Error {
+        match self {
+            Self::Start(error) | Self::Collect(error) => error,
+        }
+    }
+}
+
 /// Runs `program` with `args` to completion and collects its output; dropping
 /// the future kills the child
 ///
@@ -22,7 +43,7 @@ pub(super) async fn output(
     program: &str,
     args: &[&str],
     stdin: Option<&[u8]>,
-) -> io::Result<Output> {
+) -> Result<Output, RunError> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -36,7 +57,8 @@ pub(super) async fn output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        .map_err(RunError::Start)?;
     let pipe = child.stdin.take();
     let write = async {
         if let (Some(mut pipe), Some(input)) = (pipe, stdin) {
@@ -47,7 +69,7 @@ pub(super) async fn output(
     };
     let (output, ()) = tokio::join!(child.wait_with_output(), write);
 
-    output
+    output.map_err(RunError::Collect)
 }
 
 /// Runs `program` with `args` to completion and collects its output; dropping
@@ -61,7 +83,7 @@ pub(super) async fn output(
     program: &str,
     args: &[&str],
     stdin: Option<&[u8]>,
-) -> io::Result<Output> {
+) -> Result<Output, RunError> {
     macos::output(program, args, stdin).await
 }
 
@@ -84,6 +106,8 @@ mod macos {
         net::unix::pipe,
     };
 
+    use super::RunError;
+
     unsafe extern "C" {
         // not in the SDK headers, but exported by libsystem since macOS
         // 10.14; Chromium and LLDB start their helpers with it for the same
@@ -98,19 +122,21 @@ mod macos {
         program: &str,
         args: &[&str],
         stdin: Option<&[u8]>,
-    ) -> io::Result<Output> {
-        let (stdout_read, stdout_write) = pipe()?;
-        let (stderr_read, stderr_write) = pipe()?;
+    ) -> Result<Output, RunError> {
+        let (stdout_read, stdout_write) = pipe().map_err(RunError::Start)?;
+        let (stderr_read, stderr_write) = pipe().map_err(RunError::Start)?;
         let input = stdin
             .map(|bytes| pipe().map(|ends| (ends, bytes)))
-            .transpose()?;
+            .transpose()
+            .map_err(RunError::Start)?;
         let pid = spawn(
             program,
             args,
             input.as_ref().map(|((read, _), _)| read),
             &stdout_write,
             &stderr_write,
-        )?;
+        )
+        .map_err(RunError::Start)?;
         let child = Child::new(pid);
 
         // the reads end at the child's exit only once no copy of the write
@@ -131,7 +157,8 @@ mod macos {
         };
         let stdout = read_to_end(stdout_read);
         let stderr = read_to_end(stderr_read);
-        let (stdout, stderr, status, ()) = tokio::try_join!(stdout, stderr, child.wait(), write)?;
+        let (stdout, stderr, status, ()) =
+            tokio::try_join!(stdout, stderr, child.wait(), write).map_err(RunError::Collect)?;
 
         Ok(Output {
             status,

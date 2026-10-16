@@ -550,11 +550,18 @@ fn read_secret_from_stdin() -> Result<String> {
         bail!("pipe the secret in on stdin, e.g. `pbpaste | codemode-mcp companion create ...`");
     }
 
+    // escaping only grows a value, so anything longer than the escaped limit
+    // is refused without reading the rest of an endless pipe
+    let limit = codemode_mcp::secrets::MAX_ITEM_VALUE_JSON_BYTES;
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .wrap_err("cannot read the secret from stdin")?;
+    if bytes.len() > limit {
+        bail!("the secret on stdin is over {} KiB", limit / 1024);
+    }
     let text = String::from_utf8(bytes).map_err(|_| eyre!("the secret on stdin is not UTF-8"))?;
     let value = text
         .strip_suffix("\r\n")

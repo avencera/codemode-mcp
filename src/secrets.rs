@@ -50,7 +50,7 @@ const MAX_ITEM_NAME_CHARS: usize = 80;
 /// Most bytes a new item's value may take once escaped for JSON, well inside
 /// the companion protocol's body limit with the names around it; escaping
 /// can grow a value up to six times, so the escaped form is what is measured
-const MAX_ITEM_VALUE_JSON_BYTES: usize = 32 * 1024;
+pub const MAX_ITEM_VALUE_JSON_BYTES: usize = 32 * 1024;
 /// Longest `op://` reference accepted
 const MAX_REFERENCE_CHARS: usize = 256;
 
@@ -1095,9 +1095,9 @@ impl OnePassword {
                 reference: reference.to_owned(),
                 timeout: READ_TIMEOUT,
             })?
-            .map_err(|source| SecretError::Spawn {
+            .map_err(|error| SecretError::Spawn {
                 program: self.program.clone(),
-                source,
+                source: error.into_io(),
             })?;
 
         if !output.status.success() {
@@ -1192,12 +1192,14 @@ impl OnePassword {
                 &item.value,
             )
             .await
-            // once `op` has the template, running out of time says nothing
-            // about whether it went on to write the item
+            // once `op` has the template, running out of time or losing its
+            // answer says nothing about whether it went on to write the item
             .map_err(|error| match error {
-                CreateError::TimedOut { .. } => CreateError::Unconfirmed {
-                    reason: error.to_string(),
-                },
+                CreateError::TimedOut { .. } | CreateError::Lost { .. } => {
+                    CreateError::Unconfirmed {
+                        reason: error.to_string(),
+                    }
+                }
                 other => other,
             })?;
         let id = serde_json::from_slice::<serde_json::Value>(&created)
@@ -1229,11 +1231,25 @@ impl OnePassword {
                 command,
                 timeout: READ_TIMEOUT,
             })?
-            .map_err(|source| CreateError::Spawn {
-                program: self.program.clone(),
-                source,
+            .map_err(|error| match error {
+                spawn::RunError::Start(source) => CreateError::Spawn {
+                    program: self.program.clone(),
+                    source,
+                },
+                spawn::RunError::Collect(source) => CreateError::Lost {
+                    command,
+                    reason: source.to_string(),
+                },
             })?;
 
+        // a signal can stop `op` after it has done its work but before it
+        // has said so
+        if output.status.code().is_none() {
+            return Err(CreateError::Lost {
+                command,
+                reason: format!("`op` was stopped ({})", output.status),
+            });
+        }
         if !output.status.success() {
             let escaped = serde_json::to_string(value).unwrap_or_default();
             let escaped = escaped.trim_matches('"');
@@ -1285,6 +1301,14 @@ pub enum CreateError {
         command: &'static str,
         /// Timeout that elapsed
         timeout: Duration,
+    },
+    /// `op` started, but stopped on a signal or its answer was lost
+    #[error("`op {command}` gave no answer: {reason}")]
+    Lost {
+        /// What was being run
+        command: &'static str,
+        /// What happened to the answer
+        reason: String,
     },
     /// `op item create` may have written the item but did not confirm it
     #[error("{reason}")]

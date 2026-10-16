@@ -213,7 +213,7 @@ pbpaste | codemode-mcp companion create --vault Personal --title "Zoho MCP infra
 Options: `--category` (default `API_CREDENTIAL`), `--field` (the label of the field that holds the secret, default
 `credential`) and `--companion <name>`, which is needed only when several companions are listed. The secret is read
 from stdin, minus one trailing newline. Empty input is refused, and so is a value over 32 KiB once escaped for JSON
-(quotes, backslashes and control characters count double or more). The command waits for the Touch ID answer on the
+(quotes, backslashes and control characters count double or more); the command stops reading stdin past that. The command waits for the Touch ID answer on the
 companion Mac (up to two minutes) and prints the new item's id and its `op://vault/title/field` reference, never the
 value. Every create asks Touch ID on the companion, naming the vault first, as in `create in Personal: "Zoho MCP infraops"`,
 and no approval is reused. Details:
@@ -225,8 +225,8 @@ and no approval is reused. Details:
   trailing space) and are refused before any prompt otherwise, so the returned `op://` reference is always valid and
   cannot address another item (`?` and `$` mean something to `op`); rename the item in 1Password afterwards if you
   want more. The duplicate check includes archived items.
-- If the command times out or loses the connection after the request went out, or `op` on the companion stops or
-  answers without an item id once it has the item, it says the item may have been created.
+- If the command times out or loses the connection after the request went out, or `op` on the companion is killed,
+  loses its answer or answers without an item id once it has the item, it says the item may have been created.
   Check the vault before trying again: once Touch ID approved, the companion finishes the create even if the gateway
   hung up.
 - The command says why nothing was created: the vault is not in `create_vaults`, the title already exists, Touch ID
