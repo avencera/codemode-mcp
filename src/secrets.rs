@@ -101,6 +101,12 @@ pub enum SecretError {
         "a value read for the `url` is too short to be protected; use a key of at least {MIN_SECRET_LEN} bytes"
     )]
     UrlValueTooShort,
+    /// A value read for an embedded `url` reference could not be matched
+    /// reliably by the redactor once encoded or decoded
+    #[error(
+        "a value read for the `url` must be printable ASCII with no spaces or percent-encoding; store the key raw"
+    )]
+    UrlValueUnprotectable,
     /// `op` could not be started
     #[error("failed to start `{program}`: {source}")]
     Spawn {
@@ -424,6 +430,17 @@ impl<'a> UrlTemplate<'a> {
         if values.iter().any(|value| value.len() < MIN_SECRET_LEN) {
             return Err(SecretError::UrlValueTooShort);
         }
+        // a value that is its own decoded form leaves nothing for IDNA,
+        // `+`-as-space or percent-decoding to turn into an unmatched form
+        if !matches!(self.shape, UrlShape::Whole)
+            && values.iter().any(|value| {
+                !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && byte != b'%')
+            })
+        {
+            return Err(SecretError::UrlValueUnprotectable);
+        }
 
         match &self.shape {
             UrlShape::Whole => {
@@ -461,7 +478,10 @@ impl<'a> UrlTemplate<'a> {
                         fill_placeholders(query, tag, |index| query_encoded(&values[index]));
                     url.set_query(Some(&query));
                 }
-                let keys: Vec<String> = values.iter().flat_map(|value| url_keys(value)).collect();
+                let keys: Vec<String> = values
+                    .iter()
+                    .flat_map(|value| embedded_keys(value))
+                    .collect();
 
                 Ok(ResolvedUrl {
                     url: url.into(),
@@ -485,7 +505,20 @@ fn fill_placeholders(text: &str, tag: &str, value: impl Fn(usize) -> String) -> 
     let mut filled = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find(tag) {
-        filled.push_str(&rest[..start]);
+        let literal = &rest[..start];
+        // a trailing incomplete escape would swallow the first characters of
+        // the value, so its `%` is escaped
+        let open = literal.rfind('%').filter(|at| {
+            literal[at + 1..].len() <= 1 && literal[at + 1..].bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        match open {
+            Some(at) => {
+                filled.push_str(&literal[..at]);
+                filled.push_str("%25");
+                filled.push_str(&literal[at + 1..]);
+            }
+            None => filled.push_str(literal),
+        }
         let after = &rest[start + tag.len()..];
         let digits = after.bytes().take_while(u8::is_ascii_digit).count();
         // `parse` already checked that each placeholder is whole
@@ -553,6 +586,23 @@ fn url_keys(value: &str) -> Vec<String> {
         encoded
             .iter()
             .flat_map(|form| [form.clone(), lower_hex(form)]),
+    );
+    keys.retain(|key| !key.is_empty());
+    keys.sort();
+    keys.dedup();
+
+    keys
+}
+
+/// A printable ASCII value read for an embedded `url` reference as text may
+/// print it: as read and in the encodings the URL holds it in, each escaped
+/// the ways `variants` knows
+fn embedded_keys(value: &str) -> Vec<String> {
+    let mut keys = variants(value);
+    keys.extend(
+        [path_encoded(value), query_encoded(value)]
+            .into_iter()
+            .flat_map(|form| [lower_hex(&form), form]),
     );
     keys.retain(|key| !key.is_empty());
     keys.sort();
@@ -1080,17 +1130,45 @@ mod tests {
     fn values_are_filled_into_url_components_as_data() -> Result<(), SecretError> {
         let resolved = filled(
             "https://h.example/mcp/{{ op://a/b/c }}/message/?k={{ op://a/b/c }}&{{ op://a/b/c }}=1",
-            &["a/b\\c?d#e%f g+h", "a/b\\c?d#e%f g+h", "a/b\\c?d#e%f g+h"],
+            &["a/b\\c?d#e&f+h", "a/b\\c?d#e&f+h", "a/b\\c?d#e&f+h"],
         )?;
         let parsed = reqwest::Url::parse(&resolved.url).map_err(|_| SecretError::NotAUrl)?;
 
         assert_eq!(parsed.host_str(), Some("h.example"));
         assert_eq!(parsed.fragment(), None);
-        assert_eq!(parsed.path(), "/mcp/a%2Fb%5Cc%3Fd%23e%25f%20g+h/message/");
+        assert_eq!(parsed.path(), "/mcp/a%2Fb%5Cc%3Fd%23e&f+h/message/");
         assert_eq!(
             parsed.query(),
-            Some("k=a%2Fb%5Cc%3Fd%23e%25f+g%2Bh&a%2Fb%5Cc%3Fd%23e%25f+g%2Bh=1")
+            Some("k=a%2Fb%5Cc%3Fd%23e%26f%2Bh&a%2Fb%5Cc%3Fd%23e%26f%2Bh=1")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unprotectable_values_are_refused() {
+        for value in [
+            "has space1234",
+            "sëcret123",
+            "%41%42%43%44",
+            "50%off-secret",
+        ] {
+            assert!(
+                matches!(
+                    filled("https://h.example/mcp/{{ op://a/b/c }}", &[value]),
+                    Err(SecretError::UrlValueUnprotectable)
+                ),
+                "{value}"
+            );
+        }
+        assert!(filled("https://h.example/mcp/{{ op://a/b/c }}", &["acct:key~1234"]).is_ok());
+    }
+
+    #[test]
+    fn a_literal_percent_before_a_value_cannot_complete_an_escape() -> Result<(), SecretError> {
+        let resolved = filled("https://host/mcp/%{{ op://a/b/c }}", &["2Fsecret-1234"])?;
+
+        assert_eq!(resolved.url, "https://host/mcp/%252Fsecret-1234");
 
         Ok(())
     }

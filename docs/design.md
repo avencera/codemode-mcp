@@ -498,11 +498,15 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   with a configuration error, as is a template without a literal, non-empty host. A host is lowercased when
   parsed, so a key there could not be matched, and it is refused for every server rather than only with OAuth
 - Values are filled into the parsed URL already percent-encoded as data (path-segment encoding in the path, form
-  encoding in the query), so `/`, `\`, `?`, `#`, `%`, `&` and `+` in a value never become URL structure and any
-  character is allowed. A value under six bytes is refused. The URL a template yields is reported as a
+  encoding in the query), so `/`, `\`, `?`, `#`, `&` and `+` in a value never become URL structure. A value
+  embedded in a template must be printable ASCII (0x21 to 0x7E) without `%`: no space, control or non-ASCII
+  character and no percent-encoding, so its decoded form is itself and neither IDNA nor `+`-as-space can turn it
+  into a form the redactor does not know; anything else is refused (`SecretError::UrlValueUnprotectable`) and the
+  key must be stored raw. A literal `%` just before a placeholder is written as `%25`, so a value can never
+  complete an escape. A value under six bytes is refused. A whole-URL reference keeps its own rules. The URL a template yields is reported as a
   `configuration` failure when it does not parse (`SecretError::NotAUrl`)
 - The secrets of a `url` are exactly the values read from 1Password plus the forms text may print them in: the
-  encodings the URL holds them in, percent-decoded, `+` read as a space (form decoding), uppercase and lowercase
+  encodings the URL holds them in, uppercase and lowercase
   percent escapes, and JSON escaping. Nothing in a URL is guessed to be a key from its shape, so embed the
   reference where the key sits, e.g.
   `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
