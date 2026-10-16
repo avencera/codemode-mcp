@@ -43,7 +43,7 @@ pub struct MacNotification {
     /// Body text
     pub message: String,
     /// Page opened when the notification is clicked
-    pub click: String,
+    pub click: Option<String>,
 }
 
 /// The Mac the daemon runs on

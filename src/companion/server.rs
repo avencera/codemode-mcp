@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     config::CompanionConfig,
-    mac::{Mac, TouchId},
+    mac::{Mac, MacNotification, TouchId},
     secrets::{OnePassword, is_reference},
 };
 
@@ -60,10 +60,12 @@ impl CompanionHandle {
 /// A read takes two things the gateway cannot fake. First, the allow list:
 /// 1Password's own prompt does not name the item, and one approval lets `op`
 /// read anything for about ten minutes, so without it a compromised gateway
-/// could read every item. Second, this Mac's own Touch ID prompt, which names
-/// the reference and is asked for every request, because the 1Password
-/// approval alone would answer later requests silently. `mac` is `None` where
-/// there is no Touch ID, and every request is then denied
+/// could read every item. Second, a fingerprint for every request. While `op`
+/// is authorized it would answer silently, so this Mac asks Touch ID itself,
+/// naming the reference. Otherwise 1Password's own prompt is that
+/// fingerprint, and a notification names the reference instead, so the owner
+/// touches once either way. `mac` is `None` where there is no Touch ID, and
+/// every request is then denied
 pub async fn serve(
     config: CompanionConfig,
     mac: Option<Arc<dyn Mac>>,
@@ -192,7 +194,22 @@ impl Companion {
             "codemode-mcp on {} wants to read {reference}",
             self.config.gateway_name
         );
-        if mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
+        // still held turn: no other request can read between this check and
+        // the read below and spend the approval 1Password is about to ask for
+        if self.onepassword.signed_out().await {
+            // 1Password is about to ask for a fingerprint itself, which
+            // approves this read as well as ours would, so asking first only
+            // makes the owner touch twice. Its prompt names neither the
+            // gateway nor the reference, so a notification does
+            let notification = MacNotification {
+                title: reason,
+                message: "Approve in 1Password to send it.".to_owned(),
+                click: None,
+            };
+            if let Err(error) = mac.notify(&notification).await {
+                tracing::info!(%error, "could not name the read in a notification");
+            }
+        } else if mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
             tracing::info!(reference, "read not approved on this Mac");
 
             return fault(CompanionErrorCode::Denied, "not approved on this Mac");

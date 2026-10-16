@@ -167,8 +167,9 @@ The 1Password Environments server is not covered; it only signs in through the g
    - writes a `[companion]` section to this Mac's config, with the references the gateway's servers use as the
      allow list.
    - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
-   - asks the gateway to read one of those references through this Mac. Approve the Touch ID prompt, which
-     names the reference; 1Password may also ask the first time `op` runs there. Both Macs print the value's
+   - asks the gateway to read one of those references through this Mac. Approve the one Touch ID prompt. While
+     1Password has authorized `op` on that Mac, the prompt is the companion's and names the reference;
+     otherwise it is 1Password's, and a notification names the reference. Both Macs print the value's
      length, never the value.
 
    On a Mac that already has codemode-mcp, the second command `invite` prints, `codemode-mcp companion pair
