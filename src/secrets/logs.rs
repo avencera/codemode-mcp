@@ -2,6 +2,7 @@
 
 use std::{io, sync::Arc};
 
+use tracing::Metadata;
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::Redactor;
@@ -31,6 +32,14 @@ impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactingMakeWriter<M> {
     fn make_writer(&'a self) -> Self::Writer {
         RedactingWriter {
             inner: self.inner.make_writer(),
+            redactor: Arc::clone(&self.redactor),
+            buffer: Vec::new(),
+        }
+    }
+
+    fn make_writer_for(&'a self, metadata: &Metadata<'_>) -> Self::Writer {
+        RedactingWriter {
+            inner: self.inner.make_writer_for(metadata),
             redactor: Arc::clone(&self.redactor),
             buffer: Vec::new(),
         }

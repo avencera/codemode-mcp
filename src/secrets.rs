@@ -101,10 +101,11 @@ pub enum SecretError {
         "a value read for the `url` is too short to be protected; use a key of at least {MIN_SECRET_LEN} bytes"
     )]
     UrlValueTooShort,
-    /// A value read for an embedded `url` reference could not be matched
-    /// reliably by the redactor once encoded or decoded
+    /// A value read for an embedded `url` reference holds a character that
+    /// URL parsing, escaping or a library's logging could change into a form
+    /// the redactor does not know
     #[error(
-        "a value read for the `url` must be printable ASCII with no spaces or percent-encoding; store the key raw"
+        "a value read for the `url` may hold only ASCII letters, digits and - . _ ~ + / = : @ ! * , ; characters"
     )]
     UrlValueUnprotectable,
     /// `op` could not be started
@@ -430,14 +431,13 @@ impl<'a> UrlTemplate<'a> {
         if values.iter().any(|value| value.len() < MIN_SECRET_LEN) {
             return Err(SecretError::UrlValueTooShort);
         }
-        // a value that is its own decoded form leaves nothing for IDNA,
-        // `+`-as-space or percent-decoding to turn into an unmatched form
+        // only characters that no URL parser, escape or logger rewrites
+        // leave nothing for IDNA, `+`-as-space, percent-decoding, backslash
+        // normalization or JSON escaping to turn into an unmatched form
         if !matches!(self.shape, UrlShape::Whole)
-            && values.iter().any(|value| {
-                !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_graphic() && byte != b'%')
-            })
+            && values
+                .iter()
+                .any(|value| !value.bytes().all(is_embeddable_byte))
         {
             return Err(SecretError::UrlValueUnprotectable);
         }
@@ -491,6 +491,13 @@ impl<'a> UrlTemplate<'a> {
             }
         }
     }
+}
+
+/// Whether an embedded url value may hold `byte`: ASCII letters, digits and
+/// `- . _ ~ + / = : @ ! * , ;`, which covers hex, base64, base64url, JWT-like
+/// and colon-separated keys
+fn is_embeddable_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~+/=:@!*,;".contains(&byte)
 }
 
 /// The text standing in for the `index`th reference of a template; it ends
@@ -594,7 +601,7 @@ fn url_keys(value: &str) -> Vec<String> {
     keys
 }
 
-/// A printable ASCII value read for an embedded `url` reference as text may
+/// An allowed-character value read for an embedded `url` reference as text may
 /// print it: as read and in the encodings the URL holds it in, each escaped
 /// the ways `variants` knows
 fn embedded_keys(value: &str) -> Vec<String> {
@@ -1130,16 +1137,16 @@ mod tests {
     fn values_are_filled_into_url_components_as_data() -> Result<(), SecretError> {
         let resolved = filled(
             "https://h.example/mcp/{{ op://a/b/c }}/message/?k={{ op://a/b/c }}&{{ op://a/b/c }}=1",
-            &["a/b\\c?d#e&f+h", "a/b\\c?d#e&f+h", "a/b\\c?d#e&f+h"],
+            &["a/b=c:d@e,f+h", "a/b=c:d@e,f+h", "a/b=c:d@e,f+h"],
         )?;
         let parsed = reqwest::Url::parse(&resolved.url).map_err(|_| SecretError::NotAUrl)?;
 
         assert_eq!(parsed.host_str(), Some("h.example"));
         assert_eq!(parsed.fragment(), None);
-        assert_eq!(parsed.path(), "/mcp/a%2Fb%5Cc%3Fd%23e&f+h/message/");
+        assert_eq!(parsed.path(), "/mcp/a%2Fb=c:d@e,f+h/message/");
         assert_eq!(
             parsed.query(),
-            Some("k=a%2Fb%5Cc%3Fd%23e%26f%2Bh&a%2Fb%5Cc%3Fd%23e%26f%2Bh=1")
+            Some("k=a%2Fb%3Dc%3Ad%40e%2Cf%2Bh&a%2Fb%3Dc%3Ad%40e%2Cf%2Bh=1")
         );
 
         Ok(())
@@ -1150,6 +1157,11 @@ mod tests {
         for value in [
             "has space1234",
             "sëcret123",
+            "tenant\\SecretKey123",
+            "abc\"def\"ghi123",
+            "key'quote123",
+            "a<b>c^{d}|e[f]123",
+            "k`tick#hash?q%r&s$t(u)",
             "%41%42%43%44",
             "50%off-secret",
         ] {

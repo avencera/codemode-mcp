@@ -65,8 +65,8 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/symbolkey/credential) printf '{SYMBOL_KEY}' ;;\n\
                op://Dev/slashkey/credential) printf '%s' 'zk/9f3a71c2d8b4e6' ;;\n\
                op://Dev/mixedkey/credential) printf '%s' '{MIXED_KEY}' ;;\n\
+               op://Dev/dotkey/credential) printf '%s' 'ab/../cd12' ;;\n\
                op://Dev/colonkey/credential) printf '%s' 'zk:9f3a71c2d8b4e6' ;;\n\
-               op://Dev/backslash/credential) printf '%s' 'zk\\9f3a71c2d8b4e6' ;;\n\
                op://Dev/shortkey/credential) printf '%s' 'aB9xZ' ;;\n\
                op://Dev/encodedkey/credential) printf '%s' 'zk%2B9f3a71c2%3Dd8b4e6' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
@@ -288,8 +288,6 @@ async fn a_url_value_with_separators_is_one_encoded_path_segment() -> TestResult
          op = \"{op}\"\n\n\
          [servers.slash]\n\
          url = \"http://{plain}/mcp/{{{{ op://Dev/slashkey/credential }}}}/rpc\"\n\n\
-         [servers.backslash]\n\
-         url = \"http://{plain}/mcp/{{{{ op://Dev/backslash/credential }}}}/rpc\"\n\n\
          [servers.anonymous]\n\
          url = \"http://{oauth}/mcp/{{{{ op://Dev/slashkey/credential }}}}/rpc\"\n\
          oauth = true\n",
@@ -307,7 +305,6 @@ async fn a_url_value_with_separators_is_one_encoded_path_segment() -> TestResult
     // the value never splits the path, with or without a login, and the
     // servers still report nothing of it
     assert!(path_seen(&plain_seen, "/mcp/zk%2F9f3a71c2d8b4e6/rpc").await);
-    assert!(path_seen(&plain_seen, "/mcp/zk%5C9f3a71c2d8b4e6/rpc").await);
     assert!(path_seen(&oauth_seen, "/mcp/zk%2F9f3a71c2d8b4e6/rpc").await);
     let report = serde_json::to_string(&harness.app.gateway().report())?;
     assert!(!report.contains("9f3a71c2d8b4e6"), "{report}");

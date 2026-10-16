@@ -144,13 +144,29 @@ impl ClientRegistration {
     }
 }
 
-/// Whether the JSON form of `value` holds a key, as is or percent-decoded
+/// Whether any string or object key in `value` holds a key, by its decoded
+/// content, as is or percent-decoded
 ///
 /// Every OAuth write goes through this: the provider controls much of what
-/// is stored (issuer, scopes, vendor token fields, a registration's secret)
+/// is stored (issuer, scopes, vendor token fields, a registration's secret).
+/// The strings are checked rather than the serialized text, because JSON
+/// escaping (`\"`, `\\`) can split a key that the string holds whole
 fn holds_key(value: &impl Serialize, keys: &[String]) -> bool {
+    fn holds(value: &Value, keys: &[String]) -> bool {
+        match value {
+            Value::String(text) => Redactor::holds_any(text, keys),
+            Value::Array(items) => items.iter().any(|item| holds(item, keys)),
+            Value::Object(fields) => fields
+                .iter()
+                .any(|(name, field)| Redactor::holds_any(name, keys) || holds(field, keys)),
+            // a key of digits only can come back as a number
+            Value::Number(number) => Redactor::holds_any(&number.to_string(), keys),
+            Value::Null | Value::Bool(_) => false,
+        }
+    }
+
     // an unserializable value cannot be checked, so it counts as holding one
-    serde_json::to_string(value).map_or(true, |json| Redactor::holds_any(&json, keys))
+    serde_json::to_value(value).map_or(true, |value| holds(&value, keys))
 }
 
 /// The credentials ready to be stored, or `None` when they hold a key
@@ -440,7 +456,22 @@ impl OAuth {
         if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
             return Err(OAuthError::NoMetadata(name.to_owned()));
         }
-        manager.set_metadata(resolution.metadata);
+        // the endpoints as the provider wrote them, before rmcp parses and
+        // normalizes them (`\` becomes `/`), which could hide a key
+        let metadata = resolution.metadata;
+        let endpoints = [
+            Some(metadata.authorization_endpoint.as_str()),
+            Some(metadata.token_endpoint.as_str()),
+            metadata.registration_endpoint.as_deref(),
+        ];
+        if endpoints
+            .into_iter()
+            .flatten()
+            .any(|endpoint| Redactor::holds_any(endpoint, &keys))
+        {
+            return Err(OAuthError::LinkHoldsUrl(name.to_owned()));
+        }
+        manager.set_metadata(metadata);
         manager.set_state_store(SqliteStateStore {
             store: self.store.clone(),
             server: name.to_owned(),
@@ -771,4 +802,32 @@ fn with_params(url: &str, params: &BTreeMap<String, String>) -> Result<String, O
         .extend_pairs(params);
 
     Ok(parsed.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::holds_key;
+
+    #[test]
+    fn strings_are_checked_by_their_decoded_content_not_their_json_escapes() {
+        // JSON escaping turns the quote into `\"`, which splits the key in
+        // the serialized text but not in the string
+        let keys = [r#"abc"def"ghi123"#.to_owned()];
+
+        assert!(holds_key(
+            &json!({ "client_secret": r#"abc"def%22ghi123"# }),
+            &keys
+        ));
+        assert!(holds_key(
+            &json!({ "nested": [r#"ABC"DEF"GHI123"#] }),
+            &keys
+        ));
+        assert!(holds_key(&json!({ r#"abc"def"ghi123"#: 1 }), &keys));
+        assert!(!holds_key(
+            &json!({ "client_secret": "unrelated-value" }),
+            &keys
+        ));
+    }
 }

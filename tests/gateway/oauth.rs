@@ -1009,6 +1009,69 @@ async fn oauth_login_refuses_a_link_that_lowercases_the_key_into_a_host() -> Tes
     harness.stop().await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_refuses_an_authorization_endpoint_that_holds_the_key_before_normalizing()
+-> TestResult {
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_quirky(
+        Client::Registered,
+        String::new(),
+        None,
+        Quirks {
+            // URL parsing resolves the dot segments, so the link built from
+            // this endpoint no longer holds the key
+            authorize_url: Some("https://auth.example.invalid/ab/../cd12/authorize".to_owned()),
+            ..Quirks::default()
+        },
+    )
+    .await?;
+    let Some(harness) =
+        path_key_harness(&op, &mock.base, "op://Dev/dotkey/credential", "needs_login").await?
+    else {
+        return Ok(());
+    };
+
+    assert_login_refused(&harness, "ab/../cd12", "authorization link").await?;
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_refuses_a_registration_secret_that_echoes_the_key_percent_encoded()
+-> TestResult {
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_quirky(
+        Client::Registered,
+        String::new(),
+        None,
+        Quirks {
+            register_secret: Some("secret-zk%3A9f3a71c2d8b4e6".to_owned()),
+            ..Quirks::default()
+        },
+    )
+    .await?;
+    let Some(harness) = path_key_harness(
+        &op,
+        &mock.base,
+        "op://Dev/colonkey/credential",
+        "needs_login",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    assert_login_refused(
+        &harness,
+        "zk:9f3a71c2d8b4e6",
+        "secret from the server's url",
+    )
+    .await?;
+    assert!(!harness.state_holds("zk%3A9f3a71c2d8b4e6"));
+
+    harness.stop().await
+}
+
 /// Starts a daemon whose `url` embeds `reference` in its path
 async fn path_key_harness(
     op: &std::path::Path,
