@@ -30,8 +30,6 @@ struct GatewayView: View {
                     }
                 } header: {
                     Text("Allowed references")
-                } footer: {
-                    Text("This iPhone answers these without asking first. A reference that is not listed waits until you allow it. Swipe to remove one.")
                 }
                 Section {
                     Button("Unpair", role: .destructive) { confirmingUnpair = true }
