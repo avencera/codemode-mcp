@@ -516,16 +516,19 @@ impl OAuth {
     /// What to say about a refused callback
     ///
     /// After a restart the redactor knows nothing of a templated `url` until
-    /// it is read, and the provider's text may hold it, so it is read first.
-    /// When that fails, the text is not echoed: only the error code, if it is
-    /// a short `[a-z_]` token
+    /// it is read, and the provider's text may hold it, so it is read first,
+    /// but only for a callback that answers a login in progress: anyone who
+    /// reaches the callback could otherwise raise a 1Password prompt. When
+    /// the url is not read, the text is not echoed: only the error code, if
+    /// it is a short `[a-z_]` token
     async fn refusal(
         &self,
         server: &OAuthServer,
+        pending: bool,
         error: &str,
         description: Option<&str>,
     ) -> String {
-        if !server.url.contains("{{") || self.resolved_url(server).await.is_ok() {
+        if !server.url.contains("{{") || (pending && self.resolved_url(server).await.is_ok()) {
             return description.unwrap_or(error).to_owned();
         }
 
@@ -563,13 +566,23 @@ impl OAuth {
     async fn complete_login(&self, name: &str, callback: &Callback) -> Result<(), OAuthError> {
         let server = self.server(name)?;
         if let Some(error) = &callback.error {
+            let mut pending = false;
             if let Some(csrf) = &callback.state {
+                pending = self
+                    .store
+                    .oauth_pending(name, csrf, flow_ttl_ms())?
+                    .is_some();
                 self.store.delete_oauth_pending(name, csrf)?;
             }
 
             return Err(OAuthError::Refused(
-                self.refusal(server, error, callback.error_description.as_deref())
-                    .await,
+                self.refusal(
+                    server,
+                    pending,
+                    error,
+                    callback.error_description.as_deref(),
+                )
+                .await,
             ));
         }
         let (Some(code), Some(csrf)) = (&callback.code, &callback.state) else {

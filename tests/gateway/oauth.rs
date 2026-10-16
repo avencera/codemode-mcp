@@ -836,7 +836,7 @@ async fn oauth_refresh_that_holds_the_url_is_not_stored() -> TestResult {
 async fn oauth_callback_error_does_not_echo_a_url_that_cannot_be_read() -> TestResult {
     let key = "zk-b41d90e7a3c258";
     // no url file, so the fake `op` fails to read the reference
-    let (op, _) = super::secrets::fake_op()?;
+    let (op, log) = super::secrets::fake_op()?;
     let Some(harness) = Harness::with(Setup {
         extra: &op_url_config(&op),
         ..Setup::default()
@@ -845,6 +845,8 @@ async fn oauth_callback_error_does_not_echo_a_url_that_cannot_be_read() -> TestR
     else {
         return Ok(());
     };
+    let reference = "op://Dev/mcpurl/credential";
+    let reads_before = super::secrets::reads(&log, reference);
 
     let description = format!("bad resource http://127.0.0.1:9/mcp/{key}/sse");
     let mut callback =
@@ -858,6 +860,9 @@ async fn oauth_callback_error_does_not_echo_a_url_that_cannot_be_read() -> TestR
     let text = page.text().await?;
     assert!(text.contains("access_denied"), "{text}");
     assert!(!text.contains(key), "{text}");
+    // no login is in progress, so the callback must not raise a 1Password
+    // prompt by reading the url
+    assert_eq!(super::secrets::reads(&log, reference), reads_before);
 
     harness.stop().await
 }
