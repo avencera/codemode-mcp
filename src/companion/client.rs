@@ -421,6 +421,14 @@ impl Companions {
                     name: peer.name.clone(),
                 })
             }
+            Ok(CompanionCreateResponse::Error(fault))
+                if fault.code == CompanionErrorCode::CreateUnconfirmed =>
+            {
+                Err(CompanionFailure::CreateUnconfirmed {
+                    name: peer.name.clone(),
+                    detail: fault.message,
+                })
+            }
             Ok(CompanionCreateResponse::Error(fault)) => Err(CompanionFailure::Refused {
                 code: fault.code,
                 message: fault.message,

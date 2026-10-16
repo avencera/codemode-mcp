@@ -241,6 +241,11 @@ impl Companion {
 
                     fault(CompanionErrorCode::AlreadyExists, error.to_string())
                 }
+                Ok(Err(error @ CreateError::Unconfirmed { .. })) => {
+                    tracing::warn!(vault, title, %error, "create not confirmed on this Mac");
+
+                    fault(CompanionErrorCode::CreateUnconfirmed, error.to_string())
+                }
                 Ok(Err(error)) => {
                     tracing::warn!(vault, title, %error, "create failed on this Mac");
 
@@ -250,9 +255,8 @@ impl Companion {
                     tracing::warn!(vault, title, "create did not finish in time");
 
                     fault(
-                        CompanionErrorCode::CreateFailed,
-                        "the create did not finish in time; the item may exist, check the vault"
-                            .to_owned(),
+                        CompanionErrorCode::CreateUnconfirmed,
+                        "the create did not finish in time".to_owned(),
                     )
                 }
             }
@@ -263,9 +267,8 @@ impl Companion {
             tracing::warn!(%error, "create task failed");
 
             CompanionCreateResponse::Error(CompanionFault {
-                code: CompanionErrorCode::CreateFailed,
-                message: "the create stopped unexpectedly; the item may exist, check the vault"
-                    .to_owned(),
+                code: CompanionErrorCode::CreateUnconfirmed,
+                message: "the create stopped unexpectedly".to_owned(),
             })
         })
     }

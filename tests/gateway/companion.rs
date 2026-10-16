@@ -223,7 +223,8 @@ impl Rig {
 const OP_ECHOED_VALUE: &str = "echoed-by-op-secret";
 
 /// A stand-in for `op` that serves the fixture read, lists one item titled
-/// `Existing` and creates items, logging each call's arguments and
+/// `Existing` and creates items (answering without an id for one titled
+/// `No Id`), logging each call's arguments and
 /// environment and the template it was given on stdin, beside `reads.log`
 ///
 /// Unless `signed_in`, `whoami` fails until the first read, as if that read
@@ -256,6 +257,7 @@ fn creating_op(signed_in: bool, slow_create: bool) -> Result<(PathBuf, PathBuf),
                    *) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}}]' ;;\n\
                  esac ;;\n\
                'item create') cat > \"$d/stdin.log\"\n\
+                 grep -q '\"title\":\"No Id\"' \"$d/stdin.log\" && printf '{{}}' && exit 0\n\
                  {pause}printf '{{\"id\":\"newid123\",\"fields\":[{{\"value\":\"{OP_ECHOED_VALUE}\"}}]}}' ;;\n\
                *) exit 2 ;;\n\
              esac\n",
@@ -467,6 +469,48 @@ async fn a_create_that_touch_id_does_not_approve_writes_nothing() -> TestResult 
     let body = create(&rig, "Personal", "Zoho MCP infraops").await?;
     let message = body["refused"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("not approved"), "{body}");
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_op_does_not_confirm_may_have_made_the_item() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    // `op` exited cleanly after reading the template, so the item may well
+    // be in the vault even though no id came back
+    let body = create(&rig, "Personal", "No Id").await?;
+    let message = body["unconfirmed"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("no item id"), "{body}");
+    assert!(message.contains("may have been created"), "{body}");
+    assert!(body.get("refused").is_none(), "{body}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_too_long_to_send_is_refused_before_anyone_is_asked() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    // quotes double in JSON, so this is short as text but long once escaped
+    let value = "\"".repeat(20 * 1024);
+    let (status, body) = rig
+        .harness
+        .admin_json(
+            "/admin/companion/create",
+            &json!({ "vault": "Personal", "title": "Huge", "value": value }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let message = body["refused"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("too long"), "{body}");
+
+    assert!(created_prompts(&rig).is_empty());
     assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
 
     rig.stop().await

@@ -33,6 +33,9 @@ pub enum CompanionErrorCode {
     AlreadyExists,
     /// `op` could not create the item on the companion Mac
     CreateFailed,
+    /// `op` may have created the item but did not confirm it, so the vault
+    /// needs checking before trying again
+    CreateUnconfirmed,
 }
 
 impl CompanionErrorCode {
@@ -44,6 +47,7 @@ impl CompanionErrorCode {
             Self::ReadFailed => "read_failed",
             Self::AlreadyExists => "already_exists",
             Self::CreateFailed => "create_failed",
+            Self::CreateUnconfirmed => "create_unconfirmed",
         }
     }
 }

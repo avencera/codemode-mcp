@@ -46,6 +46,11 @@ const MIN_SECRET_LEN: usize = 6;
 const MAX_OP_ERROR_CHARS: usize = 200;
 /// Longest vault name, item title, field label or category accepted
 const MAX_ITEM_NAME_CHARS: usize = 80;
+
+/// Most bytes a new item's value may take once escaped for JSON, well inside
+/// the companion protocol's body limit with the names around it; escaping
+/// can grow a value up to six times, so the escaped form is what is measured
+const MAX_ITEM_VALUE_JSON_BYTES: usize = 32 * 1024;
 /// Longest `op://` reference accepted
 const MAX_REFERENCE_CHARS: usize = 256;
 
@@ -508,6 +513,14 @@ pub fn check_new_item(item: &NewItem) -> Result<(), String> {
     }
     if item.value.is_empty() {
         return Err("the value is empty".into());
+    }
+    if serde_json::to_string(&item.value).map_or(usize::MAX, |escaped| escaped.len())
+        > MAX_ITEM_VALUE_JSON_BYTES
+    {
+        return Err(format!(
+            "the value is too long; it must stay under {} KiB",
+            MAX_ITEM_VALUE_JSON_BYTES / 1024
+        ));
     }
 
     Ok(())
@@ -1178,13 +1191,20 @@ impl OnePassword {
                 Some(&template),
                 &item.value,
             )
-            .await?;
+            .await
+            // once `op` has the template, running out of time says nothing
+            // about whether it went on to write the item
+            .map_err(|error| match error {
+                CreateError::TimedOut { .. } => CreateError::Unconfirmed {
+                    reason: error.to_string(),
+                },
+                other => other,
+            })?;
         let id = serde_json::from_slice::<serde_json::Value>(&created)
             .ok()
             .and_then(|answer| answer["id"].as_str().map(str::to_owned))
-            .ok_or_else(|| CreateError::Failed {
-                command: "item create",
-                reason: "the answer had no item id".to_owned(),
+            .ok_or_else(|| CreateError::Unconfirmed {
+                reason: "`op item create` succeeded but its answer had no item id".to_owned(),
             })?;
 
         Ok(CreatedItem {
@@ -1265,6 +1285,12 @@ pub enum CreateError {
         command: &'static str,
         /// Timeout that elapsed
         timeout: Duration,
+    },
+    /// `op item create` may have written the item but did not confirm it
+    #[error("{reason}")]
+    Unconfirmed {
+        /// What went wrong after `op` had the item
+        reason: String,
     },
     /// `op` failed or answered something unexpected
     #[error("`op {command}` failed: {reason}")]
