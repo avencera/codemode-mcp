@@ -25,6 +25,9 @@ use crate::{
 /// How long the gateway's check may take: its read waits up to
 /// [`ASK_TIMEOUT`] for the owner, plus the dial back
 const CHECK_TIMEOUT: Duration = ASK_TIMEOUT.saturating_add(Duration::from_secs(30));
+/// How long the gateway may take to register this phone; it asks nobody,
+/// so a gateway that takes longer is stuck, and pairing must not wait on it
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The invite ticket in scanned text: the ticket alone, or the install
 /// command `companion invite` prints and shows as a QR code
@@ -128,7 +131,13 @@ async fn register(
         addrs: Vec::new(),
         phone: Some(PhoneRegistration { seal_key, push }),
     }));
-    let registered = match net::ask::<PairResponse>(&connection, &registration).await? {
+    let registered = tokio::time::timeout(
+        REGISTER_TIMEOUT,
+        net::ask::<PairResponse>(&connection, &registration),
+    )
+    .await
+    .map_err(|_| "the gateway did not finish registering this phone".to_owned())??;
+    let registered = match registered {
         PairResponse::Registered(registered) => registered,
         PairResponse::Refused { message } => return Err(message),
         other => return Err(format!("unexpected answer: {other:?}")),

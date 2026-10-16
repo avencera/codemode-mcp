@@ -49,7 +49,7 @@ App (supervisor)
   another source answered or it gave up) from a lost link (the gateway offers the read again after a reconnect).
   The phone dials because iOS does not let a suspended app accept connections; going to the background drops the
   link, and a push or the user brings it back.
-- **Request**starts `Waiting` and expires on the gateway's deadline. A reference off the allow list cannot be
+- **Request** starts `Waiting` and expires on the gateway's deadline. A reference off the allow list cannot be
   answered until the owner allows it; the app actor then adds it to the list in the Keychain. Approve calls
   `Platform::open_sealed` on a blocking thread; the actor stays free, so an expiry, a withdrawal, Deny or an
   entered value can take the Face ID prompt down through `cancel_open`. A read without a sealed copy can only be
@@ -59,7 +59,10 @@ App (supervisor)
   expired. Approve asks the request and waits for its reply, so only one Face ID prompt starts at a time.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
-second, and a failed request marks its read failed.
+second, and a failed request marks its read failed. A connection actor that cannot start, say because its endpoint
+does not bind or the Keychain is still locked after a restart, is tried again after a second the same way. A link
+that drops within ten seconds of opening counts as a failed dial, so a gateway that refuses the phone is redialed
+with the same backoff.
 
 ## Values
 

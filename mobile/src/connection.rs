@@ -7,7 +7,7 @@
 
 use std::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use companion_wire::{
@@ -32,6 +32,10 @@ use crate::{
 /// Longest wait between dials while the gateway cannot be reached
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// A link that drops sooner than this counts as a failed dial, so the next
+/// dial backs off
+const STABLE_LINK: Duration = Duration::from_secs(10);
+
 /// How long the gateway may take to send a read once it opened its stream
 const READ_WINDOW: Duration = Duration::from_secs(10);
 
@@ -49,8 +53,8 @@ pub enum ConnMsg {
     Disconnect,
     /// A dial finished
     Dialed(Result<Connection, String>),
-    /// The link with this stable id dropped
-    Lost(usize),
+    /// The link with this stable id dropped, and why
+    Lost(usize, String),
     /// Sends one request of the phone's own on the current link
     Request(PhoneRequest, RpcReplyPort<Result<PhoneResponse, String>>),
 }
@@ -70,10 +74,13 @@ pub struct ConnState {
     record: GatewayRecord,
     app: ActorRef<AppMsg>,
     connection: Option<Connection>,
+    /// When the current link came up
+    linked_at: Instant,
     dialing: bool,
     /// Whether the app wants a link, i.e. it is in the foreground
     wanted: bool,
-    /// Dials that failed in a row, for the backoff
+    /// Dials that failed or links that dropped at once, in a row, for the
+    /// backoff
     failures: u32,
 }
 
@@ -101,6 +108,20 @@ impl ConnectionActor {
             let _ = myself.cast(ConnMsg::Dialed(dialed));
         });
     }
+
+    /// Counts a failure and dials again after the backoff
+    fn retry_later(myself: &ActorRef<ConnMsg>, state: &mut ConnState, error: String) {
+        state.failures = state.failures.saturating_add(1);
+        let delay = backoff(state.failures);
+        tracing::info!(%error, ?delay, "no link to the gateway");
+        let _ = state
+            .app
+            .cast(AppMsg::Connection(ConnectionState::Retrying {
+                in_secs: u32::try_from(delay.as_secs()).unwrap_or(u32::MAX),
+                error,
+            }));
+        myself.send_after(delay, || ConnMsg::Retry);
+    }
 }
 
 impl Actor for ConnectionActor {
@@ -120,6 +141,7 @@ impl Actor for ConnectionActor {
             record: args.record,
             app: args.app,
             connection: None,
+            linked_at: Instant::now(),
             dialing: false,
             wanted: false,
             failures: 0,
@@ -143,6 +165,8 @@ impl Actor for ConnectionActor {
             ConnMsg::Retry => {}
             ConnMsg::Disconnect => {
                 state.wanted = false;
+                // the next foreground starts with a quick dial
+                state.failures = 0;
                 if let Some(connection) = state.connection.take() {
                     connection.close(0_u32.into(), b"background");
                 }
@@ -155,8 +179,8 @@ impl Actor for ConnectionActor {
 
                     return Ok(());
                 }
-                state.failures = 0;
                 state.connection = Some(connection.clone());
+                state.linked_at = Instant::now();
                 let _ = state
                     .app
                     .cast(AppMsg::Connection(ConnectionState::Connected));
@@ -164,8 +188,8 @@ impl Actor for ConnectionActor {
                 tokio::spawn(accept_reads(connection.clone(), state.app.clone()));
                 let myself = myself.clone();
                 tokio::spawn(async move {
-                    connection.closed().await;
-                    let _ = myself.cast(ConnMsg::Lost(connection.stable_id()));
+                    let reason = connection.closed().await;
+                    let _ = myself.cast(ConnMsg::Lost(connection.stable_id(), reason.to_string()));
                 });
             }
             ConnMsg::Dialed(Err(error)) => {
@@ -173,18 +197,9 @@ impl Actor for ConnectionActor {
                 if !state.wanted {
                     return Ok(());
                 }
-                state.failures = state.failures.saturating_add(1);
-                let delay = backoff(state.failures);
-                tracing::info!(%error, ?delay, "dial failed");
-                let _ = state
-                    .app
-                    .cast(AppMsg::Connection(ConnectionState::Retrying {
-                        in_secs: u32::try_from(delay.as_secs()).unwrap_or(u32::MAX),
-                        error,
-                    }));
-                myself.send_after(delay, || ConnMsg::Retry);
+                Self::retry_later(&myself, state, error);
             }
-            ConnMsg::Lost(stable_id) => {
+            ConnMsg::Lost(stable_id, reason) => {
                 let ours = state
                     .connection
                     .as_ref()
@@ -193,10 +208,16 @@ impl Actor for ConnectionActor {
                     return Ok(());
                 }
                 state.connection = None;
-                if state.wanted {
+                if !state.wanted {
+                    let _ = state.app.cast(AppMsg::Connection(ConnectionState::Offline));
+                } else if state.linked_at.elapsed() >= STABLE_LINK {
+                    state.failures = 0;
                     Self::dial(&myself, state);
                 } else {
-                    let _ = state.app.cast(AppMsg::Connection(ConnectionState::Offline));
+                    // a gateway that no longer lists this phone, while it
+                    // still lists another, accepts the dial and then closes
+                    // the link; dialing again at once would spin
+                    Self::retry_later(&myself, state, reason);
                 }
             }
             ConnMsg::Request(request, reply) => match state.connection.clone() {

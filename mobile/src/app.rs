@@ -39,6 +39,9 @@ use crate::{
 const PUSH_WAIT: Duration = Duration::from_secs(20);
 /// How long unpairing waits for the gateway before forgetting it anyway
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(5);
+/// Seconds before the connection actor is started again after it would not
+/// start or failed
+const RESTART_SECS: u32 = 1;
 
 /// How a read's stream ended without an answer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +104,9 @@ pub enum AppMsg {
     },
     /// The wait for a read opened from a push is over
     PushWaitOver(String),
+    /// Start the connection actor again, unless one runs or the gateway was
+    /// forgotten meanwhile
+    StartConnection,
 }
 
 /// The state the UI reads and the channel its updates go out on
@@ -266,13 +272,29 @@ impl App {
             .await
             .ok()
             .flatten();
+        // the Keychain is unreadable until the first unlock after a restart,
+        // so a missing key is tried again too
         let Some(key) = key else {
-            tracing::error!("the paired gateway's iroh key is missing");
+            Self::restart_connection(myself, state, "the paired gateway's key is not readable");
 
             return;
         };
 
         Self::spawn_connection(myself, state, record, key).await;
+    }
+
+    /// Starts the connection actor again shortly; ractor tells a supervisor
+    /// nothing about a child whose `pre_start` failed, so nothing else would
+    fn restart_connection(myself: &ActorRef<AppMsg>, state: &mut AppActorState, error: &str) {
+        tracing::error!(%error, "the connection is starting again");
+        state.connection = None;
+        state.shared.set_connection(ConnectionState::Retrying {
+            in_secs: RESTART_SECS,
+            error: error.to_owned(),
+        });
+        myself.send_after(Duration::from_secs(RESTART_SECS.into()), || {
+            AppMsg::StartConnection
+        });
     }
 
     async fn spawn_connection(
@@ -293,13 +315,7 @@ impl App {
                 }
                 state.connection = Some(connection);
             }
-            Err(error) => {
-                tracing::error!(%error, "cannot start the connection actor");
-                state.shared.set_connection(ConnectionState::Retrying {
-                    in_secs: 0,
-                    error: error.to_string(),
-                });
-            }
+            Err(error) => Self::restart_connection(myself, state, &error.to_string()),
         }
     }
 
@@ -670,6 +686,10 @@ impl Actor for App {
             }
             AppMsg::Unpaired => {
                 state.record = None;
+                // one restarted while the gateway was being told
+                if let Some(connection) = state.connection.take() {
+                    connection.stop(None);
+                }
                 for (_, request) in state.requests.drain() {
                     request.stop(None);
                 }
@@ -726,6 +746,10 @@ impl Actor for App {
                     });
                 }
             }
+            AppMsg::StartConnection if state.connection.is_none() => {
+                Self::start_connection(&myself, state).await;
+            }
+            AppMsg::StartConnection => {}
         }
 
         Ok(())
@@ -752,14 +776,7 @@ impl Actor for App {
         tracing::error!(%error, "a child actor failed");
 
         if is(&cell, state.connection.as_ref()) {
-            // the endpoint could not bind, or the actor broke; start over
-            state.connection = None;
-            state.shared.set_connection(ConnectionState::Retrying {
-                in_secs: 1,
-                error: error.to_string(),
-            });
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            Self::start_connection(&myself, state).await;
+            Self::restart_connection(&myself, state, &error.to_string());
 
             return Ok(());
         }

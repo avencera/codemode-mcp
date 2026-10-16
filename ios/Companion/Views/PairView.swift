@@ -24,6 +24,11 @@ struct PairView: View {
                         .foregroundStyle(.red)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
+                    // a code that failed only because the gateway was out of
+                    // reach still works once it is back
+                    if lastScanned != nil {
+                        Button("Scan the same code again") { lastScanned = nil }
+                    }
                 }
                 scanner
                 Button("Paste invite") {
@@ -42,8 +47,8 @@ struct PairView: View {
     private var scanner: some View {
         if DataScannerViewController.isSupported, DataScannerViewController.isAvailable {
             QRScanner { scanned in
-                // the scanner restarts after a failed pairing; the same code
-                // would fail the same way, so only a new one is tried
+                // the scanner restarts after a failed pairing with the code
+                // still in view; it is tried again only when the owner asks
                 guard scanned != lastScanned else { return }
                 lastScanned = scanned
                 manager.dispatch(.pair(scanned: scanned))
