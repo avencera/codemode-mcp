@@ -27,6 +27,9 @@ use crate::{
 /// How long one `op read` may take; long enough for the 1Password app's
 /// unlock or Touch ID prompt on the Mac
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the phones wait while the owner is at this Mac, whose own
+/// prompt usually answers first; a read answered within it never pushes
+pub const PHONE_GRACE: Duration = Duration::from_secs(5);
 /// How long `op whoami` may take; it answers without a prompt
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(10);
 /// What `op whoami` prints when the app has not authorized the CLI
@@ -362,10 +365,12 @@ impl OnePassword {
                 (name, value)
             });
         }
+        let grace = if local { PHONE_GRACE } else { Duration::ZERO };
         for name in phones {
             let companions = Arc::clone(companions);
             let reference = reference.to_owned();
             sources.spawn(async move {
+                tokio::time::sleep(grace).await;
                 let value = companions
                     .read_phone(&name, &reference)
                     .await

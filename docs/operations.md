@@ -257,7 +257,8 @@ and the phone's UDID in `IOS_DEVICE_UDID`).
 How reads work with a phone paired:
 
 - Every listed phone is asked alongside the gateway's own `op` and the companion Macs, and the first value
-  wins, so a read at the gateway Mac also pushes to the phone. When another source answers first, the phone's prompt is taken
+  wins. While you are at the gateway Mac, the phones are asked 5 seconds later, so a read you answer there
+  never pushes to the phone. When another source answers first, the phone's prompt is taken
   down; when the phone answers first, the other prompts are.
 - The phone dials the gateway, since iOS does not let a suspended app accept connections. The gateway sends
   each read over that connection and waits up to 120 seconds; the phone shows a countdown and marks the read

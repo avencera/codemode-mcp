@@ -35,6 +35,7 @@ use codemode_mcp::{
         },
     },
     config::Config,
+    secrets::PHONE_GRACE,
 };
 use companion_wire::seal::SoftwareKey;
 use iroh::{
@@ -801,14 +802,30 @@ async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
     let Rig {
         harness,
         phone,
+        apns,
         local_log,
         ..
     } = rig;
     phone.set_answer(Answer::Hang);
 
-    // after a restart the owner at the gateway answers 1Password, slowly
-    // enough that the phone has its prompt up first
-    let slow = slow_op(2)?;
+    // after a restart the owner at the gateway answers 1Password within
+    // the phones' grace, so the phone is never pushed or asked
+    let quick = slow_op(1)?;
+    let harness = harness
+        .restart_with(Stop::Drain, |config| {
+            config.secrets.op = quick.display().to_string();
+        })
+        .await?;
+    let body = harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], VALUE, "{body}");
+    tokio::time::sleep(PHONE_GRACE).await;
+    assert!(apns.pushes().is_empty(), "{:?}", apns.pushes());
+    assert!(phone.seen().is_empty(), "{:?}", phone.seen());
+
+    // and again, slowly enough that the phone has its prompt up first
+    let slow = slow_op(PHONE_GRACE.as_secs() + 2)?;
     let harness = harness
         .restart_with(Stop::Drain, |config| {
             config.secrets.op = slow.display().to_string();
