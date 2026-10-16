@@ -14,16 +14,14 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::{
-    CompanionFailure, Companions, HANDSHAKE_TIMEOUT, Hangup, InviteSecret, InviteTicket, PairCheck,
-    PairRequest, PairResponse, Registered, Registration, answer,
-    pair::{append_section, gateway_entry, read_config},
+    ASK_TIMEOUT, CompanionFailure, Companions, HANDSHAKE_TIMEOUT, Hangup, InviteSecret,
+    InviteTicket, MOBILE_ALPN, PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registered,
+    Registration, answer,
+    mobile::PhoneRegistration,
+    pair::{append_section, gateway_entry, phone_entry, read_config},
     read_request,
 };
-use crate::config::{CompanionPeer, Config, MAX_MAC_NAME_CHARS, is_mac_name};
-
-/// Protocol name of pairing; the gateway offers it only while an invite is
-/// open
-pub const PAIR_ALPN: &[u8] = b"codemode-mcp/pair/1";
+use crate::config::{CompanionPeer, Config, MAX_MAC_NAME_CHARS, PhonePeer, is_mac_name};
 
 /// Longest an invite stays open
 pub const MAX_INVITE_LIFETIME: Duration = Duration::from_secs(600);
@@ -72,6 +70,9 @@ pub enum InviteStatus {
         id: EndpointId,
         /// Whether it was listed before
         already_listed: bool,
+        /// Whether it is a phone rather than a Mac
+        #[serde(default)]
+        phone: bool,
     },
     /// The registered Mac hung up, after a check or without one
     Done {
@@ -87,6 +88,9 @@ pub enum InviteStatus {
         /// only once the check reaches it, so one whose setup failed is not
         /// asked in place of the local `op`
         in_use: bool,
+        /// Whether it is a phone rather than a Mac
+        #[serde(default)]
+        phone: bool,
     },
     /// A Mac used the invite but could not be listed
     Failed {
@@ -239,18 +243,22 @@ impl Invites {
     }
 
     /// Offers the pairing protocol on `endpoint` exactly while an invite is
-    /// open; decided and set under the lock, so an expiry that finds none
-    /// open cannot undo an invite opened meanwhile
-    fn offer_pairing(&self, endpoint: &Endpoint) {
+    /// open, and the phone protocol while `phones` is set; decided and set
+    /// under the lock, so an expiry that finds none open cannot undo an
+    /// invite opened meanwhile
+    fn offer_pairing(&self, endpoint: &Endpoint, phones: bool) {
         let invites = self.lock();
         let open = invites
             .iter()
             .any(|invite| matches!(invite.status(), InviteStatus::Open { .. }));
-        endpoint.set_alpns(if open {
-            vec![PAIR_ALPN.to_vec()]
-        } else {
-            Vec::new()
-        });
+        let mut alpns = Vec::new();
+        if open {
+            alpns.push(PAIR_ALPN.to_vec());
+        }
+        if phones {
+            alpns.push(MOBILE_ALPN.to_vec());
+        }
+        endpoint.set_alpns(alpns);
     }
 }
 
@@ -314,15 +322,17 @@ impl Companions {
         self.invites.status(id)
     }
 
-    /// Offers the pairing protocol exactly while an invite is open, so the
-    /// gateway refuses every incoming connection the rest of the time
-    fn refresh_alpns(&self) {
+    /// Offers the pairing protocol exactly while an invite is open and the
+    /// phone protocol while a phone is listed, so the gateway refuses every
+    /// incoming connection the rest of the time
+    pub(super) fn refresh_alpns(&self) {
         if let Some(endpoint) = self.endpoint.get() {
-            self.invites.offer_pairing(endpoint);
+            self.invites
+                .offer_pairing(endpoint, !self.phones().is_empty());
         }
     }
 
-    fn start_accepting(self: &Arc<Self>, endpoint: &Endpoint) {
+    pub(super) fn start_accepting(self: &Arc<Self>, endpoint: &Endpoint) {
         self.accepting.get_or_init(|| {
             let companions = Arc::downgrade(self);
             let endpoint = endpoint.clone();
@@ -340,10 +350,16 @@ impl Companions {
                         continue;
                     };
                     tokio::spawn(async move {
-                        let _slot = slot;
                         match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
                             Ok(Ok(connection)) if connection.alpn() == PAIR_ALPN => {
+                                let _slot = slot;
                                 companions.pairing(connection).await;
+                            }
+                            // a phone stays connected while its app is open,
+                            // so it gives its handshake slot back
+                            Ok(Ok(connection)) if connection.alpn() == MOBILE_ALPN => {
+                                drop(slot);
+                                companions.phone_connection(connection).await;
                             }
                             Ok(Ok(connection)) => {
                                 connection.close(1_u32.into(), b"unexpected protocol");
@@ -357,7 +373,7 @@ impl Companions {
         });
     }
 
-    async fn pairing(&self, connection: Connection) {
+    async fn pairing(self: &Arc<Self>, connection: Connection) {
         let connection = Hangup(connection);
         let Ok(Ok((mut send, mut receive))) =
             tokio::time::timeout(REQUEST_WINDOW, connection.0.accept_bi()).await
@@ -371,7 +387,21 @@ impl Companions {
             return;
         };
 
-        let (invite, registered, references, mut pending) = match self.register(registration).await
+        let phone = registration.phone.is_some();
+        // a phone dials with the key it registers, so the id it names must
+        // be the one the handshake proved; a Mac's agent answers on its own
+        // key, which only its holder can do
+        if phone && registration.id != connection.0.remote_id() {
+            refuse(
+                &connection,
+                &mut send,
+                "a phone must register the id it connects with",
+            )
+            .await;
+
+            return;
+        }
+        let (invite, registered, references, mut pending) = match self.register(*registration).await
         {
             Ok(registration) => registration,
             Err(message) => {
@@ -395,8 +425,11 @@ impl Companions {
             Ok(Ok((mut send, mut receive))) => {
                 match tokio::time::timeout(REQUEST_WINDOW, read_request(&mut receive)).await {
                     Ok(Some(PairRequest::Check)) => {
-                        let (check, reached) =
-                            self.check_new(&name, pending.as_ref(), &references).await;
+                        let (check, reached) = if phone {
+                            (self.check_phone(&name, &references).await, true)
+                        } else {
+                            self.check_new(&name, pending.as_ref(), &references).await
+                        };
                         if reached && let Some(peer) = pending.take() {
                             tracing::info!(name = %peer.name, "companion in use");
                             self.add_peer(peer);
@@ -432,6 +465,7 @@ impl Companions {
             name,
             id,
             already_listed,
+            phone,
         }) = status
         {
             self.invites.set(
@@ -442,6 +476,7 @@ impl Companions {
                     already_listed,
                     check,
                     in_use,
+                    phone,
                 },
             );
         }
@@ -460,7 +495,14 @@ impl Companions {
         let invite = self.invites.redeem(&secret)?;
         self.refresh_alpns();
 
-        match self.list(&registration, &invite).await {
+        let listed = match &registration.phone {
+            Some(phone) => self
+                .list_phone(&registration, phone, &invite)
+                .await
+                .map(|registered| (registered, None)),
+            None => self.list(&registration, &invite).await,
+        };
+        match listed {
             Ok((registered, pending)) => {
                 tracing::info!(
                     name = %registered.name,
@@ -473,6 +515,7 @@ impl Companions {
                         name: registered.name.clone(),
                         id: registration.id,
                         already_listed: registered.already_listed,
+                        phone: registration.phone.is_some(),
                     },
                 );
 
@@ -529,19 +572,22 @@ impl Companions {
 
         // the file may have changed since the daemon loaded it
         let existing = read_config(path).map_err(|error| error.to_string())?;
-        let in_file = Config::parse(&existing, path)
+        let in_file_secrets = Config::parse(&existing, path)
             .map_err(|error| error.to_string())?
-            .secrets
-            .companions;
+            .secrets;
+        let (in_file, in_file_phones) = (in_file_secrets.companions, in_file_secrets.phones);
         // listed by an earlier pairing whose check never reached it
         if let Some(peer) = in_file.iter().find(|peer| peer.id == registration.id) {
             return Ok((registered(&peer.name, true), Some(peer.clone())));
         }
 
+        let phones = self.phones();
         let taken: Vec<&str> = peers
             .iter()
             .chain(&in_file)
             .map(|peer| peer.name.as_str())
+            .chain(phones.iter().map(|phone| phone.name.as_str()))
+            .chain(in_file_phones.iter().map(|phone| phone.name.as_str()))
             .collect();
         let name = unique_name(&registration.name, &taken);
         let entry = gateway_entry(&name, registration.id, &addrs);
@@ -559,6 +605,130 @@ impl Companions {
         };
 
         Ok((registered(&name, false), Some(peer)))
+    }
+
+    /// Appends the phone to the config file and starts answering it at once:
+    /// a phone is asked only for values sealed to it, so one whose setup
+    /// failed costs nothing. Values this process has read are sealed to it
+    /// now. A phone already listed by id keeps its entry
+    async fn list_phone(
+        &self,
+        registration: &Registration,
+        phone: &PhoneRegistration,
+        invite: &Redeemed,
+    ) -> Result<Registered, String> {
+        let _turn = self.registering.lock().await;
+        let registered = |name: &str, already_listed| Registered {
+            gateway_name: invite.gateway_name.clone(),
+            name: name.to_owned(),
+            references: invite.references.clone(),
+            already_listed,
+        };
+        let Some(store) = &self.store else {
+            return Err("this gateway keeps no state for phones".to_owned());
+        };
+        let key = registration.id.to_string();
+        let remember_push = || {
+            store
+                .put_push_token(&key, phone.push.as_ref())
+                .map_err(|error| format!("could not keep the phone's push token: {error}"))
+        };
+        let same_key = |listed: &PhonePeer| {
+            if listed.seal_key == phone.seal_key {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} is listed with another seal key; remove its [[secrets.phones]] entry \
+                     and pair again",
+                    listed.name
+                ))
+            }
+        };
+
+        if let Some(listed) = self
+            .phones()
+            .into_iter()
+            .find(|listed| listed.id == registration.id)
+        {
+            same_key(&listed)?;
+            remember_push()?;
+            self.backfill(&listed).await;
+
+            return Ok(registered(&listed.name, true));
+        }
+        let Some(path) = &self.config_path else {
+            return Err("the gateway has no config file to list the phone in".to_owned());
+        };
+        // the file may have changed since the daemon loaded it
+        let existing = read_config(path).map_err(|error| error.to_string())?;
+        let in_file = Config::parse(&existing, path)
+            .map_err(|error| error.to_string())?
+            .secrets;
+        if let Some(listed) = in_file
+            .phones
+            .iter()
+            .find(|listed| listed.id == registration.id)
+        {
+            same_key(listed)?;
+            remember_push()?;
+            self.add_phone(listed.clone());
+            self.backfill(listed).await;
+
+            return Ok(registered(&listed.name, true));
+        }
+
+        let peers = self.peers();
+        let phones = self.phones();
+        let taken: Vec<&str> = peers
+            .iter()
+            .chain(&in_file.companions)
+            .map(|peer| peer.name.as_str())
+            .chain(
+                phones
+                    .iter()
+                    .chain(&in_file.phones)
+                    .map(|listed| listed.name.as_str()),
+            )
+            .collect();
+        let name = unique_name(&registration.name, &taken);
+        let entry = phone_entry(&name, registration.id, &phone.seal_key);
+        append_section(path, &existing, &entry)
+            .map_err(|error| format!("could not add the phone to {}: {error}", path.display()))?;
+        remember_push()?;
+        let listed = PhonePeer {
+            name: name.clone(),
+            id: registration.id,
+            seal_key: phone.seal_key.clone(),
+        };
+        self.add_phone(listed.clone());
+        self.backfill(&listed).await;
+
+        Ok(registered(&name, false))
+    }
+
+    /// Reads the first reference sealed to the new phone through it; the
+    /// value is dropped at once
+    async fn check_phone(self: &Arc<Self>, name: &str, references: &[String]) -> PairCheck {
+        if references.is_empty() {
+            return PairCheck::Skipped;
+        }
+        let Some(reference) = references
+            .iter()
+            .find(|reference| self.has_seal(name, reference))
+        else {
+            return PairCheck::NothingSealed;
+        };
+
+        match self.read_phone(name, reference, ASK_TIMEOUT).await {
+            Ok(value) => PairCheck::Read {
+                reference: reference.clone(),
+                bytes: value.len(),
+            },
+            Err(failure) => PairCheck::Failed {
+                reference: reference.clone(),
+                message: failure.to_string(),
+            },
+        }
     }
 
     /// Reads the first reference through the companion `name` (or `pending`,

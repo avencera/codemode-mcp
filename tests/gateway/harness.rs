@@ -275,6 +275,9 @@ pub struct FakeMac {
     answer_after: Mutex<Duration>,
     /// A file that must exist before a prompt answers
     answer_once: Mutex<Option<PathBuf>>,
+    /// A file each notification creates, so a test can change the world
+    /// while one is up
+    on_notify: Mutex<Option<PathBuf>>,
     shown: Mutex<Vec<String>>,
     cancel_titles: Mutex<Vec<String>>,
 }
@@ -311,6 +314,13 @@ impl FakeMac {
     /// test can order an answer after something else has started
     pub fn set_answer_once(&self, path: PathBuf) {
         if let Ok(mut slot) = self.answer_once.lock() {
+            *slot = Some(path);
+        }
+    }
+
+    /// Create `path` whenever a notification shows
+    pub fn set_on_notify(&self, path: PathBuf) {
+        if let Ok(mut slot) = self.on_notify.lock() {
             *slot = Some(path);
         }
     }
@@ -401,6 +411,9 @@ impl Mac for FakeMac {
             ))));
         }
         self.record(format!("notify {}", notification.title));
+        if let Some(path) = self.on_notify.lock().ok().and_then(|path| path.clone()) {
+            let _ = std::fs::write(path, b"");
+        }
 
         Box::pin(std::future::ready(Ok(())))
     }

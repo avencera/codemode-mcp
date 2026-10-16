@@ -7,18 +7,24 @@
 //! 1Password stays the only source of truth, and no value is stored on
 //! either side beyond the gateway's in-memory cache
 
+mod apns;
 mod client;
 mod identity;
 mod invite;
 mod join;
 mod pair;
+mod phone;
 mod server;
-mod ticket;
-mod wire;
+
+/// The wire types, shared with the phone's core
+pub use companion_wire::{mobile, ticket, wire};
 
 pub use client::{CheckOutcome, CompanionFailure, Companions};
+pub use companion_wire::{
+    ALPN, ASK_TIMEOUT, MAX_BODY_BYTES, MAX_PHONE_READ_BYTES, MOBILE_ALPN, PAIR_ALPN,
+};
 pub use identity::{IdentityError, Role, load_or_create};
-pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite, PAIR_ALPN};
+pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
 pub use pair::{PairError, Paired, Pairing, companion_id, pair};
 pub use server::{CompanionHandle, ServeError, serve};
@@ -43,23 +49,12 @@ use iroh::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 
-/// Protocol name of the companion exchange
-pub const ALPN: &[u8] = b"codemode-mcp/companion/1";
-
 /// Port a companion listens on when the gateway has discovery off and
 /// dials it directly
 pub const DIRECT_PORT: u16 = 7678;
 
 /// How long a peer may take to finish the handshake
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Longest request or response body; references and the values read for
-/// them are far below this
-const MAX_BODY_BYTES: usize = 64 * 1024;
-/// How long one companion request may take, including the owner's Touch ID
-/// answer on the other Mac; the gateway gives up after it and the companion
-/// takes its prompt down
-pub const ASK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Closes its connection when dropped
 ///

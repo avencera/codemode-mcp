@@ -218,6 +218,10 @@ impl Companion {
         } else {
             false
         };
+        // the turn lock covers only this process: another `op` on this Mac
+        // may have been approved while the notification went up, and then
+        // 1Password reads silently, so this read is asked for after all
+        let named_for_1password = named_for_1password && self.onepassword.signed_out().await;
         if !named_for_1password && mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
             tracing::info!(reference, "read not approved on this Mac");
 

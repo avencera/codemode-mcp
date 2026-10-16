@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use companion_wire::mobile::SealKey;
 use iroh::EndpointId;
 use serde::Serialize;
 
@@ -83,6 +84,15 @@ pub(super) fn gateway_entry(name: &str, id: EndpointId, addrs: &[SocketAddr]) ->
     format!(
         "[[secrets.companions]]\nname = {}\nid = \"{id}\"\n{addrs}",
         toml::Value::String(name.to_owned()),
+    )
+}
+
+/// A `[[secrets.phones]]` block
+pub(super) fn phone_entry(name: &str, id: EndpointId, seal_key: &SealKey) -> String {
+    format!(
+        "[[secrets.phones]]\nname = {}\nid = \"{id}\"\nseal_key = \"{}\"",
+        toml::Value::String(name.to_owned()),
+        seal_key.to_base64(),
     )
 }
 

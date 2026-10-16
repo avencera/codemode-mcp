@@ -633,7 +633,7 @@ async fn invite(config: &Config, valid_for: Option<u64>) -> Result<()> {
     if std::io::stdout().is_terminal() {
         println!(
             "\nOr scan this with a phone and paste the text it copies into a terminal on the \
-             other Mac:\n"
+             other Mac. To pair an iPhone instead, scan it in the codemode-mcp Companion app:\n"
         );
         // the invite is open already, so a QR failure must not end the wait
         match terminal_qr(&one_liner) {
@@ -671,13 +671,21 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
                 name,
                 id,
                 already_listed,
+                phone,
             } => {
                 if !announced {
-                    announce_registration(&name, id, already_listed);
-                    println!(
-                        "Waiting for {name} to start its companion; the check needs a Touch ID \
-                         approval there."
-                    );
+                    announce_registration(&name, id, already_listed, phone);
+                    if phone {
+                        println!(
+                            "Waiting for {name} to check the pairing; approve the read on the \
+                             phone."
+                        );
+                    } else {
+                        println!(
+                            "Waiting for {name} to start its companion; the check needs a Touch \
+                             ID approval there."
+                        );
+                    }
                     announced = true;
                 }
             }
@@ -687,9 +695,10 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
                 already_listed,
                 check,
                 in_use,
+                phone,
             } => {
                 if !announced {
-                    announce_registration(&name, id, already_listed);
+                    announce_registration(&name, id, already_listed, phone);
                 }
                 if !in_use {
                     bail!(
@@ -721,6 +730,15 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
 
                         Ok(())
                     }
+                    Some(PairCheck::NothingSealed) => {
+                        println!(
+                            "Paired, with nothing to check yet: nothing has been read since the \
+                             daemon started. {name} opens a reference with Face ID once it has \
+                             been read, and until then you enter its value there."
+                        );
+
+                        Ok(())
+                    }
                     None => {
                         println!(
                             "{name} hung up without a check; once its companion runs, try \
@@ -736,9 +754,14 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
     }
 }
 
-fn announce_registration(name: &str, id: iroh::EndpointId, already_listed: bool) {
+fn announce_registration(name: &str, id: iroh::EndpointId, already_listed: bool, phone: bool) {
     if already_listed {
         println!("{name} ({id}) registered; it was already in this Mac's config.");
+    } else if phone {
+        println!(
+            "{name} ({id}) registered and was added to [secrets.phones] in this Mac's config. \
+             The daemon asks it from now on."
+        );
     } else {
         println!(
             "{name} ({id}) registered and was added to [secrets.companions] in this Mac's \
@@ -905,6 +928,8 @@ async fn pair_with_invite(
             "Paired. No server on {gateway} uses an op:// reference yet, so there was nothing to \
              check."
         ),
+        // only a phone is answered this way
+        PairCheck::NothingSealed => println!("Paired."),
     }
 
     Ok(())
@@ -1385,7 +1410,7 @@ async fn shutdown_signal() {
 }
 
 async fn tools_command(config: Config, stubs: bool) -> Result<()> {
-    let app = App::start(config).await?;
+    let app = App::start_without_approvals(config).await?;
     app.gateway().wait_ready(SETTLE_LIMIT).await;
 
     for report in app.gateway().report() {

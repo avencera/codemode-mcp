@@ -7,7 +7,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::EndpointId;
+use iroh_base::EndpointId;
 use serde::{Deserialize, Serialize};
 
 /// Start of every manual ticket; the digit is the format version
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn an_invite_round_trips_with_both_address_kinds() -> Result<(), TicketError> {
         let ticket = InviteTicket {
-            gateway: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+            gateway: iroh_base::SecretKey::from_bytes(&[3; 32]).public(),
             secret: InviteSecret::generate(),
             addrs: vec![
                 "100.64.0.5:7678".parse().map_err(|_| TicketError::Prefix)?,

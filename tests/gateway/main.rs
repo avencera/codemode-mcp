@@ -10,6 +10,7 @@ mod harness;
 mod lazy;
 mod mac;
 mod oauth;
+mod phone;
 mod secrets;
 mod service;
 mod session_less;

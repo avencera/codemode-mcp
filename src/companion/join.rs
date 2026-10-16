@@ -130,12 +130,13 @@ pub async fn join(joining: Joining<'_>) -> Result<Joined, JoinError> {
         }
     };
 
-    let registration = PairRequest::Register(Registration {
+    let registration = PairRequest::Register(Box::new(Registration {
         secret: ticket.secret.to_hex(),
         id: joining.id,
         name: joining.name,
         addrs,
-    });
+        phone: None,
+    }));
     let response = ask::<PairResponse>(&connection.0, &registration).await;
     let registered = match response {
         Ok(PairResponse::Registered(registered)) => Ok(registered),

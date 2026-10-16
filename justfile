@@ -121,7 +121,7 @@ alias br := build-release
 
 [group('test')]
 test *args="":
-    cargo test {{args}}
+    cargo test --workspace {{args}}
 
 # ------------------------------------------------------------------------------
 # lint
@@ -133,7 +133,24 @@ fmt *args="":
 
 [group('lint')]
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# every `just <recipe>` the docs mention must exist, so they cannot drift
+# from this file
+[group('lint')]
+[script('bash')]
+docs-check:
+    set -euo pipefail
+
+    recipes=" $(just --summary) "
+    missing=0
+    while read -r recipe; do
+        if [[ "$recipes" != *" $recipe "* ]]; then
+            echo "docs mention \`just $recipe\`, which is not a recipe" >&2
+            missing=1
+        fi
+    done < <(grep -rhoE '`just [a-z][a-z0-9-]*' README.md docs mobile ios --include='*.md' | sed 's/`just //' | sort -u)
+    exit "$missing"
 
 [group('ci')]
 [script('bash')]
@@ -141,4 +158,29 @@ ci:
     set -euo pipefail
     just fmt -- --check
     just clippy
+    just docs-check
     just test
+
+# ------------------------------------------------------------------------------
+# ios
+# ------------------------------------------------------------------------------
+
+# Build the Rust core for iOS and refresh the CompanionCore Swift package. Flags: --release --sim
+[group('ios')]
+ios-core *flags="":
+    cargo xtask build-ios {{flags}}
+
+# Generate ios/Companion.xcodeproj from ios/project.yml
+[group('ios')]
+ios-project:
+    cargo xtask project
+
+# Build, install and launch the companion on the iPhone named by IOS_DEVICE_UDID (.envrc) or --udid
+[group('ios')]
+ios-run *flags="":
+    cargo xtask run-ios {{flags}}
+
+# Archive a release build and upload it to TestFlight; needs ASC_API_KEY_PATH, ASC_API_KEY_ID and ASC_API_ISSUER_ID
+[group('ios')]
+ios-testflight:
+    cargo xtask testflight

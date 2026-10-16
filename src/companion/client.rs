@@ -1,6 +1,7 @@
 //! The gateway's side: asking companions to read a reference
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, OnceLock, PoisonError, RwLock},
@@ -15,9 +16,13 @@ use tokio::{
 
 use super::{
     ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionRequest, CompanionResponse, Hangup,
-    IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, invite::Invites, load_or_create,
+    IdentityError, MAX_BODY_BYTES, Role, apns::Apns, bind_endpoint, invite::Invites,
+    load_or_create, phone::Links,
 };
-use crate::config::{CompanionPeer, SecretsConfig};
+use crate::{
+    config::{CompanionPeer, PhonePeer, SecretsConfig},
+    store::Store,
+};
 
 /// Why a companion did not send a value; none of the messages holds a value
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +87,17 @@ pub struct CheckOutcome {
 /// daemon runs
 pub struct Companions {
     peers: RwLock<Vec<CompanionPeer>>,
+    pub(super) phones: RwLock<Vec<PhonePeer>>,
+    /// Where values sealed to the phones and their push tokens are kept;
+    /// without one no phone is asked
+    pub(super) store: Option<Store>,
+    pub(super) apns: Option<Apns>,
+    pub(super) links: Links,
+    /// The reader's cache of values, shared so a newly paired phone gets
+    /// copies of what was read before it
+    pub(super) known: OnceLock<Arc<Mutex<HashMap<String, String>>>>,
     pub(super) discovery: bool,
+    listen: Option<SocketAddr>,
     identity_file: Option<PathBuf>,
     /// The config file a registered companion is appended to
     pub(super) config_path: Option<PathBuf>,
@@ -96,12 +111,19 @@ pub struct Companions {
 }
 
 impl Companions {
-    /// The companions named in `config`; a companion registering with an
-    /// invite is appended to `config_path`
-    pub fn new(config: &SecretsConfig, config_path: Option<PathBuf>) -> Self {
+    /// The companions and phones named in `config`; one registering with an
+    /// invite is appended to `config_path`. Values sealed to the phones are
+    /// kept in `store`
+    pub fn new(config: &SecretsConfig, config_path: Option<PathBuf>, store: Option<Store>) -> Self {
         Self {
             peers: RwLock::new(config.companions.clone()),
+            phones: RwLock::new(config.phones.clone()),
+            store,
+            apns: config.apns.clone().map(Apns::new),
+            links: Links::default(),
+            known: OnceLock::new(),
             discovery: config.discovery,
+            listen: config.listen,
             identity_file: config.identity_file.clone(),
             config_path,
             secret_key: Mutex::new(None),
@@ -110,6 +132,12 @@ impl Companions {
             registering: Mutex::new(()),
             accepting: OnceLock::new(),
         }
+    }
+
+    /// Shares the reader's cache, so pairing a phone seals what was read
+    /// before it
+    pub fn share_cache(&self, known: Arc<Mutex<HashMap<String, String>>>) {
+        let _ = self.known.set(known);
     }
 
     /// The companions, as configured plus any registered since
@@ -126,6 +154,14 @@ impl Companions {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push(peer);
+    }
+
+    /// Closes the iroh endpoint, if it was bound, hanging up on phones and
+    /// companions and freeing its port
+    pub async fn close(&self) {
+        if let Some(endpoint) = self.endpoint.get() {
+            endpoint.close().await;
+        }
     }
 
     /// Addresses this gateway's endpoint is bound to, once it is; empty
@@ -168,7 +204,7 @@ impl Companions {
                     .await
                     .map_err(|error| CompanionFailure::Identity(error.to_string()))?;
 
-                bind_endpoint(Role::Gateway, key, self.discovery, None)
+                bind_endpoint(Role::Gateway, key, self.discovery, self.listen)
                     .await
                     .map_err(CompanionFailure::Identity)
             })
@@ -202,10 +238,30 @@ impl Companions {
             })
     }
 
-    /// Asks every companion and reports how each answered, in configuration
-    /// order, without keeping or returning a value
+    /// Asks every companion, then every phone, and reports how each
+    /// answered, in configuration order, without keeping or returning a
+    /// value
     pub async fn check(self: &Arc<Self>, reference: &str) -> Vec<CheckOutcome> {
         let mut answers = JoinSet::new();
+        let first_phone = self.peers().len();
+        for (index, phone) in self.phones().into_iter().enumerate() {
+            let companions = Arc::clone(self);
+            let reference = reference.to_owned();
+            answers.spawn(async move {
+                let result = companions
+                    .read_phone(&phone.name, &reference, ASK_TIMEOUT)
+                    .await
+                    .map(|value| value.len());
+
+                (
+                    first_phone + index,
+                    CheckOutcome {
+                        name: phone.name,
+                        result,
+                    },
+                )
+            });
+        }
         for (index, peer) in self.peers().iter().enumerate() {
             let companions = Arc::clone(self);
             let name = peer.name.clone();
@@ -290,6 +346,7 @@ impl std::fmt::Debug for Companions {
         formatter
             .debug_struct("Companions")
             .field("peers", &self.peers().len())
+            .field("phones", &self.phones().len())
             .finish_non_exhaustive()
     }
 }

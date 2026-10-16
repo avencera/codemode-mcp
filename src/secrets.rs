@@ -21,11 +21,15 @@ use crate::{
     companion::Companions,
     config::{Config, SecretsConfig},
     mac::OnMac,
+    store::Store,
 };
 
 /// How long one `op read` may take; long enough for the 1Password app's
 /// unlock or Touch ID prompt on the Mac
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the phones wait while the owner is at this Mac, whose own
+/// prompt usually answers first; a read answered within it never pushes
+pub const PHONE_GRACE: Duration = Duration::from_secs(5);
 /// How long `op whoami` may take; it answers without a prompt
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(10);
 /// What `op whoami` prints when the app has not authorized the CLI
@@ -56,13 +60,15 @@ impl Secrets {
     /// runs the local `op`
     ///
     /// The companions are attached even when there are none yet, since one
-    /// registering with an invite is used without a restart
+    /// registering with an invite is used without a restart. Values sealed
+    /// to the phones are kept in `store`; without one no phone is asked
     pub fn new(
         config: &SecretsConfig,
         config_path: Option<PathBuf>,
         presence: Option<OnMac>,
+        store: Option<Store>,
     ) -> Self {
-        let companions = Arc::new(Companions::new(config, config_path));
+        let companions = Arc::new(Companions::new(config, config_path, store));
         let onepassword =
             OnePassword::new(config.op.clone()).with_companions(Arc::clone(&companions), presence);
 
@@ -242,6 +248,7 @@ impl OnePassword {
     /// is away keeps a 1Password prompt from waiting on an unattended screen
     #[must_use]
     pub fn with_companions(mut self, companions: Arc<Companions>, on_mac: Option<OnMac>) -> Self {
+        companions.share_cache(Arc::clone(&self.known));
         self.companions = Some(companions);
         self.on_mac = on_mac;
 
@@ -291,12 +298,40 @@ impl OnePassword {
     }
 
     async fn read(&self, reference: &str) -> Result<String, SecretError> {
+        let value = self.race(reference).await?;
+        // whichever source won, its value replaces the phones' copies: a
+        // value the owner entered on a phone is opened with Face ID next time
+        if let Some(companions) = &self.companions {
+            companions.seal_for_phones(reference, &value).await;
+        }
+
+        Ok(value)
+    }
+
+    /// Reads `reference` from every source at once; the first value wins
+    async fn race(&self, reference: &str) -> Result<String, SecretError> {
         let peers = self
             .companions
             .as_ref()
             .map(|companions| companions.peers())
             .unwrap_or_default();
-        let Some(companions) = self.companions.as_ref().filter(|_| !peers.is_empty()) else {
+        // a phone opens its sealed copy, or the owner enters the value there
+        let phones: Vec<String> = self
+            .companions
+            .as_ref()
+            .map(|companions| {
+                companions
+                    .phones()
+                    .into_iter()
+                    .map(|phone| phone.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(companions) = self
+            .companions
+            .as_ref()
+            .filter(|_| !peers.is_empty() || !phones.is_empty())
+        else {
             return self.read_local(reference).await;
         };
 
@@ -330,9 +365,25 @@ impl OnePassword {
                 (name, value)
             });
         }
+        let grace = if local { PHONE_GRACE } else { Duration::ZERO };
+        for name in phones {
+            let companions = Arc::clone(companions);
+            let reference = reference.to_owned();
+            sources.spawn(async move {
+                tokio::time::sleep(grace).await;
+                // the race gives up READ_TIMEOUT after it began, grace included
+                let value = companions
+                    .read_phone(&name, &reference, READ_TIMEOUT.saturating_sub(grace))
+                    .await
+                    .map_err(|error| error.to_string());
+
+                (name, value)
+            });
+        }
 
         // dropping the set on any exit aborts what is still running, which
-        // kills the local `op` child and hangs up on the companions
+        // kills the local `op` child, hangs up on the companions and stops
+        // the phones' streams
         let first_success = async {
             // named, so a failure with the owner away says why `op` never ran
             let mut failures = Vec::new();
@@ -351,7 +402,7 @@ impl OnePassword {
         };
 
         match tokio::time::timeout(READ_TIMEOUT, first_success).await {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(won)) => Ok(won),
             Ok(Err(failures)) if failures.is_empty() => Err(SecretError::Read {
                 reference: reference.to_owned(),
                 reason: "no source could read it".to_owned(),

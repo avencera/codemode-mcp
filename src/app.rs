@@ -118,7 +118,15 @@ impl App {
 
     /// For one-off runs outside the daemon: nobody can reach an approval
     /// page, so `ask` calls are refused with a reason saying so
-    pub async fn start_without_approvals(config: Config) -> Result<Self, AppError> {
+    ///
+    /// The run leaves the daemon its fixed iroh address and its phones:
+    /// binding `secrets.listen` would fail while the daemon holds it, and a
+    /// phone dials only the daemon, so one asked from here could never
+    /// answer, while the push would still wake it
+    pub async fn start_without_approvals(mut config: Config) -> Result<Self, AppError> {
+        config.secrets.listen = None;
+        config.secrets.phones.clear();
+
         Self::build(config, None, None, NO_APPROVAL_PAGE).await
     }
 
@@ -142,7 +150,12 @@ impl App {
         // turning Mac notifications off stops approvals asking at the Mac,
         // not secret reads checking whether the owner is there
         let on_mac = presence.clone().filter(|_| config.notify.mac.enabled);
-        let secrets = Secrets::new(&config.secrets, config.path().map(Path::to_owned), presence);
+        let secrets = Secrets::new(
+            &config.secrets,
+            config.path().map(Path::to_owned),
+            presence,
+            Some(store.clone()),
+        );
         let oauth = OAuth::new(&config, store.clone(), secrets.onepassword.clone());
         let approvals = Approvals::new(
             &config.public_base(),
@@ -207,6 +220,16 @@ impl App {
         // one whose execution did not survive
         approvals.abandon_orphans();
         approvals.renotify();
+
+        // a phone opened after a restart finds the gateway before the next
+        // read; one-off CLI runs never call this, so they never publish the
+        // gateway's id alongside the daemon
+        let companions = Arc::clone(self.gateway.companions());
+        tokio::spawn(async move {
+            if let Err(error) = companions.listen_for_phones().await {
+                tracing::warn!(%error, "phones cannot reach this gateway until the next read");
+            }
+        });
     }
 
     /// Stops accepting executions and gives the running ones up to
@@ -227,6 +250,9 @@ impl App {
     /// flushes the usage log
     pub async fn shutdown(&self) {
         self.halt();
+        // tells connected phones and frees `secrets.listen` for the next
+        // process
+        self.gateway.companions().close().await;
         self.log.flush().await;
     }
 

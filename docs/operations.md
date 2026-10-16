@@ -202,8 +202,9 @@ How reads work with a companion configured:
   own prompt does not name the item, and one approval lets `op` read anything for about ten minutes, so the
   companion asks Touch ID itself, naming the reference, on every request. Edit `allow` in its `[companion]`
   section to change what the gateway may read, then `codemode-mcp companion install` again to restart it.
-- The gateway accepts incoming iroh connections only while an invite is open, and then only for pairing; the rest
-  of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
+- The gateway accepts nothing over iroh unless a peer is listed or an invite is open. While an invite is open it
+  accepts pairing; while a phone is listed under `[[secrets.phones]]` it accepts that phone's id, and refuses
+  every other id. The rest of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
   keeps its existing entry, and a different Mac with a name that is already taken is listed as `name-2`.
 - Each Mac's iroh key is created on first use and kept in its login keychain. The binary that creates it reads it
   without a prompt, and so does any build signed with the same identity; any other program gets a keychain
@@ -215,6 +216,67 @@ How reads work with a companion configured:
   invite then carries the gateway's current addresses. Pairing gives the companion `discovery = false` and
   `listen = "0.0.0.0:7678"`, and lists that Mac's IPv4 addresses in its `[[secrets.companions]]` entry, so
   the two Macs must reach each other directly over IPv4, for example over the tailnet.
+
+## Approve from an iPhone
+
+The Companion app answers `{{ op://… }}` reads from an iPhone. The phone does not read 1Password itself: each
+time a reference is read, the gateway seals the value to a key in the phone's Secure Enclave and keeps only that
+sealed copy. The phone answers by opening the copy, which takes Face ID. So:
+
+- The first time a reference is asked for, the phone has no copy. Paste the value into the read, or fill it in
+  with AutoFill from 1Password or Passwords, and send it. The gateway seals whatever value wins, so the next
+  read opens with Face ID. Pairing seals what the daemon has already read since its last start.
+- The copy holds the value from the last time the reference was read. After rotating a secret, tap Enter a
+  different value on the phone's next read, or read it once at the gateway Mac or a companion Mac and deny it
+  on the phone: approving the old copy there first wins the race, and the daemon keeps that value until it
+  restarts.
+- Changing Face ID's enrolled faces voids the phone's key, and opening a copy then fails; pair again.
+
+Install the app from TestFlight, or build it onto a connected iPhone with `just ios-run` (needs Xcode, xcodegen,
+and the phone's UDID in `IOS_DEVICE_UDID`).
+
+1. To wake the phone when a read comes in, give the gateway an APNs key (Certificates, IDs & Profiles, Keys,
+   with Apple Push Notifications service enabled) under `[secrets]`:
+
+   ```toml
+   [secrets.apns]
+   key_file = "/Users/you/.config/codemode-mcp/apns/AuthKey_ABC123DEFG.p8"
+   key_id = "ABC123DEFG"
+   team_id = "Q8UP8C53Y8"
+   ```
+
+   Without it, the phone answers only while Companion is open on screen. The push goes through Apple and
+   names the reference and the gateway Mac, never the value. It is marked time-sensitive, so it can break
+   through a Focus that allows time-sensitive notifications.
+2. With the daemon running, run `codemode-mcp companion invite` on the gateway Mac. Open Companion and point it at
+   the QR code, or copy the command and tap Paste invite. The phone registers, the gateway
+   appends a `[[secrets.phones]]` entry to the end of its config, and the gateway reads one reference through
+   the phone: approve it with Face ID. If nothing has been read since the daemon started, there is nothing
+   sealed to check yet, and pairing says so. A phone must register the iroh id it connects with, so a leaked invite
+   cannot list a phone for another device's id.
+3. Check it later from the gateway Mac with `codemode-mcp companion check <reference>`; the phone shows the read.
+
+How reads work with a phone paired:
+
+- Every listed phone is asked alongside the gateway's own `op` and the companion Macs, and the first value
+  wins. While you are at the gateway Mac, the phones are asked 5 seconds later, so a read you answer there
+  within 5 seconds never pushes to the phone. When another source answers first, the phone's prompt is taken
+  down; when the phone answers first, the other prompts are.
+- The phone dials the gateway, since iOS does not let a suspended app accept connections. The gateway sends
+  each read over that connection and waits up to 120 seconds; the phone shows a countdown and marks the read
+  expired when the gateway stops waiting.
+- The phone shows one read at a time, naming the reference. It answers the references the gateway used when
+  it paired, matched exactly; any other reference waits for you to tap Allow this reference, after which the
+  phone answers it like the rest. The gateway screen lists the allowed references; swipe one to remove it. The values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.
+- The phone keeps its iroh key, the gateway's address and its allow list in its Keychain, readable only while
+  it is unlocked. Deleting the app forgets the pairing.
+- With `discovery = false`, set `listen` under `[secrets]` to a fixed address such as `"0.0.0.0:7679"`, so the
+  address the invite gives the phone stays valid across restarts. The phone must then reach that address
+  directly, for example over the tailnet.
+
+To unpair, tap Unpair in Companion. The gateway forgets the phone's sealed copies and push token and stops
+accepting it, and the phone forgets its keys. Remove its `[[secrets.phones]]` entry from the gateway's config by
+hand; until then a restarted daemon accepts the old id again, though no device holds its key any more.
 
 ## Calendar and Reminders access
 

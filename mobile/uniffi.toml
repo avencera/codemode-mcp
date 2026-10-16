@@ -1,0 +1,2 @@
+[bindings.swift]
+cdylib_name = "companion_core_ffi"
