@@ -493,11 +493,13 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - A `url` is parsed as a URL at config load only when it holds no reference; one with references is parsed after
   they are read (`SecretError::NotAUrl`, reported as a `configuration` failure). It is resolved at the same point
   in the connect path as `headers` and `env`, through the same reader and cache. The redactor learns the whole
-  URL, its normalized form, host, path and query, and the daemon's log writer (`secrets::redacting_logs`) scrubs
+  URL, its normalized form, host, path, query and the key-like pieces of them (16+ characters with a digit), not
+  public words such as `message`, and the daemon's log writer (`secrets::redacting_logs`) scrubs
   with the same redactor, because rmcp and reqwest print the URL in their own log events. Only the template is
   shown or stored: OAuth logins, flows and registrations are keyed by server name, never by URL, so a key in the
-  URL does not reach `codemode.sqlite`; the authorization link omits rmcp's `resource` parameter (it would be the
-  URL) for a `url` with references
+  URL does not reach `codemode.sqlite`. Credentials (token-response fields included, unused vendor fields are
+  dropped), the pending state and the authorization link are checked for the key and refused when they hold it; the
+  link's `resource` parameter is dropped only when its value holds the key
 
 ### Companions (`src/companion.rs`)
 

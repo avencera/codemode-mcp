@@ -38,6 +38,8 @@ const MAX_ERROR_TEXT: usize = 2000;
 const REDACTED: &str = "[redacted]";
 /// Shorter secrets would redact ordinary words
 const MIN_SECRET_LEN: usize = 6;
+/// Shortest path segment or query value taken for a key
+const MIN_KEY_LEN: usize = 16;
 /// Longest `op://` reference accepted
 const MAX_REFERENCE_CHARS: usize = 256;
 
@@ -178,35 +180,83 @@ pub fn is_reference(text: &str) -> bool {
     })
 }
 
-/// The parts of a URL that can hold a key: userinfo, path and query as a
-/// whole and piece by piece, plus the URL itself in the encodings an
-/// authorization server echoes back
-fn url_secrets(url: &str) -> Vec<String> {
-    let mut secrets = vec![url.to_owned()];
-    secrets.extend(encodings(url));
+/// What in a URL must stay out of text, split by how it is used
+struct UrlParts {
+    /// What identifies the URL: the URL and its path in every encoding, and
+    /// the path and query pieces that look like a key. An authorization
+    /// server's issuer or link holding one of these exposes the URL
+    keys: Vec<String>,
+    /// Parts that only the redactor needs: a query as a whole, which is
+    /// public enough to share with an authorization server, and userinfo
+    redacted: Vec<String>,
+}
+
+/// Whether `text` looks like a key rather than a word: long, made of the
+/// characters keys are made of, and holding a digit
+///
+/// Path words such as `message` or `realms` are public and would redact
+/// ordinary text and make valid issuers look like leaks
+fn is_key_like(text: &str) -> bool {
+    text.len() >= MIN_KEY_LEN
+        && text.bytes().any(|byte| byte.is_ascii_digit())
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.~-+/=".contains(&byte))
+}
+
+/// The parts of a URL that can hold a key: the URL itself and its path in
+/// the encodings an authorization server echoes back (the path only when it
+/// holds a key-like piece), the key-like pieces of the path and query, and
+/// the query and userinfo for the redactor
+fn url_parts(url: &str) -> UrlParts {
+    let mut keys = vec![url.to_owned()];
+    keys.extend(encodings(url));
+    let mut redacted = Vec::new();
 
     let Ok(parsed) = reqwest::Url::parse(url) else {
-        return secrets;
+        return UrlParts { keys, redacted };
     };
     // rmcp builds `.well-known` URLs from the path without its last `/`
     let path = parsed.path();
-    secrets.push(path.to_owned());
-    secrets.push(path.trim_end_matches('/').to_owned());
-    secrets.extend(path.split('/').map(str::to_owned));
+    // a path of public words alone, once encoded, would match an
+    // authorization server's own `resource` or issuer
+    let holds_key = path.split('/').any(is_key_like);
+    for path in [path, path.trim_end_matches('/')] {
+        if holds_key {
+            keys.push(path.to_owned());
+            keys.extend(encodings(path));
+        } else {
+            redacted.push(path.to_owned());
+        }
+    }
+    keys.extend(
+        path.split('/')
+            .filter(|segment| is_key_like(segment))
+            .map(str::to_owned),
+    );
     if let Some(query) = parsed.query() {
-        secrets.push(query.to_owned());
+        redacted.push(query.to_owned());
         let raw_values = query
             .split('&')
             .map(|pair| pair.split_once('=').map_or(pair, |(_, value)| value));
-        secrets.extend(raw_values.map(str::to_owned));
+        keys.extend(
+            raw_values
+                .filter(|value| is_key_like(value))
+                .map(str::to_owned),
+        );
     }
-    secrets.extend(parsed.query_pairs().map(|(_, value)| value.into_owned()));
+    keys.extend(
+        parsed
+            .query_pairs()
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| is_key_like(value)),
+    );
     if !parsed.username().is_empty() {
-        secrets.push(parsed.username().to_owned());
+        redacted.push(parsed.username().to_owned());
     }
-    secrets.extend(parsed.password().map(str::to_owned));
+    redacted.extend(parsed.password().map(str::to_owned));
 
-    secrets
+    UrlParts { keys, redacted }
 }
 
 /// `text` percent-encoded the ways a query string carries a URL: form
@@ -263,11 +313,12 @@ pub fn references(value: &str) -> Result<Vec<&str>, SecretError> {
 pub struct ResolvedUrl {
     /// The URL to connect to; never to be logged or stored
     pub url: String,
-    /// Everything in it that must stay out of text, for the redactor: `keys`
-    /// and the host
+    /// Everything in it that must stay out of text, for the redactor: `keys`,
+    /// the values read, the query, userinfo and the host
     pub secrets: Vec<String>,
-    /// What can hold a key, without the host, which an authorization server
-    /// on the same host legitimately shares
+    /// What identifies the URL, without the host, short path words and
+    /// public query values, which an authorization server on the same host
+    /// legitimately shares
     pub keys: Vec<String>,
 }
 
@@ -359,11 +410,22 @@ impl OnePassword {
         let url = self.resolve_text(template, &mut read).await?;
         let url = url.trim().to_owned();
         let parsed = reqwest::Url::parse(&url).map_err(|_| SecretError::NotAUrl)?;
-        let mut keys = read;
         let mut secrets = Vec::new();
-        if !keys.is_empty() {
-            keys.extend(url_secrets(&url));
-            keys.extend(url_secrets(parsed.as_str()));
+        let mut keys = Vec::new();
+        if !read.is_empty() {
+            // a value that is itself a URL holds the host, which an
+            // authorization server on the same host legitimately shares
+            keys.extend(
+                read.iter()
+                    .filter(|value| reqwest::Url::parse(value).is_err())
+                    .cloned(),
+            );
+            for url in [url.as_str(), parsed.as_str()] {
+                let parts = url_parts(url);
+                keys.extend(parts.keys);
+                secrets.extend(parts.redacted);
+            }
+            secrets.extend(read);
             secrets.extend(keys.iter().cloned());
             // reqwest prints the host
             if !is_local_host(&parsed) {

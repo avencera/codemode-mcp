@@ -350,3 +350,36 @@ fn redacting_logs_scrubs_a_registered_secret_from_a_written_line() -> TestResult
 
     Ok(())
 }
+
+#[tokio::test]
+async fn a_zoho_url_redacts_its_key_but_not_its_public_path_words() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, Redactor};
+
+    let (op, _) = fake_op()?;
+    let url = format!("https://srv-1234.zohomcp.com/mcp/{URL_KEY}/message");
+    std::fs::write(op.with_file_name("url"), &url)?;
+
+    let resolved = OnePassword::new(op.display().to_string())
+        .resolve_url("{{ op://Dev/mcpurl/credential }}")
+        .await?;
+    let redactor = Redactor::default();
+    redactor.add(resolved.secrets);
+
+    let unrelated = "Could not parse the message: messages are realms apart";
+    assert_eq!(redactor.scrub(unrelated), unrelated);
+    let leaked = redactor.scrub(&format!("GET {url} failed; key {URL_KEY}"));
+    assert!(!leaked.contains(URL_KEY), "{leaked}");
+    assert!(!leaked.contains("zohomcp.com"), "{leaked}");
+
+    // an issuer sharing the public words is not a leak, one holding the key is
+    assert!(!Redactor::holds_any(
+        "https://id.example.com/realms/message",
+        &resolved.keys
+    ));
+    assert!(Redactor::holds_any(
+        &format!("https://id.example.com/{URL_KEY}/authorize"),
+        &resolved.keys
+    ));
+
+    Ok(())
+}

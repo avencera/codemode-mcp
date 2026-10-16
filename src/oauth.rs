@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use rmcp::transport::auth::{
     AuthClient, AuthError, AuthorizationManager, AuthorizationMetadataSource, CredentialStore,
     InMemoryCredentialStore, OAuthClientConfig, StateStore, StoredAuthorizationState,
-    StoredCredentials,
+    StoredCredentials, VendorExtraTokenFields,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +38,8 @@ use crate::{
 pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 /// Client name used for registration when the config names none
 const DEFAULT_CLIENT_NAME: &str = "codemode-mcp";
+/// Longest error code echoed when the server's `url` cannot be read
+const MAX_ERROR_CODE_LEN: usize = 40;
 
 /// Why an OAuth operation failed; messages are safe to print locally
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +77,18 @@ pub enum OAuthError {
         "the authorization server's issuer for `{0}` contains part of the server's secret url; the login was not stored"
     )]
     IssuerHoldsUrl(String),
+    /// The authorization server's token response holds part of a secret
+    /// `url`, so the login is not stored
+    #[error(
+        "the authorization server's token response for `{0}` contains part of the server's secret url; the login was not stored"
+    )]
+    ResponseHoldsUrl(String),
+    /// The authorization link holds part of a secret `url` outside the
+    /// `resource` parameter, so it is not shown
+    #[error(
+        "the authorization link for `{0}` contains part of the server's secret url; the login was not started"
+    )]
+    LinkHoldsUrl(String),
     /// A failure whose text could have carried a secret `url`, with it
     /// replaced
     #[error("{0}")]
@@ -120,13 +134,37 @@ impl ClientRegistration {
     }
 }
 
-/// Whether the stored issuer names part of a secret `url`; the issuer is
-/// written to the database verbatim
-fn issuer_holds_url(credentials: &StoredCredentials, url_keys: &[String]) -> bool {
-    credentials
-        .issuer
-        .as_deref()
-        .is_some_and(|issuer| Redactor::holds_any(issuer, url_keys))
+/// Whether any string in `value`, object keys included, holds a key
+fn json_holds_key(value: &Value, url_keys: &[String]) -> bool {
+    match value {
+        Value::String(text) => Redactor::holds_any(text, url_keys),
+        Value::Array(items) => items.iter().any(|item| json_holds_key(item, url_keys)),
+        Value::Object(map) => map.iter().any(|(key, item)| {
+            Redactor::holds_any(key, url_keys) || json_holds_key(item, url_keys)
+        }),
+        _ => false,
+    }
+}
+
+/// The credentials ready to be stored, or `None` when any field of them
+/// holds part of a secret `url`
+///
+/// All of it is written to the database verbatim, and a provider controls
+/// the issuer and the token response's vendor fields, e.g. an echoed
+/// `resource`. The vendor fields are not used by anything here, so they are
+/// dropped after the check rather than kept
+fn storable(mut credentials: StoredCredentials, url_keys: &[String]) -> Option<StoredCredentials> {
+    if !url_keys.is_empty() {
+        let value = serde_json::to_value(&credentials).ok()?;
+        if json_holds_key(&value, url_keys) {
+            return None;
+        }
+    }
+    if let Some(token) = credentials.token_response.as_mut() {
+        token.set_extra_fields(VendorExtraTokenFields::default());
+    }
+
+    Some(credentials)
 }
 
 fn store_error(error: impl std::fmt::Display) -> AuthError {
@@ -137,7 +175,7 @@ fn store_error(error: impl std::fmt::Display) -> AuthError {
 struct SqliteCredentialStore {
     store: Store,
     server: String,
-    /// Parts of the server's resolved `url` that an issuer must not hold
+    /// Parts of the server's resolved `url` that nothing stored may hold
     url_keys: Vec<String>,
 }
 
@@ -155,9 +193,11 @@ impl CredentialStore for SqliteCredentialStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        if issuer_holds_url(&credentials, &self.url_keys) {
-            return Err(store_error(OAuthError::IssuerHoldsUrl(self.server.clone())));
-        }
+        let Some(credentials) = storable(credentials, &self.url_keys) else {
+            return Err(store_error(OAuthError::ResponseHoldsUrl(
+                self.server.clone(),
+            )));
+        };
         let json = serde_json::to_string(&credentials).map_err(store_error)?;
 
         self.store
@@ -177,7 +217,7 @@ impl CredentialStore for SqliteCredentialStore {
 struct SqliteStateStore {
     store: Store,
     server: String,
-    /// Parts of the server's resolved `url` that an issuer must not hold
+    /// Parts of the server's resolved `url` that nothing stored may hold
     url_keys: Vec<String>,
 }
 
@@ -427,7 +467,7 @@ impl OAuth {
     async fn begin_login(&self, name: &str) -> Result<String, OAuthError> {
         let server = self.server(name)?.clone();
         let redirect_uri = self.redirect_uri(name)?;
-        let (mut manager, _) = self.discovered(name).await?;
+        let (mut manager, url_keys) = self.discovered(name).await?;
 
         let defaults: Vec<&str> = server.scopes.iter().map(String::as_str).collect();
         let scopes = manager.select_scopes(None, &defaults);
@@ -451,13 +491,7 @@ impl OAuth {
         };
         let url = manager.get_authorization_url(&scopes).await?;
         let url = with_params(&url, &server.authorization_params)?;
-        // the CLI prints this link, and rmcp sets `resource` to the server's
-        // URL, which would be the key
-        let url = if server.url.contains("{{") {
-            without_param(&url, "resource")?
-        } else {
-            url
-        };
+        let url = checked_link(&url, &url_keys, name)?;
 
         // the state store row exists now; attach the registration to it so
         // the callback can rebuild the client
@@ -477,6 +511,34 @@ impl OAuth {
         }
 
         Ok(url)
+    }
+
+    /// What to say about a refused callback
+    ///
+    /// After a restart the redactor knows nothing of a templated `url` until
+    /// it is read, and the provider's text may hold it, so it is read first.
+    /// When that fails, the text is not echoed: only the error code, if it is
+    /// a short `[a-z_]` token
+    async fn refusal(
+        &self,
+        server: &OAuthServer,
+        error: &str,
+        description: Option<&str>,
+    ) -> String {
+        if !server.url.contains("{{") || self.resolved_url(server).await.is_ok() {
+            return description.unwrap_or(error).to_owned();
+        }
+
+        let is_code = !error.is_empty()
+            && error.len() <= MAX_ERROR_CODE_LEN
+            && error
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+        if is_code {
+            format!("the authorization server reported `{error}`")
+        } else {
+            "the authorization server reported an error".to_owned()
+        }
     }
 
     /// `secret` with its `op://` references read from 1Password
@@ -499,14 +561,16 @@ impl OAuth {
     }
 
     async fn complete_login(&self, name: &str, callback: &Callback) -> Result<(), OAuthError> {
-        self.server(name)?;
+        let server = self.server(name)?;
         if let Some(error) = &callback.error {
             if let Some(csrf) = &callback.state {
                 self.store.delete_oauth_pending(name, csrf)?;
             }
-            let detail = callback.error_description.as_deref().unwrap_or(error);
 
-            return Err(OAuthError::Refused(detail.to_owned()));
+            return Err(OAuthError::Refused(
+                self.refusal(server, error, callback.error_description.as_deref())
+                    .await,
+            ));
         }
         let (Some(code), Some(csrf)) = (&callback.code, &callback.state) else {
             return Err(OAuthError::UnknownFlow);
@@ -531,10 +595,9 @@ impl OAuth {
             .load()
             .await?
             .ok_or_else(|| OAuthError::Corrupt("no tokens after the exchange".into()))?;
-        // fail closed: the issuer is stored verbatim
-        if issuer_holds_url(&credentials, &url_keys) {
-            return Err(OAuthError::IssuerHoldsUrl(name.to_owned()));
-        }
+        // fail closed: the credentials are stored verbatim
+        let credentials = storable(credentials, &url_keys)
+            .ok_or_else(|| OAuthError::ResponseHoldsUrl(name.to_owned()))?;
         let credentials = serde_json::to_string(&credentials)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
         self.store.save_oauth_login(name, &client, &credentials)?;
@@ -634,6 +697,48 @@ impl OAuth {
 
         Ok(self.store.remove_oauth_login(name)?)
     }
+}
+
+/// The authorization link to show, or an error when it holds a key
+///
+/// rmcp sets `resource` to the server's URL, which a key in the URL makes
+/// secret. The parameter is kept unless its value holds a key: stripping it
+/// can make an RFC 8707 server, which also sees `resource` on the token
+/// request, reject the login, but a key in a link that agents and the CLI
+/// print is worse. Anything else in the link that holds a key refuses the
+/// login
+fn checked_link(link: &str, url_keys: &[String], server: &str) -> Result<String, OAuthError> {
+    if url_keys.is_empty() {
+        return Ok(link.to_owned());
+    }
+    let holds_key = |url: &str| -> Result<bool, OAuthError> {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+        // the encoded link and the decoded pieces, since a key is echoed
+        // percent-encoded in a query
+        Ok(Redactor::holds_any(url, url_keys)
+            || Redactor::holds_any(parsed.path(), url_keys)
+            || parsed
+                .query_pairs()
+                .any(|(_, value)| Redactor::holds_any(&value, url_keys)))
+    };
+
+    let parsed =
+        reqwest::Url::parse(link).map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+    let resource_holds_key = parsed
+        .query_pairs()
+        .filter(|(name, _)| name == "resource")
+        .any(|(_, value)| Redactor::holds_any(&value, url_keys));
+    let link = if resource_holds_key {
+        without_param(link, "resource")?
+    } else {
+        link.to_owned()
+    };
+    if holds_key(&link)? {
+        return Err(OAuthError::LinkHoldsUrl(server.to_owned()));
+    }
+
+    Ok(link)
 }
 
 /// `url` without the query parameter `name`
