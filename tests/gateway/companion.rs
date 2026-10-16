@@ -54,6 +54,9 @@ struct Options<'a> {
     signed_in: bool,
     /// Whether the companion's notifications fail to show
     notify_fails: bool,
+    /// Whether another `op` on the companion's Mac is approved each time a
+    /// notification shows, so its `op` is no longer signed out
+    authorized_on_notify: bool,
 }
 
 impl Default for Options<'_> {
@@ -67,6 +70,7 @@ impl Default for Options<'_> {
             local_hangs: false,
             signed_in: true,
             notify_fails: false,
+            authorized_on_notify: false,
         }
     }
 }
@@ -82,6 +86,7 @@ impl Rig {
             local_hangs,
             signed_in,
             notify_fails,
+            authorized_on_notify,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -101,6 +106,12 @@ impl Rig {
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
         companion_mac.set_notify_fails(notify_fails);
+        if authorized_on_notify {
+            let directory = companion_log
+                .parent()
+                .ok_or("the fake op has no directory")?;
+            companion_mac.set_on_notify(directory.join("authorized"));
+        }
         let text = format!(
             "[companion]\n\
              gateway = \"{expected}\"\n\
@@ -345,6 +356,34 @@ async fn a_signed_out_1password_is_the_only_fingerprint_asked() -> TestResult {
         [format!("notify {reason}"), format!("touch_id {reason}")]
     );
     assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_another_op_authorized_meanwhile_still_asks_touch_id() -> TestResult {
+    // another `op` on that Mac is approved while the notification is up,
+    // so 1Password will not ask for this read after all
+    let Some(rig) = Rig::start(Options {
+        signed_in: false,
+        authorized_on_notify: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let reason = format!("codemode-mcp on main wants to read {REFERENCE}");
+
+    let body = rig
+        .harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], VALUE, "{body}");
+    assert_eq!(
+        rig.companion_mac.shown(),
+        [format!("notify {reason}"), format!("touch_id {reason}")]
+    );
 
     rig.stop().await
 }
