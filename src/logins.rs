@@ -95,9 +95,9 @@ impl FieldRule {
     ///
     /// The server checks this before reading the value, so a wrong field
     /// never asks the owner for anything, and the Mac again right before
-    /// typing. Every page around the field must pass, so a frame from
-    /// elsewhere inside a login page is refused even when the browser does
-    /// not report the frame as a page of its own
+    /// typing. Every page around the field must pass; a frame the browser
+    /// does not report as a page of its own is not among them, so its host
+    /// goes unchecked
     pub fn check(&self, focused: &FocusedField) -> Result<String, FillError> {
         let refuse = |reason: String| Err(FillError::Refused(reason));
         match (self.field, focused.kind) {

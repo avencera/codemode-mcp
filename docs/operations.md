@@ -344,7 +344,9 @@ What a fill checks, from Accessibility rather than the agent's words:
 - A password goes only into a password field, the kind that shows bullets. A username goes only into a
   one-line text field.
 - The field's page must be `https` on port 443, and its host one of the login's `sites`. A field inside a
-  frame is checked against the frame and every page around it, so each of those hosts must be listed.
+  frame is checked against the frame and every page around it, so each of those hosts must be listed. This
+  relies on the browser exposing each frame's address to Accessibility; a frame it does not expose goes
+  unchecked.
 - Focus is checked again before each character, and typing stops once it has moved. Keys already sent may still
   land, so a few characters can reach a field in the same app that took focus; keys never go to another app. The
   answer then says to clear the field and fill again.

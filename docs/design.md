@@ -694,11 +694,11 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   role and subrole (`AXSecureTextField` for a password, `AXTextField` or `AXComboBox` for a username), and the
   `AXURL` of every `AXWebArea` above it, innermost first, so a field in a frame lists the frame's document and
   each page around it. Every one must be `https` on port 443 with a host that is a site, or under a `*.` site;
-  a web area without a readable address is refused, and so is a field nested deeper than 256 parents. Checking
-  all of them refuses a foreign frame inside a login page even where a browser does not expose the frame as a
-  web area of its own. Sites match exactly unless written `*.`, because user content often lives under the same
+  a web area without a readable address is refused, and so is a field nested deeper than 256 parents. A frame
+  is checked only when the browser exposes it as a web area of its own; one it folds into the page around it is
+  never seen, so its host is not checked. Sites match exactly unless written `*.`, because user content often lives under the same
   domain (`sites.google.com`). Config takes sites as lowercase host names only, so a site cannot carry a
-  scheme, port or path that would change the match The rule (`FieldRule`) is
+  scheme, port or path that would change the match. The rule (`FieldRule`) is
   platform-independent, so the gateway test runs it against a fake screen
 - The field is checked before the value is read, so a wrong field never prompts the owner, and again right
   before typing. Characters are posted as keyboard events (`CGEventKeyboardSetUnicodeString`, flags cleared,
