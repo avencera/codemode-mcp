@@ -267,6 +267,8 @@ impl Notifier for RecordingNotifier {
 #[derive(Default)]
 pub struct FakeMac {
     present: std::sync::atomic::AtomicBool,
+    /// Whether notifications fail, as without terminal-notifier
+    notify_fails: std::sync::atomic::AtomicBool,
     /// `None` leaves the prompt up until it is taken down
     answer: Mutex<Option<TouchId>>,
     /// How long a prompt stays up before it answers
@@ -282,6 +284,12 @@ impl FakeMac {
     pub fn set_present(&self, present: bool) {
         self.present
             .store(present, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether later notifications fail to show
+    pub fn set_notify_fails(&self, fails: bool) {
+        self.notify_fails
+            .store(fails, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How later Touch ID prompts end; `None` leaves them up until they are
@@ -387,6 +395,11 @@ impl Mac for FakeMac {
         &'a self,
         notification: &'a MacNotification,
     ) -> BoxFuture<'a, Result<(), MacError>> {
+        if self.notify_fails.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(std::future::ready(Err(MacError(
+                "terminal-notifier is not installed".to_owned(),
+            ))));
+        }
         self.record(format!("notify {}", notification.title));
 
         Box::pin(std::future::ready(Ok(())))

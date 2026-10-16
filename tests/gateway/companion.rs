@@ -52,6 +52,8 @@ struct Options<'a> {
     /// Whether the companion's `op` is already authorized, so it would read
     /// without 1Password asking
     signed_in: bool,
+    /// Whether the companion's notifications fail to show
+    notify_fails: bool,
 }
 
 impl Default for Options<'_> {
@@ -64,6 +66,7 @@ impl Default for Options<'_> {
             mac_notifications: true,
             local_hangs: false,
             signed_in: true,
+            notify_fails: false,
         }
     }
 }
@@ -78,6 +81,7 @@ impl Rig {
             mac_notifications,
             local_hangs,
             signed_in,
+            notify_fails,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -96,6 +100,7 @@ impl Rig {
         };
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
+        companion_mac.set_notify_fails(notify_fails);
         let text = format!(
             "[companion]\n\
              gateway = \"{expected}\"\n\
@@ -340,6 +345,42 @@ async fn a_signed_out_1password_is_the_only_fingerprint_asked() -> TestResult {
         [format!("notify {reason}"), format!("touch_id {reason}")]
     );
     assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_no_notification_could_name_still_asks_touch_id() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        signed_in: false,
+        notify_fails: true,
+        touch: Some(TouchId::Review),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // with 1Password about to ask but nothing naming the reference, the
+    // companion's own prompt still gates the read, and a refusal reads nothing
+    let (_, checked) = rig
+        .harness
+        .admin_json("/admin/companion/check", &json!({ "reference": REFERENCE }))
+        .await?;
+    let message = checked["companions"][0]["result"]["error"]["message"].as_str();
+    assert!(
+        message.is_some_and(|message| message.contains("not approved")),
+        "{checked}"
+    );
+    // the twin server's read as it connects was asked the same way
+    let shown = rig.companion_mac.shown();
+    let prompt = format!("touch_id codemode-mcp on main wants to read {REFERENCE}");
+    assert!(
+        !shown.is_empty() && shown.iter().all(|entry| *entry == prompt),
+        "{shown:?}"
+    );
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 0);
 
     rig.stop().await
 }
