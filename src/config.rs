@@ -1061,6 +1061,18 @@ impl ServerConfig {
                     "servers.{name}.url: not a valid URL"
                 )));
             }
+            // the key must be known exactly to keep it out of OAuth state,
+            // which holds only when it sits inside literal text
+            let scheme = url.trim_start().to_ascii_lowercase();
+            if self.oauth
+                && url.contains("{{")
+                && !scheme.starts_with("http://")
+                && !scheme.starts_with("https://")
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "servers.{name}.url: with `oauth = true`, a url that holds references must start with `http://` or `https://`, because codemode can only keep the key out of OAuth state when it knows which part of the url is the key; embed the reference, e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}/message\""
+                )));
+            }
         }
 
         match (&self.command, &self.url) {
@@ -1198,6 +1210,13 @@ mod tests {
         assert!(parse("[servers.a]\nurl = \"not a url\"").is_err());
         assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho/credential }}\"").is_ok());
         assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho\"").is_err());
+        assert!(
+            parse("[servers.a]\nurl = \"{{ op://Dev/zoho/credential }}\"\noauth = true").is_err()
+        );
+        assert!(
+            parse("[servers.a]\nurl = \"https://h/{{ op://Dev/zoho/key }}/m\"\noauth = true")
+                .is_ok()
+        );
         assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
         assert!(parse("[servers.a]\ncommand = \"x\"\noauth = true").is_err());
         assert!(parse("[servers.a]\nurl = \"https://y\"\nscopes = [\"s\"]").is_err());

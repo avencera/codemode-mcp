@@ -492,14 +492,23 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   logged
 - A `url` is parsed as a URL at config load only when it holds no reference; one with references is parsed after
   they are read (`SecretError::NotAUrl`, reported as a `configuration` failure). It is resolved at the same point
-  in the connect path as `headers` and `env`, through the same reader and cache. The redactor learns the whole
-  URL, its normalized form, host, path, query and the key-like pieces of them (16+ characters with a digit), not
-  public words such as `message`, and the daemon's log writer (`secrets::redacting_logs`) scrubs
-  with the same redactor, because rmcp and reqwest print the URL in their own log events. Only the template is
-  shown or stored: OAuth logins, flows and registrations are keyed by server name, never by URL, so a key in the
-  URL does not reach `codemode.sqlite`. Credentials (token-response fields included, unused vendor fields are
-  dropped), the pending state and the authorization link are checked for the key and refused when they hold it; the
-  link's `resource` parameter is dropped only when its value holds the key
+  in the connect path as `headers` and `env`, through the same reader and cache
+- The secrets of a `url` are exactly the values read from 1Password, plus each value's percent-encoded (form,
+  unreserved-only, all non-alphanumeric) and JSON-escaped forms. Nothing in a URL is guessed to be a key from its
+  shape, so embed the reference where the key sits, e.g.
+  `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
+  that is one whole reference still works without OAuth, and the redactor then also learns the resolved URL's
+  normalized form, full path (with and without its trailing `/`) and full query with their encodings, and nothing
+  finer. The daemon's log writer (`secrets::redacting_logs`) scrubs with the same redactor, buffering each
+  writer's bytes until `flush` or drop, because rmcp and reqwest print the URL in their own log events
+- With `oauth = true` a `url` that holds references must start with literal `http://` or `https://` text (checked
+  at config load): codemode can only keep the key out of OAuth state when it knows which part is the key, and a
+  reference in the host counts, since the exact value is then the key. Each reference must return one component:
+  a value holding `/`, `?`, `#`, `@` or `:` is refused at connect, so only the key goes in 1Password. Everything OAuth writes to `codemode.sqlite`
+  (credentials at login and on every refresh, pending state, the client registration) passes one check that
+  serializes the value and refuses it when it holds a key, raw or percent-decoded; unused vendor token fields are
+  dropped. The authorization link is checked whole the same way, and its `resource` parameter is dropped only when
+  its value holds a key
 
 ### Companions (`src/companion.rs`)
 

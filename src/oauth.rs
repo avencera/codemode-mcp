@@ -71,22 +71,21 @@ pub enum OAuthError {
     /// rmcp's OAuth client failed
     #[error("{0}")]
     Auth(#[from] AuthError),
-    /// The authorization server's issuer holds part of a secret `url`, so
-    /// the login is not stored
+    /// Something the authorization server returned holds a secret read for
+    /// the server's `url`, so it was not stored
     #[error(
-        "the authorization server's issuer for `{0}` contains part of the server's secret url; the login was not stored"
+        "what the authorization server returned for `{0}` contains a secret from the server's url; nothing was stored"
     )]
-    IssuerHoldsUrl(String),
-    /// The authorization server's token response holds part of a secret
-    /// `url`, so the login is not stored
+    HoldsKey(String),
+    /// A value read for the server's `url` is more than one URL component
     #[error(
-        "the authorization server's token response for `{0}` contains part of the server's secret url; the login was not stored"
+        "a value read for the `url` of `{0}` holds `/`, `?`, `#`, `@` or `:`; with `oauth = true` store only the key in 1Password and put the rest of the url in the config"
     )]
-    ResponseHoldsUrl(String),
+    UrlValueNotAKey(String),
     /// The authorization link holds part of a secret `url` outside the
     /// `resource` parameter, so it is not shown
     #[error(
-        "the authorization link for `{0}` contains part of the server's secret url; the login was not started"
+        "the authorization link for `{0}` contains a secret from the server's url; the login was not started"
     )]
     LinkHoldsUrl(String),
     /// A failure whose text could have carried a secret `url`, with it
@@ -134,37 +133,26 @@ impl ClientRegistration {
     }
 }
 
-/// Whether any string in `value`, object keys included, holds a key
-fn json_holds_key(value: &Value, url_keys: &[String]) -> bool {
-    match value {
-        Value::String(text) => Redactor::holds_any(text, url_keys),
-        Value::Array(items) => items.iter().any(|item| json_holds_key(item, url_keys)),
-        Value::Object(map) => map.iter().any(|(key, item)| {
-            Redactor::holds_any(key, url_keys) || json_holds_key(item, url_keys)
-        }),
-        _ => false,
-    }
+/// Whether the JSON form of `value` holds a key, as is or percent-decoded
+///
+/// Every OAuth write goes through this: the provider controls much of what
+/// is stored (issuer, scopes, vendor token fields, a registration's secret)
+fn holds_key(value: &impl Serialize, keys: &[String]) -> bool {
+    // an unserializable value cannot be checked, so it counts as holding one
+    serde_json::to_string(value).map_or(true, |json| Redactor::holds_any(&json, keys))
 }
 
-/// The credentials ready to be stored, or `None` when any field of them
-/// holds part of a secret `url`
+/// The credentials ready to be stored, or `None` when they hold a key
 ///
-/// All of it is written to the database verbatim, and a provider controls
-/// the issuer and the token response's vendor fields, e.g. an echoed
-/// `resource`. The vendor fields are not used by anything here, so they are
-/// dropped after the check rather than kept
-fn storable(mut credentials: StoredCredentials, url_keys: &[String]) -> Option<StoredCredentials> {
-    if !url_keys.is_empty() {
-        let value = serde_json::to_value(&credentials).ok()?;
-        if json_holds_key(&value, url_keys) {
-            return None;
-        }
-    }
+/// The vendor fields of the token response are not used by anything here, so
+/// they are dropped before the check: an echoed `resource` is not a reason to
+/// refuse a login, and the check covers exactly what will be stored
+fn storable(mut credentials: StoredCredentials, keys: &[String]) -> Option<StoredCredentials> {
     if let Some(token) = credentials.token_response.as_mut() {
         token.set_extra_fields(VendorExtraTokenFields::default());
     }
 
-    Some(credentials)
+    (!holds_key(&credentials, keys)).then_some(credentials)
 }
 
 fn store_error(error: impl std::fmt::Display) -> AuthError {
@@ -175,8 +163,8 @@ fn store_error(error: impl std::fmt::Display) -> AuthError {
 struct SqliteCredentialStore {
     store: Store,
     server: String,
-    /// Parts of the server's resolved `url` that nothing stored may hold
-    url_keys: Vec<String>,
+    /// Values read for the server's `url`, which nothing stored may hold
+    keys: Vec<String>,
 }
 
 #[async_trait]
@@ -193,10 +181,8 @@ impl CredentialStore for SqliteCredentialStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        let Some(credentials) = storable(credentials, &self.url_keys) else {
-            return Err(store_error(OAuthError::ResponseHoldsUrl(
-                self.server.clone(),
-            )));
+        let Some(credentials) = storable(credentials, &self.keys) else {
+            return Err(store_error(OAuthError::HoldsKey(self.server.clone())));
         };
         let json = serde_json::to_string(&credentials).map_err(store_error)?;
 
@@ -217,8 +203,8 @@ impl CredentialStore for SqliteCredentialStore {
 struct SqliteStateStore {
     store: Store,
     server: String,
-    /// Parts of the server's resolved `url` that nothing stored may hold
-    url_keys: Vec<String>,
+    /// Values read for the server's `url`, which nothing stored may hold
+    keys: Vec<String>,
 }
 
 fn flow_ttl_ms() -> i64 {
@@ -232,13 +218,8 @@ impl StateStore for SqliteStateStore {
         csrf_token: &str,
         state: StoredAuthorizationState,
     ) -> Result<(), AuthError> {
-        // the expected issuer is stored verbatim, so fail closed like `issuer_holds_url`
-        if state
-            .expected_issuer
-            .as_deref()
-            .is_some_and(|issuer| Redactor::holds_any(issuer, &self.url_keys))
-        {
-            return Err(store_error(OAuthError::IssuerHoldsUrl(self.server.clone())));
+        if holds_key(&state, &self.keys) {
+            return Err(store_error(OAuthError::HoldsKey(self.server.clone())));
         }
         let json = serde_json::to_string(&state).map_err(store_error)?;
 
@@ -416,10 +397,20 @@ impl OAuth {
     /// keyed by the server name, so a key in the URL never reaches the database
     async fn resolved_url(
         &self,
+        name: &str,
         server: &OAuthServer,
     ) -> Result<(String, Vec<String>), OAuthError> {
         let resolved = self.onepassword.resolve_url(&server.url).await?;
         self.redactor.add(resolved.secrets);
+        // the whole value is the key only when it is a single component; a
+        // value that carries the host or path could be echoed in part
+        if resolved
+            .keys
+            .iter()
+            .any(|key| key.contains(['/', '?', '#', '@', ':']))
+        {
+            return Err(OAuthError::UrlValueNotAKey(name.to_owned()));
+        }
 
         Ok((resolved.url, resolved.keys))
     }
@@ -440,7 +431,7 @@ impl OAuth {
         name: &str,
     ) -> Result<(AuthorizationManager, Vec<String>), OAuthError> {
         let server = self.server(name)?;
-        let (url, keys) = self.resolved_url(server).await?;
+        let (url, keys) = self.resolved_url(name, server).await?;
         let mut manager = AuthorizationManager::new(url.as_str()).await?;
         let resolution = manager.resolve_metadata().await?;
         if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
@@ -450,7 +441,7 @@ impl OAuth {
         manager.set_state_store(SqliteStateStore {
             store: self.store.clone(),
             server: name.to_owned(),
-            url_keys: keys.clone(),
+            keys: keys.clone(),
         });
 
         Ok((manager, keys))
@@ -467,7 +458,7 @@ impl OAuth {
     async fn begin_login(&self, name: &str) -> Result<String, OAuthError> {
         let server = self.server(name)?.clone();
         let redirect_uri = self.redirect_uri(name)?;
-        let (mut manager, url_keys) = self.discovered(name).await?;
+        let (mut manager, keys) = self.discovered(name).await?;
 
         let defaults: Vec<&str> = server.scopes.iter().map(String::as_str).collect();
         let scopes = manager.select_scopes(None, &defaults);
@@ -491,7 +482,7 @@ impl OAuth {
         };
         let url = manager.get_authorization_url(&scopes).await?;
         let url = with_params(&url, &server.authorization_params)?;
-        let url = checked_link(&url, &url_keys, name)?;
+        let url = checked_link(&url, &keys, name)?;
 
         // the state store row exists now; attach the registration to it so
         // the callback can rebuild the client
@@ -504,7 +495,13 @@ impl OAuth {
                     .map(|(_, value)| value.into_owned())
             })
             .ok_or_else(|| OAuthError::Corrupt("authorization URL has no state".into()))?;
-        let client = serde_json::to_string(&ClientRegistration::from_config(&registered))
+        let registration = ClientRegistration::from_config(&registered);
+        if holds_key(&registration, &keys) {
+            self.store.delete_oauth_pending(name, &csrf)?;
+
+            return Err(OAuthError::HoldsKey(name.to_owned()));
+        }
+        let client = serde_json::to_string(&registration)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
         if !self.store.set_oauth_pending_client(name, &csrf, &client)? {
             return Err(OAuthError::Corrupt("the login state was not stored".into()));
@@ -528,7 +525,8 @@ impl OAuth {
         error: &str,
         description: Option<&str>,
     ) -> String {
-        if !server.url.contains("{{") || (pending && self.resolved_url(server).await.is_ok()) {
+        // only the redactor's learning matters here, so the name for an error is moot
+        if !server.url.contains("{{") || (pending && self.resolved_url("", server).await.is_ok()) {
             return description.unwrap_or(error).to_owned();
         }
 
@@ -594,7 +592,7 @@ impl OAuth {
         let registration: ClientRegistration = serde_json::from_str(&client)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
 
-        let (mut manager, url_keys) = self.discovered(name).await?;
+        let (mut manager, keys) = self.discovered(name).await?;
         // the tokens land here first and reach SQLite only together with
         // the registration
         let staging = InMemoryCredentialStore::new();
@@ -609,8 +607,8 @@ impl OAuth {
             .await?
             .ok_or_else(|| OAuthError::Corrupt("no tokens after the exchange".into()))?;
         // fail closed: the credentials are stored verbatim
-        let credentials = storable(credentials, &url_keys)
-            .ok_or_else(|| OAuthError::ResponseHoldsUrl(name.to_owned()))?;
+        let credentials =
+            storable(credentials, &keys).ok_or_else(|| OAuthError::HoldsKey(name.to_owned()))?;
         let credentials = serde_json::to_string(&credentials)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
         self.store.save_oauth_login(name, &client, &credentials)?;
@@ -640,12 +638,12 @@ impl OAuth {
         let registration: ClientRegistration = serde_json::from_str(&client)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
 
-        let (url, url_keys) = self.resolved_url(server).await?;
+        let (url, keys) = self.resolved_url(name, server).await?;
         let mut manager = AuthorizationManager::new(url.as_str()).await?;
         manager.set_credential_store(SqliteCredentialStore {
             store: self.store.clone(),
             server: name.to_owned(),
-            url_keys,
+            keys,
         });
         // false when the tokens were dropped, e.g. after the issuer changed
         if !manager.initialize_from_store().await? {
@@ -714,40 +712,28 @@ impl OAuth {
 
 /// The authorization link to show, or an error when it holds a key
 ///
-/// rmcp sets `resource` to the server's URL, which a key in the URL makes
-/// secret. The parameter is kept unless its value holds a key: stripping it
-/// can make an RFC 8707 server, which also sees `resource` on the token
-/// request, reject the login, but a key in a link that agents and the CLI
-/// print is worse. Anything else in the link that holds a key refuses the
-/// login
-fn checked_link(link: &str, url_keys: &[String], server: &str) -> Result<String, OAuthError> {
-    if url_keys.is_empty() {
+/// rmcp sets `resource` to the server's URL, which holds a key when the key
+/// is embedded in it. The parameter is kept unless its value holds a key:
+/// stripping it can make an RFC 8707 server, which also sees `resource` on
+/// the token request, reject the login, but a key in a link that agents and
+/// the CLI print is worse. Anything else in the link that holds a key refuses
+/// the login
+fn checked_link(link: &str, keys: &[String], server: &str) -> Result<String, OAuthError> {
+    if keys.is_empty() {
         return Ok(link.to_owned());
     }
-    let holds_key = |url: &str| -> Result<bool, OAuthError> {
-        let parsed =
-            reqwest::Url::parse(url).map_err(|error| OAuthError::Corrupt(error.to_string()))?;
-        // the encoded link and the decoded pieces, since a key is echoed
-        // percent-encoded in a query
-        Ok(Redactor::holds_any(url, url_keys)
-            || Redactor::holds_any(parsed.path(), url_keys)
-            || parsed
-                .query_pairs()
-                .any(|(_, value)| Redactor::holds_any(&value, url_keys)))
-    };
-
     let parsed =
         reqwest::Url::parse(link).map_err(|error| OAuthError::Corrupt(error.to_string()))?;
     let resource_holds_key = parsed
         .query_pairs()
         .filter(|(name, _)| name == "resource")
-        .any(|(_, value)| Redactor::holds_any(&value, url_keys));
+        .any(|(_, value)| Redactor::holds_any(&value, keys));
     let link = if resource_holds_key {
         without_param(link, "resource")?
     } else {
         link.to_owned()
     };
-    if holds_key(&link)? {
+    if Redactor::holds_any(&link, keys) {
         return Err(OAuthError::LinkHoldsUrl(server.to_owned()));
     }
 

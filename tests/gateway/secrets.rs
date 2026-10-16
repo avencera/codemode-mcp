@@ -25,6 +25,8 @@ use super::{
 pub(super) const VALUE: &str = "value-from-1password";
 /// The part of a URL that works as a key, as in Zoho's MCP URLs
 pub(super) const URL_KEY: &str = "zk-9f3a71c2d8b4e6";
+/// A key with characters that a query string percent-encodes
+pub(super) const SYMBOL_KEY: &str = "zk+9f3a71c2=d8b4e6";
 
 /// A stand-in for the 1Password CLI that knows one item and logs each read,
 /// already authorized so it reads without asking
@@ -58,6 +60,9 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/mcpurl/credential) cat '{dir}/url' ;;\n\
                op://Dev/deadurl/credential) cat '{dir}/dead-url' ;;\n\
                op://Dev/urlkey/credential) printf '{URL_KEY}' ;;\n\
+               op://Dev/symbolkey/credential) printf '{SYMBOL_KEY}' ;;\n\
+               op://Dev/hostpath/credential) printf 'example.invalid/mcp/{URL_KEY}' ;;\n\
+               op://Dev/hostkey/credential) printf '{URL_KEY}.localhost' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
@@ -342,7 +347,11 @@ fn redacting_logs_scrubs_a_registered_secret_from_a_written_line() -> TestResult
     let logs = codemode_mcp::secrets::redacting_logs(capture.clone());
 
     let mut writer = logs.make_writer();
-    writeln!(writer, "connecting to https://host/{secret}/mcp failed")?;
+    // a writer that is given a line in pieces must not leak the secret
+    let (head, tail) = secret.split_at(secret.len() / 2);
+    write!(writer, "connecting to https://host/{head}")?;
+    writeln!(writer, "{tail}/mcp failed")?;
+    writer.flush()?;
 
     let written = capture.text();
     assert!(!written.contains(secret), "{written}");
@@ -356,30 +365,39 @@ async fn a_zoho_url_redacts_its_key_but_not_its_public_path_words() -> TestResul
     use codemode_mcp::secrets::{OnePassword, Redactor};
 
     let (op, _) = fake_op()?;
-    let url = format!("https://srv-1234.zohomcp.com/mcp/{URL_KEY}/message");
-    std::fs::write(op.with_file_name("url"), &url)?;
+    let onepassword = OnePassword::new(op.display().to_string());
+    let unrelated = "Could not parse the message: messages are realms apart";
 
-    let resolved = OnePassword::new(op.display().to_string())
-        .resolve_url("{{ op://Dev/mcpurl/credential }}")
+    // a key embedded in the url is the only secret
+    let embedded = onepassword
+        .resolve_url("https://srv-1234.zohomcp.com/mcp/{{ op://Dev/urlkey/credential }}/message")
         .await?;
     let redactor = Redactor::default();
-    redactor.add(resolved.secrets);
-
-    let unrelated = "Could not parse the message: messages are realms apart";
+    redactor.add(embedded.secrets);
     assert_eq!(redactor.scrub(unrelated), unrelated);
-    let leaked = redactor.scrub(&format!("GET {url} failed; key {URL_KEY}"));
-    assert!(!leaked.contains(URL_KEY), "{leaked}");
-    assert!(!leaked.contains("zohomcp.com"), "{leaked}");
-
-    // an issuer sharing the public words is not a leak, one holding the key is
+    let leaked = redactor.scrub(&format!("GET /mcp/{URL_KEY}/message failed"));
+    assert_eq!(leaked, "GET /mcp/[redacted]/message failed");
+    // an issuer sharing public words is not a leak, one holding the key is
     assert!(!Redactor::holds_any(
-        "https://id.example.com/realms/message",
-        &resolved.keys
+        "https://id.example.com/realms/production-us-east-1",
+        &embedded.keys
     ));
     assert!(Redactor::holds_any(
         &format!("https://id.example.com/{URL_KEY}/authorize"),
-        &resolved.keys
+        &embedded.keys
     ));
+
+    // a url that is a reference alone is a secret whole
+    let url = format!("https://srv-1234.zohomcp.com/mcp/{URL_KEY}/message");
+    std::fs::write(op.with_file_name("url"), &url)?;
+    let whole = onepassword
+        .resolve_url("{{ op://Dev/mcpurl/credential }}")
+        .await?;
+    let redactor = Redactor::default();
+    redactor.add(whole.secrets);
+    assert_eq!(redactor.scrub(unrelated), unrelated);
+    let leaked = redactor.scrub(&format!("GET {url} failed; path /mcp/{URL_KEY}/message"));
+    assert!(!leaked.contains(URL_KEY), "{leaked}");
 
     Ok(())
 }

@@ -10,8 +10,8 @@ use super::Redactor;
 /// [`Redactor`]
 ///
 /// HTTP client libraries print the URL they were connecting to in their own
-/// log events, which a URL that is a secret must not appear in. The fmt
-/// layer writes one event per call, so a secret is never split across calls
+/// log events, which a URL that is a secret must not appear in. Each writer
+/// buffers what it is given and scrubs it on `flush` and drop
 pub fn redacting_logs<M>(inner: M) -> RedactingMakeWriter<M> {
     RedactingMakeWriter {
         inner,
@@ -32,25 +32,42 @@ impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactingMakeWriter<M> {
         RedactingWriter {
             inner: self.inner.make_writer(),
             redactor: Arc::clone(&self.redactor),
+            buffer: Vec::new(),
         }
     }
 }
 
 /// One event's writer
-pub struct RedactingWriter<W> {
+///
+/// Bytes are held until `flush` or drop and scrubbed together, so a secret
+/// written in fragments is still replaced
+pub struct RedactingWriter<W: io::Write> {
     inner: W,
     redactor: Arc<Redactor>,
+    buffer: Vec<u8>,
 }
 
 impl<W: io::Write> io::Write for RedactingWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let scrubbed = self.redactor.scrub(&String::from_utf8_lossy(buffer));
-        self.inner.write_all(scrubbed.as_bytes())?;
+        self.buffer.extend_from_slice(buffer);
 
         Ok(buffer.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let scrubbed = self.redactor.scrub(&String::from_utf8_lossy(&self.buffer));
+            self.buffer.clear();
+            self.inner.write_all(scrubbed.as_bytes())?;
+        }
+
         self.inner.flush()
+    }
+}
+
+impl<W: io::Write> Drop for RedactingWriter<W> {
+    fn drop(&mut self) {
+        // nowhere to report a failed log write
+        let _ = io::Write::flush(self);
     }
 }

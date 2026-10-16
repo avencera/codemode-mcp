@@ -90,6 +90,10 @@ struct Quirks {
     login_extra: Option<Value>,
     /// Added to the token response of a refresh grant
     refresh_extra: Option<Value>,
+    /// Its `scopes_supported`, `mcp:tools` by default
+    scopes_supported: Option<Vec<String>>,
+    /// Secret its registration endpoint hands out with the client
+    register_secret: Option<String>,
 }
 
 #[derive(Clone)]
@@ -147,7 +151,7 @@ async fn authorization_server(State(mock): State<Mock>) -> Json<Value> {
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "scopes_supported": ["mcp:tools"],
+        "scopes_supported": mock.quirks.scopes_supported.clone().unwrap_or_else(|| vec!["mcp:tools".to_owned()]),
     });
     if let Client::Registered = mock.client {
         metadata["registration_endpoint"] = json!(format!("{}/register", mock.base));
@@ -167,14 +171,16 @@ async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> (StatusC
         );
     }
 
-    (
-        StatusCode::CREATED,
-        Json(json!({
-            "client_id": "mock-client",
-            "redirect_uris": body["redirect_uris"],
-            "token_endpoint_auth_method": "none",
-        })),
-    )
+    let mut client = json!({
+        "client_id": "mock-client",
+        "redirect_uris": body["redirect_uris"],
+        "token_endpoint_auth_method": "none",
+    });
+    if let Some(secret) = &mock.quirks.register_secret {
+        client["client_secret"] = json!(secret);
+    }
+
+    (StatusCode::CREATED, Json(client))
 }
 
 async fn token(
@@ -519,32 +525,48 @@ async fn oauth_login_uses_a_client_registered_ahead_of_time() -> TestResult {
     harness.stop().await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn oauth_login_resolves_a_url_held_in_1password_without_storing_it() -> TestResult {
-    let mock = start_mock(Client::Registered).await?;
-    let (op, _) = super::secrets::fake_op()?;
-    let key = super::secrets::URL_KEY;
-    std::fs::write(
-        op.with_file_name("url"),
-        format!("{}/mcp?api_key={key}", mock.base),
-    )?;
-    let extra = format!(
+/// Config of a `locked` server whose `url` embeds the key `reference` names
+/// in the query of `base`'s MCP endpoint
+fn op_url_config(op: &std::path::Path, base: &str, reference: &str) -> String {
+    format!(
         "[secrets]\nop = \"{op}\"\n\n\
          [servers.locked]\n\
-         url = \"{{{{ op://Dev/mcpurl/credential }}}}\"\n\
+         url = \"{base}/mcp?api_key={{{{ {reference} }}}}\"\n\
          oauth = true\n\
          client_name = \"codemode test\"",
         op = op.display()
-    );
+    )
+}
+
+async fn locked_harness(
+    op: &std::path::Path,
+    base: &str,
+    reference: &str,
+) -> Result<Option<Harness>, Box<dyn std::error::Error>> {
+    let extra = op_url_config(op, base, reference);
     let Some(harness) = Harness::with(Setup {
         extra: &extra,
         ..Setup::default()
     })
     .await?
     else {
-        return Ok(());
+        return Ok(None);
     };
     wait_for_state(&harness, "locked", "needs_login").await?;
+
+    Ok(Some(harness))
+}
+
+const URL_KEY_REFERENCE: &str = "op://Dev/urlkey/credential";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_resolves_a_url_with_an_embedded_key_without_storing_it() -> TestResult {
+    let mock = start_mock(Client::Registered).await?;
+    let (op, _) = super::secrets::fake_op()?;
+    let key = super::secrets::URL_KEY;
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
+        return Ok(());
+    };
 
     let (callback, url) = begin_login(&harness, &mock, "locked").await?;
     // the CLI prints this link; the resource is the public identifier the
@@ -566,18 +588,6 @@ async fn oauth_login_resolves_a_url_held_in_1password_without_storing_it() -> Te
     harness.stop().await
 }
 
-/// Config of a `locked` server whose `url` is read from the fake `op`
-fn op_url_config(op: &std::path::Path) -> String {
-    format!(
-        "[secrets]\nop = \"{op}\"\n\n\
-         [servers.locked]\n\
-         url = \"{{{{ op://Dev/mcpurl/credential }}}}\"\n\
-         oauth = true\n\
-         client_name = \"codemode test\"",
-        op = op.display()
-    )
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn oauth_failure_that_echoes_the_resolved_url_comes_back_scrubbed() -> TestResult {
     let key = super::secrets::URL_KEY;
@@ -588,20 +598,9 @@ async fn oauth_failure_that_echoes_the_resolved_url_comes_back_scrubbed() -> Tes
         Some("the url http://example.invalid/mcp/zk-9f3a71c2d8b4e6/sse".into()),
     )
     .await?;
-    std::fs::write(
-        op.with_file_name("url"),
-        format!("{}/mcp?api_key={key}", mock.base),
-    )?;
-    let extra = op_url_config(&op);
-    let Some(harness) = Harness::with(Setup {
-        extra: &extra,
-        ..Setup::default()
-    })
-    .await?
-    else {
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
         return Ok(());
     };
-    wait_for_state(&harness, "locked", "needs_login").await?;
 
     let (status, body) = harness
         .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
@@ -614,16 +613,54 @@ async fn oauth_failure_that_echoes_the_resolved_url_comes_back_scrubbed() -> Tes
     harness.stop().await
 }
 
+/// A login that must be refused with nothing stored; the answer names no key
+async fn assert_login_refused(harness: &Harness, key: &str, fragment: &str) -> TestResult {
+    let (status, body) = harness
+        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .await?;
+    assert_ne!(status, 200, "{body}");
+    assert!(body.to_string().contains(fragment), "{body}");
+    assert!(!body.to_string().contains(key), "{body}");
+
+    let (_, status) = harness
+        .admin_json("/admin/oauth/status", &Value::Null)
+        .await?;
+    assert_eq!(status["servers"][0]["logged_in"], false, "{status}");
+    assert!(!harness.state_holds(key));
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn oauth_login_refuses_an_issuer_that_holds_part_of_the_url() -> TestResult {
+async fn oauth_login_refuses_an_issuer_that_holds_the_key() -> TestResult {
     let key = super::secrets::URL_KEY;
     let (op, _) = super::secrets::fake_op()?;
     let mock = start_mock_with(Client::Registered, format!("/{key}"), None).await?;
-    std::fs::write(
-        op.with_file_name("url"),
-        format!("{}/mcp?api_key={key}", mock.base),
-    )?;
-    let extra = op_url_config(&op);
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
+        return Ok(());
+    };
+
+    // the pending flow stores the expected issuer, so the login is refused
+    // before the browser is sent anywhere
+    assert_login_refused(&harness, key, "secret from the server's url").await?;
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_refuses_an_issuer_that_holds_a_key_embedded_in_the_host() -> TestResult {
+    let key = format!("{}.localhost", super::secrets::URL_KEY);
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_with(Client::Registered, format!("/{key}"), None).await?;
+    let port = mock.base.rsplit(':').next().ok_or("no port")?;
+    let extra = format!(
+        "[secrets]\nop = \"{op}\"\n\n\
+         [servers.locked]\n\
+         url = \"http://{{{{ op://Dev/hostkey/credential }}}}:{port}/mcp\"\n\
+         oauth = true\n\
+         client_name = \"codemode test\"",
+        op = op.display()
+    );
     let Some(harness) = Harness::with(Setup {
         extra: &extra,
         ..Setup::default()
@@ -634,46 +671,57 @@ async fn oauth_login_refuses_an_issuer_that_holds_part_of_the_url() -> TestResul
     };
     wait_for_state(&harness, "locked", "needs_login").await?;
 
-    // the pending flow stores the expected issuer, so the login is refused
-    // before the browser is sent anywhere
-    let (status, body) = harness
-        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
-        .await?;
-    assert_ne!(status, 200, "{body}");
-    assert!(body.to_string().contains("issuer"), "{body}");
-    assert!(!body.to_string().contains(key), "{body}");
-
-    let (_, status) = harness
-        .admin_json("/admin/oauth/status", &Value::Null)
-        .await?;
-    assert_eq!(status["servers"][0]["logged_in"], false, "{status}");
-    assert!(!harness.state_holds(key));
+    // the mock cannot serve an issuer on the key host, so the login is
+    // refused as a mismatch; either way nothing is stored or shown
+    assert_login_refused(&harness, &key, "issuer").await?;
 
     harness.stop().await
 }
 
-/// Writes the URL the fake `op` reads for `locked`
-fn write_url(op: &std::path::Path, url: &str) -> TestResult {
-    std::fs::write(op.with_file_name("url"), url)?;
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_refuses_pending_state_whose_scopes_hold_the_key() -> TestResult {
+    let key = super::secrets::URL_KEY;
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_quirky(
+        Client::Registered,
+        String::new(),
+        None,
+        Quirks {
+            scopes_supported: Some(vec![format!("mcp:{key}")]),
+            ..Quirks::default()
+        },
+    )
+    .await?;
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
+        return Ok(());
+    };
 
-    Ok(())
+    assert_login_refused(&harness, key, "secret from the server's url").await?;
+
+    harness.stop().await
 }
 
-async fn locked_harness(
-    op: &std::path::Path,
-) -> Result<Option<Harness>, Box<dyn std::error::Error>> {
-    let extra = op_url_config(op);
-    let Some(harness) = Harness::with(Setup {
-        extra: &extra,
-        ..Setup::default()
-    })
-    .await?
-    else {
-        return Ok(None);
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_refuses_a_registration_whose_client_secret_holds_the_key() -> TestResult {
+    let key = super::secrets::URL_KEY;
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_quirky(
+        Client::Registered,
+        String::new(),
+        None,
+        Quirks {
+            register_secret: Some(format!("secret-{key}")),
+            ..Quirks::default()
+        },
+    )
+    .await?;
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
+        return Ok(());
     };
-    wait_for_state(&harness, "locked", "needs_login").await?;
 
-    Ok(Some(harness))
+    assert_login_refused(&harness, key, "secret from the server's url").await?;
+
+    harness.stop().await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -690,8 +738,7 @@ async fn oauth_login_strips_a_resource_that_holds_the_key() -> TestResult {
         },
     )
     .await?;
-    write_url(&op, &format!("{}/mcp?api_key={key}", mock.base))?;
-    let Some(harness) = locked_harness(&op).await? else {
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
         return Ok(());
     };
 
@@ -703,15 +750,15 @@ async fn oauth_login_strips_a_resource_that_holds_the_key() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oauth_login_accepts_an_issuer_that_holds_only_public_words_of_the_url() -> TestResult {
-    let key = super::secrets::URL_KEY;
+async fn oauth_login_accepts_an_issuer_with_a_public_realm_holding_digits() -> TestResult {
     let (op, _) = super::secrets::fake_op()?;
-    let mock = start_mock_with(Client::Registered, "/messages-public".into(), None).await?;
-    write_url(
-        &op,
-        &format!("{}/mcp?api_key={key}&area=messages-public", mock.base),
-    )?;
-    let Some(harness) = locked_harness(&op).await? else {
+    let mock = start_mock_with(
+        Client::Registered,
+        "/realms/production-us-east-1".into(),
+        None,
+    )
+    .await?;
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
         return Ok(());
     };
 
@@ -723,36 +770,32 @@ async fn oauth_login_accepts_an_issuer_that_holds_only_public_words_of_the_url()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oauth_login_refuses_an_authorization_link_that_holds_the_key() -> TestResult {
-    let key = super::secrets::URL_KEY;
+async fn oauth_login_refuses_a_link_that_holds_a_percent_encoded_key() -> TestResult {
+    let key = super::secrets::SYMBOL_KEY;
     let (op, _) = super::secrets::fake_op()?;
     let mock = start_mock_quirky(
         Client::Registered,
         String::new(),
         None,
         Quirks {
-            authorize_path: Some(format!("/{key}/authorize")),
+            // the key as a form-encoded query carries it
+            authorize_path: Some("/authorize?hint=zk%2B9f3a71c2%3Dd8b4e6".into()),
             ..Quirks::default()
         },
     )
     .await?;
-    write_url(&op, &format!("{}/mcp?api_key={key}", mock.base))?;
-    let Some(harness) = locked_harness(&op).await? else {
+    let Some(harness) = locked_harness(&op, &mock.base, "op://Dev/symbolkey/credential").await?
+    else {
         return Ok(());
     };
 
-    let (status, body) = harness
-        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
-        .await?;
-    assert_ne!(status, 200, "{body}");
-    assert!(body.to_string().contains("authorization link"), "{body}");
-    assert!(!body.to_string().contains(key), "{body}");
+    assert_login_refused(&harness, key, "authorization link").await?;
 
     harness.stop().await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oauth_login_refuses_a_token_response_that_holds_the_url() -> TestResult {
+async fn oauth_login_refuses_a_token_response_whose_stored_fields_hold_the_url() -> TestResult {
     let key = super::secrets::URL_KEY;
     let (op, _) = super::secrets::fake_op()?;
     let mock = start_mock_quirky(
@@ -760,13 +803,12 @@ async fn oauth_login_refuses_a_token_response_that_holds_the_url() -> TestResult
         String::new(),
         None,
         Quirks {
-            login_extra: Some(json!({ "resource": format!("https://example.invalid/mcp/{key}") })),
+            login_extra: Some(json!({ "scope": format!("mcp:{key}") })),
             ..Quirks::default()
         },
     )
     .await?;
-    write_url(&op, &format!("{}/mcp?api_key={key}", mock.base))?;
-    let Some(harness) = locked_harness(&op).await? else {
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
         return Ok(());
     };
 
@@ -785,7 +827,63 @@ async fn oauth_login_refuses_a_token_response_that_holds_the_url() -> TestResult
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oauth_refresh_that_holds_the_url_is_not_stored() -> TestResult {
+async fn oauth_login_drops_a_vendor_field_that_echoes_the_url_and_connects() -> TestResult {
+    let key = super::secrets::URL_KEY;
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_quirky(
+        Client::Registered,
+        String::new(),
+        None,
+        Quirks {
+            login_extra: Some(json!({ "resource": format!("https://example.invalid/mcp/{key}") })),
+            ..Quirks::default()
+        },
+    )
+    .await?;
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
+        return Ok(());
+    };
+
+    let (callback, _) = begin_login(&harness, &mock, "locked").await?;
+    let page = harness.http.get(&callback).send().await?;
+    assert_eq!(page.status().as_u16(), 200);
+    assert!(!harness.state_holds(key));
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_refuses_a_value_that_is_more_than_one_url_component() -> TestResult {
+    let (op, _) = super::secrets::fake_op()?;
+    let extra = format!(
+        "[secrets]\nop = \"{op}\"\n\n\
+         [servers.locked]\n\
+         url = \"https://{{{{ op://Dev/hostpath/credential }}}}\"\n\
+         oauth = true\n\
+         client_name = \"codemode test\"",
+        op = op.display()
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let (status, body) = harness
+        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .await?;
+    assert_ne!(status, 200, "{body}");
+    assert!(body.to_string().contains("store only the key"), "{body}");
+    assert!(!body.to_string().contains("zk-9f3a71c2d8b4e6"), "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_refresh_that_echoes_the_url_is_stored_without_it() -> TestResult {
     let key = super::secrets::URL_KEY;
     let (op, _) = super::secrets::fake_op()?;
     let mock = start_mock_quirky(
@@ -800,8 +898,7 @@ async fn oauth_refresh_that_holds_the_url_is_not_stored() -> TestResult {
         },
     )
     .await?;
-    write_url(&op, &format!("{}/mcp?api_key={key}", mock.base))?;
-    let Some(harness) = locked_harness(&op).await? else {
+    let Some(harness) = locked_harness(&op, &mock.base, URL_KEY_REFERENCE).await? else {
         return Ok(());
     };
 
@@ -825,7 +922,10 @@ async fn oauth_refresh_that_holds_the_url_is_not_stored() -> TestResult {
         .store()
         .oauth_login("locked")?
         .ok_or("no stored login")?;
-    assert!(stored.contains("\"refresh-0\""), "the refresh was stored");
+    assert!(
+        !stored.contains("\"refresh-0\""),
+        "the refresh was stored: {stored}"
+    );
     assert!(!stored.contains(key));
     assert!(!harness.state_holds(key));
 
@@ -837,15 +937,15 @@ async fn oauth_callback_error_does_not_echo_a_url_that_cannot_be_read() -> TestR
     let key = "zk-b41d90e7a3c258";
     // no url file, so the fake `op` fails to read the reference
     let (op, log) = super::secrets::fake_op()?;
+    let reference = "op://Dev/unreadable/credential";
     let Some(harness) = Harness::with(Setup {
-        extra: &op_url_config(&op),
+        extra: &op_url_config(&op, "http://127.0.0.1:9", reference),
         ..Setup::default()
     })
     .await?
     else {
         return Ok(());
     };
-    let reference = "op://Dev/mcpurl/credential";
     let reads_before = super::secrets::reads(&log, reference);
 
     let description = format!("bad resource http://127.0.0.1:9/mcp/{key}/sse");

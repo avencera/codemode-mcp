@@ -38,8 +38,6 @@ const MAX_ERROR_TEXT: usize = 2000;
 const REDACTED: &str = "[redacted]";
 /// Shorter secrets would redact ordinary words
 const MIN_SECRET_LEN: usize = 6;
-/// Shortest path segment or query value taken for a key
-const MIN_KEY_LEN: usize = 16;
 /// Longest `op://` reference accepted
 const MAX_REFERENCE_CHARS: usize = 256;
 
@@ -180,117 +178,83 @@ pub fn is_reference(text: &str) -> bool {
     })
 }
 
-/// What in a URL must stay out of text, split by how it is used
-struct UrlParts {
-    /// What identifies the URL: the URL and its path in every encoding, and
-    /// the path and query pieces that look like a key. An authorization
-    /// server's issuer or link holding one of these exposes the URL
-    keys: Vec<String>,
-    /// Parts that only the redactor needs: a query as a whole, which is
-    /// public enough to share with an authorization server, and userinfo
-    redacted: Vec<String>,
-}
-
-/// Whether `text` looks like a key rather than a word: long, made of the
-/// characters keys are made of, and holding a digit
-///
-/// Path words such as `message` or `realms` are public and would redact
-/// ordinary text and make valid issuers look like leaks
-fn is_key_like(text: &str) -> bool {
-    text.len() >= MIN_KEY_LEN
-        && text.bytes().any(|byte| byte.is_ascii_digit())
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_.~-+/=".contains(&byte))
-}
-
-/// The parts of a URL that can hold a key: the URL itself and its path in
-/// the encodings an authorization server echoes back (the path only when it
-/// holds a key-like piece), the key-like pieces of the path and query, and
-/// the query and userinfo for the redactor
-fn url_parts(url: &str) -> UrlParts {
-    let mut keys = vec![url.to_owned()];
-    keys.extend(encodings(url));
-    let mut redacted = Vec::new();
-
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return UrlParts { keys, redacted };
-    };
-    // rmcp builds `.well-known` URLs from the path without its last `/`
-    let path = parsed.path();
-    // a path of public words alone, once encoded, would match an
-    // authorization server's own `resource` or issuer
-    let holds_key = path.split('/').any(is_key_like);
-    for path in [path, path.trim_end_matches('/')] {
-        if holds_key {
-            keys.push(path.to_owned());
-            keys.extend(encodings(path));
-        } else {
-            redacted.push(path.to_owned());
-        }
-    }
-    keys.extend(
-        path.split('/')
-            .filter(|segment| is_key_like(segment))
-            .map(str::to_owned),
-    );
-    if let Some(query) = parsed.query() {
-        redacted.push(query.to_owned());
-        let raw_values = query
-            .split('&')
-            .map(|pair| pair.split_once('=').map_or(pair, |(_, value)| value));
-        keys.extend(
-            raw_values
-                .filter(|value| is_key_like(value))
-                .map(str::to_owned),
-        );
-    }
-    keys.extend(
-        parsed
-            .query_pairs()
-            .map(|(_, value)| value.into_owned())
-            .filter(|value| is_key_like(value)),
-    );
-    if !parsed.username().is_empty() {
-        redacted.push(parsed.username().to_owned());
-    }
-    redacted.extend(parsed.password().map(str::to_owned));
-
-    UrlParts { keys, redacted }
-}
-
-/// `text` percent-encoded the ways a query string carries a URL: form
-/// encoding (`application/x-www-form-urlencoded`), the unreserved set only,
-/// and every non-alphanumeric byte
-fn encodings(text: &str) -> [String; 3] {
-    fn encode(text: &str, kept: &[u8]) -> String {
+/// `secret` as it appears in text a library or an authorization server may
+/// print: as is, percent-encoded the ways a query string carries it (form
+/// encoding, the unreserved set only, and every non-alphanumeric byte), and
+/// escaped for JSON
+fn variants(secret: &str) -> Vec<String> {
+    fn encode(text: &str, kept: &[u8], lower: bool) -> String {
         let mut encoded = String::with_capacity(text.len() * 2);
         for byte in text.bytes() {
             if byte.is_ascii_alphanumeric() || kept.contains(&byte) {
                 encoded.push(char::from(byte));
             } else {
-                encoded.push_str(&format!("%{byte:02X}"));
+                encoded.push_str(&if lower {
+                    format!("%{byte:02x}")
+                } else {
+                    format!("%{byte:02X}")
+                });
             }
         }
 
         encoded
     }
 
-    [
-        encode(text, b"*-._"),
-        encode(text, b"-._~"),
-        encode(text, b""),
-    ]
+    // libraries differ on the case of the hex digits
+    let mut variants = vec![secret.to_owned()];
+    for lower in [false, true] {
+        variants.extend([
+            encode(secret, b"*-._", lower),
+            encode(secret, b"-._~", lower),
+            encode(secret, b"", lower),
+        ]);
+    }
+    // `"` and `\` only: a JSON string holds the rest as is or as `\uXXXX`
+    if let Ok(json) = serde_json::to_string(secret) {
+        variants.push(json[1..json.len() - 1].to_owned());
+    }
+    variants.retain(|variant| !variant.is_empty());
+    variants.sort();
+    variants.dedup();
+
+    variants
 }
 
-/// Whether the URL's host is `localhost` or an IP address, which every local
-/// server shares and redacting would blank out of unrelated output
-fn is_local_host(url: &reqwest::Url) -> bool {
-    url.domain().is_none_or(|name| {
-        let name = name.to_ascii_lowercase();
+/// `text` with its `%XX` escapes decoded; `plus_is_space` also decodes the
+/// `+` of form encoding
+fn percent_decode(text: &str, plus_is_space: bool) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = bytes
+            .get(index + 1..index + 3)
+            .filter(|_| bytes[index] == b'%')
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(if plus_is_space && bytes[index] == b'+' {
+                    b' '
+                } else {
+                    bytes[index]
+                });
+                index += 1;
+            }
+        }
+    }
 
-        name == "localhost" || name.ends_with(".localhost")
-    })
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Whether a value starts with a reference, so the value read is the whole of
+/// it and not a part
+pub fn is_whole_reference(value: &str) -> bool {
+    value.trim_start().starts_with("{{")
 }
 
 /// Checks a configured value's references without reading them
@@ -313,12 +277,11 @@ pub fn references(value: &str) -> Result<Vec<&str>, SecretError> {
 pub struct ResolvedUrl {
     /// The URL to connect to; never to be logged or stored
     pub url: String,
-    /// Everything in it that must stay out of text, for the redactor: `keys`,
-    /// the values read, the query, userinfo and the host
+    /// What the redactor learns: the keys and, when the whole URL was read
+    /// from 1Password, the URL's normalized form, path and query
     pub secrets: Vec<String>,
-    /// What identifies the URL, without the host, short path words and
-    /// public query values, which an authorization server on the same host
-    /// legitimately shares
+    /// The values read from 1Password, with their encodings: what nothing an
+    /// authorization server returns may hold when it is stored or shown
     pub keys: Vec<String>,
 }
 
@@ -402,35 +365,27 @@ impl OnePassword {
 
     /// An HTTP server's `url` with its references read
     ///
-    /// The whole URL is a secret when a reference stands in it, so the
-    /// redactor also gets the URL's own parts: errors from the HTTP client
-    /// print the normalized URL, host or path rather than what 1Password held
+    /// The keys are exactly the values read. A URL that is a reference
+    /// alone is a secret as a whole, so the redactor also learns its
+    /// normalized form, path and query, which HTTP clients print in errors
     pub async fn resolve_url(&self, template: &str) -> Result<ResolvedUrl, SecretError> {
         let mut read = Vec::new();
         let url = self.resolve_text(template, &mut read).await?;
         let url = url.trim().to_owned();
         let parsed = reqwest::Url::parse(&url).map_err(|_| SecretError::NotAUrl)?;
-        let mut secrets = Vec::new();
-        let mut keys = Vec::new();
-        if !read.is_empty() {
-            // a value that is itself a URL holds the host, which an
-            // authorization server on the same host legitimately shares
-            keys.extend(
-                read.iter()
-                    .filter(|value| reqwest::Url::parse(value).is_err())
-                    .cloned(),
-            );
-            for url in [url.as_str(), parsed.as_str()] {
-                let parts = url_parts(url);
-                keys.extend(parts.keys);
-                secrets.extend(parts.redacted);
-            }
-            secrets.extend(read);
-            secrets.extend(keys.iter().cloned());
-            // reqwest prints the host
-            if !is_local_host(&parsed) {
-                secrets.extend(parsed.host_str().map(str::to_owned));
-            }
+        let keys: Vec<String> = read.iter().flat_map(|value| variants(value)).collect();
+        let mut secrets = keys.clone();
+        if is_whole_reference(template) {
+            let path = parsed.path();
+            let parts = [
+                url.as_str(),
+                parsed.as_str(),
+                path,
+                path.trim_end_matches('/'),
+            ]
+            .into_iter()
+            .chain(parsed.query());
+            secrets.extend(parts.flat_map(variants));
         }
 
         Ok(ResolvedUrl { url, secrets, keys })
@@ -690,10 +645,16 @@ impl Redactor {
         known.dedup();
     }
 
-    /// Whether `text` holds any secret that `keys` lists
+    /// Whether `text` holds any of `keys`, as is or once percent-decoded
     pub fn holds_any(text: &str, keys: &[String]) -> bool {
-        keys.iter()
-            .any(|key| key.len() >= MIN_SECRET_LEN && text.contains(key.as_str()))
+        let keys = || keys.iter().filter(|key| key.len() >= MIN_SECRET_LEN);
+        let holds = |text: &str| keys().any(|key| text.contains(key.as_str()));
+
+        holds(text)
+            || (text.contains(['%', '+'])
+                && [false, true]
+                    .into_iter()
+                    .any(|plus| holds(&percent_decode(text, plus))))
     }
 
     /// `text` with every known secret replaced
@@ -765,6 +726,16 @@ mod tests {
                 matches!(check(value), Err(SecretError::NotAReference)),
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn lowercase_and_uppercase_percent_encoding_are_both_scrubbed() {
+        let redactor = Redactor::default();
+        redactor.add(variants("zk+9f3a71c2=d8b4e6"));
+
+        for text in ["zk%2B9f3a71c2%3Dd8b4e6", "zk%2b9f3a71c2%3dd8b4e6"] {
+            assert_eq!(redactor.scrub(text), REDACTED, "{text}");
         }
     }
 }
