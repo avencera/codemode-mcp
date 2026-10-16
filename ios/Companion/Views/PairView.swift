@@ -25,9 +25,12 @@ struct PairView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
                     // a code that failed only because the gateway was out of
-                    // reach still works once it is back
-                    if lastScanned != nil {
-                        Button("Scan the same code again") { lastScanned = nil }
+                    // reach still works once it is back; the scanner has
+                    // stopped on that code, so it is retried from here
+                    if let lastScanned {
+                        Button("Try this code again") {
+                            manager.dispatch(.pair(scanned: lastScanned))
+                        }
                     }
                 }
                 scanner

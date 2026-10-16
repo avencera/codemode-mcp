@@ -25,9 +25,10 @@ use crate::{
 /// How long the gateway's check may take: its read waits up to
 /// [`ASK_TIMEOUT`] for the owner, plus the dial back
 const CHECK_TIMEOUT: Duration = ASK_TIMEOUT.saturating_add(Duration::from_secs(30));
-/// How long the gateway may take to register this phone; it asks nobody,
-/// so a gateway that takes longer is stuck, and pairing must not wait on it
-const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the gateway may take to register this phone: it asks nobody,
+/// but waits up to 30 seconds for a read in progress before sealing what it
+/// has read to the phone, so a gateway that takes longer still is stuck
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The invite ticket in scanned text: the ticket alone, or the install
 /// command `companion invite` prints and shows as a QR code
