@@ -361,33 +361,28 @@ fn html_entity(bytes: &[u8]) -> Option<(char, usize)> {
 }
 
 impl Unescape {
-    /// Every combination worth matching text against
-    const VIEWS: [Self; 4] = [
-        Self {
-            percent: true,
-            json: false,
-            plus_is_space: false,
-            html: true,
-        },
-        Self {
-            percent: true,
-            json: false,
-            plus_is_space: true,
-            html: true,
-        },
-        Self {
-            percent: false,
-            json: true,
-            plus_is_space: false,
-            html: true,
-        },
-        Self {
-            percent: true,
-            json: true,
-            plus_is_space: false,
-            html: true,
-        },
+    /// Every combination worth matching text against, each with and without
+    /// HTML references; a header or env secret may hold a literal `&amp;`
+    /// that only a view leaving HTML alone still matches
+    const VIEWS: [Self; 8] = [
+        Self::new(true, false, false, false),
+        Self::new(true, false, true, false),
+        Self::new(false, true, false, false),
+        Self::new(true, true, false, false),
+        Self::new(true, false, false, true),
+        Self::new(true, false, true, true),
+        Self::new(false, true, false, true),
+        Self::new(true, true, false, true),
     ];
+
+    const fn new(percent: bool, json: bool, plus_is_space: bool, html: bool) -> Self {
+        Self {
+            percent,
+            json,
+            plus_is_space,
+            html,
+        }
+    }
 }
 
 /// Decoded bytes with, for each, the span of the original text it came from
@@ -1503,6 +1498,16 @@ mod tests {
             &logged,
             &["aB7cD/Ef8gH/Jk9L".to_owned()]
         ));
+    }
+
+    #[test]
+    fn a_secret_holding_a_literal_html_reference_is_redacted_through_json_escapes() {
+        let redactor = Redactor::default();
+        redactor.add(["abc&amp;def/ghi".to_owned()]);
+
+        let scrubbed = redactor.scrub(r#"{"error":"bad token abc&amp;def\/ghi"}"#);
+        assert!(!scrubbed.contains("def"), "{scrubbed}");
+        assert!(scrubbed.contains("[redacted]"), "{scrubbed}");
     }
 
     #[test]
