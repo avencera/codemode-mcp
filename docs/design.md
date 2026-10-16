@@ -504,22 +504,22 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   `#`, `?`, `%`, `&`, `$`, `(`, `)`, space, control or non-ASCII character, which URL parsers, JSON escaping or
   IDNA could turn into a form the redactor does not know; anything else is refused
   (`SecretError::UrlValueUnprotectable`) with an error naming the allowed set. A literal `%` just before a placeholder is written as `%25`, so a value can never
-  complete an escape. A value under six bytes is refused. The URL a template yields is reported as a
+  complete an escape. A value under 16 bytes is refused, so fragment redaction always applies. The URL a template yields is reported as a
   `configuration` failure when it does not parse (`SecretError::NotAUrl`)
 - The secrets of a `url` are exactly the values read from 1Password plus the forms text may print them in: the
   encodings the URL holds them in, uppercase and lowercase
-  percent escapes, and JSON escaping. Nothing in a URL is guessed to be a key from its shape, so embed the
+  percent escapes, JSON escaping, HTML character references and `+` read as a space. Nothing in a URL is guessed to be a key from its shape, so embed the
   reference where the key sits, e.g.
   `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
   that is one whole reference is refused at config load, with or without OAuth: codemode would have to guess which
   part of the URL is the key, and matching fragments of the whole URL would redact public text such as `https://`.
-  The redactor matches ASCII case-insensitively, also through the percent- and JSON-escape-decoded views of the text
+  The redactor matches ASCII case-insensitively, also through the percent-, JSON- and HTML-reference-decoded views of the text
   (decoded repeatedly, up to 4 passes, keeping a span map back to the original, since a client's `Debug` output
   escapes the JSON escapes of a body again), so a
   provider that lowercases a key into a host name cannot slip past. rmcp cuts an invalid response to 256 bytes
-  before codemode sees it, so a key at the cut leaves a prefix that no longer matches whole; for a key of at
-  least 16 bytes the redactor therefore also replaces any run of 8 or more consecutive bytes that is a substring
-  of the key (an index of the key's 8-byte windows, one scan per view). Shorter keys match whole only, and the
+  before codemode sees it, so a key at the cut leaves a prefix that no longer matches whole; the redactor
+  therefore also replaces any run of 8 or more consecutive bytes that is a substring
+  of the key (an index of the key's 8-byte windows, one scan per view). The
   OAuth write guards (`Redactor::holds_any`) never match fragments, which would refuse legitimate data. The
   daemon's log writer
   (`secrets::redacting_logs`) scrubs with the same redactor, buffering each writer's bytes until `flush` or drop,

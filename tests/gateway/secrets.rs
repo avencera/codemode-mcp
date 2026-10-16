@@ -67,9 +67,9 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/symbolkey/credential) printf '{SYMBOL_KEY}' ;;\n\
                op://Dev/slashkey/credential) printf '%s' 'zk/9f3a71c2d8b4e6' ;;\n\
                op://Dev/mixedkey/credential) printf '%s' '{MIXED_KEY}' ;;\n\
-               op://Dev/dotkey/credential) printf '%s' 'ab/../cd12' ;;\n\
+               op://Dev/dotkey/credential) printf '%s' 'abcdef/../cd12ghijkl' ;;\n\
                op://Dev/colonkey/credential) printf '%s' 'zk:9f3a71c2d8b4e6' ;;\n\
-               op://Dev/shortkey/credential) printf '%s' 'aB9xZ' ;;\n\
+               op://Dev/shortkey/credential) printf '%s' '9f3a71c2d8b4e6f' ;;\n\
                op://Dev/encodedkey/credential) printf '%s' 'zk%2B9f3a71c2%3Dd8b4e6' ;;\n\
                op://Dev/hexkey/credential) printf '%s' '{HEX_KEY}' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\

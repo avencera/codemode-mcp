@@ -104,7 +104,7 @@ pub enum SecretError {
     UrlReferenceMisplaced,
     /// A value read for a `url` is shorter than the redactor can match
     #[error(
-        "a value read for the `url` is too short to be protected; use a key of at least {MIN_SECRET_LEN} bytes"
+        "a value read for the `url` is too short to be protected; use a key of at least {MIN_FRAGMENT_KEY_LEN} bytes"
     )]
     UrlValueTooShort,
     /// A value read for an embedded `url` reference holds a character that
@@ -309,6 +309,55 @@ struct Unescape {
     percent: bool,
     json: bool,
     plus_is_space: bool,
+    html: bool,
+}
+
+/// Named HTML character references a response body may print a key's bytes as
+const HTML_ENTITIES: [(&str, char); 19] = [
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+    ("plus", '+'),
+    ("sol", '/'),
+    ("colon", ':'),
+    ("equals", '='),
+    ("commat", '@'),
+    ("excl", '!'),
+    ("ast", '*'),
+    ("comma", ','),
+    ("semi", ';'),
+    ("period", '.'),
+    ("lowbar", '_'),
+    ("tilde", '~'),
+    ("hyphen", '-'),
+    ("dash", '-'),
+];
+
+/// The character an HTML reference (`&#NN;`, `&#xHH;` or a named one) at the
+/// start of `bytes` stands for, and the reference's length
+fn html_entity(bytes: &[u8]) -> Option<(char, usize)> {
+    let rest = bytes.strip_prefix(b"&")?;
+    let end = rest.iter().take(10).position(|byte| *byte == b';')?;
+    let body = std::str::from_utf8(&rest[..end]).ok()?;
+    let character = match body.strip_prefix('#') {
+        Some(number) => {
+            // `from_str_radix` would also take a leading sign
+            if !number.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                return None;
+            }
+            let code = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16),
+                None => number.parse(),
+            };
+
+            char::from_u32(code.ok()?)?
+        }
+        None => HTML_ENTITIES.iter().find(|(name, _)| *name == body)?.1,
+    };
+
+    Some((character, end + 2))
 }
 
 impl Unescape {
@@ -318,21 +367,25 @@ impl Unescape {
             percent: true,
             json: false,
             plus_is_space: false,
+            html: true,
         },
         Self {
             percent: true,
             json: false,
             plus_is_space: true,
+            html: true,
         },
         Self {
             percent: false,
             json: true,
             plus_is_space: false,
+            html: true,
         },
         Self {
             percent: true,
             json: true,
             plus_is_space: false,
+            html: true,
         },
     ];
 }
@@ -382,7 +435,9 @@ fn unescaped_with_spans(bytes: &[u8], mode: Unescape) -> Decoded {
             decoded.push(byte);
             spans.push((index, index + 3));
             index += 3;
-        } else if let Some((character, width)) = json_escape(&bytes[index..]).filter(|_| mode.json)
+        } else if let Some((character, width)) = json_escape(&bytes[index..])
+            .filter(|_| mode.json)
+            .or_else(|| html_entity(&bytes[index..]).filter(|_| mode.html))
         {
             let mut buffer = [0; 4];
             for byte in character.encode_utf8(&mut buffer).bytes() {
@@ -524,7 +579,10 @@ impl<'a> UrlTemplate<'a> {
 
     /// The URL with `values`, one per reference in order, filled in
     pub fn fill(&self, values: &[String]) -> Result<ResolvedUrl, SecretError> {
-        if values.iter().any(|value| value.len() < MIN_SECRET_LEN) {
+        if values
+            .iter()
+            .any(|value| value.len() < MIN_FRAGMENT_KEY_LEN)
+        {
             return Err(SecretError::UrlValueTooShort);
         }
         // only characters that no URL parser, escape or logger rewrites
@@ -656,6 +714,14 @@ fn embedded_keys(value: &str) -> Vec<String> {
             .into_iter()
             .flat_map(|form| [lower_hex(&form), form]),
     );
+    // a decoder may turn `+` into a space, and `%20` then shows the same text
+    let spaced: Vec<String> = keys
+        .iter()
+        .filter(|key| key.contains('+'))
+        .map(|key| key.replace('+', " "))
+        .filter(|key| !key.trim().is_empty())
+        .collect();
+    keys.extend(spaced);
     keys.retain(|key| !key.is_empty());
     keys.sort();
     keys.dedup();
@@ -1120,7 +1186,7 @@ impl Redactor {
         };
 
         holds(text.as_bytes())
-            || (text.contains(['%', '+', '\\'])
+            || (text.contains(['%', '+', '\\', '&'])
                 && Unescape::VIEWS.into_iter().any(|mode| {
                     unescaped_layers(text, mode)
                         .iter()
@@ -1136,7 +1202,7 @@ impl Redactor {
         let mut hits = known.spans(text.to_ascii_lowercase().as_bytes());
 
         // the view is built only for text that has an escape
-        if text.contains(['%', '\\']) {
+        if text.contains(['%', '\\', '&']) {
             for mode in Unescape::VIEWS
                 .into_iter()
                 .filter(|mode| !mode.plus_is_space)
@@ -1329,16 +1395,20 @@ mod tests {
     fn values_are_filled_into_url_components_as_data() -> Result<(), SecretError> {
         let resolved = filled(
             "https://h.example/mcp/{{ op://a/b/c }}/message/?k={{ op://a/b/c }}&{{ op://a/b/c }}=1",
-            &["a/b=c:d@e,f+h", "a/b=c:d@e,f+h", "a/b=c:d@e,f+h"],
+            &[
+                "a/b=c:d@e,f+hxxxxx",
+                "a/b=c:d@e,f+hxxxxx",
+                "a/b=c:d@e,f+hxxxxx",
+            ],
         )?;
         let parsed = reqwest::Url::parse(&resolved.url).map_err(|_| SecretError::NotAUrl)?;
 
         assert_eq!(parsed.host_str(), Some("h.example"));
         assert_eq!(parsed.fragment(), None);
-        assert_eq!(parsed.path(), "/mcp/a%2Fb=c:d@e,f+h/message/");
+        assert_eq!(parsed.path(), "/mcp/a%2Fb=c:d@e,f+hxxxxx/message/");
         assert_eq!(
             parsed.query(),
-            Some("k=a%2Fb%3Dc%3Ad%40e%2Cf%2Bh&a%2Fb%3Dc%3Ad%40e%2Cf%2Bh=1")
+            Some("k=a%2Fb%3Dc%3Ad%40e%2Cf%2Bhxxxxx&a%2Fb%3Dc%3Ad%40e%2Cf%2Bhxxxxx=1")
         );
 
         Ok(())
@@ -1347,15 +1417,15 @@ mod tests {
     #[test]
     fn unprotectable_values_are_refused() {
         for value in [
-            "has space1234",
-            "sëcret123",
-            "tenant\\SecretKey123",
-            "abc\"def\"ghi123",
-            "key'quote123",
-            "a<b>c^{d}|e[f]123",
-            "k`tick#hash?q%r&s$t(u)",
-            "%41%42%43%44",
-            "50%off-secret",
+            "has space1234567",
+            "sëcret1234567890",
+            "tenant\\SecretKey123456",
+            "abc\"def\"ghi123456789",
+            "key'quote1234567890",
+            "a<b>c^{d}|e[f]1234567",
+            "k`tick#hash?q%r&s$t(u)xx",
+            "%41%42%43%44%45%46%47",
+            "50%off-secret-value",
         ] {
             assert!(
                 matches!(
@@ -1365,14 +1435,23 @@ mod tests {
                 "{value}"
             );
         }
-        assert!(filled("https://h.example/mcp/{{ op://a/b/c }}", &["acct:key~1234"]).is_ok());
+        assert!(
+            filled(
+                "https://h.example/mcp/{{ op://a/b/c }}",
+                &["acct:key~1234567890"]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn a_literal_percent_before_a_value_cannot_complete_an_escape() -> Result<(), SecretError> {
-        let resolved = filled("https://host/mcp/%{{ op://a/b/c }}", &["2Fsecret-1234"])?;
+        let resolved = filled(
+            "https://host/mcp/%{{ op://a/b/c }}",
+            &["2Fsecret-1234567890"],
+        )?;
 
-        assert_eq!(resolved.url, "https://host/mcp/%252Fsecret-1234");
+        assert_eq!(resolved.url, "https://host/mcp/%252Fsecret-1234567890");
 
         Ok(())
     }
@@ -1424,6 +1503,70 @@ mod tests {
             &logged,
             &["aB7cD/Ef8gH/Jk9L".to_owned()]
         ));
+    }
+
+    #[test]
+    fn a_key_in_an_html_error_body_is_redacted_through_character_references()
+    -> Result<(), SecretError> {
+        let resolved = filled(
+            "https://h.example/mcp/{{ op://a/b/c }}",
+            &["aB7cD+Ef8gH+Jk9L"],
+        )?;
+        let redactor = Redactor::default();
+        redactor.add(resolved.secrets.clone());
+        redactor.add_keys(resolved.fragile);
+
+        for body in [
+            "<p>bad key aB7cD&#43;Ef8gH&#43;Jk9L</p>",
+            "<p>bad key aB7cD&#x2B;Ef8gH&#X2b;Jk9L</p>",
+            "<p>bad key aB7cD&plus;Ef8gH&plus;Jk9L</p>",
+        ] {
+            let scrubbed = redactor.scrub(body);
+            assert!(!scrubbed.contains("Ef8gH"), "{scrubbed}");
+            assert!(scrubbed.contains("[redacted]"), "{scrubbed}");
+            assert!(Redactor::holds_any(body, &resolved.keys), "{body}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_echoed_with_plus_as_space_is_redacted_and_refused() -> Result<(), SecretError> {
+        let resolved = filled(
+            "https://h.example/mcp/{{ op://a/b/c }}/message",
+            &["ab+cDe/f12==xyzw"],
+        )?;
+        let redactor = Redactor::default();
+        redactor.add(resolved.secrets.clone());
+        redactor.add_keys(resolved.fragile);
+
+        for echo in [
+            "ab cDe/f12==xyzw",
+            "ab%20cDe/f12==xyzw",
+            "ab%20cDe%2Ff12%3D%3Dxyzw",
+        ] {
+            let scrubbed = redactor.scrub(echo);
+            assert!(!scrubbed.contains("cDe"), "{scrubbed}");
+            assert!(Redactor::holds_any(echo, &resolved.keys), "{echo}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_url_value_under_16_bytes_is_refused() {
+        let refused = filled(
+            "https://h.example/mcp/{{ op://a/b/c }}",
+            &["9f3a71c2d8b4e6f"],
+        );
+        assert!(matches!(refused, Err(SecretError::UrlValueTooShort)));
+        assert!(
+            filled(
+                "https://h.example/mcp/{{ op://a/b/c }}",
+                &["9f3a71c2d8b4e6f0"]
+            )
+            .is_ok()
+        );
     }
 
     #[test]

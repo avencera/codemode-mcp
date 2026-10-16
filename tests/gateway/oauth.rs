@@ -1070,7 +1070,9 @@ async fn oauth_login_refuses_an_authorization_endpoint_that_holds_the_key_before
         Quirks {
             // URL parsing resolves the dot segments, so the link built from
             // this endpoint no longer holds the key
-            authorize_url: Some("https://auth.example.invalid/ab/../cd12/authorize".to_owned()),
+            authorize_url: Some(
+                "https://auth.example.invalid/abcdef/../cd12ghijkl/authorize".to_owned(),
+            ),
             ..Quirks::default()
         },
     )
@@ -1081,7 +1083,7 @@ async fn oauth_login_refuses_an_authorization_endpoint_that_holds_the_key_before
         return Ok(());
     };
 
-    assert_login_refused(&harness, "ab/../cd12", "authorization link").await?;
+    assert_login_refused(&harness, "abcdef/../cd12ghijkl", "authorization link").await?;
 
     harness.stop().await
 }
