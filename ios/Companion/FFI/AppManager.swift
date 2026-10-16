@@ -18,7 +18,6 @@ final class AppManager: Reconciler, @unchecked Sendable {
     }
 
     func dispatch(_ action: AppAction) {
-        DebugLog.write("dispatch \(action)")
         rust.dispatch(action: action)
     }
 
@@ -40,7 +39,6 @@ final class AppManager: Reconciler, @unchecked Sendable {
         case let .connection(connection):
             state.connection = connection
         case let .reads(reads):
-            DebugLog.write("reads \(reads.map { "\($0.id.prefix(8)) \($0.status)" })")
             state.reads = reads
         case let .pairing(pairing):
             state.pairing = pairing

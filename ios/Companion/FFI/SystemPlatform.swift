@@ -106,8 +106,6 @@ final class SystemPlatform: Platform, @unchecked Sendable {
     // MARK: Face ID
 
     func openSealed(request: OpenRequest) throws -> String {
-        DebugLog.write("openSealed start \(request.id.prefix(8))")
-        defer { DebugLog.write("openSealed end \(request.id.prefix(8))") }
         guard let handle = loadSecret(key: Self.sealKeyItem) else {
             throw OpenError.Failed(message: "this iPhone has no seal key; pair it again")
         }
