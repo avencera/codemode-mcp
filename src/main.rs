@@ -1176,9 +1176,6 @@ async fn companion_serve_command(config: Config) -> Result<()> {
     let companion_config = config.companion.ok_or_else(|| {
         eyre!("the config has no [companion] section; run `codemode-mcp companion pair <ticket>`")
     })?;
-    if companion_config.allow.is_empty() {
-        tracing::warn!("[companion] allow is empty, so every request will be refused");
-    }
 
     #[cfg(target_os = "macos")]
     let mac: Option<Arc<dyn codemode_mcp::mac::Mac>> =

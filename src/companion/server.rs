@@ -63,15 +63,16 @@ impl CompanionHandle {
 
 /// Starts answering the configured gateway
 ///
-/// A read takes two things the gateway cannot fake. First, the allow list:
-/// 1Password's own prompt does not name the item, and one approval lets `op`
-/// read anything for about ten minutes, so without it a compromised gateway
-/// could read every item. Second, a fingerprint for every request. While `op`
-/// is authorized it would answer silently, so this Mac asks Touch ID itself,
-/// naming the reference. Otherwise 1Password's own prompt is that
-/// fingerprint, and a notification names the reference instead, so the owner
-/// touches once either way. `mac` is `None` where there is no Touch ID, and
-/// every request is then denied
+/// Every read takes a fingerprint the gateway cannot fake, given to a prompt
+/// that names the reference. While `op` is authorized it would answer
+/// silently, so this Mac asks Touch ID itself, naming the reference.
+/// Otherwise 1Password asks for a fingerprint, but its prompt does not name
+/// the item, and one approval lets `op` read anything for about ten minutes.
+/// For a reference on the allow list that prompt is enough, with a
+/// notification naming the reference, so the owner touches once; any other
+/// reference is asked for here by name first, so a compromised gateway cannot
+/// slip an unlisted item behind 1Password's unnamed prompt. `mac` is `None`
+/// where there is no Touch ID, and every request is then denied
 pub async fn serve(
     config: CompanionConfig,
     mac: Option<Arc<dyn Mac>>,
@@ -273,6 +274,8 @@ impl Companion {
         })
     }
 
+    /// Answers one read request: refuses anything that is not a reference,
+    /// then reads it only after a fingerprint given to a prompt that names it
     async fn answer(&self, body: &[u8]) -> CompanionResponse {
         let fault = |code, message: &str| {
             CompanionResponse::Error(CompanionFault {
@@ -285,17 +288,18 @@ impl Companion {
             return fault(CompanionErrorCode::NotAllowed, MALFORMED_REQUEST);
         };
         let reference = request.reference.trim();
-        if !is_reference(reference) || !self.config.allows(reference) {
-            tracing::warn!(
-                reference,
-                "refused a reference that is not on the allow list"
-            );
+        if !is_reference(reference) {
+            tracing::warn!(reference, "refused a request that is not a reference");
 
             return fault(
                 CompanionErrorCode::NotAllowed,
-                "the reference is not on this companion's allow list",
+                "the request is not an op://vault/item/field reference",
             );
         }
+        // 1Password's own prompt does not name the item, so only a listed
+        // reference may be approved through it; any other is asked for by
+        // name here, and the owner chooses each one as it comes
+        let listed = self.config.allows(reference);
 
         // a second request waits for the first prompt's answer
         let _turn = self.one_at_a_time.lock().await;
@@ -306,13 +310,17 @@ impl Companion {
                 "Touch ID is unavailable on this machine",
             );
         };
-        let reason = format!(
+        let mut reason = format!(
             "codemode-mcp on {} wants to read {reference}",
             self.config.gateway_name
         );
+        // so a request slipped in among routine reads stands out
+        if !listed {
+            reason.push_str(", which is not on this Mac's allow list");
+        }
         // still held turn: no other request can read between this check and
         // the read below and spend the approval 1Password is about to ask for
-        let named_for_1password = if self.onepassword.signed_out().await {
+        let named_for_1password = if listed && self.onepassword.signed_out().await {
             // 1Password is about to ask for a fingerprint itself, which
             // approves this read as well as ours would, so asking first only
             // makes the owner touch twice. Its prompt names neither the

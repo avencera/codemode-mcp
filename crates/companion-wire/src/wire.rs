@@ -22,8 +22,9 @@ pub struct CompanionRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionErrorCode {
-    /// The reference is not on the companion's allow list, or the request
-    /// was malformed
+    /// The request was malformed or named no reference, or asked for an
+    /// item in a vault the companion does not create in; older companions
+    /// also answer it for a reference off their allow list
     NotAllowed,
     /// The owner did not approve on the companion Mac
     Denied,

@@ -165,7 +165,7 @@ The 1Password Environments server is not covered; it only signs in through the g
      no restart, so a Mac whose setup fails is never asked in place of the gateway's own `op`; `invite` then
      says so and exits with an error.
    - writes a `[companion]` section to this Mac's config, with the references the gateway's servers use as the
-     allow list.
+     allow list. Other references can still be read; each is asked for by name.
    - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
    - asks the gateway to read one of those references through this Mac. Approve the one Touch ID prompt. While
      1Password has authorized `op` on that Mac, the prompt is the companion's and names the reference;
@@ -241,10 +241,12 @@ How reads work with a companion configured:
 - The gateway runs its own `op read` only while you are at the gateway Mac (input within `notify.mac.idle_secs`),
   and asks every companion at the same time. The first value wins and the other reads are cancelled, so working
   over remote desktop, which makes the gateway Mac look in use, still reaches the companion.
-- A companion answers only the gateway it was paired with, and only references on its `allow` list. 1Password's
-  own prompt does not name the item, and one approval lets `op` read anything for about ten minutes, so the
-  companion asks Touch ID itself, naming the reference, on every request. Edit `allow` in its `[companion]`
-  section to change what the gateway may read, then `codemode-mcp companion install` again to restart it.
+- A companion answers only the gateway it was paired with, and every read waits for your fingerprint. While
+  1Password has authorized `op`, the companion asks Touch ID itself, naming the reference. Otherwise 1Password
+  asks, but its prompt does not name the item and one approval lets `op` read anything for about ten minutes, so
+  only references on the `allow` list are approved through it alone, with a notification naming the reference.
+  Any other reference gets the companion's own Touch ID prompt first, which adds "which is not on this Mac's allow
+  list", so you choose each one by name as it comes and never edit the config to read something new.
 - The gateway accepts nothing over iroh unless a peer is listed or an invite is open. While an invite is open it
   accepts pairing; while a phone is listed under `[[secrets.phones]]` it accepts that phone's id, and refuses
   every other id. The rest of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
@@ -495,6 +497,30 @@ policy = "deny"
 - The server is session-less: it issues no `mcp-session-id`, for any protocol version. Clients are told apart by the client name in the request `_meta`, the `initialize` handshake or the `user-agent` header. While `execute` or `wait` is waiting, it sends progress notifications every `limits.progress_interval_ms` (15000) to clients that sent a `progressToken`.
 - Result types. A tool that declares no output schema returns a `JsonValue` that scripts read with the `json_*` accessors. Give it a type in the tool's table: `output = "text"` for prose or markdown (the script gets a `str`, never parsed), or `output_schema` with an inline JSON Schema table for JSON, e.g. `output_schema = { type = "object", required = ["id"], properties = { id = { type = "string" } } }`. An upstream-declared schema wins over `output_schema` unless the table also sets `force_output_schema = true`. Every result is checked against the schema, so write only fields the tool really returns and mark optional ones with a `required` list or a `["string", "null"]` type. Probe it first: `codemode-mcp exec` a script that prints `json.dumps(await server_tool(...))`.
 - Check the result with `codemode-mcp tools` (connects, lists every tool with its status).
+
+### Keep servers in a shared file
+
+To keep the servers in a file you can share, such as one in a public dotfiles repository, list it in `include`
+at the top of `config.toml`, before any table. The values only this Mac should have, such as `public_origin`,
+`[secrets]` peers and personal `env` values, stay in `config.toml`:
+
+```toml
+include = ["~/code/dotfiles/config/codemode-mcp/servers.toml"]
+public_origin = "https://mac.example.ts.net"
+
+[servers.gmail.env]            # added to the shared server's env
+USER_GOOGLE_EMAIL = "you@example.com"
+```
+
+- Paths start with `~/` or are relative to the directory `config.toml` sits in. When `config.toml` is a symlink,
+  that is the link's directory, not its target's.
+- An included file may hold only `[servers]`, and cannot include others. A file kept somewhere shared cannot add
+  a companion, a phone, a `[companion]` section or any other setting. Its servers still run commands on this Mac,
+  so include only files you control.
+- Tables merge key by key, so `config.toml` can add keys to a server the shared file defines. A value set in both
+  files refuses the config and names both files.
+- Pairing and invites still append to `config.toml`, never to an included file.
+- Included files are read when the config loads, so restart after editing one.
 
 ## Restarts and in-flight work
 
