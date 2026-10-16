@@ -99,6 +99,8 @@ struct Quirks {
     scopes_supported: Option<Vec<String>>,
     /// Secret its registration endpoint hands out with the client
     register_secret: Option<String>,
+    /// Raw text its registration endpoint fails with, escapes included
+    register_error_body: Option<String>,
 }
 
 #[derive(Clone)]
@@ -170,7 +172,15 @@ async fn authorization_server(State(mock): State<Mock>) -> Json<Value> {
     Json(metadata)
 }
 
-async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> Response {
+    if let Some(raw) = &mock.quirks.register_error_body {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            raw.clone(),
+        )
+            .into_response();
+    }
     if let Some(echo) = &mock.register_echo {
         return (
             StatusCode::BAD_REQUEST,
@@ -178,7 +188,8 @@ async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> (StatusC
                 "error": "invalid_client_metadata",
                 "error_description": format!("cannot register for {echo}"),
             })),
-        );
+        )
+            .into_response();
     }
 
     let mut client = json!({
@@ -190,7 +201,7 @@ async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> (StatusC
         client["client_secret"] = json!(secret);
     }
 
-    (StatusCode::CREATED, Json(client))
+    (StatusCode::CREATED, Json(client)).into_response()
 }
 
 async fn token(
@@ -620,6 +631,45 @@ async fn oauth_failure_that_echoes_the_resolved_url_comes_back_scrubbed() -> Tes
     let text = body["error"].as_str().unwrap_or_default();
     assert!(text.contains("[redacted]"), "{body}");
     assert!(!text.contains(key), "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_failure_that_echoes_the_key_with_json_escaped_slashes_comes_back_scrubbed()
+-> TestResult {
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_quirky(
+        Client::Registered,
+        String::new(),
+        None,
+        Quirks {
+            // PHP escapes `/` in JSON by default
+            register_error_body: Some(
+                r#"{"error_description":"bad key zk\/9f3a71c2d8b4e6"}"#.to_owned(),
+            ),
+            ..Quirks::default()
+        },
+    )
+    .await?;
+    let Some(harness) = path_key_harness(
+        &op,
+        &mock.base,
+        "op://Dev/slashkey/credential",
+        "needs_login",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let (status, body) = harness
+        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .await?;
+    assert_eq!(status, 502, "{body}");
+    let text = body.to_string();
+    assert!(text.contains("[redacted]"), "{body}");
+    assert!(!text.contains("9f3a71c2d8b4e6"), "{body}");
 
     harness.stop().await
 }

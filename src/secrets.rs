@@ -198,9 +198,9 @@ pub fn is_reference(text: &str) -> bool {
 }
 
 /// `secret` as it appears in text a library or an authorization server may
-/// print: as is, percent-encoded the ways a query string carries it (form
-/// encoding, the unreserved set only, and every non-alphanumeric byte), and
-/// escaped for JSON
+/// print: as is and percent-encoded the ways a query string carries it (form
+/// encoding, the unreserved set only, and every non-alphanumeric byte); JSON
+/// escapes are undone by [`unescaped_with_spans`] when text is matched
 fn variants(secret: &str) -> Vec<String> {
     fn encode(text: &str, kept: &[u8], lower: bool) -> String {
         let mut encoded = String::with_capacity(text.len() * 2);
@@ -227,10 +227,6 @@ fn variants(secret: &str) -> Vec<String> {
             encode(secret, b"-._~", lower),
             encode(secret, b"", lower),
         ]);
-    }
-    // `"` and `\` only: a JSON string holds the rest as is or as `\uXXXX`
-    if let Ok(json) = serde_json::to_string(secret) {
-        variants.push(json[1..json.len() - 1].to_owned());
     }
     variants.retain(|variant| !variant.is_empty());
     variants.sort();
@@ -277,21 +273,120 @@ fn percent_decode(text: &str, plus_is_space: bool) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-/// `text` with its `%XX` escapes decoded, and for each decoded byte the span
-/// of `text` it came from
-fn decoded_with_spans(text: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
+/// The character a JSON string escape at the start of `bytes` stands for, and
+/// the escape's width; `\uXXXX` pairs of surrogates stand for one character
+fn json_escape(bytes: &[u8]) -> Option<(char, usize)> {
+    let unit = |at: &[u8]| -> Option<u32> {
+        match at {
+            [b'\\', b'u', digits @ ..] if digits.len() >= 4 => {
+                let digits = std::str::from_utf8(&digits[..4]).ok()?;
+                if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return None;
+                }
+
+                u32::from_str_radix(digits, 16).ok()
+            }
+            _ => None,
+        }
+    };
+
+    let simple = match bytes {
+        [b'\\', b'/', ..] => Some('/'),
+        [b'\\', b'\\', ..] => Some('\\'),
+        [b'\\', b'"', ..] => Some('"'),
+        [b'\\', b'b', ..] => Some('\u{8}'),
+        [b'\\', b'f', ..] => Some('\u{c}'),
+        [b'\\', b'n', ..] => Some('\n'),
+        [b'\\', b'r', ..] => Some('\r'),
+        [b'\\', b't', ..] => Some('\t'),
+        _ => None,
+    };
+    if let Some(character) = simple {
+        return Some((character, 2));
+    }
+
+    let first = unit(bytes)?;
+    match first {
+        0xD800..=0xDBFF => {
+            // a high surrogate stands for a character only with its low half
+            let second = unit(bytes.get(6..)?)?;
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                return None;
+            }
+            let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
+
+            Some((char::from_u32(code)?, 12))
+        }
+        0xDC00..=0xDFFF => None,
+        _ => Some((char::from_u32(first)?, 6)),
+    }
+}
+
+/// Which escapes a decoded view undoes; a key holding a literal `%41` is only
+/// found in text that escaped it for JSON by leaving the percent escapes alone
+#[derive(Clone, Copy)]
+struct Unescape {
+    percent: bool,
+    json: bool,
+    plus_is_space: bool,
+}
+
+impl Unescape {
+    /// Every combination worth matching text against
+    const VIEWS: [Self; 4] = [
+        Self {
+            percent: true,
+            json: false,
+            plus_is_space: false,
+        },
+        Self {
+            percent: true,
+            json: false,
+            plus_is_space: true,
+        },
+        Self {
+            percent: false,
+            json: true,
+            plus_is_space: false,
+        },
+        Self {
+            percent: true,
+            json: true,
+            plus_is_space: false,
+        },
+    ];
+}
+
+/// `text` with the escapes `mode` names decoded in one pass, and for each
+/// decoded byte the span of `text` it came from; the bytes of a character an
+/// escape stands for share its span
+fn unescaped_with_spans(text: &str, mode: Unescape) -> (Vec<u8>, Vec<(usize, usize)>) {
     let bytes = text.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut spans = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        let (byte, width) = match escaped_byte(&bytes[index..]) {
-            Some(byte) => (byte, 3),
-            None => (bytes[index], 1),
-        };
-        decoded.push(byte);
-        spans.push((index, index + width));
-        index += width;
+        if let Some(byte) = escaped_byte(&bytes[index..]).filter(|_| mode.percent) {
+            decoded.push(byte);
+            spans.push((index, index + 3));
+            index += 3;
+        } else if let Some((character, width)) = json_escape(&bytes[index..]).filter(|_| mode.json)
+        {
+            let mut buffer = [0; 4];
+            for byte in character.encode_utf8(&mut buffer).bytes() {
+                decoded.push(byte);
+                spans.push((index, index + width));
+            }
+            index += width;
+        } else {
+            decoded.push(if mode.plus_is_space && bytes[index] == b'+' {
+                b' '
+            } else {
+                bytes[index]
+            });
+            spans.push((index, index + 1));
+            index += 1;
+        }
     }
 
     (decoded, spans)
@@ -974,7 +1069,7 @@ impl Redactor {
     }
 
     /// Whether `text` holds any of `keys`, ignoring ASCII case, as is or once
-    /// percent-decoded
+    /// its percent and JSON string escapes are decoded
     ///
     /// A provider may change the case of what it echoes, e.g. by putting a
     /// key in a host name
@@ -984,21 +1079,25 @@ impl Redactor {
             .filter(|key| key.len() >= MIN_SECRET_LEN)
             .map(|key| key.to_ascii_lowercase())
             .collect();
-        let holds = |text: &str| {
+        let holds = |text: &[u8]| {
             let text = text.to_ascii_lowercase();
 
-            keys.iter().any(|key| text.contains(key.as_str()))
+            keys.iter().any(|key| {
+                text.windows(key.len())
+                    .any(|window| window == key.as_bytes())
+            })
         };
 
-        holds(text)
-            || (text.contains(['%', '+'])
-                && [false, true]
+        holds(text.as_bytes())
+            || (text.contains(['%', '+', '\\'])
+                && Unescape::VIEWS
                     .into_iter()
-                    .any(|plus| holds(&percent_decode(text, plus))))
+                    .any(|mode| holds(&unescaped_with_spans(text, mode).0)))
     }
 
     /// `text` with every known secret replaced, ignoring ASCII case and
-    /// however its escapes are cased or mixed with plain characters
+    /// however its percent or JSON string escapes are cased or mixed with
+    /// plain characters
     pub fn scrub(&self, text: &str) -> String {
         let known = self.0.read().unwrap_or_else(PoisonError::into_inner);
         let lower = text.to_ascii_lowercase();
@@ -1012,15 +1111,20 @@ impl Redactor {
             .collect();
 
         // the view is built only for text that has an escape
-        if text.contains('%') {
-            let (mut decoded, spans) = decoded_with_spans(&lower);
-            // an escape can stand for an uppercase letter
-            decoded.make_ascii_lowercase();
-            for secret in known.iter() {
-                let needle = secret.as_bytes();
-                for (start, window) in decoded.windows(needle.len()).enumerate() {
-                    if window == needle {
-                        hits.push((spans[start].0, spans[start + needle.len() - 1].1));
+        if text.contains(['%', '\\']) {
+            for mode in Unescape::VIEWS
+                .into_iter()
+                .filter(|mode| !mode.plus_is_space)
+            {
+                let (mut decoded, spans) = unescaped_with_spans(text, mode);
+                // an escape can stand for an uppercase letter
+                decoded.make_ascii_lowercase();
+                for secret in known.iter() {
+                    let needle = secret.as_bytes();
+                    for (start, window) in decoded.windows(needle.len()).enumerate() {
+                        if window == needle {
+                            hits.push((spans[start].0, spans[start + needle.len() - 1].1));
+                        }
                     }
                 }
             }
@@ -1125,6 +1229,70 @@ mod tests {
         ] {
             assert_eq!(redactor.scrub(text), "key [redacted] end", "{text}");
         }
+    }
+
+    #[test]
+    fn json_escaped_keys_are_scrubbed_from_error_text_and_logs() {
+        let redactor = Redactor::default();
+        redactor.add([
+            "zk/9f3a71c2d8b4e6".to_owned(),
+            "a\"b\\c\td-secret".to_owned(),
+        ]);
+
+        for (text, expected) in [
+            (
+                r#"{"error":"bad key zk\/9f3a71c2d8b4e6"}"#,
+                r#"{"error":"bad key [redacted]"}"#,
+            ),
+            (
+                r#"{"error":"bad key zk\u002f9f3a71c2d8b4e6 x"}"#,
+                r#"{"error":"bad key [redacted] x"}"#,
+            ),
+            (
+                r#"k \u007A\u006b/9f3a71c2d8b4\u0065\u0036 k"#,
+                "k [redacted] k",
+            ),
+            (
+                r#"k zk\/9f3a71c2d8b4e6 and a\"b\\c\td-secret"#,
+                "k [redacted] and [redacted]",
+            ),
+        ] {
+            assert_eq!(redactor.scrub(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_key_holding_a_percent_escape_is_found_beside_json_escapes() {
+        let redactor = Redactor::default();
+        redactor.add(["ab%41\"cd-secret".to_owned()]);
+
+        assert_eq!(redactor.scrub(r#"x ab%41\"cd-secret y"#), "x [redacted] y");
+        assert!(Redactor::holds_any(
+            r#"ab%41\"cd-secret"#,
+            &["ab%41\"cd-secret".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn json_surrogate_pairs_decode_to_one_character() {
+        let redactor = Redactor::default();
+        redactor.add(["key-\u{1F600}-value".to_owned()]);
+
+        assert_eq!(
+            redactor.scrub(r"x key-\uD83D\uDE00-value y"),
+            "x [redacted] y"
+        );
+        // a lone surrogate stands for nothing
+        assert_eq!(redactor.scrub(r"key-\uD83D-value"), r"key-\uD83D-value");
+    }
+
+    #[test]
+    fn holds_any_sees_json_escaped_keys() {
+        let keys = ["zk/9f3a71c2d8b4e6".to_owned()];
+
+        assert!(Redactor::holds_any(r"https://h/zk\/9f3a71c2d8b4e6", &keys));
+        assert!(Redactor::holds_any(r"zk\u002F9f3a71c2d8b4e6", &keys));
+        assert!(!Redactor::holds_any(r"zk\q9f3a71c2d8b4e6", &keys));
     }
 
     fn filled(template: &str, values: &[&str]) -> Result<ResolvedUrl, SecretError> {
