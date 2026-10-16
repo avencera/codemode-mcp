@@ -700,10 +700,12 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 - Config refuses a `logins` server unless `fill` resolves to `ask` with `per_call`, and refuses per-tool
   settings for tools it does not have, so a missing `policy` (the default is `allow`) or a typo cannot let
   fills through unasked. Fills run one at a time, so two calls in one `asyncio.gather` cannot interleave keys
-- `fill(login, field)` types a `[logins.<name>]` username or password into the field with keyboard focus, for an
-  agent that drives the Mac's screen and must sign in without the value entering its context. `list` names the
-  logins, their sites and fields. The answer is the login, field and host; passwords read are added to the
-  redactor (not usernames, which as email addresses appear in other servers' results and would be garbled), and the server is `sensitive` under `ask`, so neither logs nor scripts see them
+- `fill(login, field)` types a `[logins.<name>]` username, password or current one-time code
+  (`one_time_code`) into the field with keyboard focus, for an agent that drives the Mac's screen and must sign
+  in without the value entering its context. `list` names the logins, their sites and fields. The answer is the
+  login, field and host; passwords and one-time password seeds read are added to the redactor (not usernames,
+  which as email addresses appear in other servers' results and would be garbled), and the server is
+  `sensitive` under `ask`, so neither logs nor scripts see them
 - Only code-signed browsers: `AXUIElementGetPid` of the focused element gives the owning process, whose
   `SecCode` (`SecCodeCopyGuestWithAttributes` with the pid) must satisfy one designated requirement in a
   built-in table: Safari and Safari Technology Preview (`anchor apple`), Chrome's four channels (Google's
@@ -746,8 +748,12 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   host, so a page that navigates under a still-focused field stops typing too; any change stops it with an
   `Interrupted` error. A character in flight when focus moves can still land in the new element
 - Values come from `OnePassword::read_reference`, the same race and cache as server secrets, so a companion Mac
-  or phone answers while the owner is away and a rotated password needs a restart. One-time codes would need a
-  fresh read every time, or the TOTP seed and a code computed here; neither is built
+  or phone answers while the owner is away and a rotated password needs a restart. `totp` names the one-time
+  password field itself (config refuses `?attribute=`, which would cache a code); its value, an
+  `otpauth://totp/` URI (SHA1, SHA256 or SHA512, 6 or 8 digits, any period) or a bare base32 secret, is turned
+  into the current RFC 6238 code in `src/logins/totp.rs` (`hmac` 0.12 with `sha1`/`sha2` 0.10, the digest line
+  SHA-1 exists on in the tree). The seed's text is redacted with fragments and the whole value without, since
+  its label is often an email address; neither the seed nor the code is returned
 - Not defended: a username is typed into a plain field and is visible like any text, and a page's
   show-password button turns the password field into one. Code in the page, or anything driving the browser by Apple Events or a debugging port, can read
   the field after it is filled. Codex's computer use reads the accessibility tree, so the fill relies on

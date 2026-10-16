@@ -365,9 +365,9 @@ client. Until it is approved every tool fails with "This agent isn't approved to
 ## Sign in to websites from an agent
 
 An agent that drives this Mac's screen, such as Codex with computer use, can sign in to a website with a
-1Password login without seeing the username or password. The `logins` server types the value into the field
-that has keyboard focus, after checking the browser, the field and the page itself; the agent only learns which
-host took it.
+1Password login without seeing the username, password or one-time code. The `logins` server types the value
+into the field that has keyboard focus, after checking the browser, the field and the page itself; the agent
+only learns which host took it.
 
 1. List the logins an agent may use, and the hosts each may be typed on:
 
@@ -382,7 +382,12 @@ host took it.
    sites = ["github.com"]
    username = "op://Personal/GitHub/username"
    password = "op://Personal/GitHub/password"
+   totp = "op://Personal/GitHub/one-time password"
    ```
+
+   `totp` is optional and names the item's one-time password field itself, without `?attribute=totp`. A
+   login with it lists a `one_time_code` field; filling it types the current code, computed in the daemon from
+   the seed, so neither the seed nor the code reaches the agent.
 
    A site is that host only; `*.github.com` covers every host under `github.com`, but not `github.com`
    itself. Name the exact hosts the login page lives on, such as `accounts.google.com`, and use `*.` only for
@@ -405,8 +410,8 @@ What a fill checks, from Accessibility and the browser's code signature rather t
   Allow JavaScript from Apple Events turned on. Safari keeps that setting in a file only a process with Full
   Disk Access can read, so the Touch ID prompt usually says it could not be checked; look at Safari's
   Develop menu before you approve. Chrome, Edge, Brave and Arc keep it in each profile's `Preferences`.
-- A password goes only into a password field, the kind that shows bullets. A username goes only into a
-  one-line text field.
+- A password goes only into a password field, the kind that shows bullets. A username or a one-time code goes
+  only into a one-line text field.
 - The field's page must be `https` on port 443, and its host one of the login's `sites`. A field inside a
   frame is checked against the frame and every page around it, so each of those hosts must be listed. This
   relies on the browser exposing each frame's address to Accessibility; a frame it does not expose goes
@@ -425,14 +430,17 @@ the login's sites, nothing is read or typed and the agent must fill again.
 
 The value is then read like a server secret, through `op` while you are at the Mac, or a companion Mac or phone
 when you are not, and kept in the daemon's memory until it restarts. After changing a password in 1Password,
-restart the daemon so the next fill reads the new one.
+restart the daemon so the next fill reads the new one. A one-time password's seed stays valid, so its codes
+keep working from the cached read.
 
 Limits:
 
 - Web pages only, in one of the browsers above. Native app fields have no page address and are refused.
-- No one-time codes yet; type those yourself, or approve the sign-in on your phone.
-- A username lands in a plain text field, so the agent sees it on screen like any typed text. A password
-  shows as bullets, until something clicks the page's show-password button; then the agent can read it too.
+- One-time codes from an authenticator seed (TOTP) only, typed into a single text field; a page that splits
+  the code across six boxes needs it typed by hand. SMS codes and push approvals stay with you.
+- A username or one-time code lands in a plain text field, so the agent sees it on screen like any typed
+  text. A password shows as bullets, until something clicks the page's show-password button; then the agent
+  can read it too.
 - The agent never gets the value from the tool, but anything that can run script in the page could read the
   field once it is filled. The daemon refuses the switches it can see, but a browser extension or a program
   you allowed to control the browser through Apple Events still could: when macOS asks whether the agent's

@@ -391,6 +391,11 @@ pub struct LoginConfig {
     /// Reference of the password
     #[serde(default)]
     pub password: Option<String>,
+    /// Reference of the one-time password field, whose current code `fill`
+    /// types as `one_time_code`; 1Password answers it as an
+    /// `otpauth://totp/...` URI or a base32 secret
+    #[serde(default)]
+    pub totp: Option<String>,
 }
 
 impl LoginConfig {
@@ -400,6 +405,7 @@ impl LoginConfig {
         self.username
             .iter()
             .chain(self.password.iter())
+            .chain(self.totp.iter())
             .map(String::as_str)
     }
 
@@ -428,12 +434,16 @@ impl LoginConfig {
                 )));
             }
         }
-        if self.username.is_none() && self.password.is_none() {
+        if self.username.is_none() && self.password.is_none() && self.totp.is_none() {
             return Err(ConfigError::Invalid(format!(
-                "{at}: set `username`, `password` or both"
+                "{at}: set at least one of `username`, `password` and `totp`"
             )));
         }
-        for (field, reference) in [("username", &self.username), ("password", &self.password)] {
+        for (field, reference) in [
+            ("username", &self.username),
+            ("password", &self.password),
+            ("totp", &self.totp),
+        ] {
             if let Some(reference) = reference
                 && !crate::secrets::is_reference(reference)
             {
@@ -441,6 +451,13 @@ impl LoginConfig {
                     "{at}.{field}: must be an op://vault/item/field reference, without braces"
                 )));
             }
+        }
+        // `?attribute=totp` reads a code, which the cache would keep past
+        // its period; the field itself holds the seed every code comes from
+        if self.totp.as_ref().is_some_and(|totp| totp.contains('?')) {
+            return Err(ConfigError::Invalid(format!(
+                "{at}.totp: name the one-time password field itself, without `?attribute=`"
+            )));
         }
 
         Ok(())
@@ -1866,6 +1883,18 @@ mod tests {
         assert!(login("sites = [\"github.com\"]").is_err());
         assert!(
             login("sites = [\"github.com\"]\npassword = \"{{ op://Personal/GitHub/password }}\"")
+                .is_err()
+        );
+        assert!(
+            login("sites = [\"github.com\"]\ntotp = \"op://Personal/GitHub/one-time password\"")
+                .is_ok()
+        );
+        assert!(
+            login("sites = [\"github.com\"]\ntotp = \"otpauth://totp/GitHub?secret=GEZDGNBV\"")
+                .is_err()
+        );
+        assert!(
+            login("sites = [\"github.com\"]\ntotp = \"op://Personal/GitHub/otp?attribute=totp\"")
                 .is_err()
         );
         assert!(parse("[servers.logins]\nbuiltin = \"logins\"\ncommand = \"x\"").is_err());

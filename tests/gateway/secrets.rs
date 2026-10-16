@@ -29,6 +29,8 @@ pub(super) const URL_KEY: &str = "zk-9f3a71c2d8b4e6";
 pub(super) const SYMBOL_KEY: &str = "zk+9f3a71c2=d8b4e6";
 /// A key with uppercase letters, which a host name would lowercase
 pub(super) const MIXED_KEY: &str = "PrivateKey123abc";
+/// The RFC 6238 SHA-1 seed, `12345678901234567890`, in base32
+pub(super) const TOTP_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 /// A 32-character hexadecimal key
 const HEX_KEY: &str = "9f3a71c2d8b4e6a05c1d7e93b2f48a60";
 
@@ -73,6 +75,7 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/encodedkey/credential) printf '%s' 'zk%2B9f3a71c2%3Dd8b4e6' ;;\n\
                op://Dev/hexkey/credential) printf '%s' '{HEX_KEY}' ;;\n\
                op://Dev/linebreak/credential) printf 'first-line\\nsecond-line' ;;\n\
+               op://Dev/totp/credential) printf '%s' 'otpauth://totp/GitHub:me?secret={TOTP_SECRET}&issuer=GitHub' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",

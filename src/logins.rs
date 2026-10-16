@@ -1,6 +1,7 @@
-//! The `logins` builtin server: types a 1Password username or password into
-//! the focused field of a page on the login's sites, so an agent driving the
-//! Mac can sign in without the value entering its context
+//! The `logins` builtin server: types a 1Password username, password or
+//! one-time code into the focused field of a page on the login's sites, so
+//! an agent driving the Mac can sign in without the value entering its
+//! context
 //!
 //! The daemon decides where a value may go, from what Accessibility and the
 //! code signature of the app report rather than what the agent says: only
@@ -30,13 +31,14 @@ use crate::{
     mac::Mac,
     secrets::{OnePassword, Redactor},
 };
+use totp::Totp;
 
 const INSTRUCTIONS: &str = "Signs in to websites on this Mac with logins from 1Password, \
-     without showing you the username or password. Click the field first, so it has keyboard \
-     focus, then call fill. A password goes only into a password field, and a username only into a \
-     text field, on an https page whose host is one of the login's sites, in Safari, Chrome, \
-     Firefox, Edge, Brave or Arc. The answer says which host it filled; the value itself is never \
-     returned.";
+     without showing you the username, password or one-time code. Click the field first, so it \
+     has keyboard focus, then call fill. A password goes only into a password field, and a \
+     username or one-time code only into a text field, on an https page whose host is one of the \
+     login's sites, in Safari, Chrome, Firefox, Edge, Brave or Arc. The answer says which host it \
+     filled; the value itself is never returned.";
 
 /// The argument the gateway puts on every `fill` call, replacing any the
 /// agent passed: what it found at the focused field before asking the
@@ -120,10 +122,12 @@ impl FocusedField {
 
 /// Which login field to fill
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum LoginField {
     Username,
     Password,
+    /// The current code from the login's one-time password
+    OneTimeCode,
 }
 
 impl LoginField {
@@ -132,6 +136,7 @@ impl LoginField {
         match self {
             Self::Username => "username",
             Self::Password => "password",
+            Self::OneTimeCode => "one-time code",
         }
     }
 }
@@ -193,8 +198,8 @@ impl FieldRule {
             ));
         }
         match (self.field, focused.kind) {
-            (LoginField::Password, FieldKind::Secure) | (LoginField::Username, FieldKind::Text) => {
-            }
+            (LoginField::Password, FieldKind::Secure)
+            | (LoginField::Username | LoginField::OneTimeCode, FieldKind::Text) => {}
             (LoginField::Password, _) => {
                 return refuse(
                     "the focused element is not a password field; click the password field first"
@@ -210,6 +215,13 @@ impl FieldRule {
             (LoginField::Username, FieldKind::Other) => {
                 return refuse(
                     "the focused element is not a text field; click the username field first"
+                        .to_owned(),
+                );
+            }
+            (LoginField::OneTimeCode, _) => {
+                return refuse(
+                    "the focused element is not a one-line text field; click the field for the \
+                     code first"
                         .to_owned(),
                 );
             }
@@ -345,6 +357,7 @@ fn target(
     let reference = match field {
         LoginField::Username => login.username.as_ref(),
         LoginField::Password => login.password.as_ref(),
+        LoginField::OneTimeCode => login.totp.as_ref(),
     };
     let Some(reference) = reference else {
         return Err(format!("the login `{name}` has no {}", field.label()));
@@ -498,6 +511,7 @@ impl LoginsServer {
                 fields: [
                     login.username.as_ref().map(|_| LoginField::Username),
                     login.password.as_ref().map(|_| LoginField::Password),
+                    login.totp.as_ref().map(|_| LoginField::OneTimeCode),
                 ]
                 .into_iter()
                 .flatten()
@@ -509,11 +523,12 @@ impl LoginsServer {
     }
 
     #[tool(
-        description = "Types a login's username or password into the field that has keyboard \
-                          focus, without returning it. Click an empty field first. A password goes \
-                          only into a password field, a username only into a text field, and \
-                          either only on an https page of one of the login's sites, in a browser \
-                          known by its code signature."
+        description = "Types a login's username, password or current one-time code into the \
+                          field that has keyboard focus, without returning it. Click an empty \
+                          field first. A password goes only into a password field, a username or \
+                          one-time code only into a text field, and any of them only on an https \
+                          page of one of the login's sites, in a browser known by its code \
+                          signature."
     )]
     async fn fill(
         &self,
@@ -547,22 +562,39 @@ impl LoginsServer {
             .read_reference(&reference)
             .await
             .map_err(failed)?;
-        // a line break or tab would act on the page, such as submitting the
-        // form, instead of landing in the field
-        if value.is_empty() || value.chars().any(char::is_control) {
-            return Err(failed(format!(
-                "the {} in 1Password is empty or holds a control character such as a line \
-                 break, so it was not typed",
-                params.field.label()
-            )));
-        }
-        // a username such as an email address also appears in other
-        // servers' results, which redacting it would garble; neither is
-        // ever returned here
-        if params.field == LoginField::Password {
-            self.0.redactor.add([value.clone()]);
-        }
-        let host = mac.fill(&value, &rule).await.map_err(failed)?;
+        let text = match params.field {
+            LoginField::OneTimeCode => {
+                // the seed makes every later code, so no server's answer may
+                // show it, whole or in part, even in a form the parser
+                // refuses; the URI around it is redacted whole only, since
+                // its label is often an email address
+                self.0.redactor.add([value.clone()]);
+                let totp = Totp::parse(&value).map_err(failed)?;
+                self.0.redactor.add_keys([totp.encoded().to_owned()]);
+
+                totp.now()
+            }
+            field => {
+                // a line break or tab would act on the page, such as
+                // submitting the form, instead of landing in the field
+                if value.is_empty() || value.chars().any(char::is_control) {
+                    return Err(failed(format!(
+                        "the {} in 1Password is empty or holds a control character such as a \
+                         line break, so it was not typed",
+                        field.label()
+                    )));
+                }
+                // a username such as an email address also appears in other
+                // servers' results, which redacting it would garble; neither
+                // is ever returned here
+                if field == LoginField::Password {
+                    self.0.redactor.add([value.clone()]);
+                }
+
+                value
+            }
+        };
+        let host = mac.fill(&text, &rule).await.map_err(failed)?;
 
         Ok(Json(Filled {
             login: params.login,

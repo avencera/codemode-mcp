@@ -113,13 +113,13 @@ policy = "ask"
 policy = "ask"
 
 # Signs an agent that drives this Mac's screen in to websites with 1Password
-# logins, typing the username or password into the focused field without
-# returning it. A password goes only into a password field, and either only
-# on an https page of the login's sites, in a code-signed Safari, Chrome,
-# Firefox, Edge, Brave or Arc that other programs cannot script. Every fill
-# asks, naming the host: Touch ID at the Mac, else a passkey on the phone.
-# The first fill asks macOS for Accessibility. To enable, uncomment and name
-# your own logins
+# logins, typing the username, password or current one-time code into the
+# focused field without returning it. A password goes only into a password
+# field, and any of them only on an https page of the login's sites, in a
+# code-signed Safari, Chrome, Firefox, Edge, Brave or Arc that other
+# programs cannot script. Every fill asks, naming the host: Touch ID at the
+# Mac, else a passkey on the phone. The first fill asks macOS for
+# Accessibility. To enable, uncomment and name your own logins
 # [servers.logins]
 # builtin = "logins"
 # policy = "ask"
@@ -130,6 +130,7 @@ policy = "ask"
 # sites = ["github.com"]
 # username = "op://Personal/GitHub/username"
 # password = "op://Personal/GitHub/password"
+# totp = "op://Personal/GitHub/one-time password"
 
 # Xcode's own MCP bridge (Xcode 26.3 or later). Xcode approves the daemon as
 # one agent for every client: the first XcodeOpenWorkspace or XcodeNewProject

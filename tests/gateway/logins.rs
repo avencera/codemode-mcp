@@ -2,22 +2,27 @@
 //! focused password field of a page on the login's site, in a browser
 //! known by its code signature, and never into the script's answer
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use codemode_mcp::{
-    logins::{Exposure, FieldKind, FocusedField, Setting},
+    logins::{Exposure, FieldKind, FocusedField, Setting, totp::Totp},
     mac::TouchId,
 };
 use serde_json::json;
 
 use super::{
     harness::{FakeMac, Harness, Setup, TestResult},
-    secrets::{VALUE, fake_op, reads},
+    secrets::{TOTP_SECRET, VALUE, fake_op, reads},
 };
 
 const REFERENCE: &str = "op://Dev/fixture/credential";
 /// A password with a line break, which typing would turn into Return
 const MULTILINE: &str = "op://Dev/linebreak/credential";
+/// A one-time password whose seed is [`TOTP_SECRET`]
+const ONE_TIME: &str = "op://Dev/totp/credential";
 
 const FILL: &str = r#"
 try:
@@ -36,8 +41,8 @@ fn field(kind: FieldKind, url: &str) -> FocusedField {
     }
 }
 
-/// A harness with a `logins` server whose `github` login has a password, on
-/// `github.com` and the hosts under `github.io`
+/// A harness with a `logins` server whose `github` login has a password
+/// and a one-time password, on `github.com` and the hosts under `github.io`
 async fn logins_harness(
     mac: &Arc<FakeMac>,
 ) -> Result<Option<(Harness, std::path::PathBuf)>, Box<dyn std::error::Error>> {
@@ -52,7 +57,8 @@ async fn logins_harness(
          tools.list.policy = \"allow\"\n\n\
          [logins.github]\n\
          sites = [\"github.com\", \"*.github.io\"]\n\
-         password = \"{REFERENCE}\"\n\n\
+         password = \"{REFERENCE}\"\n\
+         totp = \"{ONE_TIME}\"\n\n\
          [logins.multiline]\n\
          sites = [\"github.com\"]\n\
          password = \"{MULTILINE}\"\n",
@@ -94,7 +100,7 @@ async fn a_password_is_typed_into_its_site_and_never_returned() -> TestResult {
     assert_eq!(
         listed["result"],
         json!({"logins": [
-            {"name": "github", "sites": ["github.com", "*.github.io"], "fields": ["password"]},
+            {"name": "github", "sites": ["github.com", "*.github.io"], "fields": ["password", "one_time_code"]},
             {"name": "multiline", "sites": ["github.com"], "fields": ["password"]},
         ]}),
         "{listed}"
@@ -255,6 +261,65 @@ async fn a_page_that_moves_while_the_owner_decides_gets_nothing() -> TestResult 
     );
     assert_eq!(reads(&log, REFERENCE), 0);
     assert_eq!(mac.typed(), "");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_time_code_is_typed_and_its_seed_never_returned() -> TestResult {
+    let mac = Arc::new(FakeMac::default());
+    let Some((harness, log)) = logins_harness(&mac).await? else {
+        return Ok(());
+    };
+    let totp = Totp::parse(TOTP_SECRET)?;
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs())
+    };
+    let code = r#"
+try:
+    filled = await logins_fill(login="github", field="one_time_code")
+except RuntimeError as error:
+    filled = str(error)
+filled
+"#;
+
+    // a code goes into a text field, not the password field
+    mac.set_focused(field(FieldKind::Secure, "https://github.com/session"));
+    let refused = harness.execute_json(code).await?;
+    let text = refused["result"].as_str().unwrap_or_default();
+    assert!(text.contains("not a one-line text field"), "{refused}");
+    assert_eq!(reads(&log, ONE_TIME), 0);
+
+    mac.set_focused(field(
+        FieldKind::Text,
+        "https://github.com/sessions/two-factor",
+    ));
+    let before = totp.at(now());
+    let filled = harness.execute_json(code).await?;
+    let after = totp.at(now());
+    assert_eq!(
+        filled["result"],
+        json!({"login": "github", "field": "one_time_code", "host": "github.com"}),
+        "{filled}"
+    );
+    // the code is the seed's, for the time it was typed
+    let typed = mac.typed();
+    assert!(
+        typed == before || typed == after,
+        "{typed} not {before} or {after}"
+    );
+    assert!(!filled.to_string().contains(&typed), "{filled}");
+    assert!(!filled.to_string().contains(TOTP_SECRET), "{filled}");
+    assert_eq!(reads(&log, ONE_TIME), 1);
+    assert!(
+        prompts(&mac)
+            .first()
+            .is_some_and(|shown| shown.contains("one-time code for github into github.com")),
+        "{:?}",
+        mac.shown()
+    );
 
     harness.stop().await
 }
