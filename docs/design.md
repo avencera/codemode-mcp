@@ -711,7 +711,7 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 - Not defended: a username is typed into a plain field and is visible like any text, and a page's
   show-password button turns the password field into one. Code in the page, or anything driving the browser by Apple Events or a debugging port, can read
   the field after it is filled. Codex's computer use reads the accessibility tree, so the fill relies on
-  browsers exposing a password field there as bullets, not its text (not checked live yet). Same-user code is outside the threat model in any case (see Threat model)
+  browsers exposing a password field there as bullets, not its text (not checked live yet). Same-user code is outside the threat model in any case (see Threat model): an app the agent builds and runs can present an Accessibility tree that claims any page, and fills are not yet limited to code-signed browsers
 - Accessibility (`AXIsProcessTrustedWithOptions`, which asks macOS to show its prompt) and event posting
   (`CGPreflightPostEventAccess`) are checked on every call, and the error names the System Settings switch. The
   grant is the daemon's own, keyed to its signature
