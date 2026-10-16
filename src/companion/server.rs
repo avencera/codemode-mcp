@@ -196,20 +196,29 @@ impl Companion {
         );
         // still held turn: no other request can read between this check and
         // the read below and spend the approval 1Password is about to ask for
-        if self.onepassword.signed_out().await {
+        let named_for_1password = if self.onepassword.signed_out().await {
             // 1Password is about to ask for a fingerprint itself, which
             // approves this read as well as ours would, so asking first only
             // makes the owner touch twice. Its prompt names neither the
             // gateway nor the reference, so a notification does
             let notification = MacNotification {
-                title: reason,
+                title: reason.clone(),
                 message: "Approve in 1Password to send it.".to_owned(),
                 click: None,
             };
-            if let Err(error) = mac.notify(&notification).await {
-                tracing::info!(%error, "could not name the read in a notification");
+            match mac.notify(&notification).await {
+                Ok(()) => true,
+                Err(error) => {
+                    // nothing else would name the reference, so ask as well
+                    tracing::info!(%error, "could not name the read in a notification");
+
+                    false
+                }
             }
-        } else if mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
+        } else {
+            false
+        };
+        if !named_for_1password && mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
             tracing::info!(reference, "read not approved on this Mac");
 
             return fault(CompanionErrorCode::Denied, "not approved on this Mac");
