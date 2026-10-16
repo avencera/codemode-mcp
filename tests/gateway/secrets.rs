@@ -29,6 +29,8 @@ pub(super) const URL_KEY: &str = "zk-9f3a71c2d8b4e6";
 pub(super) const SYMBOL_KEY: &str = "zk+9f3a71c2=d8b4e6";
 /// A key with uppercase letters, which a host name would lowercase
 pub(super) const MIXED_KEY: &str = "PrivateKey123abc";
+/// A 32-character hexadecimal key
+const HEX_KEY: &str = "9f3a71c2d8b4e6a05c1d7e93b2f48a60";
 
 /// A stand-in for the 1Password CLI that knows one item and logs each read,
 /// already authorized so it reads without asking
@@ -69,6 +71,7 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/colonkey/credential) printf '%s' 'zk:9f3a71c2d8b4e6' ;;\n\
                op://Dev/shortkey/credential) printf '%s' 'aB9xZ' ;;\n\
                op://Dev/encodedkey/credential) printf '%s' 'zk%2B9f3a71c2%3Dd8b4e6' ;;\n\
+               op://Dev/hexkey/credential) printf '%s' '{HEX_KEY}' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
@@ -505,6 +508,80 @@ async fn a_zoho_url_redacts_its_key_but_not_its_public_path_words() -> TestResul
     assert_eq!(redactor.scrub(unrelated), unrelated);
     let leaked = redactor.scrub(&format!("GET {url} failed; path /mcp/{URL_KEY}/message"));
     assert!(!leaked.contains(URL_KEY), "{leaked}");
+
+    Ok(())
+}
+
+/// Whether `text` holds a run of `len` bytes of `key`
+fn holds_run(text: &str, key: &str, len: usize) -> bool {
+    key.as_bytes()
+        .windows(len)
+        .any(|run| text.as_bytes().windows(len).any(|window| window == run))
+}
+
+#[tokio::test]
+async fn a_whole_url_with_an_encoded_query_keeps_its_decoded_value_out_of_logs() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, Redactor};
+    use std::io::Write;
+
+    let (op, _) = fake_op()?;
+    let onepassword = OnePassword::new(op.display().to_string());
+    std::fs::write(
+        op.with_file_name("url"),
+        "https://host.example/mcp?api_key=acct%3Asecret-1234",
+    )?;
+    let whole = onepassword
+        .resolve_url("{{ op://Dev/mcpurl/credential }}")
+        .await?;
+    let redactor = Redactor::default();
+    redactor.add(whole.secrets.clone());
+    redactor.add_keys(whole.fragile.clone());
+
+    let echoed = "invalid query api_key=acct:secret-1234";
+    let scrubbed = redactor.scrub(echoed);
+    assert!(!scrubbed.contains("acct:secret-1234"), "{scrubbed}");
+    assert!(!scrubbed.contains("api_key=acct"), "{scrubbed}");
+
+    // the process's redactor also scrubs the daemon's logs
+    let shared = Redactor::shared(&codemode_mcp::config::Config::default());
+    shared.add(whole.secrets);
+    shared.add_keys(whole.fragile);
+    let capture = LogCapture::default();
+    let logs = codemode_mcp::secrets::redacting_logs(capture.clone());
+    let mut writer = logs.make_writer();
+    writeln!(writer, "{echoed}")?;
+    writer.flush()?;
+    let written = capture.text();
+    assert!(!written.contains("acct:secret-1234"), "{written}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_key_cut_short_by_a_truncated_preview_is_still_redacted() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, Redactor};
+
+    let (op, _) = fake_op()?;
+    let onepassword = OnePassword::new(op.display().to_string());
+    let resolved = onepassword
+        .resolve_url("https://example.invalid/mcp/{{ op://Dev/hexkey/credential }}")
+        .await?;
+    let redactor = Redactor::default();
+    redactor.add(resolved.secrets);
+    redactor.add_keys(resolved.fragile);
+
+    // rmcp cuts an invalid response to 256 bytes, which can end inside a key
+    let cut = &HEX_KEY[..HEX_KEY.len() - 1];
+    let scrubbed = redactor.scrub(&format!("expected value at line 1: {{\"echo\":\"{cut}"));
+    assert!(!holds_run(&scrubbed, HEX_KEY, 8), "{scrubbed}");
+    assert!(scrubbed.contains("[redacted]"), "{scrubbed}");
+
+    let scrubbed = redactor.scrub(&format!("{{\"echo\":\"{}", &HEX_KEY[10..22]));
+    assert!(!holds_run(&scrubbed, HEX_KEY, 8), "{scrubbed}");
+
+    // seven bytes in common is ordinary text
+    let unrelated = format!("trace id {} is unrelated", &HEX_KEY[..7]);
+    assert_eq!(redactor.scrub(&unrelated), unrelated);
 
     Ok(())
 }

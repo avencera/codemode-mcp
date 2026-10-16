@@ -512,9 +512,14 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   reference where the key sits, e.g.
   `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
   that is one whole reference still works without OAuth, and the redactor then also learns the resolved URL's
-  normalized form, full path (with and without its trailing `/`) and full query with their encodings, and nothing
-  finer. The redactor matches ASCII case-insensitively, also through the percent-decoded view of the text, so a
-  provider that lowercases a key into a host name cannot slip past. The daemon's log writer
+  normalized form, full path (with and without its trailing `/`) and full query, each also percent-decoded, and
+  each decoded query value, and nothing finer. The redactor matches ASCII case-insensitively, also through the percent-decoded view of the text, so a
+  provider that lowercases a key into a host name cannot slip past. rmcp cuts an invalid response to 256 bytes
+  before codemode sees it, so a key at the cut leaves a prefix that no longer matches whole; for a key of at
+  least 16 bytes the redactor therefore also replaces any run of 8 or more consecutive bytes that is a substring
+  of the key (an index of the key's 8-byte windows, one scan per view). Shorter keys match whole only, and the
+  OAuth write guards (`Redactor::holds_any`) never match fragments, which would refuse legitimate data. The
+  daemon's log writer
   (`secrets::redacting_logs`) scrubs with the same redactor, buffering each writer's bytes until `flush` or drop,
   because rmcp and reqwest print the URL in their own log events
 - With `oauth = true` a `url` cannot be one whole reference (refused at config load): codemode can only keep the

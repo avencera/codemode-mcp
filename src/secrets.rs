@@ -11,7 +11,7 @@ mod spawn;
 pub use logs::{RedactingMakeWriter, redacting_logs};
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, OnceLock, PoisonError, RwLock},
     time::Duration,
@@ -418,6 +418,9 @@ pub struct ResolvedUrl {
     /// The values read from 1Password, with their encodings: what nothing an
     /// authorization server returns may hold when it is stored or shown
     pub keys: Vec<String>,
+    /// The keys whose fragments the redactor also replaces, since a client
+    /// may print only part of a key when it cuts a response short
+    pub fragile: Vec<String>,
 }
 
 /// Where a `url` template's references sit
@@ -557,9 +560,27 @@ impl<'a> UrlTemplate<'a> {
                     .chain(url.query());
                 secrets.extend(parts.flat_map(variants));
 
+                // servers echo the decoded path and query, and each query
+                // value, which is where such a URL keeps its key
+                let decoded_query = url.query().map(|query| percent_decode(query, false));
+                let form_query = url.query().map(|query| percent_decode(query, true));
+                let values: Vec<String> =
+                    url.query_pairs().map(|(_, value)| value.into()).collect();
+                let decoded = [
+                    percent_decode(path, false),
+                    percent_decode(path.trim_end_matches('/'), false),
+                ]
+                .into_iter()
+                .chain(decoded_query)
+                .chain(form_query)
+                .chain(values.iter().cloned());
+                secrets.extend(decoded.flat_map(|text| variants(&text)));
+                let fragile = values.iter().flat_map(|value| url_keys(value)).collect();
+
                 Ok(ResolvedUrl {
                     keys: url_keys(value),
                     secrets,
+                    fragile,
                     url: url.into(),
                 })
             }
@@ -581,6 +602,7 @@ impl<'a> UrlTemplate<'a> {
                 Ok(ResolvedUrl {
                     url: url.into(),
                     secrets: keys.clone(),
+                    fragile: keys.clone(),
                     keys,
                 })
             }
@@ -982,11 +1004,68 @@ impl OnePassword {
 /// and env values, URL query strings and userinfo, and values read from
 /// 1Password (a `url` included) once a server has connected
 #[derive(Default)]
-pub struct Redactor(RwLock<Vec<String>>);
+pub struct Redactor(RwLock<Known>);
+
+/// The shortest key whose fragments are also replaced
+const MIN_FRAGMENT_KEY_LEN: usize = 16;
+
+/// The length of the shortest fragment of a key that is replaced
+const FRAGMENT_LEN: usize = 8;
+
+/// What a [`Redactor`] replaces
+#[derive(Default)]
+struct Known {
+    /// Whole secrets in lowercase, longest first
+    secrets: Vec<String>,
+    /// Every [`FRAGMENT_LEN`]-byte window of every long key, in lowercase
+    windows: HashSet<[u8; FRAGMENT_LEN]>,
+}
+
+impl Known {
+    /// The spans of `text`, already in lowercase, that hold a whole secret
+    /// or a run of at least [`FRAGMENT_LEN`] bytes of a key
+    fn spans(&self, text: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        for secret in &self.secrets {
+            let needle = secret.as_bytes();
+            for (start, window) in text.windows(needle.len()).enumerate() {
+                if window == needle {
+                    spans.push((start, start + needle.len()));
+                }
+            }
+        }
+
+        // consecutive windows that are all a key's join into the longest run
+        let mut run: Option<(usize, usize)> = None;
+        if !self.windows.is_empty() {
+            for (start, window) in text.windows(FRAGMENT_LEN).enumerate() {
+                let end = start + FRAGMENT_LEN;
+                if !self.windows.contains(window) {
+                    continue;
+                }
+                match &mut run {
+                    Some((_, last)) if start <= *last => *last = end,
+                    _ => {
+                        spans.extend(run.take());
+                        run = Some((start, end));
+                    }
+                }
+            }
+        }
+        spans.extend(run);
+
+        spans
+    }
+}
 
 impl std::fmt::Debug for Redactor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.0.read().unwrap_or_else(PoisonError::into_inner).len();
+        let count = self
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .secrets
+            .len();
 
         write!(formatter, "Redactor({count} secrets)")
     }
@@ -1053,19 +1132,44 @@ impl Redactor {
 
     /// Redacts these too from now on
     pub fn add(&self, secrets: impl IntoIterator<Item = String>) {
+        self.learn(secrets, false);
+    }
+
+    /// Redacts these too from now on, along with any run of
+    /// [`FRAGMENT_LEN`] or more bytes of one that is at least
+    /// [`MIN_FRAGMENT_KEY_LEN`] bytes long, since a client may print only the
+    /// part of a key that survives cutting a response short
+    ///
+    /// Fragments are for the redactor only; the checks on what is stored
+    /// ([`Redactor::holds_any`]) would refuse legitimate data on a fragment
+    pub fn add_keys(&self, keys: impl IntoIterator<Item = String>) {
+        self.learn(keys, true);
+    }
+
+    fn learn(&self, secrets: impl IntoIterator<Item = String>, fragments: bool) {
         let mut known = self.0.write().unwrap_or_else(PoisonError::into_inner);
         // kept in lowercase, since text is matched ignoring ASCII case
-        known.extend(
-            secrets
-                .into_iter()
-                .filter(|secret| secret.len() >= MIN_SECRET_LEN)
-                .map(|secret| secret.to_ascii_lowercase()),
-        );
+        let secrets = secrets
+            .into_iter()
+            .filter(|secret| secret.len() >= MIN_SECRET_LEN)
+            .map(|secret| secret.to_ascii_lowercase());
+        for secret in secrets {
+            if fragments && secret.len() >= MIN_FRAGMENT_KEY_LEN {
+                for window in secret.as_bytes().windows(FRAGMENT_LEN) {
+                    if let Ok(window) = window.try_into() {
+                        known.windows.insert(window);
+                    }
+                }
+            }
+            known.secrets.push(secret);
+        }
         // longest first, so a secret that contains another is replaced whole;
         // ties sort by text so `dedup` sees every duplicate and reconnects
         // do not grow the list
-        known.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        known.dedup();
+        known
+            .secrets
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        known.secrets.dedup();
     }
 
     /// Whether `text` holds any of `keys`, ignoring ASCII case, as is or once
@@ -1100,15 +1204,7 @@ impl Redactor {
     /// plain characters
     pub fn scrub(&self, text: &str) -> String {
         let known = self.0.read().unwrap_or_else(PoisonError::into_inner);
-        let lower = text.to_ascii_lowercase();
-        let mut hits: Vec<(usize, usize)> = known
-            .iter()
-            .flat_map(|secret| {
-                lower
-                    .match_indices(secret.as_str())
-                    .map(|(start, found)| (start, start + found.len()))
-            })
-            .collect();
+        let mut hits = known.spans(text.to_ascii_lowercase().as_bytes());
 
         // the view is built only for text that has an escape
         if text.contains(['%', '\\']) {
@@ -1119,14 +1215,12 @@ impl Redactor {
                 let (mut decoded, spans) = unescaped_with_spans(text, mode);
                 // an escape can stand for an uppercase letter
                 decoded.make_ascii_lowercase();
-                for secret in known.iter() {
-                    let needle = secret.as_bytes();
-                    for (start, window) in decoded.windows(needle.len()).enumerate() {
-                        if window == needle {
-                            hits.push((spans[start].0, spans[start + needle.len() - 1].1));
-                        }
-                    }
-                }
+                hits.extend(
+                    known
+                        .spans(&decoded)
+                        .into_iter()
+                        .map(|(start, end)| (spans[start].0, spans[end - 1].1)),
+                );
             }
         }
         hits.sort_unstable();

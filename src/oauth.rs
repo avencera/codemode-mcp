@@ -430,6 +430,7 @@ impl OAuth {
     ) -> Result<(String, Vec<String>), OAuthError> {
         let resolved = self.onepassword.resolve_url(&server.url).await?;
         self.redactor.add(resolved.secrets);
+        self.redactor.add_keys(resolved.fragile);
 
         Ok((resolved.url, resolved.keys))
     }

@@ -998,6 +998,8 @@ impl Upstream {
                 .chain(headers.secrets)
                 .chain(env.secrets),
         );
+        self.redactor
+            .add_keys(url.iter().flat_map(|url| url.fragile.iter().cloned()));
 
         Ok(Resolved {
             url: url.map(|url| url.url),
