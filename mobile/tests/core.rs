@@ -723,14 +723,17 @@ async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestRe
     })
     .await?;
 
-    let response = gateway
-        .offer_as(id.clone(), REFERENCE, None, 30_000)
-        .await?;
-    let CompanionResponse::Error(fault) = response else {
-        return Err("a value was sent".into());
-    };
-    assert_eq!(fault.code, CompanionErrorCode::Denied);
-    assert!(waiting(&app.state()).is_none());
+    // and offered again, as after a link that dropped while the denial went
+    for _ in 0..2 {
+        let response = gateway
+            .offer_as(id.clone(), REFERENCE, None, 30_000)
+            .await?;
+        let CompanionResponse::Error(fault) = response else {
+            return Err("a value was sent".into());
+        };
+        assert_eq!(fault.code, CompanionErrorCode::Denied);
+        assert!(waiting(&app.state()).is_none());
+    }
     assert_eq!(platform.prompts().len(), prompts);
 
     Ok(())

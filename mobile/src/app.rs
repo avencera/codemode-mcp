@@ -246,8 +246,8 @@ pub struct AppActorState {
     /// Where the gateway pushes: `None` until iOS has said, `Some(None)`
     /// once notifications are off, so that is sent too
     push: Option<Option<PushToken>>,
-    /// Reads denied while still on their way from a push, kept until they
-    /// arrive or the gateway's deadline has passed
+    /// Reads denied while still on their way from a push, kept until the
+    /// gateway's deadline has passed
     denied: HashMap<String, Instant>,
     pairing: bool,
 }
@@ -541,8 +541,14 @@ impl App {
 
             return;
         }
-        // denied while it was still on its way from a push
-        if state.denied.remove(&id).is_some() {
+        // denied while it was still on its way from a push; kept until the
+        // deadline, so a read offered again after a dropped link is denied
+        // again rather than asked about anew
+        if state
+            .denied
+            .get(&id)
+            .is_some_and(|at| at.elapsed() < ASK_TIMEOUT)
+        {
             let _ = responder.send(CompanionResponse::Error(CompanionFault {
                 code: CompanionErrorCode::Denied,
                 message: "not approved on this phone".to_owned(),

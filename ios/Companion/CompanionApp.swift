@@ -78,9 +78,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         AppManager.shared.dispatch(.pushToken(token: token, environment: environment))
     }
 
-    func application(_: UIApplication, didFailToRegisterForRemoteNotificationsWithError _: Error) {
-        AppManager.shared.dispatch(.pushToken(token: nil, environment: environment))
-    }
+    // a failed registration says nothing about whether notifications are
+    // on, so the gateway keeps the token it has; only a refused permission
+    // above clears it
+    func application(_: UIApplication, didFailToRegisterForRemoteNotificationsWithError _: Error) {}
 
     /// The owner tapped the push: show that read once the gateway sends it
     func userNotificationCenter(
