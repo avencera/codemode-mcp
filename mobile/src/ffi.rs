@@ -38,7 +38,8 @@ pub struct GatewayInfo {
     pub id: String,
     /// The name the gateway lists this phone under
     pub phone_name: String,
-    /// The references this phone answers, matched exactly
+    /// The references this phone answers without asking first, matched
+    /// exactly: the gateway's at pairing, plus each one the owner allowed
     pub allow: Vec<String>,
 }
 
@@ -75,6 +76,9 @@ pub struct PendingRead {
     /// Whether the gateway sent a copy Face ID can open; without one the
     /// owner enters the value
     pub sealed: bool,
+    /// Whether the reference is on the allow list; one that is not can be
+    /// answered only once the owner allows it
+    pub listed: bool,
     /// Where it stands
     pub status: ReadStatus,
 }
@@ -96,9 +100,6 @@ pub enum ReadStatus {
     Expired,
     /// Another source answered first, so the gateway no longer wants it
     Withdrawn,
-    /// The reference is not on this phone's allow list, so it was refused
-    /// without asking
-    NotAllowed,
     /// Opening the value failed
     Failed {
         /// Why
@@ -151,6 +152,12 @@ pub enum AppAction {
     Pair {
         /// What the camera read
         scanned: String,
+    },
+    /// Add the read's reference to the allow list, so it can be answered
+    /// now and is not asked about again
+    Allow {
+        /// The read
+        id: String,
     },
     /// Open the read's value with Face ID and send it
     Approve {

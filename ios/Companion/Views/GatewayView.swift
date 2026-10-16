@@ -25,7 +25,7 @@ struct GatewayView: View {
                 } header: {
                     Text("Allowed references")
                 } footer: {
-                    Text("The gateway can ask this iPhone for these only, and each read needs Face ID.")
+                    Text("This iPhone answers these without asking first. A reference that is not listed waits until you allow it.")
                 }
                 Section {
                     Button("Unpair", role: .destructive) { confirmingUnpair = true }

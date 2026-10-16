@@ -651,24 +651,51 @@ async fn an_entered_value_answers_a_read_with_or_without_a_sealed_copy() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_read_off_the_allow_list_is_refused_without_a_prompt() -> TestResult {
+async fn a_reference_off_the_allow_list_waits_until_the_owner_allows_it() -> TestResult {
     let gateway = FakeGateway::start().await?;
     let (app, platform, _) = paired(&gateway).await?;
+    let other = "op://Dev/other/credential";
     let prompts = platform.prompts().len();
 
-    let response = gateway.read("op://Dev/other/credential", 30_000).await?;
-    let CompanionResponse::Error(fault) = response else {
-        return Err("a value was sent".into());
-    };
-    assert_eq!(fault.code, CompanionErrorCode::NotAllowed);
+    let reading = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.read(other, 30_000).await }
+    });
+    let state = until(&app, |state| waiting(state).is_some()).await?;
+    let id = waiting(&state).ok_or("no read")?;
+    assert!(state.reads.iter().any(|read| read.id == id && !read.listed));
+
+    // neither answer goes until the owner allows the reference
+    app.dispatch(AppAction::Approve { id: id.clone() });
+    app.answer(id.clone(), "too-early".to_owned());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!reading.is_finished());
     assert_eq!(platform.prompts().len(), prompts);
+
+    app.dispatch(AppAction::Allow { id: id.clone() });
     until(&app, |state| {
-        state
-            .reads
-            .iter()
-            .any(|read| read.status == ReadStatus::NotAllowed)
+        state.reads.iter().any(|read| read.id == id && read.listed)
     })
     .await?;
+    app.dispatch(AppAction::Approve { id });
+    assert_eq!(reading.await??, CompanionResponse::Value(VALUE.to_owned()));
+
+    // it is remembered: the next read of it is answered without asking
+    // again, and the list keeps it across a relaunch
+    let reading = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.read(other, 30_000).await }
+    });
+    let state = until(&app, |state| waiting(state).is_some()).await?;
+    let id = waiting(&state).ok_or("no read")?;
+    assert!(state.reads.iter().any(|read| read.id == id && read.listed));
+    app.dispatch(AppAction::Approve { id });
+    assert_eq!(reading.await??, CompanionResponse::Value(VALUE.to_owned()));
+
+    drop(app);
+    let relaunched = FfiApp::start(Arc::new(Shared(Arc::clone(&platform)))).await?;
+    let allow = relaunched.state().gateway.ok_or("no gateway")?.allow;
+    assert_eq!(allow, [REFERENCE, other]);
 
     Ok(())
 }

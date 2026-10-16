@@ -2,7 +2,8 @@
 //! approve, deny, expire or withdraw
 //!
 //! The owner answers by opening the sealed copy with Face ID, or by entering
-//! the value (pasted or filled in) when there is no copy or it is stale.
+//! the value (pasted or filled in) when there is no copy or it is stale. A
+//! reference off the allow list waits until the owner allows it.
 //! Face ID blocks until the owner answers, so it runs on a blocking thread
 //! and its result comes back as a message; the actor stays free to take the
 //! prompt down if the read expires or is withdrawn meanwhile
@@ -37,6 +38,8 @@ impl std::fmt::Debug for Secret {
 pub enum RequestMsg {
     /// The owner tapped Approve
     Approve,
+    /// The owner allowed the reference, which was off the allow list
+    Allow,
     /// The owner entered the value
     Answer(Secret),
     /// The owner tapped Deny
@@ -88,6 +91,9 @@ pub struct RequestState {
     platform: std::sync::Arc<dyn Platform>,
     app: ActorRef<AppMsg>,
     status: ReadStatus,
+    /// The reference is on the allow list, or the owner allowed it; until
+    /// then the read cannot be answered
+    listed: bool,
 }
 
 impl RequestState {
@@ -163,7 +169,10 @@ impl Actor for RequestActor {
             RequestMsg::Expire
         });
 
+        let listed = args.record.allows(&args.read.reference);
+
         Ok(RequestState {
+            listed,
             read: args.read,
             seq: args.seq,
             responder: Some(args.responder),
@@ -177,22 +186,9 @@ impl Actor for RequestActor {
 
     async fn post_start(
         &self,
-        myself: ActorRef<Self::Msg>,
+        _myself: ActorRef<Self::Msg>,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        // refused before the owner sees it: only exact allow list matches
-        // are ever shown
-        if !state.record.allows(&state.read.reference) {
-            tracing::warn!(reference = %state.read.reference, "refused a reference off the allow list");
-            state.respond(RequestState::fault(
-                CompanionErrorCode::NotAllowed,
-                "the reference is not on this phone's allow list",
-            ));
-            state.set(ReadStatus::NotAllowed);
-            myself.stop(None);
-
-            return Ok(());
-        }
         state.set(ReadStatus::Waiting);
 
         Ok(())
@@ -205,11 +201,15 @@ impl Actor for RequestActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
+            RequestMsg::Allow => state.listed = true,
             RequestMsg::Approve => {
                 // without a sealed copy there is nothing for Face ID to open
                 let Some(sealed) = &state.read.sealed else {
                     return Ok(());
                 };
+                if !state.listed {
+                    return Ok(());
+                }
                 if state.status != ReadStatus::Waiting {
                     return Ok(());
                 }
@@ -266,7 +266,7 @@ impl Actor for RequestActor {
                 }
             }
             RequestMsg::Answer(Secret(value)) => {
-                if state.status.is_finished() {
+                if state.status.is_finished() || !state.listed {
                     return Ok(());
                 }
                 // the entered value wins over a Face ID prompt still up

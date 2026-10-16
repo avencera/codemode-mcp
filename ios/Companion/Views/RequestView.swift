@@ -9,9 +9,9 @@ struct RequestView: View {
     let read: PendingRead
     @State private var entering = false
     @State private var value = ""
-    /// Approve waits a moment after a read appears, and Done after it ends:
-    /// each takes the other's place, so a tap meant for one must not land on
-    /// the next, and the result stays readable before it can be dismissed
+    /// Each button waits a moment after it appears: Allow, Approve and Done
+    /// take each other's place, so a tap meant for one must not land on the
+    /// next, and a result stays readable before it can be dismissed
     @State private var armed = false
 
     var body: some View {
@@ -34,7 +34,7 @@ struct RequestView: View {
             actions
         }
         .padding(24)
-        .task(id: "\(read.id) \(read.status.isFinished)") {
+        .task(id: "\(read.id) \(read.status.isFinished) \(read.listed)") {
             // a new read, or one that just finished, starts with no value
             armed = false
             value = ""
@@ -66,8 +66,6 @@ struct RequestView: View {
             Text("The gateway stopped waiting. Nothing was sent.")
         case .withdrawn:
             Text("Answered elsewhere. Nothing was sent.")
-        case .notAllowed:
-            Text("Refused: this reference is not on this iPhone's allow list.")
         case let .failed(message):
             Text("Failed: \(message)")
         }
@@ -85,6 +83,20 @@ struct RequestView: View {
                 // opened from a push: whether a copy came is not known yet
                 if read.status == .connecting {
                     EmptyView()
+                } else if !read.listed {
+                    Text("This iPhone has not answered this reference before. Allow it only if you expect codemode-mcp to need it.")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                    Button {
+                        manager.dispatch(.allow(id: read.id))
+                    } label: {
+                        Label("Allow this reference", systemImage: "checkmark.shield")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(read.status != .waiting || !armed)
                 } else if read.sealed && !entering {
                     Button {
                         manager.dispatch(.approve(id: read.id))
@@ -156,7 +168,7 @@ struct RequestView: View {
     private var icon: String {
         switch read.status {
         case .approved: "checkmark.circle.fill"
-        case .denied, .notAllowed, .failed: "xmark.circle.fill"
+        case .denied, .failed: "xmark.circle.fill"
         case .expired, .withdrawn: "clock.badge.xmark"
         default: "key.fill"
         }
@@ -165,7 +177,7 @@ struct RequestView: View {
     private var tint: Color {
         switch read.status {
         case .approved: .green
-        case .denied, .notAllowed, .failed: .red
+        case .denied, .failed: .red
         case .expired, .withdrawn: .secondary
         default: .accentColor
         }

@@ -328,6 +328,7 @@ impl App {
                     Err(message) => state.shared.set_pairing(PairingState::Failed { message }),
                 }
             }
+            AppAction::Allow { id } => Self::allow(state, &id).await,
             AppAction::Approve { id } => {
                 // one Face ID prompt at a time
                 let prompting = state
@@ -403,6 +404,10 @@ impl App {
                 reference,
                 gateway,
             } => {
+                let listed = state
+                    .record
+                    .as_ref()
+                    .is_some_and(|record| record.allows(&reference));
                 state.shared.change_reads(|reads| {
                     if reads.iter().any(|read| read.id == id) {
                         return false;
@@ -415,6 +420,7 @@ impl App {
                             + i64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(i64::MAX),
                         status: ReadStatus::Connecting,
                         sealed: false,
+                        listed,
                     });
 
                     true
@@ -444,6 +450,51 @@ impl App {
 
     /// Starts a request actor for a new read, or hands a read offered again
     /// after a reconnect to the one it already has
+    /// Adds the reference of read `id` to the allow list and keeps it in
+    /// the Keychain, then lets every read of it be answered
+    async fn allow(state: &mut AppActorState, id: &str) {
+        let Some(reference) = state
+            .shared
+            .state()
+            .reads
+            .into_iter()
+            .find(|read| read.id == id && !read.status.is_finished())
+            .map(|read| read.reference)
+        else {
+            return;
+        };
+        let Some(record) = state.record.as_mut() else {
+            return;
+        };
+
+        if !record.allows(&reference) {
+            record.allow.push(reference.trim().to_owned());
+            let platform = Arc::clone(&state.platform);
+            let saved = record.clone();
+            let kept = tokio::task::spawn_blocking(move || saved.save(platform.as_ref())).await;
+            // the read goes ahead either way; only remembering it failed
+            if let Ok(Err(error)) = kept {
+                tracing::warn!(%error, "could not keep the allowed reference");
+            }
+            state.shared.set_gateway(Some(record));
+        }
+
+        let mut allowed = Vec::new();
+        state.shared.change_reads(|reads| {
+            for read in reads.iter_mut().filter(|read| read.reference == reference) {
+                read.listed = true;
+                allowed.push(read.id.clone());
+            }
+
+            !allowed.is_empty()
+        });
+        for id in allowed {
+            if let Some(request) = state.requests.get(&id) {
+                let _ = request.cast(RequestMsg::Allow);
+            }
+        }
+    }
+
     async fn incoming(myself: &ActorRef<AppMsg>, state: &mut AppActorState, incoming: Incoming) {
         let Incoming {
             read,
@@ -468,6 +519,7 @@ impl App {
             expires_at_ms,
             status: ReadStatus::Waiting,
             sealed: read.sealed.is_some(),
+            listed: record.allows(&read.reference),
         };
         state.shared.change_reads(|reads| {
             match reads.iter_mut().find(|read| read.id == id) {

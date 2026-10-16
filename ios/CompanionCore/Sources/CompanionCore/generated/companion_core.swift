@@ -895,7 +895,8 @@ public struct GatewayInfo: Equatable, Hashable {
      */
     public var phoneName: String
     /**
-     * The references this phone answers, matched exactly
+     * The references this phone answers without asking first, matched
+     * exactly: the gateway's at pairing, plus each one the owner allowed
      */
     public var allow: [String]
 
@@ -912,7 +913,8 @@ public struct GatewayInfo: Equatable, Hashable {
          * The name the gateway lists this phone under
          */phoneName: String, 
         /**
-         * The references this phone answers, matched exactly
+         * The references this phone answers without asking first, matched
+         * exactly: the gateway's at pairing, plus each one the owner allowed
          */allow: [String]) {
         self.name = name
         self.id = id
@@ -1104,6 +1106,11 @@ public struct PendingRead: Equatable, Hashable {
      */
     public var sealed: Bool
     /**
+     * Whether the reference is on the allow list; one that is not can be
+     * answered only once the owner allows it
+     */
+    public var listed: Bool
+    /**
      * Where it stands
      */
     public var status: ReadStatus
@@ -1128,6 +1135,10 @@ public struct PendingRead: Equatable, Hashable {
          * owner enters the value
          */sealed: Bool, 
         /**
+         * Whether the reference is on the allow list; one that is not can be
+         * answered only once the owner allows it
+         */listed: Bool, 
+        /**
          * Where it stands
          */status: ReadStatus) {
         self.id = id
@@ -1135,6 +1146,7 @@ public struct PendingRead: Equatable, Hashable {
         self.gatewayName = gatewayName
         self.expiresAtMs = expiresAtMs
         self.sealed = sealed
+        self.listed = listed
         self.status = status
     }
 
@@ -1159,6 +1171,7 @@ public struct FfiConverterTypePendingRead: FfiConverterRustBuffer {
                 gatewayName: FfiConverterString.read(from: &buf), 
                 expiresAtMs: FfiConverterInt64.read(from: &buf), 
                 sealed: FfiConverterBool.read(from: &buf), 
+                listed: FfiConverterBool.read(from: &buf), 
                 status: FfiConverterTypeReadStatus.read(from: &buf)
         )
     }
@@ -1169,6 +1182,7 @@ public struct FfiConverterTypePendingRead: FfiConverterRustBuffer {
         FfiConverterString.write(value.gatewayName, into: &buf)
         FfiConverterInt64.write(value.expiresAtMs, into: &buf)
         FfiConverterBool.write(value.sealed, into: &buf)
+        FfiConverterBool.write(value.listed, into: &buf)
         FfiConverterTypeReadStatus.write(value.status, into: &buf)
     }
 }
@@ -1203,6 +1217,15 @@ public enum AppAction: Equatable, Hashable {
         /**
          * What the camera read
          */scanned: String
+    )
+    /**
+     * Add the read's reference to the allow list, so it can be answered
+     * now and is not asked about again
+     */
+    case allow(
+        /**
+         * The read
+         */id: String
     )
     /**
      * Open the read's value with Face ID and send it
@@ -1289,25 +1312,28 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 1: return .pair(scanned: try FfiConverterString.read(from: &buf)
         )
         
-        case 2: return .approve(id: try FfiConverterString.read(from: &buf)
+        case 2: return .allow(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 3: return .deny(id: try FfiConverterString.read(from: &buf)
+        case 3: return .approve(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .dismiss(id: try FfiConverterString.read(from: &buf)
+        case 4: return .deny(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .unpair
-        
-        case 6: return .foreground
-        
-        case 7: return .background
-        
-        case 8: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf)
+        case 5: return .dismiss(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 9: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
+        case 6: return .unpair
+        
+        case 7: return .foreground
+        
+        case 8: return .background
+        
+        case 9: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 10: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1323,42 +1349,47 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterString.write(scanned, into: &buf)
             
         
-        case let .approve(id):
+        case let .allow(id):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(id, into: &buf)
             
         
-        case let .deny(id):
+        case let .approve(id):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(id, into: &buf)
             
         
-        case let .dismiss(id):
+        case let .deny(id):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(id, into: &buf)
             
         
-        case .unpair:
+        case let .dismiss(id):
             writeInt(&buf, Int32(5))
+            FfiConverterString.write(id, into: &buf)
+            
         
-        
-        case .foreground:
+        case .unpair:
             writeInt(&buf, Int32(6))
         
         
-        case .background:
+        case .foreground:
             writeInt(&buf, Int32(7))
         
         
-        case let .openedFromPush(id,reference,gateway):
+        case .background:
             writeInt(&buf, Int32(8))
+        
+        
+        case let .openedFromPush(id,reference,gateway):
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(reference, into: &buf)
             FfiConverterString.write(gateway, into: &buf)
             
         
         case let .pushToken(token,environment):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
             FfiConverterOptionString.write(token, into: &buf)
             FfiConverterTypePushEnvironment.write(environment, into: &buf)
             
@@ -1893,11 +1924,6 @@ public enum ReadStatus: Equatable, Hashable {
      */
     case withdrawn
     /**
-     * The reference is not on this phone's allow list, so it was refused
-     * without asking
-     */
-    case notAllowed
-    /**
      * Opening the value failed
      */
     case failed(
@@ -1940,9 +1966,7 @@ public struct FfiConverterTypeReadStatus: FfiConverterRustBuffer {
         
         case 7: return .withdrawn
         
-        case 8: return .notAllowed
-        
-        case 9: return .failed(message: try FfiConverterString.read(from: &buf)
+        case 8: return .failed(message: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1981,12 +2005,8 @@ public struct FfiConverterTypeReadStatus: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
         
         
-        case .notAllowed:
-            writeInt(&buf, Int32(8))
-        
-        
         case let .failed(message):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(message, into: &buf)
             
         }
