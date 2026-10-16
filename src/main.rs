@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rmcp=warn")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(codemode_mcp::secrets::redacting_logs(std::io::stderr))
         .init();
 
     let cli = Cli::parse();

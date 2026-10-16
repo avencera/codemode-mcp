@@ -832,7 +832,7 @@ async fn warm(State(state): State<AdminState>, Json(request): Json<WarmRequest>)
 }
 
 /// This gateway's id and the references its servers use, in `headers`,
-/// `env` and OAuth `client_secret`, for a companion Mac to pair with
+/// `env`, `url` and OAuth `client_secret`, for a companion Mac to pair with
 async fn companion_invite(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     // the ticket lists every reference the servers use
     if let Some(refused) = state.not_owner(&headers, "/admin/companion/invite") {
@@ -918,13 +918,16 @@ async fn companion_invite_status(
     }
 }
 
-/// Sorted, deduplicated references in the servers' `headers`, `env` and
-/// `client_secret`: what a companion is allowed to read
+/// Sorted, deduplicated references in the servers' `headers`, `env`, `url`
+/// and `client_secret`: what a companion is allowed to read
 fn config_references(config: &Config) -> Vec<String> {
     let mut references = std::collections::BTreeSet::new();
     for server in config.servers.values() {
         let values = server.headers.values().chain(server.env.values());
-        for value in values.chain(server.client_secret.as_ref()) {
+        for value in values
+            .chain(server.client_secret.as_ref())
+            .chain(server.url.as_ref())
+        {
             // validated at load, so a malformed value cannot be here
             for reference in secrets::references(value).unwrap_or_default() {
                 references.insert(reference.to_owned());

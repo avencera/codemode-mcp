@@ -924,7 +924,9 @@ pub struct ServerConfig {
     /// Seconds a `lazy` server may go without calls before it is stopped
     #[serde(default = "default_idle_secs")]
     pub idle_secs: u64,
-    /// Endpoint of a Streamable HTTP server
+    /// Endpoint of a Streamable HTTP server; may hold `{{ op://... }}`
+    /// references for a URL that carries a key, and is then never shown
+    /// resolved
     #[serde(default)]
     pub url: Option<String>,
     /// Static headers sent with every HTTP request
@@ -1077,7 +1079,8 @@ pub enum Transport<'a> {
     },
     /// Connect to a Streamable HTTP endpoint
     Http {
-        /// Endpoint URL
+        /// Endpoint URL as configured, which may hold `{{ op://... }}`
+        /// references; read them with `OnePassword::resolve_url`
         url: &'a str,
     },
 }
@@ -1141,6 +1144,10 @@ impl ServerConfig {
             crate::secrets::check(secret).map_err(|error| {
                 ConfigError::Invalid(format!("servers.{name}.client_secret: {error}"))
             })?;
+        }
+        if let Some(url) = &self.url {
+            crate::secrets::UrlTemplate::parse(url)
+                .map_err(|error| ConfigError::Invalid(format!("servers.{name}.url: {error}")))?;
         }
 
         match (&self.command, &self.url) {
@@ -1275,7 +1282,36 @@ mod tests {
         assert!(parse("surprise = 1").is_err());
         assert!(parse("[servers.a]\ncommand = \"x\"\nurl = \"http://y\"").is_err());
         assert!(parse("[servers.a]\npolicy = \"allow\"").is_err());
+        assert!(parse("[servers.a]\nurl = \"not a url\"").is_err());
+        // a url that is one reference is refused, with or without oauth
+        for oauth in ["", "\noauth = true"] {
+            let refused = parse(&format!(
+                "[servers.a]\nurl = \"{{{{ op://Dev/zoho/credential }}}}\"{oauth}"
+            ));
+            assert!(
+                matches!(&refused, Err(ConfigError::Invalid(message)) if message.contains("https://host/mcp/{{ op://Vault/Item/key }}")),
+                "{refused:?}"
+            );
+        }
+        assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho\"").is_err());
+        assert!(
+            parse("[servers.a]\nurl = \"https://h/{{ op://Dev/zoho/key }}/m\"\noauth = true")
+                .is_ok()
+        );
         assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
+        for host in [
+            "https://{{ op://Dev/zoho/key }}.example.com/m",
+            "https:///{{ op://Dev/zoho/key }}/m/{{ op://Dev/zoho/key }}",
+        ] {
+            assert!(
+                parse(&format!("[servers.a]\nurl = \"{host}\"")).is_err(),
+                "{host}"
+            );
+        }
+        assert!(
+            parse("[servers.a]\nurl = \"https://h.com?key={{ op://Dev/zoho/key }}\"\noauth = true")
+                .is_ok()
+        );
         assert!(parse("[servers.a]\ncommand = \"x\"\noauth = true").is_err());
         assert!(parse("[servers.a]\nurl = \"https://y\"\nscopes = [\"s\"]").is_err());
         assert!(parse("[servers.a]\nurl = \"https://y\"\nclient_id = \"c\"").is_err());

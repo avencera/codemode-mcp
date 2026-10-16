@@ -81,9 +81,16 @@ pub enum UpstreamError {
     /// A configured header is not valid HTTP
     #[error("invalid header `{0}`")]
     Header(String),
-    /// A `{{ op://... }}` reference in `headers` or `env` could not be read
+    /// A `{{ op://... }}` reference in `url`, `headers` or `env` could not be read
     #[error("could not read a secret from 1Password: {0}")]
     Secret(String),
+    /// The `url` is not a URL once its references are read
+    #[error("the url is not valid once its references are read")]
+    Url,
+    /// A value read for a `url` reference is one codemode cannot keep out of
+    /// sight: too short, or with characters outside the allowed set
+    #[error("url: {0}")]
+    UrlValue(String),
     /// The MCP handshake failed
     #[error("initialize failed: {0}")]
     Initialize(String),
@@ -140,7 +147,7 @@ impl UpstreamError {
         match self {
             Self::Unavailable { category, .. } => *category,
             Self::Spawn { .. } => ErrorCategory::Spawn,
-            Self::Header(_) => ErrorCategory::Configuration,
+            Self::Header(_) | Self::Url | Self::UrlValue(_) => ErrorCategory::Configuration,
             Self::Secret(_) => ErrorCategory::Secret,
             Self::Initialize(_) => ErrorCategory::Initialize,
             Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
@@ -174,6 +181,8 @@ impl UpstreamError {
             ),
             Self::Spawn { .. }
             | Self::Header(_)
+            | Self::Url
+            | Self::UrlValue(_)
             | Self::Secret(_)
             | Self::Initialize(_)
             | Self::OAuth(_)
@@ -281,8 +290,10 @@ impl UpstreamStatus {
     }
 }
 
-/// `headers` and `env` with their 1Password references read; never logged
+/// `url`, `headers` and `env` with their 1Password references read; never
+/// logged
 struct Resolved {
+    url: Option<String>,
     headers: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
 }
@@ -606,6 +617,7 @@ impl Upstream {
             .send_request_with_option(request, PeerRequestOptions::with_timeout(self.call_timeout))
             .await
             .map_err(|error| {
+                let error = self.redactor.apply(&error.to_string());
                 tracing::debug!(server = %self.name, %error, "sending the call failed");
 
                 UpstreamError::Unavailable {
@@ -884,7 +896,9 @@ impl Upstream {
             return true;
         }
 
-        let error = format!("connection closed ({reason:?})");
+        let error = self
+            .redactor
+            .apply(&format!("connection closed ({reason:?})"));
         tracing::warn!(server = %self.name, %error, "upstream disconnected");
         self.mark_unavailable(error, ErrorCategory::ConnectionClosed);
 
@@ -908,14 +922,25 @@ impl Upstream {
                 Some(NEEDS_LOGIN_RETRY)
             }
             error @ UpstreamError::Secret(_) => {
-                tracing::warn!(server = %self.name, %error, "upstream secret unavailable");
-                self.mark_unavailable(error.to_string(), error.category());
+                let message = self.redactor.apply(&error.to_string());
+                tracing::warn!(server = %self.name, error = %message, "upstream secret unavailable");
+                self.mark_unavailable(message, error.category());
 
                 Some(SECRET_RETRY)
             }
-            error => {
-                tracing::warn!(server = %self.name, %error, "upstream connection failed");
+            error @ UpstreamError::UrlValue(_) => {
+                tracing::warn!(server = %self.name, %error, "upstream url key refused");
                 self.mark_unavailable(error.to_string(), error.category());
+
+                // the value is cached until the daemon restarts, so a quick
+                // retry would only fail again
+                Some(SECRET_RETRY)
+            }
+            error => {
+                // transport errors can print the URL they were connecting to
+                let message = self.redactor.apply(&error.to_string());
+                tracing::warn!(server = %self.name, error = %message, "upstream connection failed");
+                self.mark_unavailable(message, error.category());
 
                 None
             }
@@ -955,9 +980,27 @@ impl Upstream {
             .map_err(|_| UpstreamError::ConnectTimeout(CONNECT_TIMEOUT))?
     }
 
-    /// `headers` and `env` with their references read
+    /// `url`, `headers` and `env` with their references read
     async fn resolved(&self) -> Result<Resolved, UpstreamError> {
-        let secret = |error: crate::secrets::SecretError| UpstreamError::Secret(error.to_string());
+        let secret = |error: crate::secrets::SecretError| match error {
+            crate::secrets::SecretError::NotAUrl => UpstreamError::Url,
+            // 1Password answered; the value itself breaks the url rules, which
+            // no retry or unlock fixes
+            error @ (crate::secrets::SecretError::UrlValueTooShort
+            | crate::secrets::SecretError::UrlValueUnprotectable) => {
+                UpstreamError::UrlValue(error.to_string())
+            }
+            error => UpstreamError::Secret(error.to_string()),
+        };
+        let url = match &self.config.url {
+            Some(template) => Some(
+                self.onepassword
+                    .resolve_url(template)
+                    .await
+                    .map_err(secret)?,
+            ),
+            None => None,
+        };
         let headers = self
             .onepassword
             .resolve(&self.config.headers)
@@ -968,10 +1011,17 @@ impl Upstream {
             .resolve(&self.config.env)
             .await
             .map_err(secret)?;
+        self.redactor.add(
+            url.iter()
+                .flat_map(|url| url.secrets.iter().cloned())
+                .chain(headers.secrets)
+                .chain(env.secrets),
+        );
         self.redactor
-            .add(headers.secrets.into_iter().chain(env.secrets));
+            .add_keys(url.iter().flat_map(|url| url.fragile.iter().cloned()));
 
         Ok(Resolved {
+            url: url.map(|url| url.url),
             headers: headers.values,
             env: env.values,
         })
@@ -995,7 +1045,8 @@ impl Upstream {
                     .await
                     .map_err(|error| UpstreamError::Initialize(error.to_string()))?
             }
-            Some(Transport::Http { url }) => {
+            Some(Transport::Http { .. }) => {
+                let url = resolved.url.as_deref().ok_or(UpstreamError::Url)?;
                 let config = self.http_config(url, &resolved.headers)?;
                 let authorized =
                     match &self.oauth {
@@ -1152,6 +1203,7 @@ impl ClientHandler for UpstreamHandler {
                 Ok(true) => upstream.changed.notify_one(),
                 Ok(false) => {}
                 Err(error) => {
+                    let error = upstream.redactor.apply(&error.to_string());
                     tracing::warn!(server = %upstream.name, %error, "tool list refresh failed");
                 }
             }

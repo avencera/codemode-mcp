@@ -471,9 +471,9 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - `oauth status` shows login state, scopes, expiry and whether a refresh token exists, never token values;
   `oauth logout <server>` deletes the login and reconnects anonymously
 
-### Secrets in headers and env
+### Secrets in headers, env and url
 
-- A `headers` or `env` value can hold `{{ op://vault/item/field }}` references (`op inject`'s template syntax),
+- A `headers`, `env` or HTTP `url` value can hold `{{ op://vault/item/field }}` references (`op inject`'s template syntax),
   alone or inside text, e.g. `Bearer {{ op://Dev/Context7/credential }}`. Malformed references fail at config load,
   and the error never quotes the text between the braces in case it is a pasted secret
 - The first connect runs `op read --no-newline <reference>` for each one (`[secrets] op`, default `op` on `PATH`),
@@ -490,6 +490,46 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - Values read are added to the redactor that already scrubs configured header and env values, URL query strings
   and userinfo from upstream error text before a script sees it, and from stdio servers' stderr before it is
   logged
+- A `url` is substituted structurally (`secrets::UrlTemplate`). Each reference becomes a unique alphanumeric
+  placeholder, the result is parsed as a URL, and the placeholders show which component each reference lands in.
+  This runs at config load and again when the references are read, in the one resolver every connection uses
+  (anonymous connects, OAuth discovery and authorized clients), before any HTTP request. References may sit only
+  in path segments and query names or values; one in the scheme, credentials, host, port or fragment is refused
+  with a configuration error, as is a template without a literal, non-empty host. A host is lowercased when
+  parsed, so a key there could not be matched, and it is refused for every server rather than only with OAuth
+- Values are filled into the parsed URL already percent-encoded as data (path-segment encoding in the path, form
+  encoding in the query), so `/` and `+` in a value never become URL structure. A value
+  embedded in a template may hold only ASCII letters, digits and `- . _ ~ + / = : @ ! * , ;` (hex, base64,
+  base64url, JWT-like and colon-separated keys): no `\`, quote, `<`, `>`, `` ` ``, `^`, `{`, `}`, `|`, `[`, `]`,
+  `#`, `?`, `%`, `&`, `$`, `(`, `)`, space, control or non-ASCII character, which URL parsers, JSON escaping or
+  IDNA could turn into a form the redactor does not know; anything else is refused
+  (`SecretError::UrlValueUnprotectable`) with an error naming the allowed set. A literal `%` just before a placeholder is written as `%25`, so a value can never
+  complete an escape. A value under 16 bytes is refused, so fragment redaction always applies. The URL a template yields is reported as a
+  `configuration` failure when it does not parse (`SecretError::NotAUrl`)
+- The secrets of a `url` are exactly the values read from 1Password plus the forms text may print them in: the
+  encodings the URL holds them in, uppercase and lowercase
+  percent escapes, JSON escaping, HTML character references and `+` read as a space. Nothing in a URL is guessed to be a key from its shape, so embed the
+  reference where the key sits, e.g.
+  `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
+  that is one whole reference is refused at config load, with or without OAuth: codemode would have to guess which
+  part of the URL is the key, and matching fragments of the whole URL would redact public text such as `https://`.
+  The redactor matches ASCII case-insensitively, also through the percent-, JSON- and HTML-reference-decoded views of the text
+  (decoded repeatedly, up to 4 passes, keeping a span map back to the original, since a client's `Debug` output
+  escapes the JSON escapes of a body again), so a
+  provider that lowercases a key into a host name cannot slip past. rmcp cuts an invalid response to 256 bytes
+  before codemode sees it, so a key at the cut leaves a prefix that no longer matches whole; the redactor
+  therefore also replaces any run of 8 or more consecutive bytes that is a substring
+  of the key (an index of the key's 8-byte windows, one scan per view). The
+  OAuth write guards (`Redactor::holds_any`) never match fragments, which would refuse legitimate data. The
+  daemon's log writer
+  (`secrets::redacting_logs`) scrubs with the same redactor, buffering each writer's bytes until `flush` or drop,
+  because rmcp and reqwest print the URL in their own log events
+- Everything OAuth writes to `codemode.sqlite`
+  (credentials at login and on every refresh, pending state, the client registration) passes one check that
+  serializes the value and refuses it when it holds a key, raw or percent-decoded, ignoring case; unused vendor
+  token fields are dropped. The authorization link is checked whole the same way, and its `resource` parameter is
+  dropped only when its value holds a key. A refused callback whose `url` cannot be read answers with fixed text,
+  plus the `error` code only when it is a standard OAuth error code; provider text is never copied
 
 ### Companions (`src/companion.rs`)
 
