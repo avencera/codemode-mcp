@@ -416,11 +416,25 @@ pub struct InviteStatusRequest {
     pub invite: String,
 }
 
-/// Body of `POST /admin/companion/check`
+/// Body of `POST /admin/companion/check`, which asks every companion and phone
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompanionCheckRequest {
     /// The reference to ask the companions for
     pub reference: String,
+}
+
+/// Body of `POST /admin/companion/check/one`
+///
+/// A route of its own rather than a field on [`CompanionCheckRequest`]: a
+/// daemon from before it answers 404 instead of ignoring the name and asking
+/// every device
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionCheckOneRequest {
+    /// The reference to ask for
+    pub reference: String,
+    /// The companion or phone to ask, by its name in `secrets.companions` or
+    /// `secrets.phones`
+    pub companion: String,
 }
 
 /// What one companion did with a check; never the value
@@ -534,6 +548,7 @@ pub fn router(app: &App) -> Router {
             post(companion_invite_status),
         )
         .route("/admin/companion/check", post(companion_check))
+        .route("/admin/companion/check/one", post(companion_check_one))
         .route("/admin/companion/create", post(companion_create))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
@@ -1038,7 +1053,19 @@ async fn companion_check(
     State(state): State<AdminState>,
     Json(request): Json<CompanionCheckRequest>,
 ) -> Response {
-    let reference = request.reference.trim();
+    check_companions(&state, &request.reference, None).await
+}
+
+/// [`companion_check`] for one named companion or phone
+async fn companion_check_one(
+    State(state): State<AdminState>,
+    Json(request): Json<CompanionCheckOneRequest>,
+) -> Response {
+    check_companions(&state, &request.reference, Some(&request.companion)).await
+}
+
+async fn check_companions(state: &AdminState, reference: &str, only: Option<&str>) -> Response {
+    let reference = reference.trim();
     if !secrets::is_reference(reference) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -1046,17 +1073,27 @@ async fn companion_check(
         );
     }
     let companions = state.gateway.companions();
-    if companions.peers().is_empty() && companions.phones().is_empty() {
+    let names = companions.names();
+    if names.is_empty() {
         return error(
             StatusCode::BAD_REQUEST,
             "no companions or phones are configured under [secrets]",
+        );
+    }
+    if let Some(only) = only.filter(|only| !names.iter().any(|name| name == only)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "no companion or phone named {only}; configured: {}",
+                names.join(", ")
+            ),
         );
     }
 
     let companions = state
         .gateway
         .companions()
-        .check(reference)
+        .check(reference, only)
         .await
         .into_iter()
         .map(|outcome| CompanionCheckEntry {

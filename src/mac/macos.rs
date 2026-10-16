@@ -5,7 +5,7 @@
 use std::{
     ffi::c_void,
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,9 @@ const TERMINAL_NOTIFIER: [&str; 2] = [
 const ANY_INPUT: CGEventType = CGEventType(u32::MAX);
 /// Pause after a prompt closes before the next queued one may show
 const PROMPT_GAP: Duration = Duration::from_secs(1);
+/// Longest an abandoned prompt is waited for to confirm it left the screen
+/// before the next one may show anyway
+const ABANDON_WAIT: Duration = Duration::from_secs(5);
 
 /// The Mac the daemon runs on
 #[derive(Default)]
@@ -82,15 +85,15 @@ fn idle() -> Duration {
 /// for the one that closed, including one taken down because its request
 /// was denied on the page
 #[derive(Default)]
-struct PromptQueue(tokio::sync::Mutex<Option<Instant>>);
+struct PromptQueue(Arc<tokio::sync::Mutex<Option<Instant>>>);
 
 /// The right to show one prompt; dropping it, by finishing or by being
 /// cancelled, starts the gap
-struct Turn<'a>(tokio::sync::MutexGuard<'a, Option<Instant>>);
+struct Turn(tokio::sync::OwnedMutexGuard<Option<Instant>>);
 
 impl PromptQueue {
-    async fn turn(&self) -> Turn<'_> {
-        let ended = self.0.lock().await;
+    async fn turn(&self) -> Turn {
+        let ended = Arc::clone(&self.0).lock_owned().await;
         if let Some(ended) = *ended {
             tokio::time::sleep_until((ended + PROMPT_GAP).into()).await;
         }
@@ -99,10 +102,25 @@ impl PromptQueue {
     }
 }
 
-impl Drop for Turn<'_> {
+impl Drop for Turn {
     fn drop(&mut self) {
         *self.0 = Some(Instant::now());
     }
+}
+
+/// Keeps `turn` until `gone` resolves or [`ABANDON_WAIT`] passes, so the
+/// next prompt never starts while an abandoned one may still be on screen
+///
+/// Without a runtime to wait on, the turn is released at once
+fn hold_until_gone(turn: Turn, gone: impl Future + Send + 'static) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+
+    runtime.spawn(async move {
+        let _ = tokio::time::timeout(ABANDON_WAIT, gone).await;
+        drop(turn);
+    });
 }
 
 /// An `LAContext` that can cross threads, and is invalidated when dropped
@@ -118,6 +136,47 @@ impl Drop for Context {
     fn drop(&mut self) {
         // ends a prompt still showing; after the reply it does nothing
         unsafe { self.0.invalidate() };
+    }
+}
+
+/// A prompt on screen, with the turn that allowed it
+///
+/// Dropped before the prompt was answered, it takes the prompt down and keeps
+/// the turn until the system reports the evaluation over. Asking for the
+/// next prompt before that can fail at once, because the old one still
+/// holds the screen
+struct Showing {
+    context: Context,
+    reply: Option<oneshot::Receiver<Reply>>,
+    turn: Option<Turn>,
+}
+
+impl Showing {
+    /// Waits for the owner's answer; a sender dropped without one counts as a
+    /// failed prompt
+    async fn answer(&mut self) -> Reply {
+        let Some(reply) = self.reply.as_mut() else {
+            return Err(LAError(0));
+        };
+        let answer = reply.await.unwrap_or(Err(LAError(0)));
+        self.reply = None;
+
+        answer
+    }
+}
+
+impl Drop for Showing {
+    fn drop(&mut self) {
+        // answered: nothing is left on screen
+        let (Some(reply), Some(turn)) = (self.reply.take(), self.turn.take()) else {
+            return;
+        };
+
+        tracing::info!("a Touch ID prompt nobody waits for is being taken down");
+        // `Context` invalidates again on drop, which does nothing; doing it
+        // here puts it before the wait
+        unsafe { self.context.0.invalidate() };
+        hold_until_gone(turn, reply);
     }
 }
 
@@ -176,7 +235,11 @@ fn answer_for(reply: Reply) -> TouchId {
     match reply {
         Ok(()) => TouchId::Approved,
         Err(LAError::UserCancel | LAError::UserFallback) => TouchId::Review,
-        Err(LAError::SystemCancel | LAError::AppCancel) => TouchId::Away,
+        Err(error @ (LAError::SystemCancel | LAError::AppCancel)) => {
+            tracing::info!(code = error.0, "Touch ID prompt was cancelled");
+
+            TouchId::Away
+        }
         Err(error) => {
             tracing::info!(code = error.0, "Touch ID prompt failed");
 
@@ -192,16 +255,18 @@ impl Mac for MacOs {
 
     fn touch_id<'a>(&'a self, reason: &'a str, cancel: &'a str) -> BoxFuture<'a, TouchId> {
         Box::pin(async move {
-            let _turn = self.prompts.turn().await;
-            let (context, receiver) = match evaluate(reason, cancel) {
+            let turn = self.prompts.turn().await;
+            let (context, reply) = match evaluate(reason, cancel) {
                 Ok(started) => started,
                 Err(answer) => return answer,
             };
-            // a sender dropped without a reply counts as a failed prompt
-            let reply = receiver.await.unwrap_or(Err(LAError(0)));
-            drop(context);
+            let mut showing = Showing {
+                context,
+                reply: Some(reply),
+                turn: Some(turn),
+            };
 
-            answer_for(reply)
+            answer_for(showing.answer().await)
         })
     }
 
@@ -284,7 +349,7 @@ async fn blocking<T: Send + 'static>(
 mod tests {
     use objc2_local_authentication::LAError;
 
-    use super::{PROMPT_GAP, PromptQueue, TouchId, answer_for};
+    use super::{PROMPT_GAP, PromptQueue, TouchId, answer_for, hold_until_gone};
 
     #[test]
     fn only_a_matched_fingerprint_approves() {
@@ -325,5 +390,29 @@ mod tests {
         let started = std::time::Instant::now();
         let _next = queue.turn().await;
         assert!(started.elapsed() >= PROMPT_GAP - std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn the_next_prompt_waits_for_an_abandoned_one_to_leave_the_screen() {
+        let queue = PromptQueue::default();
+        let (left, gone) = tokio::sync::oneshot::channel::<()>();
+
+        // the prompt's request went away; the system has not yet said the
+        // prompt is gone
+        hold_until_gone(queue.turn().await, gone);
+
+        // well past the gap that would otherwise have let it start
+        let early = tokio::time::timeout(
+            PROMPT_GAP + std::time::Duration::from_millis(300),
+            queue.turn(),
+        )
+        .await;
+        assert!(early.is_err(), "the next prompt started over a stale one");
+
+        assert!(left.send(()).is_ok(), "the wait ended early");
+        let next =
+            tokio::time::timeout(PROMPT_GAP + std::time::Duration::from_secs(1), queue.turn())
+                .await;
+        assert!(next.is_ok(), "the next prompt never got its turn");
     }
 }

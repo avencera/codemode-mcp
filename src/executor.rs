@@ -977,7 +977,7 @@ impl Driver<'_> {
                     call_id,
                     allow_eager_await,
                     ..
-                } => match self.plan(function_name, &args) {
+                } => match self.plan(function_name, &args).await {
                     Step::Ready(call) => {
                         self.dispatch(call_id, allow_eager_await, call, &mut *print)
                             .await?
@@ -1309,7 +1309,7 @@ impl Driver<'_> {
         Classification::new(outcome, format!("{exc_type}: {message}"))
     }
 
-    fn plan(&mut self, function: String, args: &monty_types::CallArgs) -> Step {
+    async fn plan(&mut self, function: String, args: &monty_types::CallArgs) -> Step {
         if args.args().len() > 0 {
             return Step::Ready(error_future(
                 ExcType::TypeError,
@@ -1337,12 +1337,16 @@ impl Driver<'_> {
             }
         }
 
-        match self.gateway.prepare(
-            &self.context,
-            &function,
-            arguments,
-            Sensitivity::of(self.sensitive_used),
-        ) {
+        let plan = self
+            .gateway
+            .prepare(
+                &self.context,
+                &function,
+                arguments,
+                Sensitivity::of(self.sensitive_used),
+            )
+            .await;
+        match plan {
             Err(error) => {
                 let answer = Answer::tool_error(&error, &function, false);
 

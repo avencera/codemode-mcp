@@ -259,13 +259,34 @@ impl Companions {
             })
     }
 
-    /// Asks every companion, then every phone, and reports how each
-    /// answered, in configuration order, without keeping or returning a
-    /// value
-    pub async fn check(self: &Arc<Self>, reference: &str) -> Vec<CheckOutcome> {
+    /// The names of the companions, then the phones; they share one
+    /// namespace
+    pub fn names(&self) -> Vec<String> {
+        let phones = self.phones();
+
+        self.peers()
+            .into_iter()
+            .map(|peer| peer.name)
+            .chain(phones.into_iter().map(|phone| phone.name))
+            .collect()
+    }
+
+    /// Asks every companion, then every phone, or only the one called
+    /// `only`, and reports how each answered, in configuration order,
+    /// without keeping or returning a value
+    ///
+    /// With `only`, the others are not asked and the report is ready as soon
+    /// as that device answers
+    pub async fn check(self: &Arc<Self>, reference: &str, only: Option<&str>) -> Vec<CheckOutcome> {
+        let wanted = |name: &str| only.is_none_or(|only| only == name);
         let mut answers = JoinSet::new();
         let first_phone = self.peers().len();
-        for (index, phone) in self.phones().into_iter().enumerate() {
+        for (index, phone) in self
+            .phones()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, phone)| wanted(&phone.name))
+        {
             let companions = Arc::clone(self);
             let reference = reference.to_owned();
             answers.spawn(async move {
@@ -283,7 +304,12 @@ impl Companions {
                 )
             });
         }
-        for (index, peer) in self.peers().iter().enumerate() {
+        for (index, peer) in self
+            .peers()
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| wanted(&peer.name))
+        {
             let companions = Arc::clone(self);
             let name = peer.name.clone();
             let reference = reference.to_owned();

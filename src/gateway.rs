@@ -24,6 +24,7 @@ use crate::{
     convert::json_to_monty,
     durable::Sensitivity,
     executor::Executor,
+    logins::FillCheck,
     mac::Mac,
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
@@ -221,6 +222,9 @@ pub struct Gateway {
     oauth: Arc<OAuth>,
     redactor: Arc<Redactor>,
     companions: Arc<Companions>,
+    /// The `logins` server's check of the focused field before a `fill`
+    /// is put to the owner
+    fill_check: FillCheck,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
 }
@@ -263,10 +267,9 @@ impl Gateway {
                 },
             mac,
         } = access;
-        let builtins = Builtins {
-            logins: Arc::new(config.logins.clone()),
-            mac,
-        };
+        let logins = Arc::new(config.logins.clone());
+        let fill_check = FillCheck::new(Arc::clone(&logins), mac.clone());
+        let builtins = Builtins { logins, mac };
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
@@ -280,6 +283,7 @@ impl Gateway {
         let gateway = Arc::new(Self {
             companions,
             redactor,
+            fill_check,
             max_tool_result_bytes: config.limits.max_tool_result_bytes,
             config,
             upstreams,
@@ -404,7 +408,10 @@ impl Gateway {
     /// execution already holds data from a sensitive server, which keeps the
     /// approval request off the disk
     ///
-    pub fn prepare(
+    /// A `logins` `fill` call also has its focused field checked here, so a
+    /// field the login may not go into is refused without asking anyone,
+    /// and the owner is shown the host it would go to
+    pub async fn prepare(
         &self,
         context: &CallContext,
         function: &str,
@@ -416,7 +423,7 @@ impl Gateway {
             .get(function)
             .ok_or_else(|| ToolCallError::Unknown(function.to_owned()))?;
         let server_config = self.config.servers.get(&entry.server);
-        let call = PreparedCall {
+        let mut call = PreparedCall {
             function: function.to_owned(),
             server: entry.server.clone(),
             tool: entry.tool.clone(),
@@ -437,6 +444,18 @@ impl Gateway {
         if let Err(error) = upstream.ensure_available() {
             return Err(self.refuse(context, &call, error.into()));
         }
+        let summary = match self
+            .fill_check
+            .prepare(server_config, &call.tool, &mut call.arguments)
+            .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                let error = ToolCallError::ToolFailed(error.to_string());
+
+                return Err(self.refuse(context, &call, error));
+            }
+        };
         if entry.policy != Policy::Ask {
             return Ok(Plan::Run {
                 call,
@@ -454,6 +473,7 @@ impl Gateway {
             script: &context.script,
             grant_mode: grant_mode.unwrap_or_default(),
             sensitivity: Sensitivity::of(call.sensitive).or(prior),
+            summary: summary.as_deref(),
         });
 
         match gate {

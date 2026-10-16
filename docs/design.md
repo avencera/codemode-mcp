@@ -700,10 +700,44 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 - Config refuses a `logins` server unless `fill` resolves to `ask` with `per_call`, and refuses per-tool
   settings for tools it does not have, so a missing `policy` (the default is `allow`) or a typo cannot let
   fills through unasked. Fills run one at a time, so two calls in one `asyncio.gather` cannot interleave keys
-- `fill(login, field)` types a `[logins.<name>]` username or password into the field with keyboard focus, for an
-  agent that drives the Mac's screen and must sign in without the value entering its context. `list` names the
-  logins, their sites and fields. The answer is the login, field and host; passwords read are added to the
-  redactor (not usernames, which as email addresses appear in other servers' results and would be garbled), and the server is `sensitive` under `ask`, so neither logs nor scripts see them
+- `fill(login, field)` types a `[logins.<name>]` username, password or current one-time code
+  (`one_time_code`) into the field with keyboard focus, for an agent that drives the Mac's screen and must sign
+  in without the value entering its context. `list` names the logins, their sites and fields. The answer is the
+  login, field and host; passwords and one-time password seeds read are added to the redactor (not usernames,
+  which as email addresses appear in other servers' results and would be garbled, nor a password shorter than
+  the redactor's 6-character floor, which would garble ordinary words), and the server is
+  `sensitive` under `ask`, so neither logs nor scripts see them
+- Only code-signed browsers: `AXUIElementGetPid` of the focused element gives the owning process, whose
+  `SecCode` (`SecCodeCopyGuestWithAttributes` with the pid) must satisfy one designated requirement in a
+  built-in table: Safari and Safari Technology Preview (`anchor apple`), Chrome's four channels (Google's
+  requirement as `codesign -d -r-` prints it, one identifier each), and Firefox, Edge, Brave and Arc as
+  `anchor apple generic` with the vendor's team id as `certificate leaf[subject.OU]`. The browser's name goes
+  into `FocusedField::browser`; `None`, any other app, is refused, since an app the agent builds could
+  present an Accessibility tree claiming any page. The pid is read once per check, so a process that exits
+  and whose pid is reused between the two reads would be judged by its successor's signature
+- Browsers that other programs can script are refused, decided in `FieldRule::check` from facts the screen
+  gathers (`Exposure`): the process's arguments and environment from `sysctl` `KERN_PROCARGS2` must not turn
+  on `--remote-debugging-port`, `--remote-debugging-pipe`, Marionette (by flag or `MOZ_MARIONETTE`) or
+  Firefox's debugger server, with switches read as the browsers read them (one dash or two, the last one
+  winning); Safari takes no such switches, so a running `safaridriver` process, which every WebDriver session
+  needs, counts as remote debugging for it. "Allow JavaScript from Apple Events" must be off: Safari's `AllowJavaScriptFromAppleEvents`
+  in its container's preferences plist, Chromium browsers' `browser.allow_javascript_apple_events` in any
+  profile's `Preferences` under the user data directory (`--user-data-dir` when given, read as Chromium reads
+  it: trimmed, and not past a `--`; an empty value means the default directory, and a relative one is left
+  unconfirmed, since it is against the browser's working directory). Only a saved "on" refuses. A saved "off" proves nothing, because browsers
+  write a change out seconds later (Chromium batches preference writes), and Safari's file needs Full Disk
+  Access, so anything but "on" becomes a note the owner sees with the request.
+  These are read once per check, not per character
+- The gateway checks a `logins` `fill` before asking anyone (`FillCheck`, called from `Gateway::prepare`,
+  which is async for it): it reads the focused field through the `Mac`, runs the login's rule, and refuses
+  without a prompt when it fails. On success it overwrites the `checked` argument with the host, browser and
+  notes, which the approval page shows, and gives the request a summary (`password for github into
+  github.com in Safari; could not check …`) that the Touch ID prompt and the Mac's own notification carry; the
+  phone notification, which crosses ntfy, still names only the tool. `checked` is skipped in the tool's
+  schema, so the stub does not offer it, and any value the agent passes is dropped. The server refuses a call
+  without it and sets the rule's `approved`, so the check before the read and the one before each character
+  also require the field to still be on the approved host, in the approved browser, with no unreadable
+  setting the owner was not shown
 - Where a value may go is decided from Accessibility, not from the agent: the system-wide focused element, its
   role and subrole (`AXSecureTextField` for a password, `AXTextField` or `AXComboBox` for a username), and the
   `AXURL` of every `AXWebArea` above it, innermost first, so a field in a frame lists the frame's document and
@@ -714,19 +748,27 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   domain (`sites.google.com`). Config takes sites as lowercase host names only, so a site cannot carry a
   scheme, port or path that would change the match. The rule (`FieldRule`) is
   platform-independent, so the gateway test runs it against a fake screen
-- The field is checked before the value is read, so a wrong field never prompts the owner, and again right
-  before typing. Characters are posted as keyboard events (`CGEventKeyboardSetUnicodeString`, flags cleared,
+- The field is checked by the gateway before the owner is asked, by the server again before the value is
+  read, and again right before typing. Characters are posted as keyboard events (`CGEventKeyboardSetUnicodeString`, flags cleared,
   from a private event source so held keys do not combine) to the field's process, one at a time. Before each, the
   focused element is compared to the original (`CFEqual`) and the whole rule is checked again against the same
   host, so a page that navigates under a still-focused field stops typing too; any change stops it with an
   `Interrupted` error. A character in flight when focus moves can still land in the new element
 - Values come from `OnePassword::read_reference`, the same race and cache as server secrets, so a companion Mac
-  or phone answers while the owner is away and a rotated password needs a restart. One-time codes would need a
-  fresh read every time, or the TOTP seed and a code computed here; neither is built
+  or phone answers while the owner is away and a rotated password needs a restart. `totp` names the one-time
+  password field itself (config refuses `?attribute=`, which would cache a code); its value, an
+  `otpauth://totp/` URI (SHA1, SHA256 or SHA512, 6 or 8 digits, any period) or a bare base32 secret, is turned
+  into the current RFC 6238 code in `src/logins/totp.rs` (`hmac`, `sha1` and `sha2` on the digest 0.11 line).
+  The seed's text is redacted with fragments and the whole value without, since its label is often an email
+  address; neither the seed nor the code is returned. The code is typed into a plain text field, so an agent
+  that reads the screen sees it, as it would a username; it expires within one period and is useless without
+  the password, which stays behind bullets
 - Not defended: a username is typed into a plain field and is visible like any text, and a page's
   show-password button turns the password field into one. Code in the page, or anything driving the browser by Apple Events or a debugging port, can read
   the field after it is filled. Codex's computer use reads the accessibility tree, so the fill relies on
-  browsers exposing a password field there as bullets, not its text (not checked live yet). Same-user code is outside the threat model in any case (see Threat model): an app the agent builds and runs can present an Accessibility tree that claims any page, and fills are not yet limited to code-signed browsers
+  browsers exposing a password field there as bullets, not its text (not checked live yet). Same-user code is
+  otherwise outside the threat model (see Threat model): a browser extension, or a program the owner allowed
+  to send the browser Apple Events, can still read the filled field
 - Accessibility (`AXIsProcessTrustedWithOptions`, which asks macOS to show its prompt) and event posting
   (`CGPreflightPostEventAccess`) are checked on every call, and the error names the System Settings switch. The
   grant is the daemon's own, keyed to its signature

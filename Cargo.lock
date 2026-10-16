@@ -1101,6 +1101,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "companion-wire",
+ "core-foundation",
  "futures-executor",
  "hex",
  "hmac 0.13.0",
@@ -1119,6 +1120,7 @@ dependencies = [
  "objc2-event-kit",
  "objc2-foundation",
  "objc2-local-authentication",
+ "plist",
  "qrcode",
  "rand 0.10.3",
  "reqwest",
@@ -1131,6 +1133,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
@@ -1446,7 +1449,7 @@ dependencies = [
  "rsa",
  "sec1 0.7.3",
  "serde",
- "sha1",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "sha2 0.11.0",
  "spki 0.7.3",
@@ -5917,6 +5920,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6826,7 +6840,7 @@ dependencies = [
  "rand 0.9.5",
  "rustls",
  "rustls-pki-types",
- "sha1",
+ "sha1 0.10.7",
  "thiserror 2.0.21",
  "utf-8",
 ]
@@ -8097,7 +8111,7 @@ checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
 dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
- "sha1",
+ "sha1 0.10.7",
  "signature 2.2.0",
  "spki 0.7.3",
  "tls_codec",
