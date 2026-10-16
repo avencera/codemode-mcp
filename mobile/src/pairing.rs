@@ -107,7 +107,19 @@ async fn register(
     let connection = tokio::time::timeout(net::DIAL_TIMEOUT, endpoint.connect(address, PAIR_ALPN))
         .await
         .map_err(|_| "the gateway did not answer; is its invite still open?".to_owned())?
-        .map_err(|error| format!("cannot reach the gateway: {error}"))?;
+        .map_err(|error| {
+            // the gateway offers pairing only while an invite is open
+            if error
+                .to_string()
+                .contains("doesn't support any known protocol")
+            {
+                "the gateway has no open invite: run `codemode-mcp companion invite` there \
+                 again and scan the new code"
+                    .to_owned()
+            } else {
+                format!("cannot reach the gateway: {error}")
+            }
+        })?;
 
     let registration = PairRequest::Register(Box::new(Registration {
         secret: ticket.secret.to_hex(),
