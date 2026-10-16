@@ -244,6 +244,11 @@ pub fn testflight(sh: &Shell, key: &ApiKey) -> Result<()> {
     .run()?;
 
     println!("uploading to App Store Connect");
+    // the export copies with /usr/bin/rsync, which starts its other end
+    // from PATH; a Homebrew rsync there rejects its `-E` and the export
+    // fails with only "Copy failed"
+    let path = std::env::var("PATH").unwrap_or_default();
+    let _path = sh.push_env("PATH", format!("/usr/bin:{path}"));
     cmd!(
         sh,
         "xcodebuild -exportArchive -archivePath {archive} -exportPath {export}
