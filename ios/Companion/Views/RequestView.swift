@@ -50,14 +50,18 @@ struct RequestView: View {
     private var status: some View {
         switch read.status {
         case .connecting:
-            Label("Reaching the gateway…", systemImage: "antenna.radiowaves.left.and.right")
-                .foregroundStyle(.secondary)
-        case .waiting, .approving:
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text("\(secondsLeft(at: context.date)) s left")
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+            VStack(spacing: 4) {
+                Label("Reaching the gateway…", systemImage: "antenna.radiowaves.left.and.right")
+                // once linked, a read that does not come within seconds is
+                // gone, so the gateway's deadline would mislead
+                if manager.state.connection != .connected {
+                    countdown
+                }
             }
+            .foregroundStyle(.secondary)
+        case .waiting, .approving:
+            countdown
+                .foregroundStyle(.secondary)
         case .approved:
             Text("Sent to the gateway.")
         case .denied:
@@ -68,6 +72,13 @@ struct RequestView: View {
             Text("Answered elsewhere. Nothing was sent.")
         case let .failed(message):
             Text("Failed: \(message)")
+        }
+    }
+
+    private var countdown: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            Text("\(secondsLeft(at: context.date)) s left")
+                .monospacedDigit()
         }
     }
 

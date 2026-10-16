@@ -194,6 +194,9 @@ pub enum AppAction {
         reference: String,
         /// The gateway name in the push
         gateway: String,
+        /// When the gateway stops waiting, in Unix milliseconds, if the
+        /// push says
+        expires_at_ms: Option<i64>,
     },
     /// APNs gave this token, or `None` when notifications are off
     PushToken {

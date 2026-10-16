@@ -10,7 +10,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, PoisonError},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use companion_wire::{
@@ -228,7 +228,8 @@ impl Companions {
         self.refresh_alpns();
 
         let id = RequestId::generate();
-        self.wake(phone, &id, reference);
+        let expires = SystemTime::now() + deadline.saturating_duration_since(Instant::now());
+        self.wake(phone, &id, reference, expires);
 
         let mut link = self.links.link(phone.id).subscribe();
         let mut lost: Option<usize> = None;
@@ -289,7 +290,7 @@ impl Companions {
     /// Sends the push that brings the phone's app up; a phone without a
     /// token, or a gateway without an APNs key, is only asked while the app
     /// is open
-    fn wake(&self, phone: &PhonePeer, id: &RequestId, reference: &str) {
+    fn wake(&self, phone: &PhonePeer, id: &RequestId, reference: &str, expires: SystemTime) {
         let (Some(apns), Some(store)) = (self.apns.clone(), self.store.clone()) else {
             return;
         };
@@ -307,6 +308,7 @@ impl Companions {
             request: id.clone(),
             reference: reference.to_owned(),
             gateway: short_hostname(),
+            expires,
         };
         let name = phone.name.clone();
 

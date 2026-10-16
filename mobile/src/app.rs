@@ -34,9 +34,11 @@ use crate::{
     request::{RequestActor, RequestArgs, RequestMsg, Secret},
 };
 
-/// How long a read opened from a push may take to arrive once the app is up
-/// before it counts as gone; the gateway sends it as soon as the phone dials
-const PUSH_WAIT: Duration = Duration::from_secs(20);
+/// How long a read opened from a push may take to arrive once the link is
+/// up before it counts as gone; the gateway sends every read still waiting
+/// as soon as the phone dials, so one that does not come was answered
+/// elsewhere or given up
+const PUSH_WAIT: Duration = Duration::from_secs(5);
 /// How long unpairing waits for the gateway before forgetting it anyway
 const UNPAIR_TIMEOUT: Duration = Duration::from_secs(5);
 /// Seconds before the connection actor is started again after it would not
@@ -102,8 +104,14 @@ pub enum AppMsg {
         /// Where it stands
         status: ReadStatus,
     },
-    /// The wait for a read opened from a push is over
-    PushWaitOver(String),
+    /// The wait for a read opened from a push is over: its deadline passed,
+    /// or, with a link number, that link has been up a while without it
+    PushWaitOver {
+        /// The read
+        id: String,
+        /// The link the wait was for, if any
+        link: Option<u64>,
+    },
     /// Start the connection actor again, unless one runs or the gateway was
     /// forgotten meanwhile
     StartConnection,
@@ -256,6 +264,9 @@ pub struct AppActorState {
     /// gateway's deadline has passed
     denied: HashMap<String, Instant>,
     pairing: bool,
+    /// Counts changes to the link, so a wait meant for one link is not
+    /// ended by its timer after that link dropped
+    link: u64,
 }
 
 pub struct App;
@@ -454,11 +465,23 @@ impl App {
                 id,
                 reference,
                 gateway,
+                expires_at_ms,
             } => {
                 let listed = state
                     .record
                     .as_ref()
                     .is_some_and(|record| record.allows(&reference));
+                let now = now_ms();
+                let longest = now + i64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
+                let expires_at_ms = expires_at_ms.map_or(longest, |at| at.min(longest));
+                // tapped after the gateway stopped waiting: say so at once;
+                // the phone still dials, and a read that comes anyway (the
+                // clocks disagree) takes this row's place
+                let status = if expires_at_ms <= now {
+                    ReadStatus::Expired
+                } else {
+                    ReadStatus::Connecting
+                };
                 state.shared.change_reads(|reads| {
                     if reads.iter().any(|read| read.id == id) {
                         return false;
@@ -467,16 +490,24 @@ impl App {
                         id: id.clone(),
                         reference,
                         gateway_name: gateway,
-                        expires_at_ms: now_ms()
-                            + i64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(i64::MAX),
-                        status: ReadStatus::Connecting,
+                        expires_at_ms,
+                        status,
                         sealed: false,
                         listed,
                     });
 
                     true
                 });
-                myself.send_after(PUSH_WAIT, move || AppMsg::PushWaitOver(id));
+                let left = Duration::from_millis(u64::try_from(expires_at_ms - now).unwrap_or(0));
+                let waiting = id.clone();
+                myself.send_after(left, move || AppMsg::PushWaitOver {
+                    id: waiting,
+                    link: None,
+                });
+                if state.shared.state().connection == ConnectionState::Connected {
+                    let link = Some(state.link);
+                    myself.send_after(PUSH_WAIT, move || AppMsg::PushWaitOver { id, link });
+                }
                 state.foreground = true;
                 if let Some(connection) = &state.connection {
                     let _ = connection.cast(ConnMsg::Connect);
@@ -643,6 +674,7 @@ impl Actor for App {
             push: None,
             denied: HashMap::new(),
             pairing: false,
+            link: 0,
         })
     }
 
@@ -706,8 +738,23 @@ impl Actor for App {
             AppMsg::Connection(connection) => {
                 let connected = connection == ConnectionState::Connected;
                 state.shared.set_connection(connection);
-                if connected && state.push.is_some() {
+                state.link = state.link.wrapping_add(1);
+                if !connected {
+                    return Ok(());
+                }
+                if state.push.is_some() {
                     Self::send_push_token(state);
+                }
+                // reads opened from a push have a short while to arrive on
+                // the new link
+                let link = Some(state.link);
+                for read in state.shared.state().reads {
+                    if read.status == ReadStatus::Connecting {
+                        myself.send_after(PUSH_WAIT, move || AppMsg::PushWaitOver {
+                            id: read.id,
+                            link,
+                        });
+                    }
                 }
             }
             AppMsg::Incoming(incoming) => Self::incoming(&myself, state, *incoming).await,
@@ -735,7 +782,11 @@ impl Actor for App {
                         .is_some()
                 });
             }
-            AppMsg::PushWaitOver(id) => {
+            AppMsg::PushWaitOver { id, link } => {
+                // the link dropped and the gateway waits for the next one
+                if link.is_some_and(|link| link != state.link) {
+                    return Ok(());
+                }
                 if state.shared.read_status(&id) == Some(ReadStatus::Connecting) {
                     state.shared.change_reads(|reads| {
                         reads

@@ -93,8 +93,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
               let reference = info["reference"] as? String,
               let gateway = info["gateway"] as? String
         else { return }
+        // JSON numbers arrive as NSNumber; a push from an older gateway has
+        // no deadline
+        let expires = (info["expires"] as? NSNumber)?.int64Value
 
-        AppManager.shared.dispatch(.openedFromPush(id: id, reference: reference, gateway: gateway))
+        AppManager.shared.dispatch(.openedFromPush(
+            id: id,
+            reference: reference,
+            gateway: gateway,
+            expiresAtMs: expires
+        ))
     }
 
     /// While the app is open the read shows on screen, so the push stays

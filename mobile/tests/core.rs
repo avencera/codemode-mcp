@@ -9,7 +9,7 @@ use std::{
     error::Error,
     net::SocketAddr,
     sync::{Arc, Condvar, Mutex},
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use companion_core::ffi::{
@@ -696,6 +696,94 @@ async fn an_answer_made_while_the_link_is_down_goes_when_the_read_is_offered_aga
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_push_tapped_after_the_read_is_gone_does_not_wait_on_the_gateway() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _, _) = paired(&gateway).await?;
+    let status = |id: &RequestId| {
+        let state = app.state();
+        state
+            .reads
+            .iter()
+            .find(|read| read.id == id.as_str())
+            .map(|read| read.status.clone())
+    };
+
+    // past the deadline the push carries: expired as soon as it is shown
+    let late = RequestId::generate();
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    app.dispatch(AppAction::OpenedFromPush {
+        id: late.to_string(),
+        reference: REFERENCE.to_owned(),
+        gateway: "mini".to_owned(),
+        expires_at_ms: Some(now - 1_000),
+    });
+    until(&app, |_| status(&late).is_some()).await?;
+    assert_eq!(status(&late), Some(ReadStatus::Expired));
+
+    // within the deadline but answered elsewhere: the gateway never offers
+    // it on the link, so it expires soon after, not at the deadline
+    let gone = RequestId::generate();
+    let started = Instant::now();
+    app.dispatch(AppAction::OpenedFromPush {
+        id: gone.to_string(),
+        reference: REFERENCE.to_owned(),
+        gateway: "mini".to_owned(),
+        expires_at_ms: Some(now + 60_000),
+    });
+    until(&app, |_| status(&gone).is_some()).await?;
+    assert_eq!(status(&gone), Some(ReadStatus::Connecting));
+    until(&app, |_| status(&gone) == Some(ReadStatus::Expired)).await?;
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_that_drops_does_not_end_the_wait_for_a_pushed_read() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _, _) = paired(&gateway).await?;
+    let id = RequestId::generate();
+    let status = || {
+        let state = app.state();
+        state
+            .reads
+            .iter()
+            .find(|read| read.id == id.as_str())
+            .map(|read| read.status.clone())
+    };
+
+    let started = Instant::now();
+    app.dispatch(AppAction::OpenedFromPush {
+        id: id.to_string(),
+        reference: REFERENCE.to_owned(),
+        gateway: "mini".to_owned(),
+        expires_at_ms: None,
+    });
+    until(&app, |_| status().is_some()).await?;
+
+    // the link drops a second in; the phone dials again after its backoff,
+    // and the gateway offers the read on that link
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    gateway.drop_link();
+    until(&app, |state| state.connection != ConnectionState::Connected).await?;
+    until(&app, |state| state.connection == ConnectionState::Connected).await?;
+
+    // past the first link's wait, the read is still awaited
+    tokio::time::sleep(Duration::from_secs(6).saturating_sub(started.elapsed())).await;
+    assert_eq!(status(), Some(ReadStatus::Connecting));
+    let offered = tokio::spawn({
+        let gateway = gateway.clone();
+        let id = id.clone();
+        async move { gateway.offer_as(id, REFERENCE, None, 30_000).await }
+    });
+    until(&app, |_| status() == Some(ReadStatus::Waiting)).await?;
+    app.dispatch(AppAction::Deny { id: id.to_string() });
+    assert!(matches!(offered.await??, CompanionResponse::Error(_)));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestResult {
     let gateway = FakeGateway::start().await?;
     let (app, platform, _) = paired(&gateway).await?;
@@ -708,6 +796,7 @@ async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestRe
         id: id.to_string(),
         reference: REFERENCE.to_owned(),
         gateway: "mini".to_owned(),
+        expires_at_ms: None,
     });
     app.dispatch(AppAction::Deny { id: id.to_string() });
     until(&app, |state| {

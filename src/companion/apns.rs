@@ -6,10 +6,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use companion_wire::{
-    ASK_TIMEOUT,
-    mobile::{PushEnvironment, PushToken, RequestId, push_keys},
-};
+use companion_wire::mobile::{PushEnvironment, PushToken, RequestId, push_keys};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -57,6 +54,8 @@ pub struct Alert {
     pub reference: String,
     /// The gateway Mac's short name
     pub gateway: String,
+    /// When the gateway stops waiting for the answer
+    pub expires: SystemTime,
 }
 
 /// Sends pushes to the phones; cheap to clone
@@ -91,10 +90,7 @@ impl Apns {
         if !token.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(PushFailure::Gone);
         }
-        let expires = SystemTime::now()
-            .checked_add(ASK_TIMEOUT)
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |since| since.as_secs());
+        let expires = alert.expires.duration_since(UNIX_EPOCH).unwrap_or_default();
         let body = json!({
             "aps": {
                 "alert": {
@@ -110,6 +106,7 @@ impl Apns {
             push_keys::REQUEST: alert.request.as_str(),
             push_keys::REFERENCE: alert.reference,
             push_keys::GATEWAY: alert.gateway,
+            push_keys::EXPIRES: u64::try_from(expires.as_millis()).unwrap_or(u64::MAX),
         });
 
         let response = self
@@ -121,7 +118,7 @@ impl Apns {
             .header("apns-topic", &self.0.config.topic)
             .header("apns-push-type", "alert")
             .header("apns-priority", "10")
-            .header("apns-expiration", expires.to_string())
+            .header("apns-expiration", expires.as_secs().to_string())
             .header("apns-collapse-id", alert.request.as_str())
             .json(&body)
             .send()

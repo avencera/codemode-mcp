@@ -9,7 +9,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use aws_lc_rs::{
@@ -645,6 +645,10 @@ async fn a_push_wakes_the_phone_and_it_opens_the_copy_sealed_to_it() -> TestResu
         "{seen:?}"
     );
     assert!(push.body["gateway"].is_string());
+    // the deadline, so a push tapped after it shows the read as gone
+    let expires = push.body["expires"].as_u64().ok_or("no deadline")?;
+    let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    assert!(expires > now && expires <= now + 120_000, "{expires} {now}");
     assert_eq!(push.body["aps"]["interruption-level"], "time-sensitive");
 
     // addressed and signed as APNs requires

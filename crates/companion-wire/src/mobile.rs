@@ -256,6 +256,9 @@ pub mod push_keys {
     pub const REFERENCE: &str = "reference";
     /// The gateway Mac's short name
     pub const GATEWAY: &str = "gateway";
+    /// When the gateway stops waiting for the answer, in Unix milliseconds;
+    /// a push tapped later names a read that is already gone
+    pub const EXPIRES: &str = "expires";
 }
 
 mod base64_bytes {

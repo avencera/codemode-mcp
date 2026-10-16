@@ -1284,7 +1284,11 @@ public enum AppAction: Equatable, Hashable {
          */reference: String, 
         /**
          * The gateway name in the push
-         */gateway: String
+         */gateway: String, 
+        /**
+         * When the gateway stops waiting, in Unix milliseconds, if the
+         * push says
+         */expiresAtMs: Int64?
     )
     /**
      * APNs gave this token, or `None` when notifications are off
@@ -1342,7 +1346,7 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         
         case 9: return .background
         
-        case 10: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf)
+        case 10: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf), expiresAtMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
         case 11: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
@@ -1398,11 +1402,12 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             writeInt(&buf, Int32(9))
         
         
-        case let .openedFromPush(id,reference,gateway):
+        case let .openedFromPush(id,reference,gateway,expiresAtMs):
             writeInt(&buf, Int32(10))
             FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(reference, into: &buf)
             FfiConverterString.write(gateway, into: &buf)
+            FfiConverterOptionInt64.write(expiresAtMs, into: &buf)
             
         
         case let .pushToken(token,environment):
@@ -2633,6 +2638,30 @@ public func FfiConverterCallbackInterfaceReconciler_lift(_ handle: UInt64) throw
 #endif
 public func FfiConverterCallbackInterfaceReconciler_lower(_ v: Reconciler) -> UInt64 {
     return FfiConverterCallbackInterfaceReconciler.lower(v)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
 }
 
 #if swift(>=5.8)
