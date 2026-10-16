@@ -821,6 +821,33 @@ impl Harness {
         .await
     }
 
+    /// Whether any file under the daemon's state directory holds `needle`
+    pub fn state_holds(&self, needle: &str) -> bool {
+        fn holds(directory: &Path, needle: &[u8]) -> bool {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                return false;
+            };
+
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                let Ok(kind) = entry.file_type() else {
+                    return false;
+                };
+                if kind.is_dir() {
+                    return holds(&path, needle);
+                }
+
+                // reading a socket or fifo would block
+                kind.is_file()
+                    && std::fs::read(&path).is_ok_and(|bytes| {
+                        bytes.windows(needle.len()).any(|window| window == needle)
+                    })
+            })
+        }
+
+        holds(&self.state_dir, needle.as_bytes())
+    }
+
     pub async fn stop(self) -> TestResult {
         self.client.cancel().await?;
         self.server.shutdown().await?;

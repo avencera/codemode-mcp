@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::{
     config::Config,
-    secrets::{OnePassword, SecretError},
+    secrets::{OnePassword, Redactor, SecretError},
     store::{Store, StoreError},
 };
 
@@ -69,6 +69,16 @@ pub enum OAuthError {
     /// rmcp's OAuth client failed
     #[error("{0}")]
     Auth(#[from] AuthError),
+    /// The authorization server's issuer holds part of a secret `url`, so
+    /// the login is not stored
+    #[error(
+        "the authorization server's issuer for `{0}` contains part of the server's secret url; the login was not stored"
+    )]
+    IssuerHoldsUrl(String),
+    /// A failure whose text could have carried a secret `url`, with it
+    /// replaced
+    #[error("{0}")]
+    Scrubbed(String),
     /// The database failed
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -110,6 +120,15 @@ impl ClientRegistration {
     }
 }
 
+/// Whether the stored issuer names part of a secret `url`; the issuer is
+/// written to the database verbatim
+fn issuer_holds_url(credentials: &StoredCredentials, url_keys: &[String]) -> bool {
+    credentials
+        .issuer
+        .as_deref()
+        .is_some_and(|issuer| Redactor::holds_any(issuer, url_keys))
+}
+
 fn store_error(error: impl std::fmt::Display) -> AuthError {
     AuthError::CredentialStoreError(error.to_string())
 }
@@ -118,6 +137,8 @@ fn store_error(error: impl std::fmt::Display) -> AuthError {
 struct SqliteCredentialStore {
     store: Store,
     server: String,
+    /// Parts of the server's resolved `url` that an issuer must not hold
+    url_keys: Vec<String>,
 }
 
 #[async_trait]
@@ -134,6 +155,9 @@ impl CredentialStore for SqliteCredentialStore {
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
+        if issuer_holds_url(&credentials, &self.url_keys) {
+            return Err(store_error(OAuthError::IssuerHoldsUrl(self.server.clone())));
+        }
         let json = serde_json::to_string(&credentials).map_err(store_error)?;
 
         self.store
@@ -153,6 +177,8 @@ impl CredentialStore for SqliteCredentialStore {
 struct SqliteStateStore {
     store: Store,
     server: String,
+    /// Parts of the server's resolved `url` that an issuer must not hold
+    url_keys: Vec<String>,
 }
 
 fn flow_ttl_ms() -> i64 {
@@ -166,6 +192,14 @@ impl StateStore for SqliteStateStore {
         csrf_token: &str,
         state: StoredAuthorizationState,
     ) -> Result<(), AuthError> {
+        // the expected issuer is stored verbatim, so fail closed like `issuer_holds_url`
+        if state
+            .expected_issuer
+            .as_deref()
+            .is_some_and(|issuer| Redactor::holds_any(issuer, &self.url_keys))
+        {
+            return Err(store_error(OAuthError::IssuerHoldsUrl(self.server.clone())));
+        }
         let json = serde_json::to_string(&state).map_err(store_error)?;
 
         self.store
@@ -205,6 +239,7 @@ enum ClientSource {
 /// OAuth settings of one configured server
 #[derive(Debug, Clone)]
 struct OAuthServer {
+    /// As configured: it may hold references and is read only when used
     url: String,
     scopes: Vec<String>,
     client: ClientSource,
@@ -244,8 +279,10 @@ pub struct Callback {
 /// Logins of every `oauth = true` server
 pub struct OAuth {
     store: Store,
-    /// Reads client secrets at login
+    /// Reads client secrets at login and `url` references
     onepassword: OnePassword,
+    /// Keeps a resolved `url` out of error text; rmcp's errors print it
+    redactor: Arc<Redactor>,
     servers: BTreeMap<String, OAuthServer>,
     /// Every configured server, to tell unknown names from non-OAuth ones
     configured: BTreeSet<String>,
@@ -290,6 +327,7 @@ impl OAuth {
         Arc::new(Self {
             store,
             onepassword,
+            redactor: Redactor::shared(config),
             servers,
             configured: config.servers.keys().cloned().collect(),
             callback_base: RwLock::new(None),
@@ -331,10 +369,39 @@ impl OAuth {
         })
     }
 
+    /// The server's `url` with its references read, and the parts of it an
+    /// issuer must not hold
+    ///
+    /// Nothing is stored under it: logins, flows and registrations are all
+    /// keyed by the server name, so a key in the URL never reaches the database
+    async fn resolved_url(
+        &self,
+        server: &OAuthServer,
+    ) -> Result<(String, Vec<String>), OAuthError> {
+        let resolved = self.onepassword.resolve_url(&server.url).await?;
+        self.redactor.add(resolved.secrets);
+
+        Ok((resolved.url, resolved.keys))
+    }
+
+    /// Replaces a secret `url` in the text of a failure
+    fn scrub(&self, error: OAuthError) -> OAuthError {
+        match error {
+            OAuthError::Auth(_) | OAuthError::Refused(_) | OAuthError::Corrupt(_) => {
+                OAuthError::Scrubbed(self.redactor.apply(&error.to_string()))
+            }
+            other => other,
+        }
+    }
+
     /// A manager with discovered metadata; refuses servers that publish none
-    async fn discovered(&self, name: &str) -> Result<AuthorizationManager, OAuthError> {
+    async fn discovered(
+        &self,
+        name: &str,
+    ) -> Result<(AuthorizationManager, Vec<String>), OAuthError> {
         let server = self.server(name)?;
-        let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
+        let (url, keys) = self.resolved_url(server).await?;
+        let mut manager = AuthorizationManager::new(url.as_str()).await?;
         let resolution = manager.resolve_metadata().await?;
         if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
             return Err(OAuthError::NoMetadata(name.to_owned()));
@@ -343,17 +410,24 @@ impl OAuth {
         manager.set_state_store(SqliteStateStore {
             store: self.store.clone(),
             server: name.to_owned(),
+            url_keys: keys.clone(),
         });
 
-        Ok(manager)
+        Ok((manager, keys))
     }
 
     /// Starts a login: discovery, client registration and a PKCE
     /// authorization URL for the browser
     pub async fn start_login(&self, name: &str) -> Result<String, OAuthError> {
+        self.begin_login(name)
+            .await
+            .map_err(|error| self.scrub(error))
+    }
+
+    async fn begin_login(&self, name: &str) -> Result<String, OAuthError> {
         let server = self.server(name)?.clone();
         let redirect_uri = self.redirect_uri(name)?;
-        let mut manager = self.discovered(name).await?;
+        let (mut manager, _) = self.discovered(name).await?;
 
         let defaults: Vec<&str> = server.scopes.iter().map(String::as_str).collect();
         let scopes = manager.select_scopes(None, &defaults);
@@ -377,6 +451,13 @@ impl OAuth {
         };
         let url = manager.get_authorization_url(&scopes).await?;
         let url = with_params(&url, &server.authorization_params)?;
+        // the CLI prints this link, and rmcp sets `resource` to the server's
+        // URL, which would be the key
+        let url = if server.url.contains("{{") {
+            without_param(&url, "resource")?
+        } else {
+            url
+        };
 
         // the state store row exists now; attach the registration to it so
         // the callback can rebuild the client
@@ -412,6 +493,12 @@ impl OAuth {
     /// Completes a login from the browser's callback and stores the
     /// registration with the tokens
     pub async fn finish_login(&self, name: &str, callback: &Callback) -> Result<(), OAuthError> {
+        self.complete_login(name, callback)
+            .await
+            .map_err(|error| self.scrub(error))
+    }
+
+    async fn complete_login(&self, name: &str, callback: &Callback) -> Result<(), OAuthError> {
         self.server(name)?;
         if let Some(error) = &callback.error {
             if let Some(csrf) = &callback.state {
@@ -430,7 +517,7 @@ impl OAuth {
         let registration: ClientRegistration = serde_json::from_str(&client)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
 
-        let mut manager = self.discovered(name).await?;
+        let (mut manager, url_keys) = self.discovered(name).await?;
         // the tokens land here first and reach SQLite only together with
         // the registration
         let staging = InMemoryCredentialStore::new();
@@ -444,6 +531,10 @@ impl OAuth {
             .load()
             .await?
             .ok_or_else(|| OAuthError::Corrupt("no tokens after the exchange".into()))?;
+        // fail closed: the issuer is stored verbatim
+        if issuer_holds_url(&credentials, &url_keys) {
+            return Err(OAuthError::IssuerHoldsUrl(name.to_owned()));
+        }
         let credentials = serde_json::to_string(&credentials)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
         self.store.save_oauth_login(name, &client, &credentials)?;
@@ -457,6 +548,15 @@ impl OAuth {
         &self,
         name: &str,
     ) -> Result<Option<AuthClient<reqwest::Client>>, OAuthError> {
+        self.signed_client(name)
+            .await
+            .map_err(|error| self.scrub(error))
+    }
+
+    async fn signed_client(
+        &self,
+        name: &str,
+    ) -> Result<Option<AuthClient<reqwest::Client>>, OAuthError> {
         let server = self.server(name)?;
         let Some((client, _)) = self.store.oauth_login(name)? else {
             return Ok(None);
@@ -464,10 +564,12 @@ impl OAuth {
         let registration: ClientRegistration = serde_json::from_str(&client)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
 
-        let mut manager = AuthorizationManager::new(server.url.as_str()).await?;
+        let (url, url_keys) = self.resolved_url(server).await?;
+        let mut manager = AuthorizationManager::new(url.as_str()).await?;
         manager.set_credential_store(SqliteCredentialStore {
             store: self.store.clone(),
             server: name.to_owned(),
+            url_keys,
         });
         // false when the tokens were dropped, e.g. after the issuer changed
         if !manager.initialize_from_store().await? {
@@ -532,6 +634,20 @@ impl OAuth {
 
         Ok(self.store.remove_oauth_login(name)?)
     }
+}
+
+/// `url` without the query parameter `name`
+fn without_param(url: &str, name: &str) -> Result<String, OAuthError> {
+    let mut parsed =
+        reqwest::Url::parse(url).map_err(|error| OAuthError::Corrupt(error.to_string()))?;
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != name)
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    parsed.query_pairs_mut().clear().extend_pairs(kept);
+
+    Ok(parsed.into())
 }
 
 /// `url` with `params` added to its query, replacing any of the same name

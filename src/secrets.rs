@@ -1,17 +1,19 @@
-//! Secrets in upstream configuration: `{{ op://vault/item/field }}`
-//! references in `headers` and `env`, read through the 1Password CLI when a
-//! server first connects, and the redactor that keeps configured and
-//! resolved values out of text handed to scripts
+//! `{{ op://vault/item/field }}` references in a server's `headers`, `env`
+//! and `url`, read through the 1Password CLI when it first connects, and the
+//! redactor that keeps secrets out of scripts' text and the logs
 //!
 //! The braces follow `op inject`'s template syntax, so a value can mix text
 //! and references, e.g. `Bearer {{ op://Dev/Context7/credential }}`
 
+mod logs;
 mod spawn;
+
+pub use logs::{RedactingMakeWriter, redacting_logs};
 
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{Arc, OnceLock, PoisonError, RwLock},
     time::Duration,
 };
 
@@ -84,6 +86,9 @@ pub enum SecretError {
     /// out of the message in case it is a pasted secret
     #[error("the text between `{{{{` and `}}}}` must be an op://vault/item/field reference")]
     NotAReference,
+    /// A resolved `url` is not a URL; the value is left out of the message
+    #[error("the `url` is not a valid URL once its references are read")]
+    NotAUrl,
     /// `op` could not be started
     #[error("failed to start `{program}`: {source}")]
     Spawn {
@@ -173,6 +178,71 @@ pub fn is_reference(text: &str) -> bool {
     })
 }
 
+/// The parts of a URL that can hold a key: userinfo, path and query as a
+/// whole and piece by piece, plus the URL itself in the encodings an
+/// authorization server echoes back
+fn url_secrets(url: &str) -> Vec<String> {
+    let mut secrets = vec![url.to_owned()];
+    secrets.extend(encodings(url));
+
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return secrets;
+    };
+    // rmcp builds `.well-known` URLs from the path without its last `/`
+    let path = parsed.path();
+    secrets.push(path.to_owned());
+    secrets.push(path.trim_end_matches('/').to_owned());
+    secrets.extend(path.split('/').map(str::to_owned));
+    if let Some(query) = parsed.query() {
+        secrets.push(query.to_owned());
+        let raw_values = query
+            .split('&')
+            .map(|pair| pair.split_once('=').map_or(pair, |(_, value)| value));
+        secrets.extend(raw_values.map(str::to_owned));
+    }
+    secrets.extend(parsed.query_pairs().map(|(_, value)| value.into_owned()));
+    if !parsed.username().is_empty() {
+        secrets.push(parsed.username().to_owned());
+    }
+    secrets.extend(parsed.password().map(str::to_owned));
+
+    secrets
+}
+
+/// `text` percent-encoded the ways a query string carries a URL: form
+/// encoding (`application/x-www-form-urlencoded`), the unreserved set only,
+/// and every non-alphanumeric byte
+fn encodings(text: &str) -> [String; 3] {
+    fn encode(text: &str, kept: &[u8]) -> String {
+        let mut encoded = String::with_capacity(text.len() * 2);
+        for byte in text.bytes() {
+            if byte.is_ascii_alphanumeric() || kept.contains(&byte) {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+
+        encoded
+    }
+
+    [
+        encode(text, b"*-._"),
+        encode(text, b"-._~"),
+        encode(text, b""),
+    ]
+}
+
+/// Whether the URL's host is `localhost` or an IP address, which every local
+/// server shares and redacting would blank out of unrelated output
+fn is_local_host(url: &reqwest::Url) -> bool {
+    url.domain().is_none_or(|name| {
+        let name = name.to_ascii_lowercase();
+
+        name == "localhost" || name.ends_with(".localhost")
+    })
+}
+
 /// Checks a configured value's references without reading them
 pub fn check(value: &str) -> Result<(), SecretError> {
     pieces(value).map(|_| ())
@@ -187,6 +257,18 @@ pub fn references(value: &str) -> Result<Vec<&str>, SecretError> {
             Piece::Text(_) => None,
         })
         .collect())
+}
+
+/// A server `url` with its references replaced
+pub struct ResolvedUrl {
+    /// The URL to connect to; never to be logged or stored
+    pub url: String,
+    /// Everything in it that must stay out of text, for the redactor: `keys`
+    /// and the host
+    pub secrets: Vec<String>,
+    /// What can hold a key, without the host, which an authorization server
+    /// on the same host legitimately shares
+    pub keys: Vec<String>,
 }
 
 /// Values with their references replaced, and the secrets that were read
@@ -260,21 +342,56 @@ impl OnePassword {
         };
 
         for (key, value) in values {
-            let mut text = String::with_capacity(value.len());
-            for piece in pieces(value)? {
-                match piece {
-                    Piece::Text(literal) => text.push_str(literal),
-                    Piece::Reference(reference) => {
-                        let secret = self.value(reference).await?;
-                        text.push_str(&secret);
-                        resolved.secrets.push(secret);
-                    }
-                }
-            }
+            let text = self.resolve_text(value, &mut resolved.secrets).await?;
             resolved.values.insert(key.clone(), text);
         }
 
         Ok(resolved)
+    }
+
+    /// An HTTP server's `url` with its references read
+    ///
+    /// The whole URL is a secret when a reference stands in it, so the
+    /// redactor also gets the URL's own parts: errors from the HTTP client
+    /// print the normalized URL, host or path rather than what 1Password held
+    pub async fn resolve_url(&self, template: &str) -> Result<ResolvedUrl, SecretError> {
+        let mut read = Vec::new();
+        let url = self.resolve_text(template, &mut read).await?;
+        let url = url.trim().to_owned();
+        let parsed = reqwest::Url::parse(&url).map_err(|_| SecretError::NotAUrl)?;
+        let mut keys = read;
+        let mut secrets = Vec::new();
+        if !keys.is_empty() {
+            keys.extend(url_secrets(&url));
+            keys.extend(url_secrets(parsed.as_str()));
+            secrets.extend(keys.iter().cloned());
+            // reqwest prints the host
+            if !is_local_host(&parsed) {
+                secrets.extend(parsed.host_str().map(str::to_owned));
+            }
+        }
+
+        Ok(ResolvedUrl { url, secrets, keys })
+    }
+
+    async fn resolve_text(
+        &self,
+        value: &str,
+        secrets: &mut Vec<String>,
+    ) -> Result<String, SecretError> {
+        let mut text = String::with_capacity(value.len());
+        for piece in pieces(value)? {
+            match piece {
+                Piece::Text(literal) => text.push_str(literal),
+                Piece::Reference(reference) => {
+                    let secret = self.value(reference).await?;
+                    text.push_str(&secret);
+                    secrets.push(secret);
+                }
+            }
+        }
+
+        Ok(text)
     }
 
     async fn value(&self, reference: &str) -> Result<String, SecretError> {
@@ -425,7 +542,7 @@ impl OnePassword {
 
 /// Replaces secrets in text that came from an upstream: configured header
 /// and env values, URL query strings and userinfo, and values read from
-/// 1Password once a server has connected
+/// 1Password (a `url` included) once a server has connected
 #[derive(Default)]
 pub struct Redactor(RwLock<Vec<String>>);
 
@@ -438,8 +555,31 @@ impl std::fmt::Debug for Redactor {
 }
 
 impl Redactor {
+    /// The process's one redactor, which also scrubs the daemon's logs, since
+    /// libraries print the URL they were connecting to; starts with the
+    /// secrets written into `config`
+    pub fn shared(config: &Config) -> Arc<Self> {
+        let redactor = Arc::clone(Self::log());
+        redactor.add(Self::configured(config));
+
+        redactor
+    }
+
+    fn log() -> &'static Arc<Self> {
+        static SHARED: OnceLock<Arc<Redactor>> = OnceLock::new();
+
+        SHARED.get_or_init(Arc::default)
+    }
+
     /// Starts with the secrets written into `config`
     pub fn new(config: &Config) -> Self {
+        let redactor = Self::default();
+        redactor.add(Self::configured(config));
+
+        redactor
+    }
+
+    fn configured(config: &Config) -> Vec<String> {
         let mut secrets = Vec::new();
         for server in config.servers.values() {
             // a value with references holds no secret until it is resolved
@@ -454,7 +594,8 @@ impl Redactor {
                     secrets.push(token.to_owned());
                 }
             }
-            if let Some(url) = server.url.as_deref() {
+            // a url with references holds no secret until it is resolved
+            if let Some(url) = server.url.as_deref().filter(|url| !url.contains("{{")) {
                 if let Some((_, query)) = url.split_once('?') {
                     secrets.push(query.to_owned());
                 }
@@ -469,10 +610,7 @@ impl Redactor {
             }
         }
 
-        let redactor = Self::default();
-        redactor.add(secrets);
-
-        redactor
+        secrets
     }
 
     /// Redacts these too from now on
@@ -483,18 +621,36 @@ impl Redactor {
                 .into_iter()
                 .filter(|secret| secret.len() >= MIN_SECRET_LEN),
         );
-        // longest first, so a secret that contains another is replaced whole
-        known.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        // longest first, so a secret that contains another is replaced whole;
+        // ties sort by text so `dedup` sees every duplicate and reconnects
+        // do not grow the list
+        known.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         known.dedup();
+    }
+
+    /// Whether `text` holds any secret that `keys` lists
+    pub fn holds_any(text: &str, keys: &[String]) -> bool {
+        keys.iter()
+            .any(|key| key.len() >= MIN_SECRET_LEN && text.contains(key.as_str()))
+    }
+
+    /// `text` with every known secret replaced
+    pub fn scrub(&self, text: &str) -> String {
+        let known = self.0.read().unwrap_or_else(PoisonError::into_inner);
+
+        known.iter().fold(text.to_owned(), |text, secret| {
+            if text.contains(secret.as_str()) {
+                text.replace(secret.as_str(), REDACTED)
+            } else {
+                text
+            }
+        })
     }
 
     /// `text` with every known secret replaced, cut to a length fit for a
     /// script
     pub fn apply(&self, text: &str) -> String {
-        let known = self.0.read().unwrap_or_else(PoisonError::into_inner);
-        let mut text = known.iter().fold(text.to_owned(), |text, secret| {
-            text.replace(secret.as_str(), REDACTED)
-        });
+        let mut text = self.scrub(text);
         if text.len() > MAX_ERROR_TEXT {
             let mut end = MAX_ERROR_TEXT;
             while !text.is_char_boundary(end) {

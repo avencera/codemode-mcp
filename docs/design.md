@@ -471,9 +471,9 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - `oauth status` shows login state, scopes, expiry and whether a refresh token exists, never token values;
   `oauth logout <server>` deletes the login and reconnects anonymously
 
-### Secrets in headers and env
+### Secrets in headers, env and url
 
-- A `headers` or `env` value can hold `{{ op://vault/item/field }}` references (`op inject`'s template syntax),
+- A `headers`, `env` or HTTP `url` value can hold `{{ op://vault/item/field }}` references (`op inject`'s template syntax),
   alone or inside text, e.g. `Bearer {{ op://Dev/Context7/credential }}`. Malformed references fail at config load,
   and the error never quotes the text between the braces in case it is a pasted secret
 - The first connect runs `op read --no-newline <reference>` for each one (`[secrets] op`, default `op` on `PATH`),
@@ -490,6 +490,14 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - Values read are added to the redactor that already scrubs configured header and env values, URL query strings
   and userinfo from upstream error text before a script sees it, and from stdio servers' stderr before it is
   logged
+- A `url` is parsed as a URL at config load only when it holds no reference; one with references is parsed after
+  they are read (`SecretError::NotAUrl`, reported as a `configuration` failure). It is resolved at the same point
+  in the connect path as `headers` and `env`, through the same reader and cache. The redactor learns the whole
+  URL, its normalized form, host, path and query, and the daemon's log writer (`secrets::redacting_logs`) scrubs
+  with the same redactor, because rmcp and reqwest print the URL in their own log events. Only the template is
+  shown or stored: OAuth logins, flows and registrations are keyed by server name, never by URL, so a key in the
+  URL does not reach `codemode.sqlite`; the authorization link omits rmcp's `resource` parameter (it would be the
+  URL) for a `url` with references
 
 ### Companions (`src/companion.rs`)
 

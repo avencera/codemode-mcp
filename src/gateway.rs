@@ -241,7 +241,7 @@ impl Gateway {
         store: &Store,
         secrets: Secrets,
     ) -> Arc<Self> {
-        let redactor = Arc::new(Redactor::new(&config));
+        let redactor = Redactor::shared(&config);
         let Secrets {
             onepassword,
             companions,

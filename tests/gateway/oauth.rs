@@ -34,7 +34,7 @@ use super::harness::{Harness, Setup, TestResult};
 
 /// The protected MCP server's only tool
 #[derive(Clone)]
-struct Locked;
+pub(super) struct Locked;
 
 #[tool_router]
 impl Locked {
@@ -84,6 +84,10 @@ struct Mock {
     base: String,
     client: Client,
     issued: Arc<Issued>,
+    /// Appended to the issuer the metadata names
+    issuer_path: String,
+    /// Makes registration fail with this text in the error
+    register_echo: Option<String>,
 }
 
 async fn require_token(State(mock): State<Mock>, request: Request, next: Next) -> Response {
@@ -113,13 +117,13 @@ async fn require_token(State(mock): State<Mock>, request: Request, next: Next) -
 async fn protected_resource(State(mock): State<Mock>) -> Json<Value> {
     Json(json!({
         "resource": format!("{}/mcp", mock.base),
-        "authorization_servers": [mock.base],
+        "authorization_servers": [format!("{}{}", mock.base, mock.issuer_path)],
     }))
 }
 
 async fn authorization_server(State(mock): State<Mock>) -> Json<Value> {
     let mut metadata = json!({
-        "issuer": mock.base,
+        "issuer": format!("{}{}", mock.base, mock.issuer_path),
         "authorization_endpoint": format!("{}/authorize", mock.base),
         "token_endpoint": format!("{}/token", mock.base),
         "response_types_supported": ["code"],
@@ -134,7 +138,17 @@ async fn authorization_server(State(mock): State<Mock>) -> Json<Value> {
     Json(metadata)
 }
 
-async fn register(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    if let Some(echo) = &mock.register_echo {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_client_metadata",
+                "error_description": format!("cannot register for {echo}"),
+            })),
+        );
+    }
+
     (
         StatusCode::CREATED,
         Json(json!({
@@ -201,11 +215,23 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Starts the mock and returns its base URL
 async fn start_mock(client: Client) -> Result<Mock, Box<dyn std::error::Error>> {
+    start_mock_with(client, String::new(), None).await
+}
+
+/// A mock whose issuer carries `issuer_path` and whose registration, when
+/// `register_echo` is set, fails with that text
+async fn start_mock_with(
+    client: Client,
+    issuer_path: String,
+    register_echo: Option<String>,
+) -> Result<Mock, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let mock = Mock {
         base: format!("http://127.0.0.1:{}", listener.local_addr()?.port()),
         client,
         issued: Arc::new(Issued::default()),
+        issuer_path,
+        register_echo,
     };
 
     let mcp = StreamableHttpService::new(
@@ -227,6 +253,10 @@ async fn start_mock(client: Client) -> Result<Mock, Box<dyn std::error::Error>> 
         )
         .route(
             "/.well-known/oauth-authorization-server",
+            get(authorization_server),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/{*issuer_path}",
             get(authorization_server),
         )
         .route("/register", post(register))
@@ -449,6 +479,134 @@ async fn oauth_login_uses_a_client_registered_ahead_of_time() -> TestResult {
     let called = harness.execute_json("await known_hello()").await?;
     assert_eq!(called["result"], "hello", "{called}");
     assert!(mock.issued.refreshes.load(Ordering::SeqCst) > 0);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_resolves_a_url_held_in_1password_without_storing_it() -> TestResult {
+    let mock = start_mock(Client::Registered).await?;
+    let (op, _) = super::secrets::fake_op()?;
+    let key = super::secrets::URL_KEY;
+    std::fs::write(
+        op.with_file_name("url"),
+        format!("{}/mcp?api_key={key}", mock.base),
+    )?;
+    let extra = format!(
+        "[secrets]\nop = \"{op}\"\n\n\
+         [servers.locked]\n\
+         url = \"{{{{ op://Dev/mcpurl/credential }}}}\"\n\
+         oauth = true\n\
+         client_name = \"codemode test\"",
+        op = op.display()
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&harness, "locked", "needs_login").await?;
+
+    let (callback, url) = begin_login(&harness, &mock, "locked").await?;
+    // the CLI prints this link, and rmcp would put the server URL in it
+    assert!(!url.contains(key), "{url}");
+    assert!(query_value(&url, "resource").is_none(), "{url}");
+    let page = harness.http.get(&callback).send().await?;
+    assert_eq!(page.status().as_u16(), 200);
+
+    wait_for_state(&harness, "locked", "connected").await?;
+    let called = harness.execute_json("await locked_hello()").await?;
+    assert_eq!(called["result"], "hello", "{called}");
+    assert!(!harness.state_holds(key));
+
+    harness.stop().await
+}
+
+/// Config of a `locked` server whose `url` is read from the fake `op`
+fn op_url_config(op: &std::path::Path) -> String {
+    format!(
+        "[secrets]\nop = \"{op}\"\n\n\
+         [servers.locked]\n\
+         url = \"{{{{ op://Dev/mcpurl/credential }}}}\"\n\
+         oauth = true\n\
+         client_name = \"codemode test\"",
+        op = op.display()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_failure_that_echoes_the_resolved_url_comes_back_scrubbed() -> TestResult {
+    let key = super::secrets::URL_KEY;
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_with(
+        Client::Registered,
+        String::new(),
+        Some("the url http://example.invalid/mcp/zk-9f3a71c2d8b4e6/sse".into()),
+    )
+    .await?;
+    std::fs::write(
+        op.with_file_name("url"),
+        format!("{}/mcp?api_key={key}", mock.base),
+    )?;
+    let extra = op_url_config(&op);
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&harness, "locked", "needs_login").await?;
+
+    let (status, body) = harness
+        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .await?;
+    assert_eq!(status, 502, "{body}");
+    let text = body["error"].as_str().unwrap_or_default();
+    assert!(text.contains("[redacted]"), "{body}");
+    assert!(!text.contains(key), "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_refuses_an_issuer_that_holds_part_of_the_url() -> TestResult {
+    let key = super::secrets::URL_KEY;
+    let (op, _) = super::secrets::fake_op()?;
+    let mock = start_mock_with(Client::Registered, format!("/{key}"), None).await?;
+    std::fs::write(
+        op.with_file_name("url"),
+        format!("{}/mcp?api_key={key}", mock.base),
+    )?;
+    let extra = op_url_config(&op);
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&harness, "locked", "needs_login").await?;
+
+    // the pending flow stores the expected issuer, so the login is refused
+    // before the browser is sent anywhere
+    let (status, body) = harness
+        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .await?;
+    assert_ne!(status, 200, "{body}");
+    assert!(body.to_string().contains("issuer"), "{body}");
+    assert!(!body.to_string().contains(key), "{body}");
+
+    let (_, status) = harness
+        .admin_json("/admin/oauth/status", &Value::Null)
+        .await?;
+    assert_eq!(status["servers"][0]["logged_in"], false, "{status}");
+    assert!(!harness.state_holds(key));
 
     harness.stop().await
 }

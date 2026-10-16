@@ -831,7 +831,9 @@ pub struct ServerConfig {
     /// Seconds a `lazy` server may go without calls before it is stopped
     #[serde(default = "default_idle_secs")]
     pub idle_secs: u64,
-    /// Endpoint of a Streamable HTTP server
+    /// Endpoint of a Streamable HTTP server; may hold `{{ op://... }}`
+    /// references for a URL that carries a key, and is then never shown
+    /// resolved
     #[serde(default)]
     pub url: Option<String>,
     /// Static headers sent with every HTTP request
@@ -984,7 +986,8 @@ pub enum Transport<'a> {
     },
     /// Connect to a Streamable HTTP endpoint
     Http {
-        /// Endpoint URL
+        /// Endpoint URL as configured, which may hold `{{ op://... }}`
+        /// references; read them with `OnePassword::resolve_url`
         url: &'a str,
     },
 }
@@ -1048,6 +1051,16 @@ impl ServerConfig {
             crate::secrets::check(secret).map_err(|error| {
                 ConfigError::Invalid(format!("servers.{name}.client_secret: {error}"))
             })?;
+        }
+        if let Some(url) = &self.url {
+            crate::secrets::check(url)
+                .map_err(|error| ConfigError::Invalid(format!("servers.{name}.url: {error}")))?;
+            // a url with references is parsed once they are read
+            if !url.contains("{{") && reqwest::Url::parse(url).is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "servers.{name}.url: not a valid URL"
+                )));
+            }
         }
 
         match (&self.command, &self.url) {
@@ -1182,6 +1195,9 @@ mod tests {
         assert!(parse("surprise = 1").is_err());
         assert!(parse("[servers.a]\ncommand = \"x\"\nurl = \"http://y\"").is_err());
         assert!(parse("[servers.a]\npolicy = \"allow\"").is_err());
+        assert!(parse("[servers.a]\nurl = \"not a url\"").is_err());
+        assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho/credential }}\"").is_ok());
+        assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho\"").is_err());
         assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
         assert!(parse("[servers.a]\ncommand = \"x\"\noauth = true").is_err());
         assert!(parse("[servers.a]\nurl = \"https://y\"\nscopes = [\"s\"]").is_err());
