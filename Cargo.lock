@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "codemode-mcp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "axum",
