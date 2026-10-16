@@ -494,6 +494,11 @@ pub enum CompanionCreateResponse {
         /// Why, in the companion's words or the connection's
         message: String,
     },
+    /// No answer came, so the item may or may not exist
+    Unconfirmed {
+        /// What went wrong
+        message: String,
+    },
 }
 
 /// Admin routes; serve them with connect info so the peer can be checked
@@ -1014,6 +1019,11 @@ async fn companion_create(
         },
         Err(CompanionFailure::Refused { message, .. }) => {
             CompanionCreateResponse::Refused { message }
+        }
+        Err(failure @ CompanionFailure::CreateUnconfirmed { .. }) => {
+            CompanionCreateResponse::Unconfirmed {
+                message: failure.to_string(),
+            }
         }
         Err(failure) => CompanionCreateResponse::Refused {
             message: failure.to_string(),

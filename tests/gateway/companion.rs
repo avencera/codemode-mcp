@@ -59,6 +59,8 @@ struct Options<'a> {
     /// Whether another `op` on the companion's Mac is approved each time a
     /// notification shows, so its `op` is no longer signed out
     authorized_on_notify: bool,
+    /// Whether the companion's `op item create` pauses, so its answer can be lost
+    slow_create: bool,
 }
 
 impl Default for Options<'_> {
@@ -74,6 +76,7 @@ impl Default for Options<'_> {
             signed_in: true,
             notify_fails: false,
             authorized_on_notify: false,
+            slow_create: false,
         }
     }
 }
@@ -91,6 +94,7 @@ impl Rig {
             signed_in,
             notify_fails,
             authorized_on_notify,
+            slow_create,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -102,7 +106,7 @@ impl Rig {
             iroh::SecretKey::generate().public()
         };
 
-        let (companion_op, companion_log) = creating_op(signed_in)?;
+        let (companion_op, companion_log) = creating_op(signed_in, slow_create)?;
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
         companion_mac.set_notify_fails(notify_fails);
@@ -223,8 +227,9 @@ const OP_ECHOED_VALUE: &str = "echoed-by-op-secret";
 /// environment and the template it was given on stdin, beside `reads.log`
 ///
 /// Unless `signed_in`, `whoami` fails until the first read, as if that read
-/// showed 1Password's prompt and was approved
-fn creating_op(signed_in: bool) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+/// showed 1Password's prompt and was approved. With `slow_create`, `item
+/// create` pauses after reading its template
+fn creating_op(signed_in: bool, slow_create: bool) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
     let log = directory.join("reads.log");
@@ -246,12 +251,16 @@ fn creating_op(signed_in: bool) -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                  [ \"$3\" = {REFERENCE} ] && printf '{VALUE}' && exit 0\n\
                  [ \"$3\" = op://Dev/big/credential ] && head -c 70000 /dev/zero | tr '\\0' a && exit 0\n\
                  echo \"[ERROR] no item matched\" >&2; exit 1 ;;\n\
-               'item list') printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}}]' ;;\n\
+               'item list') case \"$*\" in\n\
+                   *--include-archive*) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}},{{\"id\":\"old2\",\"title\":\"Archived\"}}]' ;;\n\
+                   *) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}}]' ;;\n\
+                 esac ;;\n\
                'item create') cat > \"$d/stdin.log\"\n\
-                 printf '{{\"id\":\"newid123\",\"fields\":[{{\"value\":\"{OP_ECHOED_VALUE}\"}}]}}' ;;\n\
+                 {pause}printf '{{\"id\":\"newid123\",\"fields\":[{{\"value\":\"{OP_ECHOED_VALUE}\"}}]}}' ;;\n\
                *) exit 2 ;;\n\
              esac\n",
             directory = directory.display(),
+            pause = if slow_create { "sleep 5; " } else { "" },
         ),
     )?;
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
@@ -402,6 +411,8 @@ async fn names_that_are_not_plain_ascii_are_refused_before_anyone_is_asked() -> 
         "a/b",
         "line\nbreak",
         "-leading-dash",
+        "Bank?attribute=password",
+        "${HOME}",
         "say \"hi\"",
         "back\\slash",
         " leading space",
@@ -413,7 +424,7 @@ async fn names_that_are_not_plain_ascii_are_refused_before_anyone_is_asked() -> 
         for (vault, title) in [("Personal", name), (name, "Zoho")] {
             let body = create(&rig, vault, title).await?;
             let message = body["refused"]["message"].as_str().unwrap_or_default();
-            assert!(message.contains("printable ASCII"), "{name:?}: {body}");
+            assert!(message.contains("ASCII letters"), "{name:?}: {body}");
         }
     }
 
@@ -429,7 +440,8 @@ async fn an_existing_title_is_never_overwritten() -> TestResult {
         return Ok(());
     };
 
-    for title in ["Existing", "existing"] {
+    // `Archived` is listed only when `--include-archive` is passed
+    for title in ["Existing", "existing", "Archived"] {
         let body = create(&rig, "Personal", title).await?;
         let message = body["refused"]["message"].as_str().unwrap_or_default();
         assert!(message.contains("already exists"), "{body}");
@@ -458,6 +470,56 @@ async fn a_create_that_touch_id_does_not_approve_writes_nothing() -> TestResult 
     assert!(!op_file(&rig.companion_log, "argv.log").contains("item"));
 
     rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_that_loses_its_answer_may_have_made_the_item() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        slow_create: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let Rig {
+        harness,
+        companion,
+        companion_log: log,
+        ..
+    } = rig;
+    let asking = async {
+        let (status, body) = harness
+            .admin_json(
+                "/admin/companion/create",
+                &json!({ "vault": "Personal", "title": "Zoho MCP infraops", "value": SECRET }),
+            )
+            .await?;
+        assert_eq!(status, 200, "{body}");
+
+        Ok::<_, Box<dyn Error>>(body)
+    };
+    // the companion goes away once `op item create` has started, as a lost
+    // connection would
+    let stopping = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !op_file(&log, "argv.log").contains("item create") {
+            assert!(std::time::Instant::now() < deadline, "create never started");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // the hung-up connection is what matters; the detached create keeps
+        // the companion's accept task busy until its own deadline
+        let _ = tokio::time::timeout(Duration::from_secs(3), companion.shutdown()).await;
+    };
+    let (body, ()) = tokio::join!(asking, stopping);
+    let body = body?;
+
+    let message = body["unconfirmed"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("may have been created"), "{body}");
+    assert!(body.get("refused").is_none(), "{body}");
+
+    harness.stop().await
 }
 
 /// An `op` that logs the read, then its pid beside the log, then never

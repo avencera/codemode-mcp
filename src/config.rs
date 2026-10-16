@@ -621,8 +621,8 @@ impl CompanionConfig {
         for vault in &self.create_vaults {
             if !crate::secrets::is_item_name(vault) {
                 return Err(ConfigError::Invalid(
-                    "companion.create_vaults entries must be vault names: printable ASCII \
-                     without `/`, `\\` or `\"`, no leading `-`, no leading or trailing space"
+                    "companion.create_vaults entries must be vault names: ASCII letters, \
+                     digits, spaces, `-`, `_` or `.`, no leading `-`, no leading or trailing space"
                         .into(),
                 ));
             }

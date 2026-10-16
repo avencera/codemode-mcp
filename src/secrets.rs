@@ -467,18 +467,19 @@ fn unescaped_with_spans(bytes: &[u8], mode: Unescape) -> Decoded {
 /// Whether `text` can be a vault name, item title or field label in a new
 /// item's `op://vault/title/field` reference
 ///
-/// Printable ASCII only, so no Unicode lookalike, invisible or combining
-/// character can pass for another name and the duplicate check is exact. It
-/// also rules out `/` (the reference's separator), `"` and `\` (they break
-/// quoting in the prompt and the reference), a leading `-` (read as an `op`
-/// option) and leading or trailing space. Owners can rename an item in
-/// 1Password afterwards
+/// ASCII letters, digits, space, `-`, `_` and `.` only, the characters a
+/// secret reference allows. No Unicode lookalike, invisible or combining
+/// character can pass for another name, the duplicate check is exact, and
+/// `?` (starts an attribute query), `$` (variable substitution), `/` (the
+/// separator), quotes and `\` cannot make a reference that reads another
+/// item. A leading `-` (read as an `op` option) and leading or trailing
+/// space are refused too. Owners can rename an item in 1Password afterwards
 pub fn is_item_name(text: &str) -> bool {
     !text.is_empty()
         && text.chars().count() <= MAX_ITEM_NAME_CHARS
         && text
             .chars()
-            .all(|character| (' '..='~').contains(&character) && !"\"\\/".contains(character))
+            .all(|character| character.is_ascii_alphanumeric() || " -_.".contains(character))
         && !text.starts_with(['-', ' '])
         && !text.ends_with(' ')
 }
@@ -488,8 +489,8 @@ pub fn is_item_name(text: &str) -> bool {
 pub fn check_new_item(item: &NewItem) -> Result<(), String> {
     let name_rule = |what: &str| {
         format!(
-            "the {what} must be 1 to {MAX_ITEM_NAME_CHARS} printable ASCII characters, with no \
-             `/`, `\\` or `\"`, no leading `-` and no leading or trailing space"
+            "the {what} must be 1 to {MAX_ITEM_NAME_CHARS} ASCII letters, digits, spaces, `-`, `_` \
+             or `.`, with no leading `-` and no leading or trailing space"
         )
     };
 
@@ -1108,7 +1109,7 @@ impl OnePassword {
     }
 
     /// Creates one item on this Mac, with no cache and no companions, unless
-    /// the vault already holds an item with that title
+    /// the vault already holds an item with that title, archived or not
     ///
     /// The value reaches `op` on stdin as a JSON item template, never in its
     /// arguments, environment or a file. Only `id` is read from what `op`
@@ -1118,7 +1119,15 @@ impl OnePassword {
         let list = self
             .run(
                 "item list",
-                &["item", "list", "--vault", &item.vault, "--format", "json"],
+                &[
+                    "item",
+                    "list",
+                    "--vault",
+                    &item.vault,
+                    "--include-archive",
+                    "--format",
+                    "json",
+                ],
                 None,
                 &item.value,
             )

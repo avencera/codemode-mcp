@@ -682,6 +682,13 @@ async fn companion_command(
                     eprintln!("Nothing was created: {message}");
                     std::process::exit(1);
                 }
+                admin::CompanionCreateResponse::Unconfirmed { message } => {
+                    eprintln!(
+                        "The item may have been created: {message}\nCheck the vault in \
+                         1Password before trying again."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
         CompanionCommand::Id { identity_file } => {
@@ -1792,7 +1799,13 @@ async fn admin_request<T: serde::de::DeserializeOwned>(
     owner_proof: Option<&str>,
 ) -> Result<T> {
     let url = format!("http://{}{path}", config.admin_listen);
-    let mut request = reqwest::Client::new()
+    // no_proxy: the body can hold a secret and the proof is bound to this
+    // route, and the daemon is always on this machine, so an HTTP(S)_PROXY or
+    // ALL_PROXY in the environment must not see either. Every admin call
+    // goes through here
+    let mut request = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
         .post(&url)
         .timeout(ADMIN_TIMEOUT)
         .json(body);

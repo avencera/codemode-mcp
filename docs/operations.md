@@ -220,8 +220,10 @@ and no approval is reused. Details:
 - A companion only creates. There is no request to edit or delete an item, and a create is refused when the vault
   already holds an item with that title (compared without regard to case), so an existing secret is never
   overwritten.
-- The vault, title and field label must be printable ASCII (no `/`, `\` or `"`, no leading `-`, no leading or trailing
-  space) and are refused before any prompt otherwise; rename the item in 1Password afterwards if you want more.
+- The vault, title and field label must be ASCII letters, digits, spaces, `-`, `_` or `.` (no leading `-`, no leading or
+  trailing space) and are refused before any prompt otherwise, so the returned `op://` reference is always valid and
+  cannot address another item (`?` and `$` mean something to `op`); rename the item in 1Password afterwards if you
+  want more. The duplicate check includes archived items.
 - If the command times out or loses the connection after the request went out, it says the item may have been created.
   Check the vault before trying again: once Touch ID approved, the companion finishes the create even if the gateway
   hung up.
