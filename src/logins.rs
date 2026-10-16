@@ -65,8 +65,9 @@ pub enum Setting {
     Off,
     /// On
     On,
-    /// It could not be read, as when the file holding it needs Full Disk
-    /// Access
+    /// It could not be confirmed off: the file holding it needs Full Disk
+    /// Access, or it holds only the last value the browser saved, which a
+    /// change made seconds ago may not have reached yet
     Unknown,
 }
 
@@ -112,7 +113,7 @@ impl FocusedField {
         }
         if self.exposure.apple_events_javascript == Setting::Unknown {
             notes.push(format!(
-                "could not check whether {browser} allows JavaScript from Apple Events"
+                "could not confirm that {browser} blocks JavaScript from Apple Events"
             ));
         }
 
@@ -414,10 +415,20 @@ impl FillCheck {
         tool: &str,
         arguments: &mut Map<String, Value>,
     ) -> Result<Option<String>, FillError> {
-        if server.and_then(|server| server.builtin) != Some(Builtin::Logins) || tool != "fill" {
+        let Some(server) = server.filter(|server| server.builtin == Some(Builtin::Logins)) else {
+            return Ok(None);
+        };
+        if tool != "fill" {
             return Ok(None);
         }
         arguments.remove(CHECKED);
+        // the server's fixed arguments, such as a `login`, are what the call
+        // runs with, so the check and the owner see them too
+        for (name, value) in &server.arguments {
+            if name != CHECKED && !arguments.contains_key(name) {
+                arguments.insert(name.clone(), value.clone());
+            }
+        }
 
         #[derive(Deserialize)]
         struct Call {

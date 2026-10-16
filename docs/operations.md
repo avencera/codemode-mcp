@@ -365,9 +365,10 @@ client. Until it is approved every tool fails with "This agent isn't approved to
 ## Sign in to websites from an agent
 
 An agent that drives this Mac's screen, such as Codex with computer use, can sign in to a website with a
-1Password login without seeing the username, password or one-time code. The `logins` server types the value
-into the field that has keyboard focus, after checking the browser, the field and the page itself; the agent
-only learns which host took it.
+1Password login without the tool ever handing it the username, password or one-time password seed. The
+`logins` server types the value into the field that has keyboard focus, after checking the browser, the field
+and the page itself; the agent only learns which host took it. A password stays hidden behind bullets; a
+username or one-time code is typed into a plain field, where the agent can see it on screen (see Limits).
 
 1. List the logins an agent may use, and the hosts each may be typed on:
 
@@ -387,7 +388,8 @@ only learns which host took it.
 
    `totp` is optional and names the item's one-time password field itself, without `?attribute=totp`. A
    login with it lists a `one_time_code` field; filling it types the current code, computed in the daemon from
-   the seed, so neither the seed nor the code reaches the agent.
+   the seed, so the seed never reaches the agent. The code itself lands in a plain text field, where the agent
+   can see it on screen until it expires.
 
    A site is that host only; `*.github.com` covers every host under `github.com`, but not `github.com`
    itself. Name the exact hosts the login page lives on, such as `accounts.google.com`, and use `*.` only for
@@ -407,9 +409,10 @@ What a fill checks, from Accessibility and the browser's code signature rather t
   refused, including one an agent built to look like a browser.
 - The browser cannot be scripted by other programs: a Chromium browser or Firefox started with
   `--remote-debugging-port`, `--remote-debugging-pipe` or Marionette is refused, and so is a browser with
-  Allow JavaScript from Apple Events turned on. Safari keeps that setting in a file only a process with Full
-  Disk Access can read, so the Touch ID prompt usually says it could not be checked; look at Safari's
-  Develop menu before you approve. Chrome, Edge, Brave and Arc keep it in each profile's `Preferences`.
+  Allow JavaScript from Apple Events turned on in its saved preferences. A saved "off" is not proof, since a
+  browser writes a change out only seconds later, and Safari's file needs Full Disk Access to read at all, so
+  the Touch ID prompt says the setting could not be confirmed off; look at the browser's Develop menu before
+  you approve. Chrome, Edge, Brave and Arc keep it in each profile's `Preferences`.
 - A password goes only into a password field, the kind that shows bullets. A username or a one-time code goes
   only into a one-line text field.
 - The field's page must be `https` on port 443, and its host one of the login's `sites`. A field inside a

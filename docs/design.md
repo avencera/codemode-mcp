@@ -720,8 +720,10 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   Firefox's debugger server, with switches read as the browsers read them (one dash or two, the last one
   winning), and "Allow JavaScript from Apple Events" must be off: Safari's `AllowJavaScriptFromAppleEvents`
   in its container's preferences plist, Chromium browsers' `browser.allow_javascript_apple_events` in any
-  profile's `Preferences` under the user data directory (`--user-data-dir` when given). A setting that cannot be read, usually
-  Safari's without Full Disk Access, does not refuse; it becomes a note the owner sees with the request.
+  profile's `Preferences` under the user data directory (`--user-data-dir` when given, read as Chromium reads
+  it: trimmed, and not past a `--`). Only a saved "on" refuses. A saved "off" proves nothing, because browsers
+  write a change out seconds later (Chromium batches preference writes), and Safari's file needs Full Disk
+  Access, so anything but "on" becomes a note the owner sees with the request.
   These are read once per check, not per character
 - The gateway checks a `logins` `fill` before asking anyone (`FillCheck`, called from `Gateway::prepare`,
   which is async for it): it reads the focused field through the `Mac`, runs the login's rule, and refuses
@@ -753,9 +755,11 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   or phone answers while the owner is away and a rotated password needs a restart. `totp` names the one-time
   password field itself (config refuses `?attribute=`, which would cache a code); its value, an
   `otpauth://totp/` URI (SHA1, SHA256 or SHA512, 6 or 8 digits, any period) or a bare base32 secret, is turned
-  into the current RFC 6238 code in `src/logins/totp.rs` (`hmac` 0.12 with `sha1`/`sha2` 0.10, the digest line
-  SHA-1 exists on in the tree). The seed's text is redacted with fragments and the whole value without, since
-  its label is often an email address; neither the seed nor the code is returned
+  into the current RFC 6238 code in `src/logins/totp.rs` (`hmac`, `sha1` and `sha2` on the digest 0.11 line).
+  The seed's text is redacted with fragments and the whole value without, since its label is often an email
+  address; neither the seed nor the code is returned. The code is typed into a plain text field, so an agent
+  that reads the screen sees it, as it would a username; it expires within one period and is useless without
+  the password, which stays behind bullets
 - Not defended: a username is typed into a plain field and is visible like any text, and a page's
   show-password button turns the password field into one. Code in the page, or anything driving the browser by Apple Events or a debugging port, can read
   the field after it is filled. Codex's computer use reads the accessibility tree, so the fill relies on

@@ -395,9 +395,12 @@ impl CommandLine {
     /// Whether it turns on a debugging protocol: Chromium's port or pipe,
     /// which Firefox also takes for its own protocol, or Firefox's
     /// Marionette, by flag or environment, and devtools server
+    ///
+    /// Every argument is looked at, past a `--` too: reading more than the
+    /// browser would only refuses more
     fn remote_debugging(&self) -> bool {
         self.arguments.iter().any(|argument| {
-            switch_name(argument).is_some_and(|(name, _)| {
+            switch_name(argument.trim_ascii()).is_some_and(|(name, _)| {
                 matches!(
                     name,
                     "remote-debugging-port"
@@ -413,13 +416,17 @@ impl CommandLine {
         })
     }
 
-    /// The value of switch `name`, read as Chromium reads it: with one dash
-    /// or two, and the last one given winning
+    /// The value of switch `name`, read as Chromium reads it: trimmed of
+    /// spaces, with one dash or two, none after a `--`, and the last one
+    /// given winning
     fn switch(&self, name: &str) -> Option<&str> {
         self.arguments
             .iter()
+            .map(|argument| argument.trim_ascii())
+            .take_while(|argument| *argument != "--")
+            .collect::<Vec<_>>()
+            .into_iter()
             .rev()
-            .map(String::as_str)
             .filter_map(switch_name)
             .find(|(switch, _)| *switch == name)
             .map(|(_, value)| value.unwrap_or_default())
@@ -525,52 +532,38 @@ fn safari_javascript(bundle: &str) -> Setting {
         .and_then(|preferences| preferences.get("AllowJavaScriptFromAppleEvents"))
         .and_then(plist::Value::as_boolean);
 
+    // a saved "off" is only the last value Safari wrote out, not proof the
+    // live setting is off
     if on == Some(true) {
         Setting::On
     } else {
-        Setting::Off
+        Setting::Unknown
     }
 }
 
 /// A Chromium browser's "Allow JavaScript from Apple Events": on when any
-/// profile turned it on, since the field may be in any of them, and
-/// unknown when a profile or the directory cannot be read
+/// profile's saved preferences turned it on, since the field may be in any
+/// of them, and otherwise unknown
 fn chromium_javascript(user_data: &Path) -> Setting {
     let Ok(entries) = std::fs::read_dir(user_data) else {
         return Setting::Unknown;
     };
-    let mut profiles = 0;
-    let mut unread = false;
-    for entry in entries {
-        let Ok(entry) = entry else {
-            unread = true;
-            continue;
-        };
-        let path = entry.path().join("Preferences");
-        if !path.is_file() {
-            continue;
-        }
-        profiles += 1;
-        let preferences = std::fs::read(&path)
+    for entry in entries.flatten() {
+        let on = std::fs::read(entry.path().join("Preferences"))
             .ok()
-            .and_then(|text| serde_json::from_slice::<serde_json::Value>(&text).ok());
-        let Some(preferences) = preferences else {
-            unread = true;
-            continue;
-        };
-        if preferences.pointer("/browser/allow_javascript_apple_events")
-            == Some(&serde_json::Value::Bool(true))
-        {
+            .and_then(|text| serde_json::from_slice::<serde_json::Value>(&text).ok())
+            .is_some_and(|preferences| {
+                preferences.pointer("/browser/allow_javascript_apple_events")
+                    == Some(&serde_json::Value::Bool(true))
+            });
+        if on {
             return Setting::On;
         }
     }
 
-    // no profile at all means the setting was looked for in the wrong place
-    if unread || profiles == 0 {
-        Setting::Unknown
-    } else {
-        Setting::Off
-    }
+    // Chromium writes preferences out seconds after a change, so profiles
+    // that all say "off" do not prove the live setting is off
+    Setting::Unknown
 }
 
 fn describe(element: &AXUIElement, owner: &Owner) -> Result<FocusedField, FillError> {
@@ -735,6 +728,9 @@ mod tests {
             "--marionette",
             "-marionette",
             "--start-debugger-server=6000",
+            // Chromium trims spaces around each argument
+            " --remote-debugging-port=9222",
+            "--remote-debugging-pipe\t",
         ] {
             assert!(started(&["x", flag], &[]).remote_debugging(), "{flag}");
         }
@@ -761,5 +757,12 @@ mod tests {
             &[],
         );
         assert_eq!(profiles.switch("user-data-dir"), Some("/b"));
+
+        // spaces are trimmed, and nothing after `--` is a switch
+        let terminated = started(
+            &["x", " --user-data-dir=/a ", "--", "--user-data-dir=/b"],
+            &[],
+        );
+        assert_eq!(terminated.switch("user-data-dir"), Some("/a"));
     }
 }

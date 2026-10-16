@@ -46,6 +46,14 @@ fn field(kind: FieldKind, url: &str) -> FocusedField {
 async fn logins_harness(
     mac: &Arc<FakeMac>,
 ) -> Result<Option<(Harness, std::path::PathBuf)>, Box<dyn std::error::Error>> {
+    logins_harness_with(mac, "").await
+}
+
+/// [`logins_harness`] with `server` added to the `logins` server's table
+async fn logins_harness_with(
+    mac: &Arc<FakeMac>,
+    server: &str,
+) -> Result<Option<(Harness, std::path::PathBuf)>, Box<dyn std::error::Error>> {
     let (op, log) = fake_op()?;
     let extra = format!(
         "[secrets]\n\
@@ -54,7 +62,8 @@ async fn logins_harness(
          builtin = \"logins\"\n\
          policy = \"ask\"\n\
          tools.fill.grant = \"per_call\"\n\
-         tools.list.policy = \"allow\"\n\n\
+         tools.list.policy = \"allow\"\n\
+         {server}\n\n\
          [logins.github]\n\
          sites = [\"github.com\", \"*.github.io\"]\n\
          password = \"{REFERENCE}\"\n\
@@ -164,6 +173,38 @@ async fn a_password_is_typed_into_its_site_and_never_returned() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_login_fixed_in_the_config_is_checked_and_filled() -> TestResult {
+    let mac = Arc::new(FakeMac::default());
+    let Some((harness, log)) =
+        logins_harness_with(&mac, "arguments = { login = \"github\" }").await?
+    else {
+        return Ok(());
+    };
+
+    // the stub takes no `login`; the config's is the one checked and shown
+    mac.set_focused(field(FieldKind::Secure, "https://github.com/login"));
+    let filled = harness
+        .execute_json(r#"await logins_fill(field="password")"#)
+        .await?;
+    assert_eq!(
+        filled["result"],
+        json!({"login": "github", "field": "password", "host": "github.com"}),
+        "{filled}"
+    );
+    assert_eq!(mac.typed(), VALUE);
+    assert_eq!(reads(&log, REFERENCE), 1);
+    assert!(
+        prompts(&mac)
+            .first()
+            .is_some_and(|shown| shown.contains("password for github into github.com")),
+        "{:?}",
+        mac.shown()
+    );
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn only_a_verified_browser_that_scripts_cannot_drive_gets_a_login() -> TestResult {
     let mac = Arc::new(FakeMac::default());
     let Some((harness, log)) = logins_harness(&mac).await? else {
@@ -225,8 +266,8 @@ async fn only_a_verified_browser_that_scripts_cannot_drive_gets_a_login() -> Tes
     assert_eq!(filled["result"]["host"], "github.com", "{filled}");
     assert!(
         prompts(&mac).first().is_some_and(|shown| shown.contains(
-            "password for github into github.com in Chrome; could not check whether Chrome \
-             allows JavaScript from Apple Events"
+            "password for github into github.com in Chrome; could not confirm that Chrome \
+             blocks JavaScript from Apple Events"
         )),
         "{:?}",
         mac.shown()
