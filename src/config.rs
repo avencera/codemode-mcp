@@ -822,6 +822,9 @@ impl Merged {
         )
     }
 
+    /// Merges `incoming` into `base` key by key, where `key` is the path of
+    /// both tables; a key already set is refused unless both sides are
+    /// tables, and every new key is recorded as coming from `file`
     fn merge(
         base: &mut toml::Table,
         incoming: toml::Table,

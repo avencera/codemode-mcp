@@ -274,6 +274,8 @@ impl Companion {
         })
     }
 
+    /// Answers one read request: refuses anything that is not a reference,
+    /// then reads it only after a fingerprint given to a prompt that names it
     async fn answer(&self, body: &[u8]) -> CompanionResponse {
         let fault = |code, message: &str| {
             CompanionResponse::Error(CompanionFault {
