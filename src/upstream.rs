@@ -928,6 +928,14 @@ impl Upstream {
 
                 Some(SECRET_RETRY)
             }
+            error @ UpstreamError::UrlValue(_) => {
+                tracing::warn!(server = %self.name, %error, "upstream url key refused");
+                self.mark_unavailable(error.to_string(), error.category());
+
+                // the value is cached until the daemon restarts, so a quick
+                // retry would only fail again
+                Some(SECRET_RETRY)
+            }
             error => {
                 // transport errors can print the URL they were connecting to
                 let message = self.redactor.apply(&error.to_string());
