@@ -347,9 +347,9 @@ What a fill checks, from Accessibility rather than the agent's words:
   frame is checked against the frame and every page around it, so each of those hosts must be listed. This
   relies on the browser exposing each frame's address to Accessibility; a frame it does not expose goes
   unchecked.
-- Focus is checked again before each character, and typing stops once it has moved. Keys already sent may still
-  land, so a few characters can reach a field in the same app that took focus; keys never go to another app. The
-  answer then says to clear the field and fill again.
+- Focus and the page are checked again before each character, and typing stops once either has changed. Keys
+  already sent may still land, so a few characters can reach a field in the same app that took focus; keys never
+  go to another app. The answer then says to clear the field and fill again.
 
 Each fill is approved like any `per_call` tool: Touch ID while you are at the Mac, otherwise a passkey on the
 phone. The value is then read like a server secret, through `op` while you are at the Mac, or a companion Mac or

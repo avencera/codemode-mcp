@@ -82,10 +82,10 @@ pub trait Mac: Send + Sync + 'static {
     /// Types `text` into the focused field once `rule` passes it, and
     /// answers the page's host
     ///
-    /// Focus is checked again before each character, and typing stops with
-    /// [`FillError::Interrupted`] once it has left the field. Keys already
-    /// sent may still land, so a few characters can reach a field in the
-    /// same app that took focus
+    /// Focus and `rule` are checked again before each character, and typing
+    /// stops with [`FillError::Interrupted`] once the field has lost focus or
+    /// no longer passes on the same host. Keys already sent may still land,
+    /// so a few characters can reach a field in the same app that took focus
     fn fill<'a>(
         &'a self,
         text: &'a str,

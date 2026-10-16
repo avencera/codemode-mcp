@@ -702,8 +702,9 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   platform-independent, so the gateway test runs it against a fake screen
 - The field is checked before the value is read, so a wrong field never prompts the owner, and again right
   before typing. Characters are posted as keyboard events (`CGEventKeyboardSetUnicodeString`, flags cleared,
-  from a private event source so held keys do not combine) to the field's process, one at a time, with the
-  focused element compared to the original (`CFEqual`) before each; a change stops typing with an
+  from a private event source so held keys do not combine) to the field's process, one at a time. Before each, the
+  focused element is compared to the original (`CFEqual`) and the whole rule is checked again against the same
+  host, so a page that navigates under a still-focused field stops typing too; any change stops it with an
   `Interrupted` error. A character in flight when focus moves can still land in the new element
 - Values come from `OnePassword::read_reference`, the same race and cache as server secrets, so a companion Mac
   or phone answers while the owner is away and a rotated password needs a restart. One-time codes would need a

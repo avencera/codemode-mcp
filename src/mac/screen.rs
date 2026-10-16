@@ -218,11 +218,16 @@ pub fn fill(text: &str, rule: &FieldRule) -> Result<String, FillError> {
 
     let mut units = [0_u16; 2];
     for character in text.chars() {
-        // before each character, so typing stops soon after focus moves;
-        // keys already posted may still land, since the app handles them
-        // after this check. A failed check stops it too, and the field may
-        // then hold part of the value
-        if focused_element().ok().as_ref() != Some(&field) {
+        // before each character, so typing stops soon after focus moves or
+        // the page under the same field navigates, or a show-password
+        // button turns the field into plain text; keys already posted may
+        // still land, since the app handles them after this check. A failed
+        // check stops it too, and the field may then hold part of the value
+        let unchanged = focused_element().ok().as_ref() == Some(&field)
+            && describe(&field)
+                .and_then(|now| rule.check(&now))
+                .is_ok_and(|now| now == host);
+        if !unchanged {
             return Err(FillError::Interrupted);
         }
         let encoded = character.encode_utf16(&mut units);
