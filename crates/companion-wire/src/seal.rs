@@ -74,15 +74,29 @@ impl SoftwareKey {
         reference: &str,
         sealed: &Sealed,
     ) -> Result<Vec<u8>, SealError> {
-        let enc = <Kem as hpke::Kem>::EncappedKey::from_bytes(&sealed.enc)
-            .map_err(|_| SealError::Hpke)?;
+        self.open_with_info(
+            &seal_info(gateway, reference),
+            &sealed.enc,
+            &sealed.ciphertext,
+        )
+    }
+
+    /// Opens with a ready-made `info`, as the phone's core hands it to the
+    /// Secure Enclave
+    pub fn open_with_info(
+        &self,
+        info: &[u8],
+        enc: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, SealError> {
+        let enc = <Kem as hpke::Kem>::EncappedKey::from_bytes(enc).map_err(|_| SealError::Hpke)?;
 
         hpke::single_shot_open::<AesGcm256, HkdfSha256, Kem>(
             &OpModeR::Base,
             &self.0,
             &enc,
-            &seal_info(gateway, reference),
-            &sealed.ciphertext,
+            info,
+            ciphertext,
             &[],
         )
         .map_err(|_| SealError::Hpke)

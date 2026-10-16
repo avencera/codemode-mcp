@@ -387,6 +387,19 @@ impl Companions {
         };
 
         let phone = registration.phone.is_some();
+        // a phone dials with the key it registers, so the id it names must
+        // be the one the handshake proved; a Mac's agent answers on its own
+        // key, which only its holder can do
+        if phone && registration.id != connection.0.remote_id() {
+            refuse(
+                &connection,
+                &mut send,
+                "a phone must register the id it connects with",
+            )
+            .await;
+
+            return;
+        }
         let (invite, registered, references, mut pending) = match self.register(*registration).await
         {
             Ok(registration) => registration,

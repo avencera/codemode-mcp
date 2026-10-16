@@ -887,6 +887,23 @@ async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResu
 
         Ok::<_, Box<dyn Error>>(response)
     };
+    // naming another phone's id is refused before the invite is spent
+    let impostor = PairRequest::Register(Box::new(Registration {
+        secret: ticket.secret.to_hex(),
+        id: iroh::SecretKey::generate().public(),
+        name: "iPhone".to_owned(),
+        addrs: Vec::new(),
+        phone: Some(PhoneRegistration {
+            seal_key: phone.key.public().clone(),
+            push: None,
+        }),
+    }));
+    let refused = answer(phone.dial(PAIR_ALPN).await?, impostor).await?;
+    assert!(
+        matches!(refused, PairResponse::Refused { .. }),
+        "{refused:?}"
+    );
+
     let PairResponse::Registered(registered) = answer(pairing.clone(), register).await? else {
         return Err("the phone was not registered".into());
     };

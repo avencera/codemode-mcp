@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/companion-wire"]
+members = [".", "crates/companion-wire", "mobile"]
 resolver = "3"
 
 [package]

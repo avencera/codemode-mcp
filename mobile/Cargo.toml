@@ -1,0 +1,33 @@
+[package]
+name = "companion-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "The Rust core of the codemode-mcp iPhone companion"
+
+[lib]
+name = "companion_core"
+# staticlib for the iOS xcframework; lib for the tests and bindgen
+crate-type = ["lib", "staticlib"]
+
+[dependencies]
+companion-wire = { path = "../crates/companion-wire" }
+hex = "0.4.3"
+# the gateway's pin and features: no portmapper and no metrics
+iroh = { version = "1.3.0", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
+ractor = "0.16.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.21"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.44"
+# pinned to Cove's revision, with proc-macros and no UDL
+uniffi = { git = "https://github.com/mozilla/uniffi-rs", rev = "42e834a4371547d9da47fd06e34062a91fa25b57", features = ["tokio"] }
+
+[dev-dependencies]
+companion-wire = { path = "../crates/companion-wire", features = ["seal"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
