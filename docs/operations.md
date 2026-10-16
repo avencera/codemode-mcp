@@ -231,9 +231,10 @@ and no approval is reused. Details:
   hung up.
 - The command says why nothing was created: the vault is not in `create_vaults`, the title already exists, Touch ID
   was not approved, `op` failed, or the companion is too old to create items (update codemode-mcp on that Mac).
-- The companion runs `op item list --vault <vault> --format json` to look for the title, then `op item create
-  --vault <vault> --format json -` with the item as a JSON template on stdin. The value is in neither `op`'s
-  arguments nor its environment, and no file holds it. Only the new item's id is taken from `op`'s answer, and an error line from `op` is shown with the value removed.
+- The companion runs `op item list --vault <vault> --include-archive --format json` to look for the title, then
+  `op item create --vault <vault> --format json -` with the item as a JSON template on stdin. The value is in neither
+  `op`'s arguments nor its environment, and no file holds it. Only the new item's id is taken from `op`'s answer, and
+  an error line from `op` is shown with the value removed.
 
 How reads work with a companion configured:
 
