@@ -214,6 +214,11 @@ impl Rig {
 
 /// An `op` that logs the read, then its pid beside the log, then never
 /// answers; the pid file appears whole and only after the log line
+///
+/// Like a wrapper that does not `exec` the real `op`, it leaves a child
+/// holding its stdout. Once `op` is gone, killed and reaped, or after ten
+/// seconds, that child writes there and records in `pipe` beside the log
+/// whether anyone still had the pipe open
 fn hanging_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
@@ -224,10 +229,16 @@ fn hanging_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
         format!(
             "#!/bin/sh\n\
              echo \"$3\" >> '{log}'\n\
+             (trap '' PIPE; i=0; \
+               while kill -0 $$ 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done; \
+               sleep 0.2; \
+               if /bin/echo x 2>/dev/null; then state=open; else state=closed; fi; \
+               echo $state > '{pipe}.tmp'; mv '{pipe}.tmp' '{pipe}') &\n\
              echo $$ > '{pid}.tmp'\n\
              mv '{pid}.tmp' '{pid}'\n\
              exec sleep 60\n",
             pid = directory.join("pid").display(),
+            pipe = directory.join("pipe").display(),
             log = log.display(),
         ),
     )?;
@@ -617,6 +628,17 @@ async fn a_companion_wins_while_the_gateway_looks_in_use() -> TestResult {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!alive, "the local op {} still runs", pid.trim());
+
+    // and its output is no longer read, though a child of it still holds
+    // the pipe
+    let pipe = rig.local_log.with_file_name("pipe");
+    for _ in 0..150 {
+        if pipe.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&pipe)?.trim(), "closed");
 
     rig.stop().await
 }
