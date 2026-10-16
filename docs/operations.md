@@ -427,19 +427,16 @@ An authorization server without dynamic client registration needs a client you c
 `client_id`, and `client_secret` for a confidential client. The secret can be an `op://` reference; it is read
 at login and stored with the tokens. `authorization_params` adds query parameters to the sign-in URL.
 
-### Gmail and Google Calendar
+### Gmail
 
-Google's Workspace MCP servers (developer preview) take a client from your own Google Cloud project:
+Google's Gmail MCP server (developer preview) takes a client from your own Google Cloud project:
 
-1. In a Google Cloud project, enable the Gmail API, Google Calendar API, `gmailmcp.googleapis.com` and
-   `calendarmcp.googleapis.com`.
+1. In a Google Cloud project, enable the Gmail API and `gmailmcp.googleapis.com`.
 2. Under Google Auth Platform, set up the consent screen (audience Internal for a Workspace account; External
    needs you added as a test user).
 3. Create an OAuth client of type Web application, tick "Use this client for an AI-powered agent", and add the
-   redirect URIs `http://127.0.0.1:7682/oauth/callback/gmail` and
-   `http://127.0.0.1:7682/oauth/callback/google_calendar`.
-4. Save the client secret in 1Password, add the tables below, restart, and run `codemode-mcp oauth login gmail`
-   and `codemode-mcp oauth login google_calendar`.
+   redirect URI `http://127.0.0.1:7682/oauth/callback/gmail`.
+4. Save the client secret in 1Password, add the tables below, restart, and run `codemode-mcp oauth login gmail`.
 
 ```toml
 # every Gmail call asks on the phone; reads accept a 15 or 60 minute session
@@ -464,33 +461,15 @@ aliases = ["email", "mail"]
 [servers.gmail.tools.create_draft]
 grant = "per_call"
 # ...and the same for every other tool that is not a read
-
-[servers.google_calendar]
-url = "https://calendarmcp.googleapis.com/mcp/v1"
-oauth = true
-client_id = "<id>.apps.googleusercontent.com"
-client_secret = "{{ op://Private/Google Workspace MCP/credential }}"
-authorization_params = { access_type = "offline", prompt = "consent" }
-scopes = [
-  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
-  "https://www.googleapis.com/auth/calendar.events",
-  "https://www.googleapis.com/auth/calendar.events.freebusy",
-]
-aliases = ["gcal"]
-
-[servers.google_calendar.tools.create_event]
-policy = "ask"
-[servers.google_calendar.tools.update_event]
-policy = "ask"
-[servers.google_calendar.tools.respond_to_event]
-policy = "ask"
-[servers.google_calendar.tools.delete_event]
-policy = "ask"
-grant = "per_call"
 ```
 
-Both servers list their tools without a login, so they appear in the catalog at once; calls fail until you
-sign in.
+The server lists its tools without a login, so they appear in the catalog at once; calls fail until you sign
+in.
+
+Google's Calendar MCP server (`calendarmcp.googleapis.com`) refuses every tool call unless the Google Cloud
+project is enrolled in the Workspace Developer Preview Program. For Google Calendar, add the account to the
+Mac's Calendar app and use the `calendar` server instead (see
+[Calendar and Reminders access](#calendar-and-reminders-access)).
 
 ## Add a server
 
