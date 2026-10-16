@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     app::App,
     approvals::{AdminAction, AdminRequest, Approvals, Verdict, Waiting, confirmation_code},
-    companion::{self, Ticket},
+    companion::{self, CompanionFailure, Ticket},
     config::Config,
     gateway::{Gateway, WarmResult},
     host::is_direct_local,
@@ -455,6 +455,47 @@ pub struct CompanionCheckResponse {
     pub companions: Vec<CompanionCheckEntry>,
 }
 
+/// Body of `POST /admin/companion/create`
+#[derive(Serialize, Deserialize)]
+pub struct CompanionCreateRequest {
+    /// The companion to ask; unset, the only one listed
+    #[serde(default)]
+    pub companion: Option<String>,
+    /// The item and its value
+    #[serde(flatten)]
+    pub item: companion::NewItem,
+}
+
+impl std::fmt::Debug for CompanionCreateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompanionCreateRequest")
+            .field("companion", &self.companion)
+            .field("item", &self.item)
+            .finish()
+    }
+}
+
+/// Answer of `POST /admin/companion/create`; never the value
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionCreateResponse {
+    /// The companion created the item
+    Created {
+        /// Companion name
+        companion: String,
+        /// 1Password's id for the new item
+        id: String,
+        /// `op://vault/title/field` for the value
+        reference: String,
+    },
+    /// Nothing was created
+    Refused {
+        /// Why, in the companion's words or the connection's
+        message: String,
+    },
+}
+
 /// Admin routes; serve them with connect info so the peer can be checked
 pub fn router(app: &App) -> Router {
     let state = AdminState {
@@ -488,6 +529,7 @@ pub fn router(app: &App) -> Router {
             post(companion_invite_status),
         )
         .route("/admin/companion/check", post(companion_check))
+        .route("/admin/companion/create", post(companion_create))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
         .route("/admin/oauth/logout", post(oauth_logout))
@@ -939,6 +981,45 @@ fn config_references(config: &Config) -> Vec<String> {
     }
 
     references.into_iter().collect()
+}
+
+/// Asks a companion Mac to create one item; the value is passed on and
+/// kept nowhere
+async fn companion_create(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionCreateRequest>,
+) -> Response {
+    // the body holds a secret and the route writes to 1Password
+    if let Some(refused) = state.not_owner(&headers, "/admin/companion/create") {
+        return refused;
+    }
+
+    // refused here too, so a bad name never reaches a companion's prompt
+    if let Err(message) = crate::secrets::check_new_item(&request.item) {
+        return Json(CompanionCreateResponse::Refused { message }).into_response();
+    }
+
+    let answer = state
+        .gateway
+        .companions()
+        .create(request.companion.as_deref(), &request.item)
+        .await;
+
+    Json(match answer {
+        Ok((companion, created)) => CompanionCreateResponse::Created {
+            companion,
+            id: created.id,
+            reference: created.reference,
+        },
+        Err(CompanionFailure::Refused { message, .. }) => {
+            CompanionCreateResponse::Refused { message }
+        }
+        Err(failure) => CompanionCreateResponse::Refused {
+            message: failure.to_string(),
+        },
+    })
+    .into_response()
 }
 
 /// Asks the companions, and only them, to read a reference; local `op` and

@@ -32,7 +32,8 @@ pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
 };
 pub use wire::{
-    CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse, PairCheck,
+    CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode, CompanionFault,
+    CompanionRequest, CompanionResponse, CreatedItem, MALFORMED_REQUEST, NewItem, PairCheck,
     PairRequest, PairResponse, Registered, Registration,
 };
 

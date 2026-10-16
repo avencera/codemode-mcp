@@ -543,6 +543,16 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   the gateway Mac look in use. Presence is checked even with `notify.mac.enabled = false`, which only stops
   approvals asking at the Mac. All failing gives one error listing each source's reason. With none the read is
   local only
+- Creating (`companion create`, `POST /admin/companion/create`, owner proof required): the CLI posts the item and
+  its value, read from stdin, to the daemon, which sends `{"create": {vault, title, category?, field?, value}}` on
+  the same ALPN to one Mac companion (the named one, or the only one). The companion refuses vaults not in its own
+  `create_vaults` (default empty) as `not_allowed` before asking anyone, asks Touch ID per request under the same
+  lock as reads, lists the vault with `op item list` and refuses a title already there (`already_exists`), then runs
+  `op item create --vault V --format json -` with a JSON template on stdin (`secrets/spawn.rs` takes stdin, so the
+  value is not in argv, env or a file) and answers `{"created": {id, reference}}` or `{"error": ...}` (`create_failed`
+  for `op` failures). Only `id` is read from `op`'s answer; the line of `op`'s stderr forwarded on failure has the value and its JSON-escaped form replaced with `[redacted]` and is cut to one bounded line. Vault, title and field label must be printable ASCII with no `/`, `\`, `"`, leading `-` or edge spaces, so lookalike and hidden characters never pass and the case-insensitive duplicate check is exact; the gateway and the companion both refuse before any prompt. Once Touch ID approves, the title check and `op item create` run in a detached task with its own deadline that keeps the prompt lock, so a hangup or the request timeout cannot kill `op` mid-create; a gateway or CLI that loses the answer says the item may have been created and to check the vault. There is no edit or delete
+  request. A companion from before this answers the request, which has no `reference`, with `not_allowed` /
+  `malformed request` (`wire::MALFORMED_REQUEST`); the gateway reports that as "does not support creating items"
 - Upstream connections and OAuth logins share one `Secrets` (the reader, its cache and the one `Companions`
   endpoint), so an OAuth `client_secret` reaches companions too, and `companion invite` lists its references
   with those in `headers` and `env`

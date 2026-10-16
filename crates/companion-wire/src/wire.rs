@@ -29,6 +29,10 @@ pub enum CompanionErrorCode {
     Denied,
     /// `op read` failed on the companion Mac
     ReadFailed,
+    /// An item with that title is already in the vault; nothing was written
+    AlreadyExists,
+    /// `op` could not create the item on the companion Mac
+    CreateFailed,
 }
 
 impl CompanionErrorCode {
@@ -38,8 +42,103 @@ impl CompanionErrorCode {
             Self::NotAllowed => "not_allowed",
             Self::Denied => "denied",
             Self::ReadFailed => "read_failed",
+            Self::AlreadyExists => "already_exists",
+            Self::CreateFailed => "create_failed",
         }
     }
+}
+
+/// What a companion that predates [`CompanionCreateRequest`] answers to it,
+/// as a [`CompanionErrorCode::NotAllowed`] fault: the request has no
+/// `reference`, so it is "malformed" to that companion
+pub const MALFORMED_REQUEST: &str = "malformed request";
+
+/// Category of an item created when the request names none
+pub const DEFAULT_CATEGORY: &str = "API_CREDENTIAL";
+
+/// Label of the field that holds the secret when the request names none
+pub const DEFAULT_FIELD: &str = "credential";
+
+/// Asks a companion to create one item in 1Password, sent as
+/// `{"create": {...}}`
+///
+/// There is no request to edit or delete an item, and a companion refuses
+/// to create one whose title is already in the vault
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionCreateRequest {
+    /// The item to create
+    pub create: NewItem,
+}
+
+impl std::fmt::Debug for CompanionCreateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("CompanionCreateRequest")
+            .field(&self.create)
+            .finish()
+    }
+}
+
+/// An item for a companion to create
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewItem {
+    /// Vault the item goes in
+    pub vault: String,
+    /// Title of the item; the companion refuses a title already in use
+    pub title: String,
+    /// 1Password category such as `API_CREDENTIAL`; unset, that one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Label of the one field that holds the value; unset, `credential`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    /// The secret to store
+    pub value: String,
+}
+
+impl std::fmt::Debug for NewItem {
+    // the value stays out of logs
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewItem")
+            .field("vault", &self.vault)
+            .field("title", &self.title)
+            .field("category", &self.category)
+            .field("field", &self.field)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NewItem {
+    /// The category, with the default filled in
+    pub fn category(&self) -> &str {
+        self.category.as_deref().unwrap_or(DEFAULT_CATEGORY)
+    }
+
+    /// The field label, with the default filled in
+    pub fn field(&self) -> &str {
+        self.field.as_deref().unwrap_or(DEFAULT_FIELD)
+    }
+}
+
+/// The item a companion created; never the value
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedItem {
+    /// 1Password's id for the new item
+    pub id: String,
+    /// `op://vault/title/field` for the value just stored
+    pub reference: String,
+}
+
+/// A companion's answer to a [`CompanionCreateRequest`]: `{"created": {...}}`
+/// or `{"error": {...}}`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionCreateResponse {
+    /// The item exists now
+    Created(CreatedItem),
+    /// Nothing was written
+    Error(CompanionFault),
 }
 
 /// A refusal or failure, with text that never holds a value
@@ -169,4 +268,35 @@ pub enum PairCheck {
     /// A new phone has nothing to open yet: no reference was read since the
     /// gateway started, so nothing is sealed to it
     NothingSealed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> CompanionCreateRequest {
+        CompanionCreateRequest {
+            create: NewItem {
+                vault: "Personal".to_owned(),
+                title: "Zoho".to_owned(),
+                category: None,
+                field: None,
+                value: "hunter2-secret".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn debug_output_never_holds_the_value() {
+        assert!(!format!("{:?}", request()).contains("hunter2"));
+    }
+
+    #[test]
+    fn a_companion_from_before_creating_cannot_read_the_request() {
+        // it parses requests as `CompanionRequest`, which needs `reference`,
+        // and answers MALFORMED_REQUEST to anything else
+        let body = serde_json::to_vec(&request()).unwrap_or_default();
+
+        assert!(serde_json::from_slice::<CompanionRequest>(&body).is_err());
+    }
 }

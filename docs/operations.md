@@ -193,6 +193,44 @@ again and prints the block again.
 A companion built from a checkout instead of a release is signed by `companion install`, which needs the InfraOps
 signing identity as in [Install](#install).
 
+Creating items through a companion. An agent on the gateway Mac sometimes needs to save a new secret, and
+`op item create` there would show 1Password's approval prompt on a screen nobody is at. Instead, the gateway can ask
+a companion Mac to create the item. Creating is off until you opt in: list the vaults the companion may create items
+in under `[companion]` in its config (the default is empty), then run `codemode-mcp companion install` again to
+restart it:
+
+```toml
+[companion]
+create_vaults = ["Personal"]
+```
+
+Then, on the gateway Mac, pipe the secret in:
+
+```sh
+pbpaste | codemode-mcp companion create --vault Personal --title "Zoho MCP infraops"
+```
+
+Options: `--category` (default `API_CREDENTIAL`), `--field` (the label of the field that holds the secret, default
+`credential`) and `--companion <name>`, which is needed only when several companions are listed. The secret is read
+from stdin, minus one trailing newline, and empty input is refused. The command waits for the Touch ID answer on the
+companion Mac (up to two minutes) and prints the new item's id and its `op://vault/title/field` reference, never the
+value. Every create asks Touch ID on the companion, naming the vault first, as in `create in Personal: "Zoho MCP infraops"`,
+and no approval is reused. Details:
+
+- A companion only creates. There is no request to edit or delete an item, and a create is refused when the vault
+  already holds an item with that title (compared without regard to case), so an existing secret is never
+  overwritten.
+- The vault, title and field label must be printable ASCII (no `/`, `\` or `"`, no leading `-`, no leading or trailing
+  space) and are refused before any prompt otherwise; rename the item in 1Password afterwards if you want more.
+- If the command times out or loses the connection after the request went out, it says the item may have been created.
+  Check the vault before trying again: once Touch ID approved, the companion finishes the create even if the gateway
+  hung up.
+- The command says why nothing was created: the vault is not in `create_vaults`, the title already exists, Touch ID
+  was not approved, `op` failed, or the companion is too old to create items (update codemode-mcp on that Mac).
+- The companion runs `op item list --vault <vault> --format json` to look for the title, then `op item create
+  --vault <vault> --format json -` with the item as a JSON template on stdin. The value is in neither `op`'s
+  arguments nor its environment, and no file holds it. Only the new item's id is taken from `op`'s answer, and an error line from `op` is shown with the value removed.
+
 How reads work with a companion configured:
 
 - The gateway runs its own `op read` only while you are at the gateway Mac (input within `notify.mac.idle_secs`),

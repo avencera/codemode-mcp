@@ -757,7 +757,7 @@ impl Harness {
             .post(format!("{}{path}", self.admin_base()))
             .json(body);
         // the invite routes need the owner's proof, as the CLI makes it
-        if path.starts_with("/admin/companion/invite") {
+        if path.starts_with("/admin/companion/invite") || path == "/admin/companion/create" {
             request = request.header(
                 codemode_mcp::admin::OWNER_PROOF_HEADER,
                 self.owner_proof(path).await?,

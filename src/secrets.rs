@@ -20,7 +20,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinSet};
 
 use crate::{
-    companion::Companions,
+    companion::{Companions, CreatedItem, NewItem},
     config::{Config, SecretsConfig},
     mac::OnMac,
     store::Store,
@@ -42,6 +42,10 @@ const MAX_ERROR_TEXT: usize = 2000;
 const REDACTED: &str = "[redacted]";
 /// Shorter secrets would redact ordinary words
 const MIN_SECRET_LEN: usize = 6;
+/// Longest line of `op`'s error output forwarded from a failed create
+const MAX_OP_ERROR_CHARS: usize = 200;
+/// Longest vault name, item title, field label or category accepted
+const MAX_ITEM_NAME_CHARS: usize = 80;
 /// Longest `op://` reference accepted
 const MAX_REFERENCE_CHARS: usize = 256;
 
@@ -458,6 +462,63 @@ fn unescaped_with_spans(bytes: &[u8], mode: Unescape) -> Decoded {
     }
 
     (decoded, spans)
+}
+
+/// Whether `text` can be a vault name, item title or field label in a new
+/// item's `op://vault/title/field` reference
+///
+/// Printable ASCII only, so no Unicode lookalike, invisible or combining
+/// character can pass for another name and the duplicate check is exact. It
+/// also rules out `/` (the reference's separator), `"` and `\` (they break
+/// quoting in the prompt and the reference), a leading `-` (read as an `op`
+/// option) and leading or trailing space. Owners can rename an item in
+/// 1Password afterwards
+pub fn is_item_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().count() <= MAX_ITEM_NAME_CHARS
+        && text
+            .chars()
+            .all(|character| (' '..='~').contains(&character) && !"\"\\/".contains(character))
+        && !text.starts_with(['-', ' '])
+        && !text.ends_with(' ')
+}
+
+/// Why `item` cannot be created, if it cannot: the vault, title, field label
+/// and category must pass their checks and the value must not be empty
+pub fn check_new_item(item: &NewItem) -> Result<(), String> {
+    let name_rule = |what: &str| {
+        format!(
+            "the {what} must be 1 to {MAX_ITEM_NAME_CHARS} printable ASCII characters, with no \
+             `/`, `\\` or `\"`, no leading `-` and no leading or trailing space"
+        )
+    };
+
+    if !is_item_name(&item.vault) {
+        return Err(name_rule("vault name"));
+    }
+    if !is_item_name(&item.title) {
+        return Err(name_rule("title"));
+    }
+    if !is_item_name(item.field()) {
+        return Err(name_rule("field label"));
+    }
+    if !is_category(item.category()) {
+        return Err("the category must be upper-case letters and `_`, like API_CREDENTIAL".into());
+    }
+    if item.value.is_empty() {
+        return Err("the value is empty".into());
+    }
+
+    Ok(())
+}
+
+/// Whether `text` names a 1Password category such as `API_CREDENTIAL`
+pub fn is_category(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_ITEM_NAME_CHARS
+        && text
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character == '_')
 }
 
 /// Checks a configured value's references without reading them
@@ -997,8 +1058,10 @@ impl OnePassword {
     /// timeout, a failed start or any other error may still read silently,
     /// so those answer `false` and the caller keeps asking for itself
     pub async fn signed_out(&self) -> bool {
-        let whoami =
-            tokio::time::timeout(WHOAMI_TIMEOUT, spawn::output(&self.program, &["whoami"]));
+        let whoami = tokio::time::timeout(
+            WHOAMI_TIMEOUT,
+            spawn::output(&self.program, &["whoami"], None),
+        );
 
         matches!(
             whoami.await,
@@ -1012,7 +1075,7 @@ impl OnePassword {
     /// The companion side answers with this: every request asks anew
     pub async fn read_local(&self, reference: &str) -> Result<String, SecretError> {
         let args = ["read", "--no-newline", reference];
-        let output = tokio::time::timeout(READ_TIMEOUT, spawn::output(&self.program, &args))
+        let output = tokio::time::timeout(READ_TIMEOUT, spawn::output(&self.program, &args, None))
             .await
             .map_err(|_| SecretError::TimedOut {
                 reference: reference.to_owned(),
@@ -1043,6 +1106,166 @@ impl OnePassword {
             reason: "the value is not UTF-8".to_owned(),
         })
     }
+
+    /// Creates one item on this Mac, with no cache and no companions, unless
+    /// the vault already holds an item with that title
+    ///
+    /// The value reaches `op` on stdin as a JSON item template, never in its
+    /// arguments, environment or a file. Only `id` is read from what `op`
+    /// prints on success; on failure only one redacted line of its error
+    /// output is kept
+    pub async fn create_local(&self, item: &NewItem) -> Result<CreatedItem, CreateError> {
+        let list = self
+            .run(
+                "item list",
+                &["item", "list", "--vault", &item.vault, "--format", "json"],
+                None,
+                &item.value,
+            )
+            .await?;
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_slice(&list).map_err(|_| CreateError::Failed {
+                command: "item list",
+                reason: "the answer was not a JSON list".to_owned(),
+            })?;
+        let taken = listed.iter().any(|existing| {
+            existing["title"]
+                .as_str()
+                .is_some_and(|title| title.trim().eq_ignore_ascii_case(&item.title))
+        });
+        if taken {
+            return Err(CreateError::Exists {
+                vault: item.vault.clone(),
+                title: item.title.clone(),
+            });
+        }
+
+        let template = serde_json::json!({
+            "title": item.title,
+            "category": item.category(),
+            "fields": [{
+                "id": item.field(),
+                "label": item.field(),
+                "type": "CONCEALED",
+                "value": item.value,
+            }],
+        });
+        let template = serde_json::to_vec(&template).map_err(|error| CreateError::Failed {
+            command: "item create",
+            reason: error.to_string(),
+        })?;
+        let created = self
+            .run(
+                "item create",
+                &[
+                    "item",
+                    "create",
+                    "--vault",
+                    &item.vault,
+                    "--format",
+                    "json",
+                    "-",
+                ],
+                Some(&template),
+                &item.value,
+            )
+            .await?;
+        let id = serde_json::from_slice::<serde_json::Value>(&created)
+            .ok()
+            .and_then(|answer| answer["id"].as_str().map(str::to_owned))
+            .ok_or_else(|| CreateError::Failed {
+                command: "item create",
+                reason: "the answer had no item id".to_owned(),
+            })?;
+
+        Ok(CreatedItem {
+            id,
+            reference: format!("op://{}/{}/{}", item.vault, item.title, item.field()),
+        })
+    }
+
+    /// Runs `op` and returns its stdout; failures carry one bounded line of
+    /// `op`'s error output with `value` and its JSON-escaped form replaced,
+    /// never its stdout
+    async fn run(
+        &self,
+        command: &'static str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        value: &str,
+    ) -> Result<Vec<u8>, CreateError> {
+        let output = tokio::time::timeout(READ_TIMEOUT, spawn::output(&self.program, args, stdin))
+            .await
+            .map_err(|_| CreateError::TimedOut {
+                command,
+                timeout: READ_TIMEOUT,
+            })?
+            .map_err(|source| CreateError::Spawn {
+                program: self.program.clone(),
+                source,
+            })?;
+
+        if !output.status.success() {
+            let escaped = serde_json::to_string(value).unwrap_or_default();
+            let escaped = escaped.trim_matches('"');
+            // a value that spans lines is redacted before the first line is
+            // taken, and escaped form first because it may contain the raw one
+            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if !value.is_empty() {
+                stderr = stderr.replace(escaped, REDACTED).replace(value, REDACTED);
+            }
+            let line = stderr
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no error output");
+            let reason = crate::prompt::one_line(line.trim(), MAX_OP_ERROR_CHARS);
+
+            return Err(CreateError::Failed {
+                command,
+                reason: format!("{reason} ({})", output.status),
+            });
+        }
+
+        Ok(output.stdout)
+    }
+}
+
+/// Why `op` did not create an item; no message holds the value
+#[derive(Debug, thiserror::Error)]
+pub enum CreateError {
+    /// The title is already used in the vault, so nothing was written
+    #[error("an item titled \"{title}\" already exists in {vault}")]
+    Exists {
+        /// Vault searched
+        vault: String,
+        /// Title that is taken
+        title: String,
+    },
+    /// `op` did not start
+    #[error("cannot run {program}: {source}")]
+    Spawn {
+        /// Program that failed to start
+        program: String,
+        /// Underlying error
+        source: std::io::Error,
+    },
+    /// `op` did not answer in time, e.g. a prompt nobody answered
+    #[error("`op {command}` took longer than {timeout:?}")]
+    TimedOut {
+        /// What was being run
+        command: &'static str,
+        /// Timeout that elapsed
+        timeout: Duration,
+    },
+    /// `op` failed or answered something unexpected
+    #[error("`op {command}` failed: {reason}")]
+    Failed {
+        /// What was being run
+        command: &'static str,
+        /// First line of `op`'s error output, or what was wrong with its
+        /// answer
+        reason: String,
+    },
 }
 
 /// Replaces secrets in text that came from an upstream: configured header

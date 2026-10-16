@@ -1,22 +1,28 @@
 //! The companion's side: answering the gateway's requests on this Mac
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use super::{
-    ALPN, ASK_TIMEOUT, CompanionErrorCode, CompanionFault, CompanionRequest, CompanionResponse,
-    HANDSHAKE_TIMEOUT, Hangup, IdentityError, MAX_BODY_BYTES, Role, bind_endpoint, load_or_create,
+    ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
+    CompanionFault, CompanionRequest, CompanionResponse, HANDSHAKE_TIMEOUT, Hangup, IdentityError,
+    MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem, Role, bind_endpoint, load_or_create,
 };
 use crate::{
     config::CompanionConfig,
     mac::{Mac, MacNotification, TouchId},
-    secrets::{OnePassword, is_reference},
+    secrets::{CreateError, OnePassword, check_new_item, is_reference},
 };
 
 /// Cancel button of the Touch ID prompt; pressing it denies the read
 const CANCEL_TITLE: &str = "Deny";
+
+/// Longest a create runs once Touch ID approved it; `op` itself gives up on
+/// each of its two steps sooner, and the gateway has stopped waiting long
+/// before
+const CREATE_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Why the companion could not start
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +88,7 @@ pub async fn serve(
         onepassword: OnePassword::new(config.op.clone()),
         config,
         mac,
-        one_at_a_time: Mutex::new(()),
+        one_at_a_time: Arc::new(Mutex::new(())),
     });
     let accepting = endpoint.clone();
     let task = tokio::spawn(async move {
@@ -107,13 +113,13 @@ struct Companion {
     config: CompanionConfig,
     mac: Option<Arc<dyn Mac>>,
     onepassword: OnePassword,
-    /// Held from the Touch ID prompt to the end of the read, so prompts
-    /// never stack
-    one_at_a_time: Mutex<()>,
+    /// Held from the Touch ID prompt to the end of the read or create, so
+    /// prompts never stack
+    one_at_a_time: Arc<Mutex<()>>,
 }
 
 impl Companion {
-    async fn connection(&self, connection: Connection) {
+    async fn connection(self: &Arc<Self>, connection: Connection) {
         let remote = connection.remote_id();
         if remote != self.config.gateway || connection.alpn() != ALPN {
             tracing::warn!(%remote, "refused a connection that is not from the paired gateway");
@@ -136,7 +142,7 @@ impl Companion {
             // down a Touch ID prompt that is still showing; a gateway that
             // only stops the stream, or never gives up, loses it the same way
             let response = tokio::select! {
-                response = tokio::time::timeout(ASK_TIMEOUT, self.answer(&body)) => {
+                response = tokio::time::timeout(ASK_TIMEOUT, self.dispatch(&body)) => {
                     let Ok(response) = response else {
                         tracing::info!("companion request was not answered in time");
 
@@ -148,13 +154,120 @@ impl Companion {
                 _ = send.stopped() => continue,
                 _ = connection.0.closed() => return,
             };
-            let Ok(bytes) = serde_json::to_vec(&response) else {
-                return;
-            };
-            if send.write_all(&bytes).await.is_err() || send.finish().is_err() {
+            if send.write_all(&response).await.is_err() || send.finish().is_err() {
                 return;
             }
         }
+    }
+
+    /// The serialized answer to one request body: a read, or a create
+    async fn dispatch(self: &Arc<Self>, body: &[u8]) -> Vec<u8> {
+        let bytes = if let Ok(create) = serde_json::from_slice::<CompanionCreateRequest>(body) {
+            serde_json::to_vec(&self.create(create.create).await)
+        } else {
+            serde_json::to_vec(&self.answer(body).await)
+        };
+
+        // a failure to serialize leaves the stream empty, which the gateway
+        // reports as an unusable answer
+        bytes.unwrap_or_default()
+    }
+
+    async fn create(self: &Arc<Self>, item: NewItem) -> CompanionCreateResponse {
+        let fault = |code, message: String| {
+            CompanionCreateResponse::Error(CompanionFault { code, message })
+        };
+
+        if let Err(reason) = check_new_item(&item) {
+            return fault(CompanionErrorCode::NotAllowed, reason);
+        }
+        let (vault, title) = (item.vault.as_str(), item.title.as_str());
+        if !self.config.allows_create(vault) {
+            tracing::warn!(
+                vault,
+                "refused to create an item in a vault that is not allowed"
+            );
+
+            return fault(
+                CompanionErrorCode::NotAllowed,
+                format!("this companion does not create items in {vault}"),
+            );
+        }
+
+        // a second request waits for the first prompt's answer
+        let turn = Arc::clone(&self.one_at_a_time).lock_owned().await;
+
+        let Some(mac) = &self.mac else {
+            return fault(
+                CompanionErrorCode::Denied,
+                "Touch ID is unavailable on this machine".to_owned(),
+            );
+        };
+        // every create asks, whatever was approved before
+        let reason = format!(
+            "codemode-mcp on {} wants to create in {vault}: \"{title}\"",
+            self.config.gateway_name
+        );
+        if mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
+            tracing::info!(vault, title, "create not approved on this Mac");
+
+            return fault(
+                CompanionErrorCode::Denied,
+                "not approved on this Mac".to_owned(),
+            );
+        }
+
+        // from here on the item may be written, so the work must not be
+        // cancelled when the gateway hangs up or the request times out: that
+        // could kill `op item create` mid-run and leave an item the gateway
+        // was told was not created. The task keeps the turn until it ends
+        let companion = Arc::clone(self);
+        let created = tokio::spawn(async move {
+            let _turn = turn;
+            let item = item;
+            let created =
+                tokio::time::timeout(CREATE_DEADLINE, companion.onepassword.create_local(&item))
+                    .await;
+            let (vault, title) = (item.vault.as_str(), item.title.as_str());
+
+            match created {
+                Ok(Ok(created)) => {
+                    tracing::info!(vault, title, "create approved and done");
+
+                    CompanionCreateResponse::Created(created)
+                }
+                Ok(Err(error @ CreateError::Exists { .. })) => {
+                    tracing::info!(vault, title, "refused to create over an existing item");
+
+                    fault(CompanionErrorCode::AlreadyExists, error.to_string())
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(vault, title, %error, "create failed on this Mac");
+
+                    fault(CompanionErrorCode::CreateFailed, error.to_string())
+                }
+                Err(_) => {
+                    tracing::warn!(vault, title, "create did not finish in time");
+
+                    fault(
+                        CompanionErrorCode::CreateFailed,
+                        "the create did not finish in time; the item may exist, check the vault"
+                            .to_owned(),
+                    )
+                }
+            }
+        })
+        .await;
+
+        created.unwrap_or_else(|error| {
+            tracing::warn!(%error, "create task failed");
+
+            CompanionCreateResponse::Error(CompanionFault {
+                code: CompanionErrorCode::CreateFailed,
+                message: "the create stopped unexpectedly; the item may exist, check the vault"
+                    .to_owned(),
+            })
+        })
     }
 
     async fn answer(&self, body: &[u8]) -> CompanionResponse {
@@ -166,7 +279,7 @@ impl Companion {
         };
 
         let Ok(request) = serde_json::from_slice::<CompanionRequest>(body) else {
-            return fault(CompanionErrorCode::NotAllowed, "malformed request");
+            return fault(CompanionErrorCode::NotAllowed, MALFORMED_REQUEST);
         };
         let reference = request.reference.trim();
         if !is_reference(reference) || !self.config.allows(reference) {

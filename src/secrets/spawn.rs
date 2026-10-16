@@ -11,25 +11,58 @@
 
 use std::{io, process::Output};
 
-/// Runs `program` with `args` to completion, stdin closed, and collects its
-/// output; dropping the future kills the child
+/// Runs `program` with `args` to completion and collects its output; dropping
+/// the future kills the child
+///
+/// `stdin` is what the child reads, or nothing: a value passed this way is
+/// in neither the argument list nor the environment, which other processes
+/// of the same user can read
 #[cfg(not(target_os = "macos"))]
-pub(super) async fn output(program: &str, args: &[&str]) -> io::Result<Output> {
+pub(super) async fn output(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> io::Result<Output> {
     use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
 
-    tokio::process::Command::new(program)
+    let mut child = tokio::process::Command::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
+        .spawn()?;
+    let pipe = child.stdin.take();
+    let write = async {
+        if let (Some(mut pipe), Some(input)) = (pipe, stdin) {
+            // a child that exits without reading leaves a broken pipe; its
+            // status says why
+            let _ = pipe.write_all(input).await;
+        }
+    };
+    let (output, ()) = tokio::join!(child.wait_with_output(), write);
+
+    output
 }
 
-/// Runs `program` with `args` to completion, stdin closed, and collects its
-/// output; dropping the future kills the child
+/// Runs `program` with `args` to completion and collects its output; dropping
+/// the future kills the child
+///
+/// `stdin` is what the child reads, or nothing: a value passed this way is
+/// in neither the argument list nor the environment, which other processes
+/// of the same user can read
 #[cfg(target_os = "macos")]
-pub(super) async fn output(program: &str, args: &[&str]) -> io::Result<Output> {
-    macos::output(program, args).await
+pub(super) async fn output(
+    program: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> io::Result<Output> {
+    macos::output(program, args, stdin).await
 }
 
 #[cfg(target_os = "macos")]
@@ -46,7 +79,10 @@ mod macos {
         sync::{Arc, Mutex, OnceLock, PoisonError},
     };
 
-    use tokio::{io::AsyncReadExt, net::unix::pipe};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::unix::pipe,
+    };
 
     unsafe extern "C" {
         // not in the SDK headers, but exported by libsystem since macOS
@@ -58,19 +94,44 @@ mod macos {
         ) -> c_int;
     }
 
-    pub(super) async fn output(program: &str, args: &[&str]) -> io::Result<Output> {
+    pub(super) async fn output(
+        program: &str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> io::Result<Output> {
         let (stdout_read, stdout_write) = pipe()?;
         let (stderr_read, stderr_write) = pipe()?;
-        let pid = spawn(program, args, &stdout_write, &stderr_write)?;
+        let input = stdin
+            .map(|bytes| pipe().map(|ends| (ends, bytes)))
+            .transpose()?;
+        let pid = spawn(
+            program,
+            args,
+            input.as_ref().map(|((read, _), _)| read),
+            &stdout_write,
+            &stderr_write,
+        )?;
         let child = Child::new(pid);
 
         // the reads end at the child's exit only once no copy of the write
-        // ends is left here
+        // ends is left here, and the child sees the end of stdin only once
+        // no copy of its read end is
         drop((stdout_write, stderr_write));
+        let input = input.map(|((read, write), bytes)| {
+            drop(read);
 
+            (write, bytes)
+        });
+
+        let write = async {
+            match input {
+                Some((write, bytes)) => write_all(write, bytes).await,
+                None => Ok(()),
+            }
+        };
         let stdout = read_to_end(stdout_read);
         let stderr = read_to_end(stderr_read);
-        let (stdout, stderr, status) = tokio::try_join!(stdout, stderr, child.wait())?;
+        let (stdout, stderr, status, ()) = tokio::try_join!(stdout, stderr, child.wait(), write)?;
 
         Ok(Output {
             status,
@@ -151,13 +212,15 @@ mod macos {
     }
 
     /// Starts `program`, looked up on `PATH`, with responsibility disclaimed
-    /// and only stdin from /dev/null and the two pipes inherited
+    /// and only stdin (from `stdin`, else /dev/null) and the two pipes
+    /// inherited
     ///
     /// Like std's `Command`, it unblocks every signal and restores SIGPIPE,
     /// which the daemon ignores, to its default
     fn spawn(
         program: &str,
         args: &[&str],
+        stdin: Option<&OwnedFd>,
         stdout: &OwnedFd,
         stderr: &OwnedFd,
     ) -> io::Result<libc::pid_t> {
@@ -196,13 +259,20 @@ mod macos {
                 libc::sigaddset(&mut signals, libc::SIGPIPE);
                 check(libc::posix_spawnattr_setsigdefault(&mut attrs, &signals))?;
                 check(responsibility_spawnattrs_setdisclaim(&mut attrs, 1))?;
-                check(libc::posix_spawn_file_actions_addopen(
-                    &mut actions,
-                    libc::STDIN_FILENO,
-                    c"/dev/null".as_ptr(),
-                    libc::O_RDONLY,
-                    0,
-                ))?;
+                match stdin {
+                    Some(stdin) => check(libc::posix_spawn_file_actions_adddup2(
+                        &mut actions,
+                        stdin.as_raw_fd(),
+                        libc::STDIN_FILENO,
+                    ))?,
+                    None => check(libc::posix_spawn_file_actions_addopen(
+                        &mut actions,
+                        libc::STDIN_FILENO,
+                        c"/dev/null".as_ptr(),
+                        libc::O_RDONLY,
+                        0,
+                    ))?,
+                }
                 check(libc::posix_spawn_file_actions_adddup2(
                     &mut actions,
                     stdout.as_raw_fd(),
@@ -253,6 +323,16 @@ mod macos {
         pipe.read_to_end(&mut bytes).await?;
 
         Ok(bytes)
+    }
+
+    /// Writes `bytes` to the child's stdin and closes it, on the runtime like
+    /// the reads; a child that exits without reading leaves a broken pipe,
+    /// which its status explains
+    async fn write_all(fd: OwnedFd, bytes: &[u8]) -> io::Result<()> {
+        let mut pipe = pipe::Sender::from_owned_fd(fd)?;
+        let _ = pipe.write_all(bytes).await;
+
+        Ok(())
     }
 
     /// A started child, killed if dropped before it exits
