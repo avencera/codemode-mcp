@@ -8,8 +8,18 @@ use super::harness::{Harness, Setup, TestResult, execute, temp_state_dir, text_o
 
 pub(super) const VALUE: &str = "value-from-1password";
 
-/// A stand-in for the 1Password CLI that knows one item and logs each read
+/// A stand-in for the 1Password CLI that knows one item and logs each read,
+/// already authorized so it reads without asking
 pub(super) fn fake_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let (program, log) = signed_out_op()?;
+    std::fs::write(log.with_file_name("authorized"), "")?;
+
+    Ok((program, log))
+}
+
+/// Like [`fake_op`], but `whoami` fails until the first read, as if that
+/// read showed 1Password's prompt and was approved
+pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
     let log = directory.join("reads.log");
@@ -18,14 +28,20 @@ pub(super) fn fake_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
         &program,
         format!(
             "#!/bin/sh\n\
+             if [ \"$1\" = whoami ]; then\n\
+               [ -e '{authorized}' ] && exit 0\n\
+               echo '[ERROR] 2026/10/15 21:12:29 account is not signed in' >&2; exit 1\n\
+             fi\n\
              echo \"$3\" >> '{log}'\n\
              [ \"$1 $2\" = 'read --no-newline' ] || exit 2\n\
+             touch '{authorized}'\n\
              case \"$3\" in\n\
                op://Dev/fixture/credential) printf '{VALUE}' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
             log = log.display(),
+            authorized = directory.join("authorized").display(),
         ),
     )?;
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;

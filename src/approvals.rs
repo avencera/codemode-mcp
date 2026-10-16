@@ -816,7 +816,7 @@ impl Approvals {
                     let local = MacNotification {
                         title: notification.title,
                         message: notification.message,
-                        click: url,
+                        click: Some(url),
                     };
                     if let Err(error) = on_mac.mac.notify(&local).await {
                         tracing::warn!(%error, "Mac notification failed");
@@ -916,7 +916,7 @@ impl Approvals {
                         let local = MacNotification {
                             title: notification.title,
                             message: "Click to review.".to_owned(),
-                            click: url.clone(),
+                            click: Some(url.clone()),
                         };
                         if let Err(error) = on_mac.mac.notify(&local).await {
                             tracing::warn!(%error, "Mac notification failed");

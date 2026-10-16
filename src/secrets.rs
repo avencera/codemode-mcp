@@ -26,6 +26,10 @@ use crate::{
 /// How long one `op read` may take; long enough for the 1Password app's
 /// unlock or Touch ID prompt on the Mac
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long `op whoami` may take; it answers without a prompt
+const WHOAMI_TIMEOUT: Duration = Duration::from_secs(10);
+/// What `op whoami` prints when the app has not authorized the CLI
+const SIGNED_OUT: &str = "account is not signed in";
 /// Longest upstream error text handed to a script
 const MAX_ERROR_TEXT: usize = 2000;
 /// Replacement for secrets found in upstream text
@@ -361,6 +365,24 @@ impl OnePassword {
                 timeout: READ_TIMEOUT,
             }),
         }
+    }
+
+    /// Whether `op` is surely signed out, so the next read puts 1Password's
+    /// own prompt up
+    ///
+    /// `op whoami` answers from the current authorization and never puts a
+    /// prompt up itself. Only its explicit signed-out answer counts: a
+    /// timeout, a failed start or any other error may still read silently,
+    /// so those answer `false` and the caller keeps asking for itself
+    pub async fn signed_out(&self) -> bool {
+        let whoami =
+            tokio::time::timeout(WHOAMI_TIMEOUT, spawn::output(&self.program, &["whoami"]));
+
+        matches!(
+            whoami.await,
+            Ok(Ok(output)) if !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).contains(SIGNED_OUT)
+        )
     }
 
     /// Runs `op read` on this Mac, with no cache and no companions

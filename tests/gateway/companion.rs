@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::{
     harness::{FakeMac, Harness, Setup, TestResult, temp_state_dir},
-    secrets::{VALUE, fake_op, reads},
+    secrets::{VALUE, fake_op, reads, signed_out_op},
     service::{codemode, files},
 };
 
@@ -49,6 +49,9 @@ struct Options<'a> {
     mac_notifications: bool,
     /// Whether the gateway's own `op` hangs instead of answering
     local_hangs: bool,
+    /// Whether the companion's `op` is already authorized, so it would read
+    /// without 1Password asking
+    signed_in: bool,
 }
 
 impl Default for Options<'_> {
@@ -60,6 +63,7 @@ impl Default for Options<'_> {
             present: false,
             mac_notifications: true,
             local_hangs: false,
+            signed_in: true,
         }
     }
 }
@@ -73,6 +77,7 @@ impl Rig {
             present,
             mac_notifications,
             local_hangs,
+            signed_in,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -84,7 +89,11 @@ impl Rig {
             iroh::SecretKey::generate().public()
         };
 
-        let (companion_op, companion_log) = fake_op()?;
+        let (companion_op, companion_log) = if signed_in {
+            fake_op()?
+        } else {
+            signed_out_op()?
+        };
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
         let text = format!(
@@ -291,6 +300,46 @@ async fn every_request_asks_touch_id_again() -> TestResult {
     );
     assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
     assert_eq!(rig.companion_mac.cancel_titles().len(), 3);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_out_1password_is_the_only_fingerprint_asked() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        signed_in: false,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let reason = format!("codemode-mcp on main wants to read {REFERENCE}");
+
+    // 1Password's own prompt approves the first read, so the companion only
+    // names it
+    let body = rig
+        .harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], VALUE, "{body}");
+    assert_eq!(rig.companion_mac.shown(), [format!("notify {reason}")]);
+
+    // once `op` is authorized it would read silently, so the companion asks
+    let (status, checked) = rig
+        .harness
+        .admin_json("/admin/companion/check", &json!({ "reference": REFERENCE }))
+        .await?;
+    assert_eq!(status, 200, "{checked}");
+    assert!(
+        checked["companions"][0]["result"]["ok"].is_object(),
+        "{checked}"
+    );
+    assert_eq!(
+        rig.companion_mac.shown(),
+        [format!("notify {reason}"), format!("touch_id {reason}")]
+    );
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
 
     rig.stop().await
 }

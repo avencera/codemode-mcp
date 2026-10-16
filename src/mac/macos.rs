@@ -216,11 +216,15 @@ impl Mac for MacOs {
                             .to_owned(),
                     )
                 })?;
-            let status = Command::new(program)
+            let mut command = Command::new(program);
+            command
                 .args(["-title", &notification.title])
                 .args(["-message", &notification.message])
-                .args(["-open", &notification.click])
-                .args(["-sound", "default"])
+                .args(["-sound", "default"]);
+            if let Some(click) = &notification.click {
+                command.args(["-open", click]);
+            }
+            let status = command
                 .status()
                 .await
                 .map_err(|error| MacError(format!("terminal-notifier did not start: {error}")))?;

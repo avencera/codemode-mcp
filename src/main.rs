@@ -884,8 +884,8 @@ async fn pair_with_invite(
     }
 
     println!(
-        "Checking the pairing: approve the Touch ID prompt on this Mac. 1Password may ask too \
-         the first time."
+        "Checking the pairing: approve the Touch ID prompt on this Mac, which is 1Password's \
+         own while it has not yet let `op` in."
     );
     let check = joined
         .check()
