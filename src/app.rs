@@ -11,7 +11,7 @@ use crate::{
     config::{Config, ConfigError},
     executions::Executions,
     executor::{Executor, ExecutorError},
-    gateway::Gateway,
+    gateway::{Gateway, UpstreamAccess},
     mac::{Mac, OnMac},
     notify::{Notifier, Ntfy},
     oauth::OAuth,
@@ -143,6 +143,8 @@ impl App {
         let sealer = Sealer::load_or_create(&state_dir).map_err(ExecutorError::from)?;
         let passkeys = Arc::new(Passkeys::new(&config.public_origin(), store.clone())?);
         let session_store = store.clone();
+        // the `logins` server types on the Mac whether or not approvals ask there
+        let screen = mac.clone();
         let presence = mac.map(|mac| OnMac {
             mac,
             config: config.notify.mac.clone(),
@@ -172,9 +174,12 @@ impl App {
             Arc::clone(&executor),
             approvals,
             log.clone(),
-            oauth,
-            &session_store,
-            secrets,
+            UpstreamAccess {
+                oauth,
+                store: session_store.clone(),
+                secrets,
+                mac: screen,
+            },
         );
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),

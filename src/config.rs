@@ -117,6 +117,10 @@ pub struct Config {
     /// Upstream MCP servers by name
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
+    /// 1Password logins a `builtin = "logins"` server may type into a page
+    /// on their sites, by name
+    #[serde(default)]
+    pub logins: BTreeMap<String, LoginConfig>,
     /// The file this was loaded from; `None` when parsed from text, and then
     /// nothing can be written back
     #[serde(skip)]
@@ -141,6 +145,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             companion: None,
             servers: BTreeMap::new(),
+            logins: BTreeMap::new(),
             path: None,
         }
     }
@@ -284,9 +289,105 @@ impl Config {
             }
             server.validate(name)?;
         }
+        for (name, login) in &self.logins {
+            login.validate(name)?;
+        }
 
         Ok(())
     }
+}
+
+/// The tools of the `logins` builtin, which per-tool settings may name
+const LOGINS_TOOLS: [&str; 2] = ["fill", "list"];
+
+/// Longest login name; the approval page and prompts show it
+const MAX_LOGIN_NAME_CHARS: usize = 63;
+
+/// A 1Password login the `logins` server may type into the focused field
+/// of a page on one of its sites
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginConfig {
+    /// Hosts the login may be typed on: `github.com` is that host only,
+    /// and `*.github.com` any host under it
+    pub sites: Vec<String>,
+    /// Reference of the username, such as `op://Personal/GitHub/username`
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Reference of the password
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl LoginConfig {
+    /// The references the login reads, for a companion's or phone's allow
+    /// list
+    pub fn references(&self) -> impl Iterator<Item = &str> {
+        self.username
+            .iter()
+            .chain(self.password.iter())
+            .map(String::as_str)
+    }
+
+    fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        let at = format!("logins.{name}");
+        // agents pass the name and the approval page shows it
+        let plain = name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        if name.is_empty() || name.chars().count() > MAX_LOGIN_NAME_CHARS || !plain {
+            return Err(ConfigError::Invalid(format!(
+                "{at}: login names must be 1 to {MAX_LOGIN_NAME_CHARS} lowercase letters, digits, \
+                 `-` or `_`"
+            )));
+        }
+        if self.sites.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{at}: `sites` must name at least one host, such as \"github.com\""
+            )));
+        }
+        for site in &self.sites {
+            if !is_site(site) {
+                return Err(ConfigError::Invalid(format!(
+                    "{at}: `{site}` in `sites` must be a lowercase host name with a dot, such as \
+                     \"github.com\" or \"*.github.com\", without a scheme, port or path"
+                )));
+            }
+        }
+        if self.username.is_none() && self.password.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "{at}: set `username`, `password` or both"
+            )));
+        }
+        for (field, reference) in [("username", &self.username), ("password", &self.password)] {
+            if let Some(reference) = reference
+                && !crate::secrets::is_reference(reference)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{at}.{field}: must be an op://vault/item/field reference, without braces"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A host a login may be typed on: lowercase labels joined by dots, after
+/// an optional `*.` for the hosts under it
+fn is_site(site: &str) -> bool {
+    let host = site.strip_prefix("*.").unwrap_or(site);
+    let labels: Vec<&str> = host.split('.').collect();
+
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
 }
 
 /// The 1Password CLI that reads `{{ op://vault/item/field }}` references in
@@ -981,6 +1082,19 @@ pub struct ServerConfig {
     /// for `onepassword`
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// A server the daemon serves itself instead of `command` or `url`
+    #[serde(default)]
+    pub builtin: Option<Builtin>,
+}
+
+/// A server served inside the daemon, which holds what it needs: the
+/// 1Password reader and the Mac's screen
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Builtin {
+    /// Types a `[logins]` username or password into the focused field of a
+    /// page on the login's sites
+    Logins,
 }
 
 /// Per-tool settings that override the server defaults
@@ -1083,14 +1197,17 @@ pub enum Transport<'a> {
         /// references; read them with `OnePassword::resolve_url`
         url: &'a str,
     },
+    /// Serve it inside the daemon
+    Builtin(Builtin),
 }
 
 impl ServerConfig {
     /// The transport this server uses; validation guarantees exactly one
     pub fn transport(&self) -> Option<Transport<'_>> {
-        match (&self.command, &self.url) {
-            (Some(command), None) => Some(Transport::Stdio { command }),
-            (None, Some(url)) => Some(Transport::Http { url }),
+        match (&self.command, &self.url, self.builtin) {
+            (Some(command), None, None) => Some(Transport::Stdio { command }),
+            (None, Some(url), None) => Some(Transport::Http { url }),
+            (None, None, Some(builtin)) => Some(Transport::Builtin(builtin)),
             _ => None,
         }
     }
@@ -1150,12 +1267,16 @@ impl ServerConfig {
                 .map_err(|error| ConfigError::Invalid(format!("servers.{name}.url: {error}")))?;
         }
 
+        if self.builtin.is_some() {
+            return self.validate_builtin(name);
+        }
+
         match (&self.command, &self.url) {
             (Some(_), Some(_)) => Err(ConfigError::Invalid(format!(
                 "servers.{name}: set either `command` or `url`, not both"
             ))),
             (None, None) => Err(ConfigError::Invalid(format!(
-                "servers.{name}: one of `command` or `url` is required"
+                "servers.{name}: one of `command`, `url` or `builtin` is required"
             ))),
             (Some(_), None) if !self.headers.is_empty() => Err(ConfigError::Invalid(format!(
                 "servers.{name}: `headers` only applies to `url` servers"
@@ -1219,6 +1340,63 @@ impl ServerConfig {
             }
             _ => Ok(()),
         }
+    }
+
+    /// A builtin runs in the daemon, so nothing about starting or reaching
+    /// a process applies
+    fn validate_builtin(&self, name: &str) -> Result<(), ConfigError> {
+        if self.command.is_some() || self.url.is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}: set one of `command`, `url` or `builtin`"
+            )));
+        }
+        let process = !self.args.is_empty()
+            || !self.env.is_empty()
+            || self.cwd.is_some()
+            || self.lazy
+            || !self.headers.is_empty()
+            || self.oauth
+            || !self.scopes.is_empty()
+            || self.client_name.is_some()
+            || self.client_id.is_some()
+            || self.client_secret.is_some()
+            || !self.authorization_params.is_empty()
+            || !self.setup.is_empty()
+            || self.warm.is_some();
+        if process {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}: a `builtin` server takes no `args`, `env`, `cwd`, `lazy`, \
+                 `headers`, OAuth settings, `setup` or `warm`"
+            )));
+        }
+
+        match self.builtin {
+            Some(Builtin::Logins) => self.validate_logins(name),
+            None => Ok(()),
+        }
+    }
+
+    /// Every fill must ask, once per call: a default `allow`, or a session
+    /// grant, would let an agent type a password as often as it likes
+    fn validate_logins(&self, name: &str) -> Result<(), ConfigError> {
+        if let Some(tool) = self
+            .tools
+            .keys()
+            .find(|tool| !LOGINS_TOOLS.contains(&tool.as_str()))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}.tools.{tool}: the logins server has only {}",
+                LOGINS_TOOLS.join(" and ")
+            )));
+        }
+        if self.policy_for("fill") != Policy::Ask || self.grant_for("fill") != GrantMode::PerCall {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}: the logins server's `fill` must ask on every call; set \
+                 `policy = \"ask\"` and `tools.fill.grant = \"per_call\"`"
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -1375,5 +1553,57 @@ mod tests {
         assert!(secrets(&[peer("mba\\nok")], "").is_err());
         assert!(companion("\"op://Dev/Context7\\u202e/credential\"").is_err());
         assert!(companion(&format!("\"op://Dev/{}/credential\"", "x".repeat(300))).is_err());
+    }
+
+    #[test]
+    fn logins_take_plain_hosts_and_bare_references() {
+        let login = |body: &str| {
+            parse(&format!(
+                "[servers.logins]\nbuiltin = \"logins\"\npolicy = \"ask\"\n\
+                 tools.fill.grant = \"per_call\"\n\n[logins.github]\n{body}"
+            ))
+        };
+        let password = "password = \"op://Personal/GitHub/password\"";
+
+        assert!(
+            login(&format!(
+                "sites = [\"github.com\", \"*.github.io\"]\n{password}"
+            ))
+            .is_ok()
+        );
+        for site in [
+            "https://github.com",
+            "github.com/login",
+            "github.com:443",
+            "GitHub.com",
+            "com",
+            ".github.com",
+            "*.com",
+            "*github.com",
+            "*.*.github.com",
+        ] {
+            assert!(
+                login(&format!("sites = [\"{site}\"]\n{password}")).is_err(),
+                "{site}"
+            );
+        }
+        assert!(login(&format!("sites = []\n{password}")).is_err());
+        assert!(login("sites = [\"github.com\"]").is_err());
+        assert!(
+            login("sites = [\"github.com\"]\npassword = \"{{ op://Personal/GitHub/password }}\"")
+                .is_err()
+        );
+        assert!(parse("[servers.logins]\nbuiltin = \"logins\"\ncommand = \"x\"").is_err());
+        assert!(parse("[servers.logins]\nbuiltin = \"logins\"\nlazy = true").is_err());
+        // a fill must ask on every call
+        assert!(parse("[servers.logins]\nbuiltin = \"logins\"").is_err());
+        assert!(parse("[servers.logins]\nbuiltin = \"logins\"\npolicy = \"ask\"").is_err());
+        assert!(
+            parse(
+                "[servers.logins]\nbuiltin = \"logins\"\npolicy = \"ask\"\n\
+                 tools.fill.grant = \"per_call\"\ntools.fil.grant = \"per_call\""
+            )
+            .is_err()
+        );
     }
 }

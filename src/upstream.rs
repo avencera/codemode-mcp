@@ -29,18 +29,33 @@ use rmcp::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, BufReader, DuplexStream},
     process::Command,
     sync::{Mutex, Notify, watch},
     task::JoinHandle,
 };
 
 use crate::{
-    config::{ServerConfig, Transport},
+    config::{Builtin, LoginConfig, ServerConfig, Transport},
+    logins::LoginsServer,
+    mac::Mac,
     oauth::OAuth,
     secrets::{OnePassword, Redactor},
     store::Store,
 };
+
+/// Bytes the in-memory pipe to a builtin server buffers each way; a larger
+/// message waits for the other side to read
+const BUILTIN_PIPE_BYTES: usize = 64 * 1024;
+
+/// What the servers the daemon serves itself need beyond their config
+#[derive(Clone, Default)]
+pub struct Builtins {
+    /// Logins the `logins` server may fill
+    pub logins: Arc<BTreeMap<String, LoginConfig>>,
+    /// The Mac whose screen the `logins` server types on; `None` off macOS
+    pub mac: Option<Arc<dyn Mac>>,
+}
 
 /// Time allowed for the initialize handshake plus the first tool listing
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -342,6 +357,8 @@ pub struct Upstream {
     onepassword: OnePassword,
     /// Learns the values read, so upstream text never shows them
     redactor: Arc<Redactor>,
+    /// What a `builtin` server is built from
+    builtins: Builtins,
     /// Counts calls that want a sleeping `lazy` server started
     wake: watch::Sender<u64>,
     /// Counts finished connect attempts, so a woken call knows when to look
@@ -1045,6 +1062,15 @@ impl Upstream {
                     .await
                     .map_err(|error| UpstreamError::Initialize(error.to_string()))?
             }
+            Some(Transport::Builtin(builtin)) => {
+                let (ours, theirs) = tokio::io::duplex(BUILTIN_PIPE_BYTES);
+                self.spawn_builtin(builtin, theirs);
+
+                handler
+                    .serve(ours)
+                    .await
+                    .map_err(|error| UpstreamError::Initialize(error.to_string()))?
+            }
             Some(Transport::Http { .. }) => {
                 let url = resolved.url.as_deref().ok_or(UpstreamError::Url)?;
                 let config = self.http_config(url, &resolved.headers)?;
@@ -1101,6 +1127,24 @@ impl Upstream {
         self.changed.notify_one();
 
         Ok(service)
+    }
+
+    /// Serves `builtin` on `io` until the connection drops its end
+    fn spawn_builtin(&self, builtin: Builtin, io: DuplexStream) {
+        let server = match builtin {
+            Builtin::Logins => LoginsServer::new(
+                Arc::clone(&self.builtins.logins),
+                self.onepassword.clone(),
+                Arc::clone(&self.redactor),
+                self.builtins.mac.clone(),
+            ),
+        };
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            if let Err(error) = server.serve_on(io).await {
+                tracing::debug!(server = %name, %error, "builtin server stopped");
+            }
+        });
     }
 
     fn spawn_child(
@@ -1270,6 +1314,7 @@ impl Upstreams {
         store: &Store,
         onepassword: &OnePassword,
         redactor: &Arc<Redactor>,
+        builtins: &Builtins,
     ) -> Self {
         let changed = Arc::new(Notify::new());
         let mut upstreams = Vec::new();
@@ -1303,6 +1348,7 @@ impl Upstreams {
                 reconnect: watch::channel(0).0,
                 onepassword: onepassword.clone(),
                 redactor: Arc::clone(redactor),
+                builtins: builtins.clone(),
                 wake: watch::channel(0).0,
                 attempts: watch::channel(0).0,
                 usage: std::sync::Mutex::new(Usage {

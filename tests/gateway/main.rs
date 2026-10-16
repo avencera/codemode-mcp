@@ -8,6 +8,7 @@ mod companion;
 mod durable;
 mod harness;
 mod lazy;
+mod logins;
 mod mac;
 mod oauth;
 mod phone;

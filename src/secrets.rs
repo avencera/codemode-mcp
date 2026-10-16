@@ -849,6 +849,12 @@ impl OnePassword {
         Ok(text)
     }
 
+    /// What 1Password holds for one `op://` reference, through the cache
+    /// and every source a configured value would use
+    pub async fn read_reference(&self, reference: &str) -> Result<String, SecretError> {
+        self.value(reference).await
+    }
+
     async fn value(&self, reference: &str) -> Result<String, SecretError> {
         // held across the read on purpose: a second caller waits for the
         // first prompt's answer instead of raising its own

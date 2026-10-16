@@ -919,7 +919,7 @@ async fn companion_invite_status(
 }
 
 /// Sorted, deduplicated references in the servers' `headers`, `env`, `url`
-/// and `client_secret`: what a companion is allowed to read
+/// and `client_secret`, and in `[logins]`: what a companion is allowed to read
 fn config_references(config: &Config) -> Vec<String> {
     let mut references = std::collections::BTreeSet::new();
     for server in config.servers.values() {
@@ -933,6 +933,9 @@ fn config_references(config: &Config) -> Vec<String> {
                 references.insert(reference.to_owned());
             }
         }
+    }
+    for login in config.logins.values() {
+        references.extend(login.references().map(str::to_owned));
     }
 
     references.into_iter().collect()

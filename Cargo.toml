@@ -105,18 +105,32 @@ objc2-event-kit = { version = "0.3.2", default-features = false, features = [
     "EKSource",
     "EKTypes",
 ] }
-# screen lock and input idle time, to tell whether the owner is at the Mac
+# Accessibility, for the `logins` server: the focused field, its kind and
+# the address of the page holding it
+objc2-application-services = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "AXError",
+    "AXUIElement",
+    "HIServices",
+    "libc",
+] }
+# screen lock and input idle time, to tell whether the owner is at the Mac;
+# CFURL and the CGEvent features are for the `logins` server's typing
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "CFDictionary",
     "CFNumber",
     "CFString",
+    "CFURL",
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
     "std",
+    "CGEvent",
     "CGEventSource",
     "CGEventTypes",
+    "CGRemoteOperation",
     "CGSession",
+    "libc",
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",

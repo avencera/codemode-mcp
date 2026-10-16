@@ -18,6 +18,7 @@ pub mod gateway;
 mod guidance;
 pub mod host;
 pub mod json_access;
+pub mod logins;
 pub mod mac;
 pub mod notify;
 pub mod oauth;

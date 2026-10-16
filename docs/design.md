@@ -678,6 +678,45 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 - Not on Linux: the EventKit code and its dependencies are macOS-only; elsewhere the subcommands exit with an
   error
 
+### Logins (`src/logins.rs`, `src/mac/screen.rs`)
+
+- A server with `builtin = "logins"` is served inside the daemon, over a `tokio::io::duplex` pipe that the
+  ordinary upstream client connects through, so the catalog, policies, approvals and usage log treat it like
+  any other server. It is in process because it needs the daemon's 1Password reader and the Mac's screen
+- Config refuses a `logins` server unless `fill` resolves to `ask` with `per_call`, and refuses per-tool
+  settings for tools it does not have, so a missing `policy` (the default is `allow`) or a typo cannot let
+  fills through unasked. Fills run one at a time, so two calls in one `asyncio.gather` cannot interleave keys
+- `fill(login, field)` types a `[logins.<name>]` username or password into the field with keyboard focus, for an
+  agent that drives the Mac's screen and must sign in without the value entering its context. `list` names the
+  logins, their sites and fields. The answer is the login, field and host; passwords read are added to the
+  redactor (not usernames, which as email addresses appear in other servers' results and would be garbled), and the server is `sensitive` under `ask`, so neither logs nor scripts see them
+- Where a value may go is decided from Accessibility, not from the agent: the system-wide focused element, its
+  role and subrole (`AXSecureTextField` for a password, `AXTextField` or `AXComboBox` for a username), and the
+  `AXURL` of every `AXWebArea` above it, innermost first, so a field in a frame lists the frame's document and
+  each page around it. Every one must be `https` on port 443 with a host that is a site, or under a `*.` site;
+  a web area without a readable address is refused, and so is a field nested deeper than 256 parents. A frame
+  is checked only when the browser exposes it as a web area of its own; one it folds into the page around it is
+  never seen, so its host is not checked. Sites match exactly unless written `*.`, because user content often lives under the same
+  domain (`sites.google.com`). Config takes sites as lowercase host names only, so a site cannot carry a
+  scheme, port or path that would change the match. The rule (`FieldRule`) is
+  platform-independent, so the gateway test runs it against a fake screen
+- The field is checked before the value is read, so a wrong field never prompts the owner, and again right
+  before typing. Characters are posted as keyboard events (`CGEventKeyboardSetUnicodeString`, flags cleared,
+  from a private event source so held keys do not combine) to the field's process, one at a time. Before each, the
+  focused element is compared to the original (`CFEqual`) and the whole rule is checked again against the same
+  host, so a page that navigates under a still-focused field stops typing too; any change stops it with an
+  `Interrupted` error. A character in flight when focus moves can still land in the new element
+- Values come from `OnePassword::read_reference`, the same race and cache as server secrets, so a companion Mac
+  or phone answers while the owner is away and a rotated password needs a restart. One-time codes would need a
+  fresh read every time, or the TOTP seed and a code computed here; neither is built
+- Not defended: a username is typed into a plain field and is visible like any text, and a page's
+  show-password button turns the password field into one. Code in the page, or anything driving the browser by Apple Events or a debugging port, can read
+  the field after it is filled. Codex's computer use reads the accessibility tree, so the fill relies on
+  browsers exposing a password field there as bullets, not its text (not checked live yet). Same-user code is outside the threat model in any case (see Threat model): an app the agent builds and runs can present an Accessibility tree that claims any page, and fills are not yet limited to code-signed browsers
+- Accessibility (`AXIsProcessTrustedWithOptions`, which asks macOS to show its prompt) and event posting
+  (`CGPreflightPostEventAccess`) are checked on every call, and the error names the System Settings switch. The
+  grant is the daemon's own, keyed to its signature
+
 ### Xcode
 
 - The `xcode` server is Xcode's own stdio bridge, `/usr/bin/xcrun mcpbridge`, with no adapter of ours. It talks

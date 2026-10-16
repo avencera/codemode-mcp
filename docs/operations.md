@@ -307,6 +307,67 @@ client. Until it is approved every tool fails with "This agent isn't approved to
   In headless mode, `sudo xcrun mcp-server approve <id>` approves a pending request by the id `status` shows.
 - Revoke: `sudo xcrun mcp-server clear-permissions` removes every agent and folder grant.
 
+## Sign in to websites from an agent
+
+An agent that drives this Mac's screen, such as Codex with computer use, can sign in to a website with a
+1Password login without seeing the username or password. The `logins` server types the value into the field
+that has keyboard focus, after checking the field and the page itself; the agent only learns which host took it.
+
+1. List the logins an agent may use, and the hosts each may be typed on:
+
+   ```toml
+   [servers.logins]
+   builtin = "logins"
+   policy = "ask"
+   tools.fill.grant = "per_call"
+   tools.list.policy = "allow"
+
+   [logins.github]
+   sites = ["github.com"]
+   username = "op://Personal/GitHub/username"
+   password = "op://Personal/GitHub/password"
+   ```
+
+   A site is that host only; `*.github.com` covers every host under `github.com`, but not `github.com`
+   itself. Name the exact hosts the login page lives on, such as `accounts.google.com`, and use `*.` only for
+   a domain whose subdomains are all its owner's: under `*.google.com`, any page on `sites.google.com` could
+   take the password. The `logins` server must ask on every call; the config is refused unless `fill` is
+   `ask` with `grant = "per_call"`.
+2. Restart the daemon (`codemode-mcp service restart`). The first fill asks macOS to let codemode-mcp use
+   Accessibility; turn it on in System Settings > Privacy & Security > Accessibility and fill again. The grant
+   belongs to the signed binary, so updates keep it.
+3. Pair phones and companion Macs again (`companion invite`) if they should answer these references without a
+   tap on Allow this reference; pairing hands them the references in `[logins]` too.
+
+What a fill checks, from Accessibility rather than the agent's words:
+
+- A password goes only into a password field, the kind that shows bullets. A username goes only into a
+  one-line text field.
+- The field's page must be `https` on port 443, and its host one of the login's `sites`. A field inside a
+  frame is checked against the frame and every page around it, so each of those hosts must be listed. This
+  relies on the browser exposing each frame's address to Accessibility; a frame it does not expose goes
+  unchecked.
+- Focus and the page are checked again before each character, and typing stops once either has changed. Keys
+  already sent may still land, so a few characters can reach a field in the same app that took focus; keys never
+  go to another app. The answer then says to clear the field and fill again.
+
+Each fill is approved like any `per_call` tool: Touch ID while you are at the Mac, otherwise a passkey on the
+phone. The value is then read like a server secret, through `op` while you are at the Mac, or a companion Mac or
+phone when you are not, and kept in the daemon's memory until it restarts. After changing a password in
+1Password, restart the daemon so the next fill reads the new one.
+
+Limits:
+
+- Web pages only, in a browser that exposes its pages to Accessibility, such as Safari or Chrome. Native
+  app fields have no page address and are refused.
+- No one-time codes yet; type those yourself, or approve the sign-in on your phone.
+- A username lands in a plain text field, so the agent sees it on screen like any typed text. A password
+  shows as bullets, until something clicks the page's show-password button; then the agent can read it too.
+- The agent never gets the value from the tool, but anything that can run script in the page could read the
+  field once it is filled. Keep agents from driving the browser through Apple Events: when macOS asks whether
+  the agent's app may control Safari or Chrome, choose Don't Allow, and leave Safari's Allow JavaScript from
+  Apple Events off. Do not sign in this way in a Chrome started with `--remote-debugging-port`.
+
 ## OAuth sign-in
 
 ```sh
