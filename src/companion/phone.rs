@@ -22,7 +22,8 @@ use iroh::{EndpointId, endpoint::Connection};
 use tokio::{sync::watch, time::Instant};
 
 use super::{
-    ASK_TIMEOUT, CompanionFailure, CompanionResponse, Companions, MAX_BODY_BYTES, answer,
+    ASK_TIMEOUT, CompanionFailure, CompanionResponse, Companions, MAX_BODY_BYTES,
+    MAX_PHONE_READ_BYTES, answer,
     apns::{Alert, PushFailure},
     read_request, short_hostname,
 };
@@ -184,12 +185,13 @@ impl Companions {
     }
 
     /// Asks the phone called `name` for `reference`, sending its sealed copy
-    /// if there is one: pushes to wake it, then waits for it to dial in and
-    /// answer
+    /// if there is one: pushes to wake it, then waits up to `within` for it
+    /// to dial in and answer; the phone's prompt shows the same deadline
     pub async fn read_phone(
         self: &Arc<Self>,
         name: &str,
         reference: &str,
+        within: Duration,
     ) -> Result<String, CompanionFailure> {
         let phone = self
             .phones()
@@ -197,12 +199,14 @@ impl Companions {
             .find(|phone| phone.name == name)
             .ok_or_else(|| CompanionFailure::Unknown(name.to_owned()))?;
 
-        tokio::time::timeout(ASK_TIMEOUT, self.ask_phone(&phone, reference))
+        let within = within.min(ASK_TIMEOUT);
+        let deadline = Instant::now() + within;
+        tokio::time::timeout(within, self.ask_phone(&phone, reference, deadline))
             .await
             .unwrap_or_else(|_| {
                 Err(CompanionFailure::TimedOut {
                     name: phone.name.clone(),
-                    timeout: ASK_TIMEOUT,
+                    timeout: within,
                 })
             })
     }
@@ -211,8 +215,8 @@ impl Companions {
         self: &Arc<Self>,
         phone: &PhonePeer,
         reference: &str,
+        deadline: Instant,
     ) -> Result<String, CompanionFailure> {
-        let deadline = Instant::now() + ASK_TIMEOUT;
         let key = phone.id.to_string();
         // without a copy the owner enters the value on the phone
         let sealed = self
@@ -312,7 +316,8 @@ impl Companions {
                 Ok(()) => tracing::info!(phone = %name, request = %alert.request, "phone woken"),
                 Err(PushFailure::Gone) => {
                     tracing::warn!(phone = %name, "APNs no longer knows the phone's token");
-                    if let Err(error) = store.put_push_token(&key, None) {
+                    // only that token: the phone may have sent a newer one
+                    if let Err(error) = store.drop_push_token(&key, &token.token) {
                         tracing::warn!(%error, "could not forget the token");
                     }
                 }
@@ -436,7 +441,17 @@ async fn offer(connection: &Connection, read: &PhoneRead) -> Result<CompanionRes
         }
     };
 
-    let request = serde_json::to_vec(read).map_err(|error| Offer::Exchange(error.to_string()))?;
+    let mut request =
+        serde_json::to_vec(read).map_err(|error| Offer::Exchange(error.to_string()))?;
+    // a copy too large for the phone to take: the owner enters the value
+    if request.len() > MAX_PHONE_READ_BYTES && read.sealed.is_some() {
+        let unsealed = PhoneRead {
+            sealed: None,
+            ..read.clone()
+        };
+        request =
+            serde_json::to_vec(&unsealed).map_err(|error| Offer::Exchange(error.to_string()))?;
+    }
     let (mut send, mut receive) = connection
         .open_bi()
         .await

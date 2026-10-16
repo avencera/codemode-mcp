@@ -28,6 +28,11 @@ pub const MOBILE_ALPN: &[u8] = b"codemode-mcp/mobile/1";
 /// them are far below this
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// Longest read the gateway sends a phone: it carries the value sealed and
+/// base64-encoded, which grows a value of up to [`MAX_BODY_BYTES`] by about
+/// a third
+pub const MAX_PHONE_READ_BYTES: usize = 2 * MAX_BODY_BYTES;
+
 /// How long one companion or phone request may take, including the owner's
 /// answer on the other device; the gateway gives up after it and the other
 /// device takes its prompt down

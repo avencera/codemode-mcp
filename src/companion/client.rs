@@ -249,7 +249,7 @@ impl Companions {
             let reference = reference.to_owned();
             answers.spawn(async move {
                 let result = companions
-                    .read_phone(&phone.name, &reference)
+                    .read_phone(&phone.name, &reference, ASK_TIMEOUT)
                     .await
                     .map(|value| value.len());
 

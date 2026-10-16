@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::{
-    CompanionFailure, Companions, HANDSHAKE_TIMEOUT, Hangup, InviteSecret, InviteTicket,
-    MOBILE_ALPN, PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registered, Registration, answer,
+    ASK_TIMEOUT, CompanionFailure, Companions, HANDSHAKE_TIMEOUT, Hangup, InviteSecret,
+    InviteTicket, MOBILE_ALPN, PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registered,
+    Registration, answer,
     mobile::PhoneRegistration,
     pair::{append_section, gateway_entry, phone_entry, read_config},
     read_request,
@@ -718,7 +719,7 @@ impl Companions {
             return PairCheck::NothingSealed;
         };
 
-        match self.read_phone(name, reference).await {
+        match self.read_phone(name, reference, ASK_TIMEOUT).await {
             Ok(value) => PairCheck::Read {
                 reference: reference.clone(),
                 bytes: value.len(),

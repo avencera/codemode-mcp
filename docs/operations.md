@@ -227,7 +227,9 @@ sealed copy. The phone answers by opening the copy, which takes Face ID. So:
   with AutoFill from 1Password or Passwords, and send it. The gateway seals whatever value wins, so the next
   read opens with Face ID. Pairing seals what the daemon has already read since its last start.
 - The copy holds the value from the last time the reference was read. After rotating a secret, tap Enter a
-  different value on the phone's next read, or read it once at the gateway Mac or a companion Mac.
+  different value on the phone's next read, or read it once at the gateway Mac or a companion Mac and deny it
+  on the phone: approving the old copy there first wins the race, and the daemon keeps that value until it
+  restarts.
 - Changing Face ID's enrolled faces voids the phone's key, and opening a copy then fails; pair again.
 
 Install the app from TestFlight, or build it onto a connected iPhone with `just ios-run` (needs Xcode, xcodegen,
@@ -258,7 +260,7 @@ How reads work with a phone paired:
 
 - Every listed phone is asked alongside the gateway's own `op` and the companion Macs, and the first value
   wins. While you are at the gateway Mac, the phones are asked 5 seconds later, so a read you answer there
-  never pushes to the phone. When another source answers first, the phone's prompt is taken
+  within 5 seconds never pushes to the phone. When another source answers first, the phone's prompt is taken
   down; when the phone answers first, the other prompts are.
 - The phone dials the gateway, since iOS does not let a suspended app accept connections. The gateway sends
   each read over that connection and waits up to 120 seconds; the phone shows a countdown and marks the read

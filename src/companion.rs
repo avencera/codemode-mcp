@@ -20,7 +20,9 @@ mod server;
 pub use companion_wire::{mobile, ticket, wire};
 
 pub use client::{CheckOutcome, CompanionFailure, Companions};
-pub use companion_wire::{ALPN, ASK_TIMEOUT, MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN};
+pub use companion_wire::{
+    ALPN, ASK_TIMEOUT, MAX_BODY_BYTES, MAX_PHONE_READ_BYTES, MOBILE_ALPN, PAIR_ALPN,
+};
 pub use identity::{IdentityError, Role, load_or_create};
 pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};

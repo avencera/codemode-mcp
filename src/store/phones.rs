@@ -66,6 +66,17 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets `token` if it is still the phone's, as when APNs no longer
+    /// knows it; a newer token the phone sent meanwhile stays
+    pub fn drop_push_token(&self, phone: &str, token: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "DELETE FROM phone_push WHERE phone = ?1 AND token = ?2",
+            params![phone, token],
+        )?;
+
+        Ok(())
+    }
+
     /// Where to push to wake the phone
     pub fn push_token(&self, phone: &str) -> Result<Option<PushToken>, StoreError> {
         let row: Option<(String, String)> = self.connection().query_optional(

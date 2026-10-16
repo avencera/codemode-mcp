@@ -371,8 +371,9 @@ impl OnePassword {
             let reference = reference.to_owned();
             sources.spawn(async move {
                 tokio::time::sleep(grace).await;
+                // the race gives up READ_TIMEOUT after it began, grace included
                 let value = companions
-                    .read_phone(&name, &reference)
+                    .read_phone(&name, &reference, READ_TIMEOUT.saturating_sub(grace))
                     .await
                     .map_err(|error| error.to_string());
 
