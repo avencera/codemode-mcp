@@ -190,7 +190,8 @@ The 1Password Environments server is not covered; it only signs in through the g
    ```
 
    `--companion` takes a name from `[[secrets.companions]]` or `[[secrets.phones]]` and returns as soon as that
-   device answers. An unknown name is refused with the list of configured ones.
+   device answers. An unknown name is refused with the list of configured ones. A daemon that predates
+   `--companion` refuses it too, asking nobody, until `codemode-mcp service restart` runs the new binary.
 
 If the other Mac cannot reach the gateway, pair by hand. `codemode-mcp companion invite --manual` prints a ticket
 holding the gateway's id and references. `codemode-mcp companion pair <ticket>` on the other Mac writes its

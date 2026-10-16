@@ -871,7 +871,7 @@ async fn a_check_can_ask_one_device_and_finishes_when_it_answers() -> TestResult
     let (status, checked) = rig
         .harness
         .admin_json(
-            "/admin/companion/check",
+            "/admin/companion/check/one",
             &json!({ "reference": REFERENCE, "companion": "iphone" }),
         )
         .await?;
@@ -890,7 +890,7 @@ async fn a_check_can_ask_one_device_and_finishes_when_it_answers() -> TestResult
     let (status, refused) = rig
         .harness
         .admin_json(
-            "/admin/companion/check",
+            "/admin/companion/check/one",
             &json!({ "reference": REFERENCE, "companion": "ipad" }),
         )
         .await?;

@@ -12,10 +12,11 @@ use clap::{Parser, Subcommand};
 use codemode_mcp::{
     adapters::apple::Entity,
     admin::{
-        self, CompanionCheckRequest, CompanionCheckResponse, CompanionCheckResult, EnrollRequest,
-        EnrollResponse, InviteOpenRequest, InviteOpenResponse, InviteResponse, InviteStatusRequest,
-        OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest, OAuthStatusResponse,
-        RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
+        self, CompanionCheckOneRequest, CompanionCheckRequest, CompanionCheckResponse,
+        CompanionCheckResult, EnrollRequest, EnrollResponse, InviteOpenRequest, InviteOpenResponse,
+        InviteResponse, InviteStatusRequest, OAuthLoginResponse, OAuthLogoutResponse,
+        OAuthServerRequest, OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest,
+        WarmResponse,
     },
     app::App,
     catalog::function_prefix,
@@ -631,15 +632,37 @@ async fn companion_command(
                      Macs; approve there."
                 ),
             }
-            let response: CompanionCheckResponse = admin_post(
-                &config,
-                "/admin/companion/check",
-                &CompanionCheckRequest {
-                    reference,
-                    companion,
-                },
-            )
-            .await?;
+            let response: CompanionCheckResponse = match companion {
+                Some(companion) => admin_post(
+                    &config,
+                    "/admin/companion/check/one",
+                    &CompanionCheckOneRequest {
+                        reference,
+                        companion,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    // a daemon from before `--companion` has no such route,
+                    // so it refuses instead of asking every device
+                    if error.to_string().contains("404") {
+                        error.wrap_err(
+                            "the running daemon cannot check one device; restart it with \
+                             `codemode-mcp service restart`",
+                        )
+                    } else {
+                        error
+                    }
+                })?,
+                None => {
+                    admin_post(
+                        &config,
+                        "/admin/companion/check",
+                        &CompanionCheckRequest { reference },
+                    )
+                    .await?
+                }
+            };
 
             let mut failed = false;
             for entry in response.companions {
