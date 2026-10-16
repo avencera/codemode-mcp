@@ -152,8 +152,16 @@ impl Companion {
 
                     response
                 }
-                _ = send.stopped() => continue,
-                _ = connection.0.closed() => return,
+                _ = send.stopped() => {
+                    tracing::info!("gateway stopped waiting; dropped the request");
+
+                    continue;
+                }
+                _ = connection.0.closed() => {
+                    tracing::info!("gateway hung up; dropped the request");
+
+                    return;
+                }
             };
             if send.write_all(&response).await.is_err() || send.finish().is_err() {
                 return;

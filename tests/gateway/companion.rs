@@ -61,6 +61,9 @@ struct Options<'a> {
     authorized_on_notify: bool,
     /// Whether the companion's `op item create` pauses, so its answer can be lost
     slow_create: bool,
+    /// Whether the gateway's own `op` takes a second to read, so the
+    /// companion is asked first and a prompt is up when the local read wins
+    slow_local: bool,
 }
 
 impl Default for Options<'_> {
@@ -77,6 +80,7 @@ impl Default for Options<'_> {
             notify_fails: false,
             authorized_on_notify: false,
             slow_create: false,
+            slow_local: false,
         }
     }
 }
@@ -95,6 +99,7 @@ impl Rig {
             notify_fails,
             authorized_on_notify,
             slow_create,
+            slow_local,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -109,6 +114,7 @@ impl Rig {
         let (companion_op, companion_log) = creating_op(signed_in, slow_create)?;
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
+        companion_mac.set_one_prompt(true);
         companion_mac.set_notify_fails(notify_fails);
         if authorized_on_notify {
             let directory = companion_log
@@ -156,6 +162,12 @@ impl Rig {
         } else {
             fake_op()?
         };
+        if slow_local {
+            let program = local_log.with_file_name("op");
+            let script = std::fs::read_to_string(&program)?
+                .replace("echo \"$3\" >>", "sleep 1; echo \"$3\" >>");
+            std::fs::write(&program, script)?;
+        }
         let gateway_mac = Arc::new(FakeMac::default());
         gateway_mac.set_present(present);
         let extra = format!(
@@ -1067,6 +1079,86 @@ async fn a_read_that_is_given_up_takes_the_prompt_down() -> TestResult {
     }
     assert!(dismissed, "{:?}", rig.companion_mac.shown());
     assert_eq!(reads(&rig.companion_log, REFERENCE), 1);
+    assert_eq!(rig.companion_mac.showing(), 0);
+
+    // the next request is asked normally, not refused over the old prompt
+    rig.companion_mac.set_answer(Some(TouchId::Approved));
+    let value = rig
+        .harness
+        .app
+        .gateway()
+        .companions()
+        .read("mba", REFERENCE)
+        .await?;
+    assert_eq!(value, VALUE);
+    assert!(
+        !rig.companion_mac
+            .shown()
+            .iter()
+            .any(|entry| entry.starts_with("refused")),
+        "{:?}",
+        rig.companion_mac.shown()
+    );
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_that_answers_first_takes_the_companion_prompt_down() -> TestResult {
+    // the companion's prompt stays up while the gateway's own `op` reads, a
+    // second later, during the first read after boot
+    let Some(rig) = Rig::start(Options {
+        present: true,
+        touch: None,
+        slow_local: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let mut dismissed = false;
+    for _ in 0..80 {
+        dismissed = rig
+            .companion_mac
+            .shown()
+            .iter()
+            .any(|entry| entry == "dismissed");
+        if dismissed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        rig.companion_mac.shown(),
+        [
+            format!("touch_id codemode-mcp on main wants to read {REFERENCE}"),
+            "dismissed".to_owned()
+        ],
+        "the losing companion's prompt stayed up"
+    );
+    assert!(dismissed);
+    assert_eq!(rig.companion_mac.showing(), 0);
+    assert_eq!(reads(&rig.local_log, REFERENCE), 1);
+
+    // the owner reaches the companion's Mac later; the old prompt must not
+    // make this request fail
+    rig.companion_mac.set_answer(Some(TouchId::Approved));
+    let value = rig
+        .harness
+        .app
+        .gateway()
+        .companions()
+        .read("mba", REFERENCE)
+        .await?;
+    assert_eq!(value, VALUE);
+    assert_eq!(
+        rig.companion_mac.shown().len(),
+        3,
+        "{:?}",
+        rig.companion_mac.shown()
+    );
 
     rig.stop().await
 }

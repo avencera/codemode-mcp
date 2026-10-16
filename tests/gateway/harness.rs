@@ -279,6 +279,11 @@ pub struct FakeMac {
     /// A file each notification creates, so a test can change the world
     /// while one is up
     on_notify: Mutex<Option<PathBuf>>,
+    /// Whether a prompt asked while another still shows fails at once, as
+    /// Touch ID does on a Mac whose last prompt was never taken down
+    one_prompt: std::sync::atomic::AtomicBool,
+    /// Prompts on screen: asked and neither answered nor taken down
+    showing: std::sync::atomic::AtomicUsize,
     shown: Mutex<Vec<String>>,
     cancel_titles: Mutex<Vec<String>>,
     /// The field with keyboard focus; `None` is a screen with none
@@ -298,6 +303,17 @@ impl FakeMac {
     pub fn set_notify_fails(&self, fails: bool) {
         self.notify_fails
             .store(fails, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a prompt asked over one that is still showing fails at once
+    pub fn set_one_prompt(&self, one_prompt: bool) {
+        self.one_prompt
+            .store(one_prompt, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many Touch ID prompts are on screen right now
+    pub fn showing(&self) -> usize {
+        self.showing.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How later Touch ID prompts end; `None` leaves them up until they are
@@ -377,11 +393,24 @@ impl FakeMac {
     }
 }
 
-/// Records `dismissed` when a prompt's future is dropped before it answered
+/// A prompt on screen; records `dismissed` when its future is dropped
+/// before it answered
 struct Prompt<'a>(&'a FakeMac);
+
+impl Prompt<'_> {
+    fn answered(self) {
+        self.0
+            .showing
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        std::mem::forget(self);
+    }
+}
 
 impl Drop for Prompt<'_> {
     fn drop(&mut self) {
+        self.0
+            .showing
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         self.0.record("dismissed".to_owned());
     }
 }
@@ -406,8 +435,21 @@ impl Mac for FakeMac {
             .unwrap_or_default();
         let gate = self.answer_once.lock().ok().and_then(|path| path.clone());
 
+        let over_another = self
+            .showing
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+            && self.one_prompt.load(std::sync::atomic::Ordering::SeqCst);
+        let prompt = Prompt(self);
+        if over_another {
+            // the new prompt never shows: it is refused without being taken down
+            prompt.answered();
+            self.record("refused over a prompt still showing".to_owned());
+
+            return Box::pin(std::future::ready(TouchId::Away));
+        }
+
         Box::pin(async move {
-            let prompt = Prompt(self);
             match answer {
                 Some(answer) => {
                     if let Some(gate) = gate {
@@ -420,7 +462,7 @@ impl Mac for FakeMac {
                     }
 
                     tokio::time::sleep(delay).await;
-                    std::mem::forget(prompt);
+                    prompt.answered();
 
                     answer
                 }
