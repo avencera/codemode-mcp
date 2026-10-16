@@ -15,7 +15,8 @@ use rmcp::{
     ClientHandler, ServiceExt,
     model::{
         CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotification,
-        CancelledNotificationParam, ClientRequest, RequestId, ServerResult, Tool,
+        CancelledNotificationParam, ClientConfig, ClientRequest, ProtocolVersion, RequestId,
+        ServerResult, Tool,
     },
     service::{
         NotificationContext, Peer, PeerRequestOptions, RoleClient, RunningService,
@@ -1232,6 +1233,19 @@ struct UpstreamHandler {
 }
 
 impl ClientHandler for UpstreamHandler {
+    /// Names the newest version that still has an `initialize` handshake
+    ///
+    /// rmcp's default is its newest version, which replaced `initialize`, so
+    /// naming it there is a contradiction most servers paper over by
+    /// answering with an older version. Google's Workspace MCP servers refuse
+    /// it with "Method not supported" instead
+    fn get_info(&self) -> ClientConfig {
+        let mut info = ClientConfig::default();
+        info.protocol_version = ProtocolVersion::LATEST_WITH_INITIALIZE;
+
+        info
+    }
+
     async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) {
         let upstream = Arc::clone(&self.upstream);
         let epoch = self.epoch;
