@@ -63,14 +63,11 @@ schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 # arbitrary_precision keeps integers beyond i64/u64 exact in both directions
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+# SHA-1 for one-time codes, which most sites still issue; on the same digest
+# line as `hmac` and `sha2`
+sha1 = "0.11.0"
 sha2 = "0.11.0"
 thiserror = "2.0.21"
-# the `logins` server's one-time codes: RFC 6238 needs HMAC-SHA1, and the
-# tree has SHA-1 only on the digest 0.10 line, so the codes use that line's
-# HMAC and SHA-2 too instead of a new crate
-totp-hmac = { package = "hmac", version = "0.12.1" }
-totp-sha1 = { package = "sha1", version = "0.10.6" }
-totp-sha2 = { package = "sha2", version = "0.10.9" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "signal", "sync", "io-util", "io-std"] }
 tokio-util = "0.7.20"
 toml = "1.1.8"

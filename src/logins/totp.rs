@@ -7,9 +7,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use totp_hmac::{Hmac, Mac, digest::KeyInit};
-use totp_sha1::Sha1;
-use totp_sha2::{Sha256, Sha512};
+use hmac::{Hmac, KeyInit, Mac};
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
 
 /// The hash the code is computed with
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
