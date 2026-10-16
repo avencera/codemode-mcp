@@ -15,7 +15,7 @@ use companion_wire::{
     mobile::{PhoneRead, seal_info},
     wire::{CompanionErrorCode, CompanionFault, CompanionResponse},
 };
-use ractor::{Actor, ActorProcessingErr, ActorRef};
+use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -36,8 +36,9 @@ impl std::fmt::Debug for Secret {
 
 /// What a request actor is told
 pub enum RequestMsg {
-    /// The owner tapped Approve
-    Approve,
+    /// The owner tapped Approve; replies whether Face ID was asked, so
+    /// the app keeps to one prompt at a time
+    Approve(RpcReplyPort<bool>),
     /// The owner put the reference on the allow list, or took it off
     Listed(bool),
     /// The owner entered the value
@@ -87,6 +88,9 @@ pub struct RequestState {
     responder: Option<oneshot::Sender<CompanionResponse>>,
     /// An answer made while the link was down, sent once it is back
     unsent: Option<CompanionResponse>,
+    /// The answer handed to the current stream, kept until it is delivered
+    /// in case the link drops while it goes
+    in_flight: Option<CompanionResponse>,
     record: GatewayRecord,
     platform: std::sync::Arc<dyn Platform>,
     app: ActorRef<AppMsg>,
@@ -105,25 +109,27 @@ impl RequestState {
         });
     }
 
-    /// Sends `response` now, or once the link is back; true when it went
-    fn respond(&mut self, response: CompanionResponse) -> bool {
-        match self.responder.take() {
-            Some(responder) => {
-                let _ = responder.send(response);
+    /// Hands `response` to the current stream, or keeps it for the next
+    /// one; the actor stops once the stream reports it delivered
+    fn respond(&mut self, response: CompanionResponse) {
+        let unsent = match self.responder.take() {
+            // the stream's task is gone when the link dropped before its end
+            // reached this actor; the gateway offers the read again
+            Some(responder) => match responder.send(response.clone()) {
+                Ok(()) => {
+                    self.in_flight = Some(response);
 
-                true
-            }
-            None => {
-                self.unsent = Some(response);
-
-                false
-            }
-        }
+                    return;
+                }
+                Err(response) => response,
+            },
+            None => response,
+        };
+        self.unsent = Some(unsent);
     }
 
-    /// Sends `value` unless it is over the gateway's limit, and stops once
-    /// it went
-    fn send_value(&mut self, myself: &ActorRef<RequestMsg>, value: String) {
+    /// Sends `value` unless it is over the gateway's limit
+    fn send_value(&mut self, value: String) {
         let response = CompanionResponse::Value(value);
         // the gateway reads at most MAX_BODY_BYTES
         let fits = serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= MAX_BODY_BYTES);
@@ -138,11 +144,8 @@ impl RequestState {
                 },
             )
         };
-        let sent = self.respond(response);
+        self.respond(response);
         self.set(status);
-        if sent {
-            myself.stop(None);
-        }
     }
 
     fn fault(code: CompanionErrorCode, message: &str) -> CompanionResponse {
@@ -177,6 +180,7 @@ impl Actor for RequestActor {
             seq: args.seq,
             responder: Some(args.responder),
             unsent: None,
+            in_flight: None,
             record: args.record,
             platform: args.platform,
             app: args.app,
@@ -201,16 +205,24 @@ impl Actor for RequestActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            RequestMsg::Listed(listed) => state.listed = listed,
-            RequestMsg::Approve => {
+            RequestMsg::Listed(listed) => {
+                state.listed = listed;
+                // taken off the list mid-prompt: the prompt goes, and what it
+                // opens is not sent
+                if !listed && state.status == ReadStatus::Approving {
+                    state.platform.cancel_open(state.read.id.to_string());
+                }
+            }
+            RequestMsg::Approve(reply) => {
                 // without a sealed copy there is nothing for Face ID to open
                 let Some(sealed) = &state.read.sealed else {
+                    let _ = reply.send(false);
+
                     return Ok(());
                 };
-                if !state.listed {
-                    return Ok(());
-                }
-                if state.status != ReadStatus::Waiting {
+                if !state.listed || state.status != ReadStatus::Waiting {
+                    let _ = reply.send(false);
+
                     return Ok(());
                 }
                 let request = OpenRequest {
@@ -222,6 +234,7 @@ impl Actor for RequestActor {
                     ciphertext: sealed.ciphertext.clone(),
                 };
                 state.set(ReadStatus::Approving);
+                let _ = reply.send(true);
 
                 let platform = std::sync::Arc::clone(&state.platform);
                 let myself = myself.clone();
@@ -242,12 +255,13 @@ impl Actor for RequestActor {
                     return Ok(());
                 }
                 let (response, status) = match opened {
-                    Ok(Secret(value)) => {
-                        state.send_value(&myself, value);
+                    Ok(Secret(value)) if state.listed => {
+                        state.send_value(value);
 
                         return Ok(());
                     }
-                    Err(OpenError::Denied) => (
+                    // opened after the reference left the allow list: dropped
+                    Ok(_) | Err(OpenError::Denied) => (
                         RequestState::fault(
                             CompanionErrorCode::Denied,
                             "not approved on this phone",
@@ -259,11 +273,8 @@ impl Actor for RequestActor {
                         ReadStatus::Failed { message },
                     ),
                 };
-                let sent = state.respond(response);
+                state.respond(response);
                 state.set(status);
-                if sent {
-                    myself.stop(None);
-                }
             }
             RequestMsg::Answer(Secret(value)) => {
                 if state.status.is_finished() || !state.listed {
@@ -273,7 +284,7 @@ impl Actor for RequestActor {
                 if state.status == ReadStatus::Approving {
                     state.platform.cancel_open(state.read.id.to_string());
                 }
-                state.send_value(&myself, value);
+                state.send_value(value);
             }
             RequestMsg::Deny => {
                 if state.status.is_finished() {
@@ -282,23 +293,22 @@ impl Actor for RequestActor {
                 if state.status == ReadStatus::Approving {
                     state.platform.cancel_open(state.read.id.to_string());
                 }
-                let sent = state.respond(RequestState::fault(
+                state.respond(RequestState::fault(
                     CompanionErrorCode::Denied,
                     "not approved on this phone",
                 ));
                 state.set(ReadStatus::Denied);
-                if sent {
-                    myself.stop(None);
-                }
             }
             RequestMsg::Expire => {
                 if state.status == ReadStatus::Approving {
                     state.platform.cancel_open(state.read.id.to_string());
                 }
-                // the gateway has given up, so the value is not sent late
+                // the gateway has given up, so the value is not sent late; an
+                // answer still waiting for the link never went, whatever the
+                // screen said
                 state.responder = None;
-                state.unsent = None;
-                if !state.status.is_finished() {
+                state.in_flight = None;
+                if state.unsent.take().is_some() || !state.status.is_finished() {
                     state.set(ReadStatus::Expired);
                 }
                 myself.stop(None);
@@ -308,17 +318,22 @@ impl Actor for RequestActor {
                     return Ok(());
                 }
                 match end {
+                    StreamEnd::Delivered => myself.stop(None),
                     StreamEnd::Withdrawn => {
                         if state.status == ReadStatus::Approving {
                             state.platform.cancel_open(state.read.id.to_string());
                         }
-                        state.unsent = None;
-                        if !state.status.is_finished() {
+                        if state.unsent.take().is_some() || !state.status.is_finished() {
                             state.set(ReadStatus::Withdrawn);
                         }
                         myself.stop(None);
                     }
-                    StreamEnd::Interrupted => state.responder = None,
+                    StreamEnd::Interrupted => {
+                        state.responder = None;
+                        if let Some(response) = state.in_flight.take() {
+                            state.unsent = Some(response);
+                        }
+                    }
                 }
             }
             RequestMsg::Replace { seq, responder } => {
@@ -326,7 +341,6 @@ impl Actor for RequestActor {
                 state.responder = Some(responder);
                 if let Some(response) = state.unsent.take() {
                     state.respond(response);
-                    myself.stop(None);
                 }
             }
         }

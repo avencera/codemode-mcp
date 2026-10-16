@@ -17,7 +17,7 @@ use companion_wire::{
     mobile::{
         PhoneRead, PhoneRequest, PushEnvironment as WirePushEnvironment, PushToken, RequestId,
     },
-    wire::{CompanionResponse, PairCheck},
+    wire::{CompanionErrorCode, CompanionFault, CompanionResponse, PairCheck},
 };
 use iroh::SecretKey;
 use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, SupervisionEvent};
@@ -43,9 +43,12 @@ const UNPAIR_TIMEOUT: Duration = Duration::from_secs(5);
 /// How a read's stream ended without an answer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamEnd {
+    /// The answer reached the gateway
+    Delivered,
     /// The gateway stopped it: another source answered, or it gave up
     Withdrawn,
-    /// The link dropped; the gateway offers the read again on the next one
+    /// The link dropped, before or while the answer went; the gateway offers
+    /// the read again on the next one
     Interrupted,
 }
 
@@ -233,7 +236,12 @@ pub struct AppActorState {
     shared: Arc<Shared>,
     record: Option<GatewayRecord>,
     connection: Option<ActorRef<ConnMsg>>,
+    /// Every request actor still running, finished or not: one holding an
+    /// answer for a dropped link stays until the gateway offers the read
+    /// again
     requests: HashMap<String, ActorRef<RequestMsg>>,
+    /// The read whose Face ID prompt is up; one at a time
+    approving: Option<String>,
     foreground: bool,
     push: Option<PushToken>,
     pairing: bool,
@@ -342,15 +350,17 @@ impl App {
             }
             AppAction::Disallow { reference } => Self::list(state, &reference, false).await,
             AppAction::Approve { id } => {
-                // one Face ID prompt at a time
-                let prompting = state
-                    .shared
-                    .state()
-                    .reads
-                    .iter()
-                    .any(|read| read.status == ReadStatus::Approving);
-                if !prompting && let Some(request) = state.requests.get(&id) {
-                    let _ = request.cast(RequestMsg::Approve);
+                // one Face ID prompt at a time: the request answers before
+                // the next action is taken, so two quick taps cannot both
+                // start one
+                if state.approving.is_some() {
+                    return;
+                }
+                if let Some(request) = state.requests.get(&id) {
+                    let started = ractor::call_t!(request, RequestMsg::Approve, 2_000);
+                    if matches!(started, Ok(true)) {
+                        state.approving = Some(id);
+                    }
                 }
             }
             AppAction::Deny { id } => match state.requests.get(&id) {
@@ -518,6 +528,15 @@ impl App {
 
             return;
         }
+        // denied while it was still on its way from a push
+        if state.shared.read_status(&id) == Some(ReadStatus::Denied) {
+            let _ = responder.send(CompanionResponse::Error(CompanionFault {
+                code: CompanionErrorCode::Denied,
+                message: "not approved on this phone".to_owned(),
+            }));
+
+            return;
+        }
         let Some(record) = state.record.clone() else {
             return;
         };
@@ -584,6 +603,7 @@ impl Actor for App {
             record: args.record,
             connection: None,
             requests: HashMap::new(),
+            approving: None,
             foreground: false,
             push: None,
             pairing: false,
@@ -662,8 +682,10 @@ impl Actor for App {
                 }
             }
             AppMsg::ReadChanged { id, status } => {
-                if status.is_finished() {
-                    state.requests.remove(&id);
+                if status != ReadStatus::Approving
+                    && state.approving.as_deref() == Some(id.as_str())
+                {
+                    state.approving = None;
                 }
                 state.shared.change_reads(|reads| {
                     reads
@@ -695,8 +717,17 @@ impl Actor for App {
         event: SupervisionEvent,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        let SupervisionEvent::ActorFailed(cell, error) = event else {
-            return Ok(());
+        let (cell, error) = match event {
+            SupervisionEvent::ActorFailed(cell, error) => (cell, error),
+            // a request that stopped is done with its read
+            SupervisionEvent::ActorTerminated(cell, ..) => {
+                state
+                    .requests
+                    .retain(|_, request| request.get_id() != cell.get_id());
+
+                return Ok(());
+            }
+            _ => return Ok(()),
         };
         tracing::error!(%error, "a child actor failed");
 
@@ -720,6 +751,9 @@ impl Actor for App {
             .map(|(id, _)| id.clone());
         if let Some(id) = failed {
             state.requests.remove(&id);
+            if state.approving.as_deref() == Some(id.as_str()) {
+                state.approving = None;
+            }
             let message = error.to_string();
             state.shared.change_reads(|reads| {
                 reads

@@ -30,13 +30,28 @@ struct CompanionApp: App {
 
 /// Push registration and taps on the pushes that wake the app
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    /// Builds from Xcode get sandbox tokens, TestFlight builds production ones
-    private var environment: PushEnvironment {
-        #if DEBUG
-            .development
-        #else
-            .production
-        #endif
+    /// Which APNs environment issued this build's token, as its signing
+    /// says: a development profile (any build from Xcode, Debug or Release)
+    /// gets sandbox tokens; TestFlight and the App Store, whose builds carry
+    /// a distribution profile or none, get production ones
+    private let environment = AppDelegate.signedEnvironment()
+
+    private static func signedEnvironment() -> PushEnvironment {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              // the profile is a signed blob around a plain XML plist
+              let text = String(data: data, encoding: .isoLatin1),
+              let start = text.range(of: "<?xml"),
+              let end = text.range(of: "</plist>"),
+              let plist = text[start.lowerBound ..< end.upperBound].data(using: .isoLatin1),
+              let profile = try? PropertyListSerialization.propertyList(from: plist, format: nil) as? [String: Any],
+              let entitlements = profile["Entitlements"] as? [String: Any],
+              entitlements["aps-environment"] as? String == "development"
+        else {
+            return .production
+        }
+
+        return .development
     }
 
     func application(

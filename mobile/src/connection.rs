@@ -11,7 +11,7 @@ use std::{
 };
 
 use companion_wire::{
-    MAX_BODY_BYTES, MOBILE_ALPN,
+    ASK_TIMEOUT, MAX_PHONE_READ_BYTES, MOBILE_ALPN,
     mobile::{PhoneRead, PhoneRequest, PhoneResponse, RequestId},
     wire::CompanionResponse,
 };
@@ -32,6 +32,9 @@ use crate::{
 /// Longest wait between dials while the gateway cannot be reached
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// How long the gateway may take to send a read once it opened its stream
+const READ_WINDOW: Duration = Duration::from_secs(10);
+
 /// Numbers each stream the gateway opens, so a read offered again after a
 /// reconnect is told apart from the stream it replaces
 static STREAMS: AtomicU64 = AtomicU64::new(0);
@@ -40,6 +43,8 @@ static STREAMS: AtomicU64 = AtomicU64::new(0);
 pub enum ConnMsg {
     /// Keep a link to the gateway up
     Connect,
+    /// Dial again after a failed dial, unless the link is no longer wanted
+    Retry,
     /// Hang up and stay down, as the app goes to the background
     Disconnect,
     /// A dial finished
@@ -132,6 +137,10 @@ impl Actor for ConnectionActor {
                 state.wanted = true;
                 Self::dial(&myself, state);
             }
+            // a retry queued before the app went to the background must not
+            // bring the link back
+            ConnMsg::Retry if state.wanted => Self::dial(&myself, state),
+            ConnMsg::Retry => {}
             ConnMsg::Disconnect => {
                 state.wanted = false;
                 if let Some(connection) = state.connection.take() {
@@ -173,7 +182,7 @@ impl Actor for ConnectionActor {
                         in_secs: u32::try_from(delay.as_secs()).unwrap_or(u32::MAX),
                         error,
                     }));
-                myself.send_after(delay, || ConnMsg::Connect);
+                myself.send_after(delay, || ConnMsg::Retry);
             }
             ConnMsg::Lost(stable_id) => {
                 let ours = state
@@ -228,14 +237,21 @@ async fn accept_reads(connection: Connection, app: ActorRef<AppMsg>) {
     while let Ok((send, mut receive)) = connection.accept_bi().await {
         let app = app.clone();
         tokio::spawn(async move {
-            let Ok(body) = receive.read_to_end(MAX_BODY_BYTES).await else {
+            let body =
+                tokio::time::timeout(READ_WINDOW, receive.read_to_end(MAX_PHONE_READ_BYTES)).await;
+            let Ok(Ok(body)) = body else {
                 return;
             };
-            let Ok(read) = serde_json::from_slice::<PhoneRead>(&body) else {
+            let Ok(mut read) = serde_json::from_slice::<PhoneRead>(&body) else {
                 tracing::warn!("the gateway sent a read this phone cannot parse");
 
                 return;
             };
+            // the gateway never waits longer than this, so neither does the
+            // phone's prompt
+            read.expires_in_ms = read
+                .expires_in_ms
+                .min(u64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
             let id = read.id.clone();
             let seq = STREAMS.fetch_add(1, Ordering::Relaxed);
             let (responder, answered) = oneshot::channel();
@@ -276,14 +292,22 @@ async fn answer(
         }
         answer = answered => match answer {
             Ok(response) => {
-                let Ok(bytes) = serde_json::to_vec(&response) else {
-                    return;
+                // the request keeps its answer until this says it arrived,
+                // so a link that drops mid-write loses nothing
+                let delivered = match serde_json::to_vec(&response) {
+                    Ok(bytes) => {
+                        send.write_all(&bytes).await.is_ok()
+                            && send.finish().is_ok()
+                            && send.stopped().await.is_ok()
+                    }
+                    Err(_) => false,
                 };
-                if send.write_all(&bytes).await.is_ok() {
-                    let _ = send.finish();
-                    // the value is gone from this task once the gateway has it
-                    let _ = send.stopped().await;
-                }
+                let end = if delivered {
+                    StreamEnd::Delivered
+                } else {
+                    StreamEnd::Interrupted
+                };
+                let _ = app.cast(AppMsg::StreamEnded { id, seq, end });
             }
             Err(_) => {
                 let _ = send.reset(0_u32.into());

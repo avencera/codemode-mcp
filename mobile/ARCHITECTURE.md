@@ -49,13 +49,14 @@ App (supervisor)
   another source answered or it gave up) from a lost link (the gateway offers the read again after a reconnect).
   The phone dials because iOS does not let a suspended app accept connections; going to the background drops the
   link, and a push or the user brings it back.
-- **Request** starts `Waiting` and expires on the gateway's deadline. A reference off the allow list cannot be
+- **Request**starts `Waiting` and expires on the gateway's deadline. A reference off the allow list cannot be
   answered until the owner allows it; the app actor then adds it to the list in the Keychain. Approve calls
   `Platform::open_sealed` on a blocking thread; the actor stays free, so an expiry, a withdrawal, Deny or an
   entered value can take the Face ID prompt down through `cancel_open`. A read without a sealed copy can only be
   answered with a value the owner enters; `FfiApp::answer` carries it, apart from `AppAction`, so it never sits in
-  a type that derives `Debug`. An answer made while the link is down is sent once the gateway offers the read
-  again, unless the read has expired.
+  a type that derives `Debug`. An answer stays with its request until the stream reports it delivered; one made
+  while the link is down, or lost with it, is sent once the gateway offers the read again, unless the read has
+  expired. Approve asks the request and waits for its reply, so only one Face ID prompt starts at a time.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
 second, and a failed request marks its read failed.

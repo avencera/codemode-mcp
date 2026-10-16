@@ -391,6 +391,19 @@ impl FakeGateway {
         sealed: Option<Sealed>,
         expires_in_ms: u64,
     ) -> Result<CompanionResponse, String> {
+        self.offer_as(RequestId::generate(), reference, sealed, expires_in_ms)
+            .await
+    }
+
+    /// [`Self::offer`] under a chosen request id, as a push names it or a
+    /// re-offer after a dropped link repeats it
+    async fn offer_as(
+        &self,
+        id: RequestId,
+        reference: &str,
+        sealed: Option<Sealed>,
+        expires_in_ms: u64,
+    ) -> Result<CompanionResponse, String> {
         let connection = self
             .link
             .subscribe()
@@ -401,7 +414,7 @@ impl FakeGateway {
             .ok_or("no link")?;
 
         let read = PhoneRead {
-            id: RequestId::generate(),
+            id,
             reference: reference.to_owned(),
             sealed,
             expires_in_ms,
@@ -646,6 +659,73 @@ async fn an_entered_value_answers_a_read_with_or_without_a_sealed_copy() -> Test
     // the entered value is in no state, update or Debug output
     let updates = recorder.0.lock().map(|u| u.clone()).unwrap_or_default();
     assert!(!format!("{:?}{updates:?}", app.state()).contains(entered));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_made_while_the_link_is_down_goes_when_the_read_is_offered_again() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _, _) = paired(&gateway).await?;
+    let entered = "entered-offline";
+    let id = RequestId::generate();
+
+    let first = tokio::spawn({
+        let gateway = gateway.clone();
+        let id = id.clone();
+        async move { gateway.offer_as(id, REFERENCE, None, 30_000).await }
+    });
+    until(&app, |state| waiting(state).is_some()).await?;
+
+    // the link drops and the owner answers before the gateway asks again
+    gateway.drop_link();
+    assert!(first.await?.is_err());
+    app.answer(id.to_string(), entered.to_owned());
+    until(&app, |state| {
+        state
+            .reads
+            .iter()
+            .any(|read| read.id == id.as_str() && read.status == ReadStatus::Approved)
+    })
+    .await?;
+
+    let again = gateway.offer_as(id, REFERENCE, None, 30_000).await?;
+    assert_eq!(again, CompanionResponse::Value(entered.to_owned()));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, platform, _) = paired(&gateway).await?;
+    let prompts = platform.prompts().len();
+    let id = RequestId::generate();
+
+    // tapped from the push, then denied while the read is on its way
+    app.dispatch(AppAction::OpenedFromPush {
+        id: id.to_string(),
+        reference: REFERENCE.to_owned(),
+        gateway: "mini".to_owned(),
+    });
+    app.dispatch(AppAction::Deny { id: id.to_string() });
+    until(&app, |state| {
+        state
+            .reads
+            .iter()
+            .any(|read| read.id == id.as_str() && read.status == ReadStatus::Denied)
+    })
+    .await?;
+
+    let response = gateway
+        .offer_as(id.clone(), REFERENCE, None, 30_000)
+        .await?;
+    let CompanionResponse::Error(fault) = response else {
+        return Err("a value was sent".into());
+    };
+    assert_eq!(fault.code, CompanionErrorCode::Denied);
+    assert!(waiting(&app.state()).is_none());
+    assert_eq!(platform.prompts().len(), prompts);
 
     Ok(())
 }

@@ -19,6 +19,9 @@ final class SystemPlatform: Platform, @unchecked Sendable {
     /// The Face ID context of each read whose prompt is up, so the core can
     /// take it down
     private var contexts: [String: LAContext] = [:]
+    /// Reads taken down before their prompt came up: the core cancels as
+    /// soon as it asks, and the blocking call may not have started yet
+    private var cancelled: Set<String> = []
 
     init() {
         name = MainActor.assumeIsolated { UIDevice.current.name }
@@ -112,7 +115,14 @@ final class SystemPlatform: Platform, @unchecked Sendable {
 
         let context = LAContext()
         context.localizedCancelTitle = "Deny"
-        lock.withLock { contexts[request.id] = context }
+        let alreadyCancelled = lock.withLock {
+            contexts[request.id] = context
+            return cancelled.remove(request.id) != nil
+        }
+        if alreadyCancelled {
+            _ = lock.withLock { contexts.removeValue(forKey: request.id) }
+            throw OpenError.Denied
+        }
         defer { _ = lock.withLock { contexts.removeValue(forKey: request.id) } }
 
         // asked once here; the key use below takes this context instead of
@@ -162,7 +172,10 @@ final class SystemPlatform: Platform, @unchecked Sendable {
     }
 
     func cancelOpen(id: String) {
-        let context = lock.withLock { contexts[id] }
+        let context = lock.withLock {
+            if contexts[id] == nil { cancelled.insert(id) }
+            return contexts[id]
+        }
         context?.invalidate()
     }
 
