@@ -39,7 +39,7 @@ before the script sees them.
 - **Keys from 1Password.** Header, environment and HTTP `url` values can hold `{{ op://vault/item/field }}`
   references, read once by the daemon and redacted from anything a script sees and from the daemon's logs. Embed
   the reference where a URL's key sits: `url = "https://host/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`
-  (with `oauth = true` the `url` must start with `http://` or `https://`, and each reference must return only the key)
+  (references may sit only in path segments and query names or values, not in the host, and with `oauth = true` the `url` cannot be one whole reference)
 - **Approvals.** Each tool is `allow`, `ask` or `deny`. An `ask` call waits for approval with Touch ID at the Mac,
   or with a passkey on your phone after an [ntfy](https://ntfy.sh) push. Approvals can cover one call or a 15 or
   60 minute session

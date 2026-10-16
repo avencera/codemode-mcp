@@ -1053,38 +1053,13 @@ impl ServerConfig {
             })?;
         }
         if let Some(url) = &self.url {
-            crate::secrets::check(url)
+            let template = crate::secrets::UrlTemplate::parse(url)
                 .map_err(|error| ConfigError::Invalid(format!("servers.{name}.url: {error}")))?;
-            // a url with references is parsed once they are read
-            if !url.contains("{{") && reqwest::Url::parse(url).is_err() {
-                return Err(ConfigError::Invalid(format!(
-                    "servers.{name}.url: not a valid URL"
-                )));
-            }
             // the key must be known exactly to keep it out of OAuth state,
             // which holds only when it sits inside literal text
-            let scheme = url.trim_start().to_ascii_lowercase();
-            if self.oauth
-                && url.contains("{{")
-                && !scheme.starts_with("http://")
-                && !scheme.starts_with("https://")
-            {
+            if self.oauth && template.is_whole() {
                 return Err(ConfigError::Invalid(format!(
-                    "servers.{name}.url: with `oauth = true`, a url that holds references must start with `http://` or `https://`, because codemode can only keep the key out of OAuth state when it knows which part of the url is the key; embed the reference, e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}/message\""
-                )));
-            }
-            // the host is lowercased when parsed, so a key in it would no
-            // longer match what 1Password returned
-            if self.oauth
-                && url.contains("{{")
-                && url.trim_start().split_once("://").is_none_or(|(_, rest)| {
-                    rest.split('/')
-                        .next()
-                        .is_none_or(|host| host.contains("{{"))
-                })
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "servers.{name}.url: with `oauth = true`, references may appear only after the host, in the path or query, because the host is lowercased when parsed; embed the reference, e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}/message\""
+                    "servers.{name}.url: with `oauth = true`, the url cannot be a single reference, because codemode can only keep the key out of OAuth state when it knows which part of the url is the key; embed the reference, e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}/message\""
                 )));
             }
         }
@@ -1232,11 +1207,18 @@ mod tests {
                 .is_ok()
         );
         assert!(parse("admin_listen = \"0.0.0.0:7682\"").is_err());
+        for host in [
+            "https://{{ op://Dev/zoho/key }}.example.com/m",
+            "https:///{{ op://Dev/zoho/key }}/m/{{ op://Dev/zoho/key }}",
+        ] {
+            assert!(
+                parse(&format!("[servers.a]\nurl = \"{host}\"")).is_err(),
+                "{host}"
+            );
+        }
         assert!(
-            parse(
-                "[servers.a]\nurl = \"https://{{ op://Dev/zoho/key }}.example.com/m\"\noauth = true"
-            )
-            .is_err()
+            parse("[servers.a]\nurl = \"https://h.com?key={{ op://Dev/zoho/key }}\"\noauth = true")
+                .is_ok()
         );
         assert!(parse("[servers.a]\ncommand = \"x\"\noauth = true").is_err());
         assert!(parse("[servers.a]\nurl = \"https://y\"\nscopes = [\"s\"]").is_err());

@@ -27,6 +27,8 @@ pub(super) const VALUE: &str = "value-from-1password";
 pub(super) const URL_KEY: &str = "zk-9f3a71c2d8b4e6";
 /// A key with characters that a query string percent-encodes
 pub(super) const SYMBOL_KEY: &str = "zk+9f3a71c2=d8b4e6";
+/// A key with uppercase letters, which a host name would lowercase
+pub(super) const MIXED_KEY: &str = "PrivateKey123abc";
 
 /// A stand-in for the 1Password CLI that knows one item and logs each read,
 /// already authorized so it reads without asking
@@ -61,7 +63,8 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/deadurl/credential) cat '{dir}/dead-url' ;;\n\
                op://Dev/urlkey/credential) printf '{URL_KEY}' ;;\n\
                op://Dev/symbolkey/credential) printf '{SYMBOL_KEY}' ;;\n\
-               op://Dev/hostpath/credential) printf 'example.invalid/mcp/{URL_KEY}' ;;\n\
+               op://Dev/slashkey/credential) printf '%s' 'zk/9f3a71c2d8b4e6' ;;\n\
+               op://Dev/mixedkey/credential) printf '%s' '{MIXED_KEY}' ;;\n\
                op://Dev/colonkey/credential) printf '%s' 'zk:9f3a71c2d8b4e6' ;;\n\
                op://Dev/backslash/credential) printf '%s' 'zk\\9f3a71c2d8b4e6' ;;\n\
                op://Dev/shortkey/credential) printf '%s' 'aB9xZ' ;;\n\
@@ -238,6 +241,110 @@ pub(super) async fn serve_keyed_endpoint() -> Result<std::net::SocketAddr, Box<d
     tokio::spawn(async move { axum::serve(listener, router).await });
 
     Ok(address)
+}
+
+/// Answers 404 to everything and records the raw path of each request
+async fn serve_recorder() -> Result<(std::net::SocketAddr, Arc<Mutex<Vec<String>>>), Box<dyn Error>>
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let router = Router::new().fallback(move |request: axum::extract::Request| {
+        let recorded = Arc::clone(&recorded);
+        async move {
+            if let Ok(mut paths) = recorded.lock() {
+                paths.push(request.uri().path().to_owned());
+            }
+
+            axum::http::StatusCode::NOT_FOUND
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, router).await });
+
+    Ok((address, seen))
+}
+
+/// Waits for `expected` among the paths `seen` has recorded
+async fn path_seen(seen: &Arc<Mutex<Vec<String>>>, expected: &str) -> bool {
+    for _ in 0..80 {
+        let paths = seen.lock().map(|paths| paths.clone()).unwrap_or_default();
+        if paths.iter().any(|path| path == expected) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_url_value_with_separators_is_one_encoded_path_segment() -> TestResult {
+    let (op, _) = fake_op()?;
+    let (plain, plain_seen) = serve_recorder().await?;
+    let (oauth, oauth_seen) = serve_recorder().await?;
+    let extra = format!(
+        "[secrets]\n\
+         op = \"{op}\"\n\n\
+         [servers.slash]\n\
+         url = \"http://{plain}/mcp/{{{{ op://Dev/slashkey/credential }}}}/rpc\"\n\n\
+         [servers.backslash]\n\
+         url = \"http://{plain}/mcp/{{{{ op://Dev/backslash/credential }}}}/rpc\"\n\n\
+         [servers.anonymous]\n\
+         url = \"http://{oauth}/mcp/{{{{ op://Dev/slashkey/credential }}}}/rpc\"\n\
+         oauth = true\n",
+        op = op.display(),
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // the value never splits the path, with or without a login, and the
+    // servers still report nothing of it
+    assert!(path_seen(&plain_seen, "/mcp/zk%2F9f3a71c2d8b4e6/rpc").await);
+    assert!(path_seen(&plain_seen, "/mcp/zk%5C9f3a71c2d8b4e6/rpc").await);
+    assert!(path_seen(&oauth_seen, "/mcp/zk%2F9f3a71c2d8b4e6/rpc").await);
+    let report = serde_json::to_string(&harness.app.gateway().report())?;
+    assert!(!report.contains("9f3a71c2d8b4e6"), "{report}");
+
+    harness.stop().await
+}
+
+#[tokio::test]
+async fn a_url_value_with_separators_is_redacted_in_every_encoding() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, Redactor};
+
+    let (op, _) = fake_op()?;
+    let onepassword = OnePassword::new(op.display().to_string());
+    let resolved = onepassword
+        .resolve_url("https://example.invalid/mcp/{{ op://Dev/slashkey/credential }}/rpc")
+        .await?;
+    assert_eq!(
+        resolved.url,
+        "https://example.invalid/mcp/zk%2F9f3a71c2d8b4e6/rpc"
+    );
+
+    let redactor = Redactor::default();
+    redactor.add(resolved.secrets);
+    for text in [
+        resolved.url.as_str(),
+        "key zk/9f3a71c2d8b4e6",
+        "key ZK%2f9F3A71C2D8B4E6",
+    ] {
+        let scrubbed = redactor.scrub(text);
+        assert!(scrubbed.contains("[redacted]"), "{scrubbed}");
+        assert!(
+            !scrubbed.to_lowercase().contains("9f3a71c2d8b4e6"),
+            "{scrubbed}"
+        );
+    }
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -437,6 +544,28 @@ async fn a_decoded_form_of_an_encoded_url_key_is_redacted() -> TestResult {
         redactor.scrub("bad key zk+9f3a71c2=d8b4e6"),
         "bad key [redacted]"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_form_decoded_query_value_is_redacted() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, Redactor};
+
+    let (op, _) = fake_op()?;
+    let onepassword = OnePassword::new(op.display().to_string());
+
+    // a library that form-decodes the query turns `+` into a space
+    let resolved = onepassword
+        .resolve_url("https://example.invalid/mcp?k={{ op://Dev/symbolkey/credential }}")
+        .await?;
+    let redactor = Redactor::default();
+    redactor.add(resolved.secrets);
+    assert_eq!(
+        redactor.scrub("bad key zk 9f3a71c2=d8b4e6"),
+        "bad key [redacted]"
+    );
+    assert!(!redactor.scrub(&resolved.url).contains("9f3a71c2"));
 
     Ok(())
 }

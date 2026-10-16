@@ -38,8 +38,24 @@ use crate::{
 pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 /// Client name used for registration when the config names none
 const DEFAULT_CLIENT_NAME: &str = "codemode-mcp";
-/// Longest error code echoed when the server's `url` cannot be read
-const MAX_ERROR_CODE_LEN: usize = 40;
+/// OAuth error codes echoed when the server's `url` cannot be read: RFC 6749
+/// sections 4.1.2.1 and 5.2, and the ones later specs added
+const STANDARD_ERROR_CODES: [&str; 14] = [
+    "invalid_request",
+    "unauthorized_client",
+    "access_denied",
+    "unsupported_response_type",
+    "invalid_scope",
+    "server_error",
+    "temporarily_unavailable",
+    "invalid_client",
+    "invalid_grant",
+    "unsupported_grant_type",
+    "invalid_target",
+    "interaction_required",
+    "login_required",
+    "consent_required",
+];
 
 /// Why an OAuth operation failed; messages are safe to print locally
 #[derive(Debug, thiserror::Error)]
@@ -77,11 +93,6 @@ pub enum OAuthError {
         "what the authorization server returned for `{0}` contains a secret from the server's url; nothing was stored"
     )]
     HoldsKey(String),
-    /// A value read for the server's `url` is more than one URL component
-    #[error(
-        "a value read for the `url` of `{0}` holds `/`, `\\`, `?`, `#`, `%`, whitespace or a control character (or `&` or `+` in the query); with `oauth = true` store only the key in 1Password and put the rest of the url in the config"
-    )]
-    UrlValueNotAKey(String),
     /// The authorization link holds part of a secret `url` outside the
     /// `resource` parameter, so it is not shown
     #[error(
@@ -393,30 +404,16 @@ impl OAuth {
     /// The server's `url` with its references read, and the parts of it an
     /// issuer must not hold
     ///
-    /// Nothing is stored under it: logins, flows and registrations are all
-    /// keyed by the server name, so a key in the URL never reaches the database
+    /// The same reader every connection uses, so the placement and value
+    /// rules hold before any HTTP request. Nothing is stored under it:
+    /// logins, flows and registrations are all keyed by the server name, so
+    /// a key in the URL never reaches the database
     async fn resolved_url(
         &self,
-        name: &str,
         server: &OAuthServer,
     ) -> Result<(String, Vec<String>), OAuthError> {
         let resolved = self.onepassword.resolve_url(&server.url).await?;
         self.redactor.add(resolved.secrets);
-        // a value is the key only when it is one URL component that parsing
-        // leaves as it is; anything else could be echoed in part or changed
-        // into a form the redactor does not know
-        let refused = resolved.read.iter().any(|value| {
-            value.text.chars().any(|c| {
-                matches!(c, '/' | '\\' | '?' | '#' | '%')
-                    || c.is_whitespace()
-                    || c.is_control()
-                    // form decoding turns `+` into a space and `&` splits
-                    || (value.in_query && matches!(c, '&' | '+'))
-            })
-        });
-        if refused {
-            return Err(OAuthError::UrlValueNotAKey(name.to_owned()));
-        }
 
         Ok((resolved.url, resolved.keys))
     }
@@ -437,7 +434,7 @@ impl OAuth {
         name: &str,
     ) -> Result<(AuthorizationManager, Vec<String>), OAuthError> {
         let server = self.server(name)?;
-        let (url, keys) = self.resolved_url(name, server).await?;
+        let (url, keys) = self.resolved_url(server).await?;
         let mut manager = AuthorizationManager::new(url.as_str()).await?;
         let resolution = manager.resolve_metadata().await?;
         if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
@@ -523,7 +520,7 @@ impl OAuth {
     /// but only for a callback that answers a login in progress: anyone who
     /// reaches the callback could otherwise raise a 1Password prompt. When
     /// the url is not read, the text is not echoed: only the error code, if
-    /// it is a short `[a-z_]` token
+    /// it is a standard OAuth error code
     async fn refusal(
         &self,
         server: &OAuthServer,
@@ -531,17 +528,12 @@ impl OAuth {
         error: &str,
         description: Option<&str>,
     ) -> String {
-        // only the redactor's learning matters here, so the name for an error is moot
-        if !server.url.contains("{{") || (pending && self.resolved_url("", server).await.is_ok()) {
+        // only the redactor's learning matters here
+        if !server.url.contains("{{") || (pending && self.resolved_url(server).await.is_ok()) {
             return description.unwrap_or(error).to_owned();
         }
 
-        let is_code = !error.is_empty()
-            && error.len() <= MAX_ERROR_CODE_LEN
-            && error
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
-        if is_code {
+        if STANDARD_ERROR_CODES.contains(&error) {
             format!("the authorization server reported `{error}`")
         } else {
             "the authorization server reported an error".to_owned()
@@ -644,7 +636,7 @@ impl OAuth {
         let registration: ClientRegistration = serde_json::from_str(&client)
             .map_err(|error| OAuthError::Corrupt(error.to_string()))?;
 
-        let (url, keys) = self.resolved_url(name, server).await?;
+        let (url, keys) = self.resolved_url(server).await?;
         let mut manager = AuthorizationManager::new(url.as_str()).await?;
         manager.set_credential_store(SqliteCredentialStore {
             store: self.store.clone(),

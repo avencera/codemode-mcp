@@ -490,25 +490,35 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - Values read are added to the redactor that already scrubs configured header and env values, URL query strings
   and userinfo from upstream error text before a script sees it, and from stdio servers' stderr before it is
   logged
-- A `url` is parsed as a URL at config load only when it holds no reference; one with references is parsed after
-  they are read (`SecretError::NotAUrl`, reported as a `configuration` failure). It is resolved at the same point
-  in the connect path as `headers` and `env`, through the same reader and cache
-- The secrets of a `url` are exactly the values read from 1Password, plus each value's percent-encoded (form,
-  unreserved-only, all non-alphanumeric) and JSON-escaped forms. Nothing in a URL is guessed to be a key from its
-  shape, so embed the reference where the key sits, e.g.
+- A `url` is substituted structurally (`secrets::UrlTemplate`). Each reference becomes a unique alphanumeric
+  placeholder, the result is parsed as a URL, and the placeholders show which component each reference lands in.
+  This runs at config load and again when the references are read, in the one resolver every connection uses
+  (anonymous connects, OAuth discovery and authorized clients), before any HTTP request. References may sit only
+  in path segments and query names or values; one in the scheme, credentials, host, port or fragment is refused
+  with a configuration error, as is a template without a literal, non-empty host. A host is lowercased when
+  parsed, so a key there could not be matched, and it is refused for every server rather than only with OAuth
+- Values are filled into the parsed URL already percent-encoded as data (path-segment encoding in the path, form
+  encoding in the query), so `/`, `\`, `?`, `#`, `%`, `&` and `+` in a value never become URL structure and any
+  character is allowed. A value under six bytes is refused. The URL a template yields is reported as a
+  `configuration` failure when it does not parse (`SecretError::NotAUrl`)
+- The secrets of a `url` are exactly the values read from 1Password plus the forms text may print them in: the
+  encodings the URL holds them in, percent-decoded, `+` read as a space (form decoding), uppercase and lowercase
+  percent escapes, and JSON escaping. Nothing in a URL is guessed to be a key from its shape, so embed the
+  reference where the key sits, e.g.
   `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
   that is one whole reference still works without OAuth, and the redactor then also learns the resolved URL's
   normalized form, full path (with and without its trailing `/`) and full query with their encodings, and nothing
-  finer. The daemon's log writer (`secrets::redacting_logs`) scrubs with the same redactor, buffering each
-  writer's bytes until `flush` or drop, because rmcp and reqwest print the URL in their own log events
-- With `oauth = true` a `url` that holds references must start with literal `http://` or `https://` text (checked
-  at config load): codemode can only keep the key out of OAuth state when it knows which part is the key, and a
-  reference in the host counts, since the exact value is then the key. Each reference must return one component:
-  a value holding `/`, `?`, `#`, `@` or `:` is refused at connect, so only the key goes in 1Password. Everything OAuth writes to `codemode.sqlite`
+  finer. The redactor matches ASCII case-insensitively, also through the percent-decoded view of the text, so a
+  provider that lowercases a key into a host name cannot slip past. The daemon's log writer
+  (`secrets::redacting_logs`) scrubs with the same redactor, buffering each writer's bytes until `flush` or drop,
+  because rmcp and reqwest print the URL in their own log events
+- With `oauth = true` a `url` cannot be one whole reference (refused at config load): codemode can only keep the
+  key out of OAuth state when it knows which part is the key. Everything OAuth writes to `codemode.sqlite`
   (credentials at login and on every refresh, pending state, the client registration) passes one check that
-  serializes the value and refuses it when it holds a key, raw or percent-decoded; unused vendor token fields are
-  dropped. The authorization link is checked whole the same way, and its `resource` parameter is dropped only when
-  its value holds a key
+  serializes the value and refuses it when it holds a key, raw or percent-decoded, ignoring case; unused vendor
+  token fields are dropped. The authorization link is checked whole the same way, and its `resource` parameter is
+  dropped only when its value holds a key. A refused callback whose `url` cannot be read answers with fixed text,
+  plus the `error` code only when it is a standard OAuth error code; provider text is never copied
 
 ### Companions (`src/companion.rs`)
 
