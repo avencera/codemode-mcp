@@ -498,6 +498,30 @@ policy = "deny"
 - Result types. A tool that declares no output schema returns a `JsonValue` that scripts read with the `json_*` accessors. Give it a type in the tool's table: `output = "text"` for prose or markdown (the script gets a `str`, never parsed), or `output_schema` with an inline JSON Schema table for JSON, e.g. `output_schema = { type = "object", required = ["id"], properties = { id = { type = "string" } } }`. An upstream-declared schema wins over `output_schema` unless the table also sets `force_output_schema = true`. Every result is checked against the schema, so write only fields the tool really returns and mark optional ones with a `required` list or a `["string", "null"]` type. Probe it first: `codemode-mcp exec` a script that prints `json.dumps(await server_tool(...))`.
 - Check the result with `codemode-mcp tools` (connects, lists every tool with its status).
 
+### Keep servers in a shared file
+
+To keep the servers in a file you can share, such as one in a public dotfiles repository, list it in `include`
+at the top of `config.toml`, before any table. The values only this Mac should have, such as `public_origin`,
+`[secrets]` peers and personal `env` values, stay in `config.toml`:
+
+```toml
+include = ["~/code/dotfiles/config/codemode-mcp/servers.toml"]
+public_origin = "https://mac.example.ts.net"
+
+[servers.gmail.env]            # added to the shared server's env
+USER_GOOGLE_EMAIL = "you@example.com"
+```
+
+- Paths start with `~/` or are relative to the directory `config.toml` sits in. When `config.toml` is a symlink,
+  that is the link's directory, not its target's.
+- An included file may hold only `[servers]`, and cannot include others. A file kept somewhere shared cannot add
+  a companion, a phone, a `[companion]` section or any other setting. Its servers still run commands on this Mac,
+  so include only files you control.
+- Tables merge key by key, so `config.toml` can add keys to a server the shared file defines. A value set in both
+  files refuses the config and names both files.
+- Pairing and invites still append to `config.toml`, never to an included file.
+- Included files are read when the config loads, so restart after editing one.
+
 ## Restarts and in-flight work
 
 `service install`, `service restart`, a crash and a reboot all restart the daemon. State is in

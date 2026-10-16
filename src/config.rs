@@ -16,6 +16,10 @@ use crate::{
     stubs::is_brand_name,
 };
 
+/// Top-level key listing the files merged under a config
+const INCLUDE_KEY: &str = "include";
+/// The only table an included file may hold
+const INCLUDED_KEY: &str = "servers";
 /// ntfy server used when a notify section names none
 const DEFAULT_NTFY_SERVER: &str = "https://ntfy.sh";
 /// Authorization URL parameters rmcp sets; overriding one would break
@@ -47,6 +51,17 @@ pub enum ConfigError {
     Parse {
         /// Path that was parsed
         path: PathBuf,
+        /// Underlying TOML error
+        source: toml::de::Error,
+    },
+    /// Each file parsed, but merged with its includes they are not a valid
+    /// config; the merged table has no line numbers, so the error names
+    /// every file instead
+    #[error("failed to parse config {files}: {source}")]
+    ParseIncluded {
+        /// The including file and the files it includes, as one message
+        /// phrase so the error stays as small as the others
+        files: String,
         /// Underlying TOML error
         source: toml::de::Error,
     },
@@ -178,12 +193,71 @@ impl Config {
         self.path.as_deref()
     }
 
-    /// Parses and validates configuration text; `path` is used in errors only
+    /// Parses and validates configuration text; `path` is used in errors and
+    /// to resolve relative `include` paths
+    ///
+    /// A top-level `include = ["..."]` merges other TOML files under this
+    /// one, so a shared file can hold the servers while this file keeps what
+    /// belongs to one Mac. Tables merge key by key; a value set in two files
+    /// is refused rather than overridden, so neither file silently loses.
+    /// An included file may hold only `[servers]`: one kept somewhere shared
+    /// must not be able to add a peer, a companion or a policy unnoticed
     pub fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        let parse_error = |source| ConfigError::Parse {
             path: path.to_owned(),
             source,
-        })?;
+        };
+        let mut table: toml::Table = toml::from_str(text).map_err(parse_error)?;
+
+        let config: Self = match table.remove(INCLUDE_KEY) {
+            // parsed from the text itself so errors keep their line numbers
+            None => toml::from_str(text).map_err(parse_error)?,
+            Some(include) => {
+                let mut merged = Merged::default();
+                let included_paths = include_paths(include, path)?;
+                for included in &included_paths {
+                    let text =
+                        std::fs::read_to_string(included).map_err(|source| ConfigError::Read {
+                            path: included.clone(),
+                            source,
+                        })?;
+                    let shared: toml::Table =
+                        toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                            path: included.clone(),
+                            source,
+                        })?;
+                    // `include` too, so included files cannot include others
+                    if let Some(key) = shared.keys().find(|key| *key != INCLUDED_KEY) {
+                        return Err(ConfigError::Invalid(format!(
+                            "{} is included by {}, so it may hold only [{INCLUDED_KEY}]; \
+                             move `{key}` into {}",
+                            included.display(),
+                            path.display(),
+                            path.display()
+                        )));
+                    }
+
+                    merged.add(shared, included)?;
+                }
+                merged.add(table, path)?;
+
+                merged
+                    .table
+                    .try_into()
+                    .map_err(|source| ConfigError::ParseIncluded {
+                        files: format!(
+                            "{} together with {}",
+                            path.display(),
+                            included_paths
+                                .iter()
+                                .map(|included| included.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        source,
+                    })?
+            }
+        };
         config.validate()?;
 
         Ok(config)
@@ -699,6 +773,95 @@ pub fn expand_home(path: &Path) -> PathBuf {
     match (path.strip_prefix("~"), std::env::var_os("HOME")) {
         (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => path.to_owned(),
+    }
+}
+
+/// The files an `include` names: `~/` against the home directory, relative
+/// paths against the including file's directory
+fn include_paths(include: toml::Value, path: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    let invalid = || ConfigError::Invalid("include must be a list of file paths".into());
+    let toml::Value::Array(entries) = include else {
+        return Err(invalid());
+    };
+    let directory = path.parent().unwrap_or(Path::new(""));
+
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            toml::Value::String(entry) if !entry.trim().is_empty() => {
+                let expanded = expand_home(Path::new(&entry));
+
+                Ok(if expanded.is_absolute() {
+                    expanded
+                } else {
+                    directory.join(expanded)
+                })
+            }
+            _ => Err(invalid()),
+        })
+        .collect()
+}
+
+/// Tables merged from several files, remembering which file first set each
+/// key so a clash can name both
+#[derive(Default)]
+struct Merged {
+    table: toml::Table,
+    origins: BTreeMap<Vec<String>, PathBuf>,
+}
+
+impl Merged {
+    /// Merges `table`, read from `file`, into what is already here
+    fn add(&mut self, table: toml::Table, file: &Path) -> Result<(), ConfigError> {
+        Self::merge(
+            &mut self.table,
+            table,
+            &mut Vec::new(),
+            file,
+            &mut self.origins,
+        )
+    }
+
+    fn merge(
+        base: &mut toml::Table,
+        incoming: toml::Table,
+        key: &mut Vec<String>,
+        file: &Path,
+        origins: &mut BTreeMap<Vec<String>, PathBuf>,
+    ) -> Result<(), ConfigError> {
+        for (name, value) in incoming {
+            key.push(name.clone());
+            match (base.get_mut(&name), value) {
+                (Some(toml::Value::Table(existing)), toml::Value::Table(value)) => {
+                    Self::merge(existing, value, key, file, origins)?;
+                }
+                // arrays too: appending `[[secrets.phones]]` from two files
+                // would hide which file a peer came from
+                (Some(_), _) => {
+                    // a table that arrived whole is recorded at its own key
+                    let first = (1..=key.len())
+                        .rev()
+                        .find_map(|end| origins.get(&key[..end]))
+                        .map_or_else(
+                            || "another file".to_owned(),
+                            |first| first.display().to_string(),
+                        );
+
+                    return Err(ConfigError::Invalid(format!(
+                        "`{}` is set in both {first} and {}",
+                        key.join("."),
+                        file.display()
+                    )));
+                }
+                (None, value) => {
+                    origins.insert(key.clone(), file.to_owned());
+                    base.insert(name, value);
+                }
+            }
+            key.pop();
+        }
+
+        Ok(())
     }
 }
 
@@ -1426,6 +1589,95 @@ mod tests {
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::parse(text, Path::new("test.toml"))
+    }
+
+    #[test]
+    fn an_include_merges_a_shared_file_under_this_macs_own()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("codemode-include-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(directory.join("shared"))?;
+        let shared = directory.join("shared/servers.toml");
+        std::fs::write(
+            &shared,
+            "[servers.mail]\ncommand = \"mail-mcp\"\n\
+             env = { SECRET = \"{{ op://Dev/mail/credential }}\" }\n",
+        )?;
+        let path = directory.join("config.toml");
+        // relative to the including file; the values only this Mac has stay
+        // here, including keys inside a shared table
+        std::fs::write(
+            &path,
+            "include = [\"shared/servers.toml\"]\n\
+             public_origin = \"https://mini.example.ts.net\"\n\n\
+             [servers.mail.env]\nUSER = \"owner@example.com\"\n",
+        )?;
+
+        let config = Config::load(&path)?;
+        let mail = &config.servers["mail"];
+        assert_eq!(mail.command.as_deref(), Some("mail-mcp"));
+        assert_eq!(
+            mail.env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["SECRET", "USER"]
+        );
+        assert_eq!(config.public_origin(), "https://mini.example.ts.net");
+        // pairing appends to the including file, not the shared one
+        assert_eq!(config.path(), Some(path.as_path()));
+
+        // a value set in both is refused by name rather than overridden
+        let clash = directory.join("clash.toml");
+        std::fs::write(
+            &clash,
+            "include = [\"shared/servers.toml\"]\n[servers.mail]\ncommand = \"other\"\n",
+        )?;
+        let refused = Config::load(&clash).err().map(|error| error.to_string());
+        let refused = refused.unwrap_or_default();
+        assert!(
+            refused.contains("`servers.mail.command`")
+                && refused.contains(&shared.display().to_string())
+                && refused.contains(&clash.display().to_string()),
+            "{refused}"
+        );
+
+        // an unknown field in the shared file still fails the load
+        std::fs::write(
+            &shared,
+            "[servers.mail]\ncommand = \"mail-mcp\"\ntypo = 1\n",
+        )?;
+        let refused = Config::load(&path).err();
+        assert!(
+            matches!(&refused, Some(error @ ConfigError::ParseIncluded { .. })
+                if error.to_string().contains(&shared.display().to_string())),
+            "{refused:?}"
+        );
+
+        // a shared file cannot add a peer the gateway would trust, nor
+        // include further files
+        let id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        for text in [
+            format!("[[secrets.companions]]\nname = \"mba\"\nid = \"{id}\"\n"),
+            "include = [\"../config.toml\"]\n".to_owned(),
+        ] {
+            std::fs::write(&shared, text)?;
+            let refused = Config::load(&path).err().map(|error| error.to_string());
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|refused| refused.contains("may hold only [servers]")),
+                "{refused:?}"
+            );
+        }
+
+        // a missing file names itself
+        std::fs::remove_file(&shared)?;
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Read { path: missing, .. }) if missing == shared
+        ));
+
+        std::fs::remove_dir_all(&directory)?;
+
+        Ok(())
     }
 
     #[test]
