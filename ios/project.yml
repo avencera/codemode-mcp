@@ -37,8 +37,8 @@ targets:
       properties:
         # App Store Connect refuses a name another app has taken, as
         # "Companion" is
-        CFBundleDisplayName: codemode-mcp
-        CFBundleName: codemode-mcp
+        CFBundleDisplayName: CMCP Companion
+        CFBundleName: CMCP Companion
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSCameraUsageDescription: Companion scans the QR code `codemode-mcp companion invite` shows, to pair with the gateway.
