@@ -305,27 +305,30 @@ async fn a_page_that_moves_while_the_owner_decides_gets_nothing() -> TestResult 
 
     // the same host, but in another browser, or in one whose setting could
     // no longer be read, is not what the owner was shown either
-    for moved_to in [
-        FocusedField {
-            browser: Some("Chrome".to_owned()),
-            ..field(FieldKind::Secure, "https://github.com/login")
-        },
-        FocusedField {
-            exposure: Exposure {
-                apple_events_javascript: Setting::Unknown,
-                ..Exposure::default()
+    for (moved_to, why) in [
+        (
+            FocusedField {
+                browser: Some("Chrome".to_owned()),
+                ..field(FieldKind::Secure, "https://github.com/login")
             },
-            ..field(FieldKind::Secure, "https://github.com/login")
-        },
+            "now in Chrome, not as the owner approved in Safari",
+        ),
+        (
+            FocusedField {
+                exposure: Exposure {
+                    apple_events_javascript: Setting::Unknown,
+                    ..Exposure::default()
+                },
+                ..field(FieldKind::Secure, "https://github.com/login")
+            },
+            "Safari changed since the owner approved: could not confirm",
+        ),
     ] {
         mac.set_focused(field(FieldKind::Secure, "https://github.com/login"));
         mac.set_focus_on_prompt(moved_to);
         let moved = harness.execute_json(FILL).await?;
         let text = moved["result"].as_str().unwrap_or_default();
-        assert!(
-            text.contains("not as the owner approved in Safari"),
-            "{moved}"
-        );
+        assert!(text.contains(why), "{moved}");
     }
     assert_eq!(reads(&log, REFERENCE), 0);
     assert_eq!(mac.typed(), "");

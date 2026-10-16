@@ -349,7 +349,9 @@ fn exposure(pid: libc::pid_t, browser: &Browser) -> Exposure {
         Scripting::Chromium(_) | Scripting::Firefox => Some(command_line(pid)),
     };
     let remote_debugging = match &started {
-        None => Setting::Off,
+        // Safari takes no debugging switches; WebDriver drives it through
+        // `safaridriver`, which runs for as long as a session does
+        None => running("safaridriver"),
         Some(None) => Setting::Unknown,
         Some(Some(started)) if started.remote_debugging() => Setting::On,
         Some(Some(_)) => Setting::Off,
@@ -357,14 +359,22 @@ fn exposure(pid: libc::pid_t, browser: &Browser) -> Exposure {
     let apple_events_javascript = match browser.scripting {
         Scripting::Safari(bundle) => safari_javascript(bundle),
         Scripting::Chromium(directory) => {
+            // an empty value leaves Chromium on its default directory, and a
+            // relative one is against the browser's working directory, which
+            // is not this one, so it stays unconfirmed
             let flagged = started
                 .flatten()
-                .and_then(|started| started.switch("user-data-dir").map(PathBuf::from));
-            match flagged
-                .or_else(|| home().map(|home| home.join(APPLICATION_SUPPORT).join(directory)))
-            {
-                Some(directory) => chromium_javascript(&directory),
-                None => Setting::Unknown,
+                .and_then(|started| started.switch("user-data-dir").map(PathBuf::from))
+                .filter(|flagged| !flagged.as_os_str().is_empty());
+            match flagged {
+                Some(flagged) if flagged.is_relative() => Setting::Unknown,
+                Some(flagged) => chromium_javascript(&flagged),
+                None => match home() {
+                    Some(home) => {
+                        chromium_javascript(&home.join(APPLICATION_SUPPORT).join(directory))
+                    }
+                    None => Setting::Unknown,
+                },
             }
         }
         Scripting::Firefox => Setting::Off,
@@ -374,6 +384,44 @@ fn exposure(pid: libc::pid_t, browser: &Browser) -> Exposure {
         remote_debugging,
         apple_events_javascript,
     }
+}
+
+/// On when a process named `name` is running, unknown when the process list
+/// cannot be read
+fn running(name: &str) -> Setting {
+    // room for every process now, with headroom for any started meanwhile
+    // SAFETY: a null buffer asks only for the count
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Ok(count) = usize::try_from(count) else {
+        return Setting::Unknown;
+    };
+    let mut pids = vec![0 as libc::pid_t; count + 64];
+    let bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())).unwrap_or(0);
+    // SAFETY: `pids` holds `bytes` bytes
+    let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), bytes) };
+    let Ok(listed) = usize::try_from(listed) else {
+        return Setting::Unknown;
+    };
+
+    let mut buffer = [0_u8; 256];
+    for &pid in pids.iter().take(listed.min(pids.len())) {
+        // SAFETY: `buffer` holds the bytes given
+        let length = unsafe {
+            libc::proc_name(
+                pid,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer.len() as u32,
+            )
+        };
+        let Ok(length) = usize::try_from(length) else {
+            continue;
+        };
+        if buffer.get(..length) == Some(name.as_bytes()) {
+            return Setting::On;
+        }
+    }
+
+    Setting::Off
 }
 
 /// Where Chromium browsers keep their user data, under the home folder
@@ -646,7 +694,9 @@ mod tests {
     use core_foundation::url::CFURL;
     use security_framework::os::macos::code_signing::{Flags, SecRequirement, SecStaticCode};
 
-    use super::{BROWSERS, CommandLine, command_line, procargs};
+    use std::ffi::c_void;
+
+    use super::{BROWSERS, CommandLine, Setting, command_line, procargs, running};
 
     #[test]
     fn every_requirement_compiles_and_matches_its_installed_browser() {
@@ -690,6 +740,25 @@ mod tests {
             arguments: arguments.iter().map(|text| (*text).to_owned()).collect(),
             environment: environment.iter().map(|text| (*text).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn a_running_process_is_found_by_name() {
+        let mut buffer = [0_u8; 256];
+        // SAFETY: `buffer` holds the bytes given
+        let length = unsafe {
+            libc::proc_name(
+                std::process::id() as libc::pid_t,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer.len() as u32,
+            )
+        };
+        let own = std::str::from_utf8(&buffer[..usize::try_from(length).unwrap_or(0)])
+            .unwrap_or_default();
+        assert!(!own.is_empty());
+
+        assert_eq!(running(own), Setting::On);
+        assert_eq!(running("no-such-process-anywhere"), Setting::Off);
     }
 
     #[test]

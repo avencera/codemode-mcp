@@ -704,7 +704,8 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   (`one_time_code`) into the field with keyboard focus, for an agent that drives the Mac's screen and must sign
   in without the value entering its context. `list` names the logins, their sites and fields. The answer is the
   login, field and host; passwords and one-time password seeds read are added to the redactor (not usernames,
-  which as email addresses appear in other servers' results and would be garbled), and the server is
+  which as email addresses appear in other servers' results and would be garbled, nor a password shorter than
+  the redactor's 6-character floor, which would garble ordinary words), and the server is
   `sensitive` under `ask`, so neither logs nor scripts see them
 - Only code-signed browsers: `AXUIElementGetPid` of the focused element gives the owning process, whose
   `SecCode` (`SecCodeCopyGuestWithAttributes` with the pid) must satisfy one designated requirement in a
@@ -718,10 +719,12 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   gathers (`Exposure`): the process's arguments and environment from `sysctl` `KERN_PROCARGS2` must not turn
   on `--remote-debugging-port`, `--remote-debugging-pipe`, Marionette (by flag or `MOZ_MARIONETTE`) or
   Firefox's debugger server, with switches read as the browsers read them (one dash or two, the last one
-  winning), and "Allow JavaScript from Apple Events" must be off: Safari's `AllowJavaScriptFromAppleEvents`
+  winning); Safari takes no such switches, so a running `safaridriver` process, which every WebDriver session
+  needs, counts as remote debugging for it. "Allow JavaScript from Apple Events" must be off: Safari's `AllowJavaScriptFromAppleEvents`
   in its container's preferences plist, Chromium browsers' `browser.allow_javascript_apple_events` in any
   profile's `Preferences` under the user data directory (`--user-data-dir` when given, read as Chromium reads
-  it: trimmed, and not past a `--`). Only a saved "on" refuses. A saved "off" proves nothing, because browsers
+  it: trimmed, and not past a `--`; an empty value means the default directory, and a relative one is left
+  unconfirmed, since it is against the browser's working directory). Only a saved "on" refuses. A saved "off" proves nothing, because browsers
   write a change out seconds later (Chromium batches preference writes), and Safari's file needs Full Disk
   Access, so anything but "on" becomes a note the owner sees with the request.
   These are read once per check, not per character

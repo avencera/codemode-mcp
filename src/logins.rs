@@ -246,15 +246,22 @@ impl FieldRule {
             }
             // the same host in another browser, or one whose settings could
             // no longer be read, is not what the owner saw
-            let unseen = focused
-                .unchecked()
-                .into_iter()
-                .any(|note| !approved.unchecked.contains(&note));
-            if approved.browser != *browser || unseen {
+            if approved.browser != *browser {
                 return refuse(format!(
                     "the focused field is now in {browser}, not as the owner approved in {}; \
                      fill again to ask",
                     approved.browser
+                ));
+            }
+            let unseen: Vec<String> = focused
+                .unchecked()
+                .into_iter()
+                .filter(|note| !approved.unchecked.contains(note))
+                .collect();
+            if !unseen.is_empty() {
+                return refuse(format!(
+                    "{browser} changed since the owner approved: {}; fill again to ask",
+                    unseen.join("; ")
                 ));
             }
         }

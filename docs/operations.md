@@ -408,7 +408,8 @@ What a fill checks, from Accessibility and the browser's code signature rather t
   Brave or Arc, identified by the running app's code signature, not its name. Fields in any other app are
   refused, including one an agent built to look like a browser.
 - The browser cannot be scripted by other programs: a Chromium browser or Firefox started with
-  `--remote-debugging-port`, `--remote-debugging-pipe` or Marionette is refused, and so is a browser with
+  `--remote-debugging-port`, `--remote-debugging-pipe` or Marionette is refused, so is Safari while
+  `safaridriver` runs (a WebDriver session needs it), and so is a browser with
   Allow JavaScript from Apple Events turned on in its saved preferences. A saved "off" is not proof, since a
   browser writes a change out only seconds later, and Safari's file needs Full Disk Access to read at all, so
   the Touch ID prompt says the setting could not be confirmed off; look at the browser's Develop menu before
