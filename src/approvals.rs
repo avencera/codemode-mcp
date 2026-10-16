@@ -217,6 +217,11 @@ pub struct ApprovalInfo {
     /// order the script made them, though many share a millisecond
     #[serde(default)]
     pub order: u64,
+    /// What the daemon, not the agent, found the call would do; shown with
+    /// the Touch ID prompt and the Mac's notification, while the page shows
+    /// the arguments it came from
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 impl ApprovalInfo {
@@ -296,6 +301,9 @@ pub struct GateRequest<'a> {
     /// Whether the call or its execution holds data from a sensitive
     /// server, so the request must not reach the disk
     pub sensitivity: Sensitivity,
+    /// What the daemon found the call would do, shown with the Touch ID
+    /// prompt, such as the host a `logins` `fill` would type on
+    pub summary: Option<&'a str>,
 }
 
 /// Whether a call may run now
@@ -570,6 +578,7 @@ impl Approvals {
             expires_ms: self.expiry(),
             batch: None,
             order: self.order.fetch_add(1, Ordering::SeqCst),
+            summary: request.summary.map(str::to_owned),
         };
 
         Gate::Wait(self.open(info, request.sensitivity, None, Some(notifier)))
@@ -642,6 +651,7 @@ impl Approvals {
             expires_ms: self.expiry(),
             batch: None,
             order: self.order.fetch_add(1, Ordering::SeqCst),
+            summary: None,
         };
         let notifier = self.notifier.clone();
 
@@ -808,6 +818,7 @@ impl Approvals {
             let url = approvals.url_for(&info.id);
             let notification = approvals.notification_for(&info);
             let calls = approvals.calls(&info);
+            let summaries = approvals.summaries(&info);
 
             if let ApprovalKind::Admin { .. } = &info.kind {
                 approvals.notify(phone, &info);
@@ -882,7 +893,7 @@ impl Approvals {
 
             let ask_here = async {
                 let answer = if on_mac.config.touch_id {
-                    let reason = touch_id_reason(&info, &calls);
+                    let reason = touch_id_reason(&info, &calls, &summaries);
                     // dropping the prompt's future takes it off the screen
                     tokio::select! {
                         answer = on_mac.mac.touch_id(&reason, APPROVAL_CANCEL_TITLE) => answer,
@@ -913,9 +924,16 @@ impl Approvals {
                     }
                     TouchId::Away => now.cancel(),
                     TouchId::Unavailable => {
+                        // the Mac's own notification, unlike the phone's,
+                        // does not cross the ntfy server
+                        let message = if summaries.is_empty() {
+                            "Click to review.".to_owned()
+                        } else {
+                            format!("{}. Click to review.", summaries.join("; "))
+                        };
                         let local = MacNotification {
                             title: notification.title,
-                            message: "Click to review.".to_owned(),
+                            message,
                             click: Some(url.clone()),
                         };
                         if let Err(error) = on_mac.mac.notify(&local).await {
@@ -1265,6 +1283,20 @@ impl Approvals {
         tool_counts(&batch)
     }
 
+    /// The summaries of the calls of `info`'s batch, in the order they were
+    /// made
+    fn summaries(&self, info: &ApprovalInfo) -> Vec<String> {
+        let batch = self.batch(&info.id);
+        if batch.is_empty() {
+            return info.summary.iter().cloned().collect();
+        }
+
+        batch
+            .iter()
+            .filter_map(|member| member.summary.clone())
+            .collect()
+    }
+
     /// Closes the batch of `info` to later requests, as when it is shown on
     /// the page, so approving it covers only the calls shown
     pub fn close_batch(&self, info: &ApprovalInfo) {
@@ -1493,11 +1525,11 @@ impl Approvals {
 }
 
 /// Text of the Touch ID prompt: the calls of the batch, what a fingerprint
-/// grants, and who asks and why
+/// grants and what the daemon found the calls would do, and who asks and why
 ///
 /// Unlike the phone notification, which crosses the ntfy server, the prompt
 /// stays on the Mac, so it may carry the agent's thread title and reason
-fn touch_id_reason(info: &ApprovalInfo, calls: &[(String, usize)]) -> String {
+fn touch_id_reason(info: &ApprovalInfo, calls: &[(String, usize)], summaries: &[String]) -> String {
     let client = info.caller.client_label();
     let grant = match info.fingerprint_choice() {
         Choice::Session(length) => {
@@ -1513,6 +1545,11 @@ fn touch_id_reason(info: &ApprovalInfo, calls: &[(String, usize)]) -> String {
             length.as_secs() / 60
         ),
         Choice::Once | Choice::Deny => "once".to_owned(),
+    };
+    let grant = if summaries.is_empty() {
+        grant
+    } else {
+        format!("{grant}: {}", summaries.join("; "))
     };
 
     prompt_text(

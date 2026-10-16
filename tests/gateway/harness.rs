@@ -288,6 +288,8 @@ pub struct FakeMac {
     cancel_titles: Mutex<Vec<String>>,
     /// The field with keyboard focus; `None` is a screen with none
     focused: Mutex<Option<FocusedField>>,
+    /// The field that takes focus when the next prompt shows
+    focus_on_prompt: Mutex<Option<FocusedField>>,
     /// Everything `fill` typed, in order
     typed: Mutex<String>,
 }
@@ -370,6 +372,14 @@ impl FakeMac {
         }
     }
 
+    /// Gives `field` keyboard focus once the next Touch ID prompt shows, as
+    /// when the page moves on while the owner decides
+    pub fn set_focus_on_prompt(&self, field: FocusedField) {
+        if let Ok(mut slot) = self.focus_on_prompt.lock() {
+            *slot = Some(field);
+        }
+    }
+
     /// What `fill` typed so far
     pub fn typed(&self) -> String {
         self.typed
@@ -424,6 +434,14 @@ impl Mac for FakeMac {
 
     fn touch_id<'a>(&'a self, reason: &'a str, cancel: &'a str) -> BoxFuture<'a, TouchId> {
         self.record(format!("touch_id {reason}"));
+        if let Some(field) = self
+            .focus_on_prompt
+            .lock()
+            .ok()
+            .and_then(|mut next| next.take())
+        {
+            self.set_focused(field);
+        }
         if let Ok(mut titles) = self.cancel_titles.lock() {
             titles.push(cancel.to_owned());
         }

@@ -366,7 +366,8 @@ client. Until it is approved every tool fails with "This agent isn't approved to
 
 An agent that drives this Mac's screen, such as Codex with computer use, can sign in to a website with a
 1Password login without seeing the username or password. The `logins` server types the value into the field
-that has keyboard focus, after checking the field and the page itself; the agent only learns which host took it.
+that has keyboard focus, after checking the browser, the field and the page itself; the agent only learns which
+host took it.
 
 1. List the logins an agent may use, and the hosts each may be typed on:
 
@@ -394,8 +395,16 @@ that has keyboard focus, after checking the field and the page itself; the agent
 3. Pair phones and companion Macs again (`companion invite`) if they should answer these references without a
    tap on Allow this reference; pairing hands them the references in `[logins]` too.
 
-What a fill checks, from Accessibility rather than the agent's words:
+What a fill checks, from Accessibility and the browser's code signature rather than the agent's words:
 
+- The field belongs to Safari, Safari Technology Preview, Chrome (any channel), Firefox, Microsoft Edge,
+  Brave or Arc, identified by the running app's code signature, not its name. Fields in any other app are
+  refused, including one an agent built to look like a browser.
+- The browser cannot be scripted by other programs: a Chromium browser or Firefox started with
+  `--remote-debugging-port`, `--remote-debugging-pipe` or Marionette is refused, and so is a browser with
+  Allow JavaScript from Apple Events turned on. Safari keeps that setting in a file only a process with Full
+  Disk Access can read, so the Touch ID prompt usually says it could not be checked; look at Safari's
+  Develop menu before you approve. Chrome, Edge, Brave and Arc keep it in each profile's `Preferences`.
 - A password goes only into a password field, the kind that shows bullets. A username goes only into a
   one-line text field.
 - The field's page must be `https` on port 443, and its host one of the login's `sites`. A field inside a
@@ -406,22 +415,28 @@ What a fill checks, from Accessibility rather than the agent's words:
   already sent may still land, so a few characters can reach a field in the same app that took focus; keys never
   go to another app. The answer then says to clear the field and fill again.
 
-Each fill is approved like any `per_call` tool: Touch ID while you are at the Mac, otherwise a passkey on the
-phone. The value is then read like a server secret, through `op` while you are at the Mac, or a companion Mac or
-phone when you are not, and kept in the daemon's memory until it restarts. After changing a password in
-1Password, restart the daemon so the next fill reads the new one.
+These checks run before you are asked, so a fill into the wrong place is refused without a prompt. Each fill
+is then approved like any `per_call` tool: Touch ID while you are at the Mac, otherwise a passkey on the phone.
+The Touch ID prompt and the Mac's notification say what goes where, such as `password for github into
+github.com in Safari`, followed by any setting that could not be checked, and the approval page shows the same
+under `checked`. The phone's notification names only the tool, as for every call. After you approve, the field
+is checked again and must still be on the host you approved; if the page moved to another host, even one of
+the login's sites, nothing is read or typed and the agent must fill again.
+
+The value is then read like a server secret, through `op` while you are at the Mac, or a companion Mac or phone
+when you are not, and kept in the daemon's memory until it restarts. After changing a password in 1Password,
+restart the daemon so the next fill reads the new one.
 
 Limits:
 
-- Web pages only, in a browser that exposes its pages to Accessibility, such as Safari or Chrome. Native
-  app fields have no page address and are refused.
+- Web pages only, in one of the browsers above. Native app fields have no page address and are refused.
 - No one-time codes yet; type those yourself, or approve the sign-in on your phone.
 - A username lands in a plain text field, so the agent sees it on screen like any typed text. A password
   shows as bullets, until something clicks the page's show-password button; then the agent can read it too.
 - The agent never gets the value from the tool, but anything that can run script in the page could read the
-  field once it is filled. Keep agents from driving the browser through Apple Events: when macOS asks whether
-  the agent's app may control Safari or Chrome, choose Don't Allow, and leave Safari's Allow JavaScript from
-  Apple Events off. Do not sign in this way in a Chrome started with `--remote-debugging-port`.
+  field once it is filled. The daemon refuses the switches it can see, but a browser extension or a program
+  you allowed to control the browser through Apple Events still could: when macOS asks whether the agent's
+  app may control Safari or Chrome, choose Don't Allow.
 
 ## OAuth sign-in
 

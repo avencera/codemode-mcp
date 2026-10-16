@@ -95,6 +95,9 @@ block2 = "0.6.2"
 # workspace shares one lockfile and the phone gets this version too
 libc = "=0.2.189"
 objc2 = "0.6.5"
+# Safari's "Allow JavaScript from Apple Events" setting, for the `logins`
+# server; already in the tree
+plist = "1.10.1"
 objc2-event-kit = { version = "0.3.2", default-features = false, features = [
     "std",
     "block2",
@@ -166,6 +169,11 @@ objc2-local-authentication = { version = "0.3.2", default-features = false, feat
 aws-lc-rs = "1.18.2"
 tower = { version = "0.5.3", features = ["util"] }
 webauthn-authenticator-rs = { version = "=0.6.1-dev", features = ["softpasskey"] }
+
+# the URL type security-framework takes, to check the browser table against
+# the installed apps; already in the tree through it
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-foundation = "0.10.1"
 
 # stdio MCP server used only by the integration tests; lives in tests/ so it
 # stays out of the shipped sources but still gets CARGO_BIN_EXE_ for free

@@ -1,10 +1,18 @@
-//! The focused field through Accessibility, and typing into it with keyboard
-//! events posted to the app that owns it
+//! The focused field through Accessibility, the browser that owns it by its
+//! code signature, and typing into it with keyboard events posted to that
+//! browser
 //!
 //! Everything here blocks: Accessibility messages the target app and waits
-//! for its answer, up to [`MESSAGING_TIMEOUT`]
+//! for its answer, up to [`MESSAGING_TIMEOUT`], and the browser's settings
+//! are read from disk
 
-use std::{ptr::NonNull, sync::Mutex, time::Duration};
+use std::{
+    ffi::c_void,
+    path::{Path, PathBuf},
+    ptr::NonNull,
+    sync::Mutex,
+    time::Duration,
+};
 
 use objc2_application_services::{AXError, AXIsProcessTrustedWithOptions, AXUIElement};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType, CFURL};
@@ -13,7 +21,11 @@ use objc2_core_graphics::{
     CGRequestPostEventAccess,
 };
 
-use crate::logins::{FieldKind, FieldRule, FillError, FocusedField};
+use security_framework::os::macos::code_signing::{
+    Flags, GuestAttributes, SecCode, SecRequirement,
+};
+
+use crate::logins::{Exposure, FieldKind, FieldRule, FillError, FocusedField, Setting};
 
 /// How long one Accessibility request may wait on a busy app
 const MESSAGING_TIMEOUT: f32 = 1.0;
@@ -28,6 +40,115 @@ static TYPING: Mutex<()> = Mutex::new(());
 /// What the System Settings switch is called, for the error that asks for it
 const GRANT: &str = "turn on codemode-mcp in System Settings > Privacy & Security > \
      Accessibility, then fill again";
+
+/// Where a browser keeps "Allow JavaScript from Apple Events"
+enum Scripting {
+    /// Safari's preferences, in the container of this bundle id
+    Safari(&'static str),
+    /// A Chromium browser's user data directory under Application Support,
+    /// each of whose profiles has a `Preferences` file
+    Chromium(&'static str),
+    /// Firefox, which has no such setting
+    Firefox,
+}
+
+/// A browser the `logins` server types into, known by its designated
+/// requirement rather than its name, which any app can copy
+struct Browser {
+    /// Shown to the owner and in errors
+    name: &'static str,
+    /// Code signing requirement the running process must satisfy
+    requirement: &'static str,
+    scripting: Scripting,
+}
+
+/// Chrome's designated requirement as `codesign -d -r-` prints it, narrowed
+/// from its four channels to one so each channel finds its own profiles
+macro_rules! chrome {
+    ($identifier:literal) => {
+        concat!(
+            "identifier \"",
+            $identifier,
+            "\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] \
+             /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and \
+             certificate leaf[subject.OU] = EQHXZ8M8AV"
+        )
+    };
+}
+
+/// A Developer ID app of the team `$team`
+macro_rules! developer_id {
+    ($identifier:literal, $team:literal) => {
+        concat!(
+            "identifier \"",
+            $identifier,
+            "\" and anchor apple generic and certificate leaf[subject.OU] = \"",
+            $team,
+            "\""
+        )
+    };
+}
+
+/// The browsers a login may be typed into
+///
+/// Read from `codesign -d -r-` on a local install: Safari and Google Chrome.
+/// Team ids from the vendors' published signing identity, as listed on
+/// appcatalog.cloud, without a local install to compare: Firefox
+/// (Mozilla, 43AQ936H96), Microsoft Edge (UBF8T346G9), Brave (KL8N8XSYF4)
+/// and Arc (The Browser Company, S6N382Y83G). Safari Technology Preview
+/// follows Safari's form. An entry that is wrong only refuses its browser
+const BROWSERS: [Browser; 10] = [
+    Browser {
+        name: "Safari",
+        requirement: "identifier \"com.apple.Safari\" and anchor apple",
+        scripting: Scripting::Safari("com.apple.Safari"),
+    },
+    Browser {
+        name: "Safari Technology Preview",
+        requirement: "identifier \"com.apple.SafariTechnologyPreview\" and anchor apple",
+        scripting: Scripting::Safari("com.apple.SafariTechnologyPreview"),
+    },
+    Browser {
+        name: "Chrome",
+        requirement: chrome!("com.google.Chrome"),
+        scripting: Scripting::Chromium("Google/Chrome"),
+    },
+    Browser {
+        name: "Chrome Beta",
+        requirement: chrome!("com.google.Chrome.beta"),
+        scripting: Scripting::Chromium("Google/Chrome Beta"),
+    },
+    Browser {
+        name: "Chrome Dev",
+        requirement: chrome!("com.google.Chrome.dev"),
+        scripting: Scripting::Chromium("Google/Chrome Dev"),
+    },
+    Browser {
+        name: "Chrome Canary",
+        requirement: chrome!("com.google.Chrome.canary"),
+        scripting: Scripting::Chromium("Google/Chrome Canary"),
+    },
+    Browser {
+        name: "Firefox",
+        requirement: developer_id!("org.mozilla.firefox", "43AQ936H96"),
+        scripting: Scripting::Firefox,
+    },
+    Browser {
+        name: "Microsoft Edge",
+        requirement: developer_id!("com.microsoft.edgemac", "UBF8T346G9"),
+        scripting: Scripting::Chromium("Microsoft Edge"),
+    },
+    Browser {
+        name: "Brave",
+        requirement: developer_id!("com.brave.Browser", "KL8N8XSYF4"),
+        scripting: Scripting::Chromium("BraveSoftware/Brave-Browser"),
+    },
+    Browser {
+        name: "Arc",
+        requirement: developer_id!("company.thebrowser.Browser", "S6N382Y83G"),
+        scripting: Scripting::Chromium("Arc/User Data"),
+    },
+];
 
 /// Checks that the daemon may read other apps and post keyboard events,
 /// asking macOS to show its prompt when it may not
@@ -178,18 +299,260 @@ fn web_area_url(area: &AXUIElement) -> Result<Option<String>, FillError> {
     })
 }
 
-fn describe(element: &AXUIElement) -> Result<FocusedField, FillError> {
-    Ok(FocusedField {
-        kind: kind(element)?,
-        pages: page_urls(element)?,
+/// The browser that owns the focused field, and what other programs could
+/// do with it; read once per check, since the app behind a field does not
+/// change while it keeps focus
+struct Owner {
+    pid: libc::pid_t,
+    browser: Option<&'static Browser>,
+    exposure: Exposure,
+}
+
+fn owner(field: &AXUIElement) -> Result<Owner, FillError> {
+    let mut pid: libc::pid_t = 0;
+    // SAFETY: `pid` is a valid out pointer
+    if unsafe { field.pid(NonNull::from(&mut pid)) } != AXError::Success {
+        return Err(FillError::Failed(
+            "could not tell which app owns the focused field".to_owned(),
+        ));
+    }
+    let browser = browser(pid);
+    let exposure = browser
+        .map(|browser| exposure(pid, browser))
+        .unwrap_or_default();
+
+    Ok(Owner {
+        pid,
+        browser,
+        exposure,
     })
 }
 
-/// The focused field, for the check before a value is read
+/// The browser whose designated requirement the running process `pid`
+/// satisfies, asked of the kernel's code signing rather than the app
+fn browser(pid: libc::pid_t) -> Option<&'static Browser> {
+    let mut attributes = GuestAttributes::new();
+    attributes.set_pid(pid);
+    let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE).ok()?;
+
+    BROWSERS.iter().find(|browser| {
+        browser
+            .requirement
+            .parse::<SecRequirement>()
+            .is_ok_and(|requirement| code.check_validity(Flags::NONE, &requirement).is_ok())
+    })
+}
+
+fn exposure(pid: libc::pid_t, browser: &Browser) -> Exposure {
+    let arguments = match browser.scripting {
+        Scripting::Safari(_) => None,
+        Scripting::Chromium(_) | Scripting::Firefox => Some(arguments(pid)),
+    };
+    let remote_debugging = match &arguments {
+        None => Setting::Off,
+        Some(None) => Setting::Unknown,
+        Some(Some(arguments)) if arguments.iter().any(|argument| remote_debugging(argument)) => {
+            Setting::On
+        }
+        Some(Some(_)) => Setting::Off,
+    };
+    let apple_events_javascript = match browser.scripting {
+        Scripting::Safari(bundle) => safari_javascript(bundle),
+        Scripting::Chromium(directory) => {
+            let flagged = arguments
+                .flatten()
+                .and_then(|arguments| user_data_dir(&arguments));
+            match flagged
+                .or_else(|| home().map(|home| home.join(APPLICATION_SUPPORT).join(directory)))
+            {
+                Some(directory) => chromium_javascript(&directory),
+                None => Setting::Unknown,
+            }
+        }
+        Scripting::Firefox => Setting::Off,
+    };
+
+    Exposure {
+        remote_debugging,
+        apple_events_javascript,
+    }
+}
+
+/// Where Chromium browsers keep their user data, under the home folder
+const APPLICATION_SUPPORT: &str = "Library/Application Support";
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Whether a command line argument turns on a debugging protocol: Chromium's
+/// port or pipe, which Firefox also takes for its own protocol, or Firefox's
+/// Marionette and devtools server
+fn remote_debugging(argument: &str) -> bool {
+    let name = argument.trim_start_matches('-');
+    let name = name.split_once('=').map_or(name, |(name, _)| name);
+    // Firefox takes its flags with one dash as well as two
+    argument.starts_with('-')
+        && matches!(
+            name,
+            "remote-debugging-port"
+                | "remote-debugging-pipe"
+                | "marionette"
+                | "start-debugger-server"
+        )
+}
+
+/// A `--user-data-dir` the browser was started with, which moves its
+/// profiles and so the setting
+fn user_data_dir(arguments: &[String]) -> Option<PathBuf> {
+    arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--user-data-dir=").map(PathBuf::from))
+}
+
+/// The command line of process `pid`, from `KERN_PROCARGS2`; `None` when
+/// the kernel will not say, as for another user's process
+fn arguments(pid: libc::pid_t) -> Option<Vec<String>> {
+    let mut max: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut name = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: `max` holds `size` bytes, and the name has the two parts given
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            2,
+            (&raw mut max).cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 || max <= 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0_u8; usize::try_from(max).ok()?];
+    let mut size = buffer.len();
+    let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: `buffer` holds `size` bytes, and the name has the three parts
+    // given
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+
+    procargs(&buffer)
+}
+
+/// The arguments in a `KERN_PROCARGS2` answer: the argument count, the
+/// executable's path, padding, then the arguments, each ending in a NUL
+fn procargs(buffer: &[u8]) -> Option<Vec<String>> {
+    let (count, rest) = buffer.split_first_chunk::<4>()?;
+    let count = usize::try_from(i32::from_ne_bytes(*count)).ok()?;
+    let rest = &rest[rest.iter().position(|byte| *byte == 0)?..];
+    let rest = &rest[rest.iter().position(|byte| *byte != 0)?..];
+    let arguments: Vec<String> = rest
+        .split(|byte| *byte == 0)
+        .take(count)
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect();
+
+    (arguments.len() == count).then_some(arguments)
+}
+
+/// Safari's "Allow JavaScript from Apple Events", from its container, which
+/// only a process with Full Disk Access may read
+fn safari_javascript(bundle: &str) -> Setting {
+    let Some(home) = home() else {
+        return Setting::Unknown;
+    };
+    let path = home
+        .join("Library/Containers")
+        .join(bundle)
+        .join("Data/Library/Preferences")
+        .join(format!("{bundle}.plist"));
+    let Ok(preferences) = plist::Value::from_file(path) else {
+        return Setting::Unknown;
+    };
+    let on = preferences
+        .as_dictionary()
+        .and_then(|preferences| preferences.get("AllowJavaScriptFromAppleEvents"))
+        .and_then(plist::Value::as_boolean);
+
+    if on == Some(true) {
+        Setting::On
+    } else {
+        Setting::Off
+    }
+}
+
+/// A Chromium browser's "Allow JavaScript from Apple Events": on when any
+/// profile turned it on, since the field may be in any of them, and
+/// unknown when a profile or the directory cannot be read
+fn chromium_javascript(user_data: &Path) -> Setting {
+    let Ok(entries) = std::fs::read_dir(user_data) else {
+        return Setting::Unknown;
+    };
+    let mut profiles = 0;
+    let mut unread = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unread = true;
+            continue;
+        };
+        let path = entry.path().join("Preferences");
+        if !path.is_file() {
+            continue;
+        }
+        profiles += 1;
+        let preferences = std::fs::read(&path)
+            .ok()
+            .and_then(|text| serde_json::from_slice::<serde_json::Value>(&text).ok());
+        let Some(preferences) = preferences else {
+            unread = true;
+            continue;
+        };
+        if preferences.pointer("/browser/allow_javascript_apple_events")
+            == Some(&serde_json::Value::Bool(true))
+        {
+            return Setting::On;
+        }
+    }
+
+    // no profile at all means the setting was looked for in the wrong place
+    if unread || profiles == 0 {
+        Setting::Unknown
+    } else {
+        Setting::Off
+    }
+}
+
+fn describe(element: &AXUIElement, owner: &Owner) -> Result<FocusedField, FillError> {
+    Ok(FocusedField {
+        kind: kind(element)?,
+        pages: page_urls(element)?,
+        browser: owner.browser.map(|browser| browser.name.to_owned()),
+        exposure: owner.exposure.clone(),
+    })
+}
+
+/// The focused field, for the checks before the owner is asked and before a
+/// value is read
 pub fn focused_field() -> Result<FocusedField, FillError> {
     trusted()?;
+    let field = focused_element()?;
 
-    describe(&*focused_element()?)
+    describe(&field, &owner(&field)?)
 }
 
 /// Types `text` into the focused field once `rule` passes it; see
@@ -202,15 +565,9 @@ pub fn fill(text: &str, rule: &FieldRule) -> Result<String, FillError> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     trusted()?;
     let field = focused_element()?;
-    let host = rule.check(&describe(&field)?)?;
+    let owner = owner(&field)?;
+    let host = rule.check(&describe(&field, &owner)?)?;
 
-    let mut pid: libc::pid_t = 0;
-    // SAFETY: `pid` is a valid out pointer
-    if unsafe { field.pid(NonNull::from(&mut pid)) } != AXError::Success {
-        return Err(FillError::Failed(
-            "could not tell which app owns the focused field".to_owned(),
-        ));
-    }
     // a private source, so keys held on the real keyboard do not combine
     // with the characters typed here
     let source = CGEventSource::new(CGEventSourceStateID::Private)
@@ -222,9 +579,11 @@ pub fn fill(text: &str, rule: &FieldRule) -> Result<String, FillError> {
         // the page under the same field navigates, or a show-password
         // button turns the field into plain text; keys already posted may
         // still land, since the app handles them after this check. A failed
-        // check stops it too, and the field may then hold part of the value
+        // check stops it too, and the field may then hold part of the value.
+        // The same element keeps the same app, so its signature and
+        // settings are not read again
         let unchanged = focused_element().ok().as_ref() == Some(&field)
-            && describe(&field)
+            && describe(&field, &owner)
                 .and_then(|now| rule.check(&now))
                 .is_ok_and(|now| now == host);
         if !unchanged {
@@ -243,10 +602,95 @@ pub fn fill(text: &str, rule: &FieldRule) -> Result<String, FillError> {
                     encoded.as_ptr(),
                 );
             }
-            CGEvent::post_to_pid(pid, Some(&event));
+            CGEvent::post_to_pid(owner.pid, Some(&event));
         }
         std::thread::sleep(KEY_GAP);
     }
 
     Ok(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use core_foundation::url::CFURL;
+    use security_framework::os::macos::code_signing::{Flags, SecRequirement, SecStaticCode};
+
+    use super::{BROWSERS, arguments, procargs, remote_debugging};
+
+    #[test]
+    fn every_requirement_compiles_and_matches_its_installed_browser() {
+        for browser in &BROWSERS {
+            let requirement = SecRequirement::from_str(browser.requirement);
+            assert!(requirement.is_ok(), "{}", browser.name);
+        }
+
+        // only the browsers this Mac has; an entry that is wrong for one
+        // it lacks refuses that browser rather than letting another in
+        for (name, path) in [
+            ("Safari", "/Applications/Safari.app"),
+            ("Chrome", "/Applications/Google Chrome.app"),
+            ("Firefox", "/Applications/Firefox.app"),
+            ("Microsoft Edge", "/Applications/Microsoft Edge.app"),
+            ("Brave", "/Applications/Brave Browser.app"),
+            ("Arc", "/Applications/Arc.app"),
+        ] {
+            let Some(url) = CFURL::from_path(path, true) else {
+                continue;
+            };
+            let Ok(code) = SecStaticCode::from_path(&url, Flags::NONE) else {
+                continue;
+            };
+            let matched: Vec<&str> = BROWSERS
+                .iter()
+                .filter(|browser| {
+                    SecRequirement::from_str(browser.requirement).is_ok_and(|requirement| {
+                        code.check_validity(Flags::BASIC_VALIDATE_ONLY, &requirement)
+                            .is_ok()
+                    })
+                })
+                .map(|browser| browser.name)
+                .collect();
+            assert_eq!(matched, [name], "{path}");
+        }
+    }
+
+    #[test]
+    fn the_kernel_reports_this_process_s_own_arguments() {
+        let expected: Vec<String> = std::env::args().collect();
+
+        assert_eq!(arguments(std::process::id() as libc::pid_t), Some(expected));
+        let mut answer = 2_i32.to_ne_bytes().to_vec();
+        answer.extend_from_slice(b"/bin/x\0\0\0x\0--remote-debugging-port=9222\0HOME=/u\0");
+        assert_eq!(
+            procargs(&answer),
+            Some(vec![
+                "x".to_owned(),
+                "--remote-debugging-port=9222".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn debugging_flags_are_found_in_either_form() {
+        for flag in [
+            "--remote-debugging-port=9222",
+            "--remote-debugging-port=0",
+            "--remote-debugging-pipe",
+            "-remote-debugging-port",
+            "--marionette",
+            "-marionette",
+            "--start-debugger-server=6000",
+        ] {
+            assert!(remote_debugging(flag), "{flag}");
+        }
+        for other in [
+            "https://example.com/--remote-debugging-port",
+            "--remote-allow-origins=*",
+            "marionette",
+        ] {
+            assert!(!remote_debugging(other), "{other}");
+        }
+    }
 }

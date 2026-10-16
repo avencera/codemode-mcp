@@ -2,10 +2,13 @@
 //! the focused field of a page on the login's sites, so an agent driving the
 //! Mac can sign in without the value entering its context
 //!
-//! The daemon decides where a value may go, from what Accessibility reports
-//! rather than what the agent says: a password only into a password field,
-//! which shows bullets, and either only on an `https` page whose host is one
-//! of the login's `sites`. The value is read through the same 1Password
+//! The daemon decides where a value may go, from what Accessibility and the
+//! code signature of the app report rather than what the agent says: only
+//! into a known browser that other programs cannot script, a password only
+//! into a password field, which shows bullets, and any of them only on an
+//! `https` page whose host is one of the login's `sites`. The gateway runs
+//! that check before asking the owner, shows them the host, and the server
+//! types only on that host. The value is read through the same 1Password
 //! reader as server secrets, so a companion Mac or a phone can answer it,
 //! and the tool answers with the host it filled on, never the value
 
@@ -16,13 +19,14 @@ use std::{collections::BTreeMap, sync::Arc};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig as McpServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::{
-    config::LoginConfig,
+    config::{Builtin, LoginConfig, ServerConfig},
     mac::Mac,
     secrets::{OnePassword, Redactor},
 };
@@ -30,22 +34,55 @@ use crate::{
 const INSTRUCTIONS: &str = "Signs in to websites on this Mac with logins from 1Password, \
      without showing you the username or password. Click the field first, so it has keyboard \
      focus, then call fill. A password goes only into a password field, and a username only into a \
-     text field, on an https page whose host is one of the login's sites. The answer says which \
-     host it filled; the value itself is never returned.";
+     text field, on an https page whose host is one of the login's sites, in Safari, Chrome, \
+     Firefox, Edge, Brave or Arc. The answer says which host it filled; the value itself is never \
+     returned.";
+
+/// The argument the gateway puts on every `fill` call, replacing any the
+/// agent passed: what it found at the focused field before asking the
+/// owner, so the page shows it and the server types only on its host
+pub const CHECKED: &str = "checked";
 
 /// What kind of field has keyboard focus
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FieldKind {
     /// A password field, which shows bullets instead of its text
     Secure,
     /// A one-line text field
     Text,
     /// Anything else, such as a text area, a button or no element at all
+    #[default]
     Other,
 }
 
-/// The element with keyboard focus, as Accessibility reports it
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Whether a browser setting that lets other programs script its pages is on
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Setting {
+    /// Off, or the browser has no such setting
+    #[default]
+    Off,
+    /// On
+    On,
+    /// It could not be read, as when the file holding it needs Full Disk
+    /// Access
+    Unknown,
+}
+
+/// What other programs on the Mac could do with the browser's pages, as
+/// far as the daemon could tell
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Exposure {
+    /// The browser was started with a remote debugging port or pipe, through
+    /// which any program on the Mac can read its pages and run script in them
+    pub remote_debugging: Setting,
+    /// "Allow JavaScript from Apple Events", which lets any program that may
+    /// send the browser Apple Events run script in its pages
+    pub apple_events_javascript: Setting,
+}
+
+/// The element with keyboard focus, as Accessibility and the code signature
+/// of the app that owns it report it
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FocusedField {
     /// Kind of field
     pub kind: FieldKind,
@@ -53,6 +90,32 @@ pub struct FocusedField {
     /// a frame lists the frame, then each page holding it. Empty outside a
     /// web page
     pub pages: Vec<String>,
+    /// Name of the browser that owns the field, such as `Safari`, when its
+    /// code signature is one the daemon knows; `None` for any other app
+    pub browser: Option<String>,
+    /// What other programs could do with that browser
+    pub exposure: Exposure,
+}
+
+impl FocusedField {
+    /// The settings that could not be read, for the owner to weigh before
+    /// approving; a setting known to be on refuses the fill instead
+    pub fn unchecked(&self) -> Vec<String> {
+        let browser = self.browser.as_deref().unwrap_or("the app");
+        let mut notes = Vec::new();
+        if self.exposure.remote_debugging == Setting::Unknown {
+            notes.push(format!(
+                "could not check whether {browser} was started with remote debugging"
+            ));
+        }
+        if self.exposure.apple_events_javascript == Setting::Unknown {
+            notes.push(format!(
+                "could not check whether {browser} allows JavaScript from Apple Events"
+            ));
+        }
+
+        notes
+    }
 }
 
 /// Which login field to fill
@@ -64,7 +127,8 @@ pub enum LoginField {
 }
 
 impl LoginField {
-    fn name(self) -> &'static str {
+    /// The field as messages and the owner's prompt name it
+    fn label(self) -> &'static str {
         match self {
             Self::Username => "username",
             Self::Password => "password",
@@ -72,7 +136,8 @@ impl LoginField {
     }
 }
 
-/// Where one login field may be typed: the kind of field and the sites
+/// Where one login field may be typed: the browser, the kind of field and
+/// the sites
 #[derive(Debug, Clone)]
 pub struct FieldRule {
     /// The field being filled
@@ -80,6 +145,9 @@ pub struct FieldRule {
     /// Hosts a page must be on: `github.com` is that host only, and
     /// `*.github.com` any host under it
     pub sites: Vec<String>,
+    /// The host the owner approved, which the page must still be on; `None`
+    /// before the owner was asked
+    pub approved_host: Option<String>,
 }
 
 /// Whether `host` is `site`, or under it for a `*.` site
@@ -95,13 +163,35 @@ fn site_matches(site: &str, host: &str) -> bool {
 impl FieldRule {
     /// The innermost page's host when `focused` may take this field
     ///
-    /// The server checks this before reading the value, so a wrong field
-    /// never asks the owner for anything, and the Mac again right before
-    /// typing. Every page around the field must pass; a frame the browser
-    /// does not report as a page of its own is not among them, so its host
-    /// goes unchecked
+    /// The gateway checks this before asking the owner, so a wrong field
+    /// never puts a prompt in front of them, the server again before reading
+    /// the value, and the Mac before each character it types. Every page
+    /// around the field must pass; a frame the browser does not report as a
+    /// page of its own is not among them, so its host goes unchecked
     pub fn check(&self, focused: &FocusedField) -> Result<String, FillError> {
         let refuse = |reason: String| Err(FillError::Refused(reason));
+        // a page's address and the field's kind come from the app that owns
+        // the field, so they mean something only from a browser known by its
+        // code signature
+        let Some(browser) = &focused.browser else {
+            return refuse(
+                "the focused field is not in a browser codemode-mcp can verify by its code \
+                 signature (Safari, Chrome, Firefox, Edge, Brave or Arc)"
+                    .to_owned(),
+            );
+        };
+        if focused.exposure.remote_debugging == Setting::On {
+            return refuse(format!(
+                "{browser} was started with remote debugging, which lets any program on this Mac \
+                 read and script its pages; quit it, open it normally and fill again"
+            ));
+        }
+        if focused.exposure.apple_events_javascript == Setting::On {
+            return refuse(format!(
+                "{browser} allows JavaScript from Apple Events, which lets other programs on this \
+                 Mac script its pages; turn that off in its developer menu and fill again"
+            ));
+        }
         match (self.field, focused.kind) {
             (LoginField::Password, FieldKind::Secure) | (LoginField::Username, FieldKind::Text) => {
             }
@@ -131,6 +221,14 @@ impl FieldRule {
         let host = self.page_host(innermost)?;
         for page in outer {
             self.page_host(page)?;
+        }
+        if let Some(approved) = &self.approved_host
+            && *approved != host
+        {
+            return refuse(format!(
+                "the focused field is now on {host}, but the owner approved filling on \
+                 {approved}; fill again to ask for {host}"
+            ));
         }
 
         Ok(host)
@@ -216,6 +314,125 @@ pub struct FillParams {
     pub login: String,
     /// Which of its fields to type into the focused field
     pub field: LoginField,
+    /// Set by the gateway, never the agent, so it stays out of the schema
+    #[serde(default)]
+    #[schemars(skip)]
+    pub checked: Option<Checked>,
+}
+
+/// What the gateway found at the focused field before asking the owner,
+/// under [`CHECKED`] in the call's arguments
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Checked {
+    /// Host of the page; the server types only while the field is on it
+    pub host: String,
+    /// Browser that owns the field
+    pub browser: String,
+    /// Settings that could not be read, which the owner saw
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchecked: Vec<String>,
+}
+
+/// The reference of `login`'s `field` and the rule for where it may go
+fn target(
+    logins: &BTreeMap<String, LoginConfig>,
+    name: &str,
+    field: LoginField,
+) -> Result<(String, FieldRule), String> {
+    let Some(login) = logins.get(name) else {
+        return Err(format!("no login named `{name}`; call list for the names"));
+    };
+    let reference = match field {
+        LoginField::Username => login.username.as_ref(),
+        LoginField::Password => login.password.as_ref(),
+    };
+    let Some(reference) = reference else {
+        return Err(format!("the login `{name}` has no {}", field.label()));
+    };
+    let rule = FieldRule {
+        field,
+        sites: login.sites.clone(),
+        approved_host: None,
+    };
+
+    Ok((reference.clone(), rule))
+}
+
+/// The check the gateway runs on a `logins` server's `fill` call before
+/// asking the owner; cheap to clone
+#[derive(Clone)]
+pub struct FillCheck {
+    logins: Arc<BTreeMap<String, LoginConfig>>,
+    mac: Option<Arc<dyn Mac>>,
+}
+
+impl FillCheck {
+    /// A check of the focused field on `mac` against `logins`
+    pub fn new(logins: Arc<BTreeMap<String, LoginConfig>>, mac: Option<Arc<dyn Mac>>) -> Self {
+        Self { logins, mac }
+    }
+
+    /// For a `fill` call of a `logins` server, checks the focused field
+    /// against the login's rule, records what it found under [`CHECKED`] in
+    /// `arguments`, and answers what the owner is asked to approve, such as
+    /// `password for github into github.com in Safari`; `None` for any
+    /// other call
+    ///
+    /// A refusal ends the call before anyone is asked. Whatever the agent
+    /// passed under [`CHECKED`] is dropped either way
+    pub async fn prepare(
+        &self,
+        server: Option<&ServerConfig>,
+        tool: &str,
+        arguments: &mut Map<String, Value>,
+    ) -> Result<Option<String>, FillError> {
+        if server.and_then(|server| server.builtin) != Some(Builtin::Logins) || tool != "fill" {
+            return Ok(None);
+        }
+        arguments.remove(CHECKED);
+
+        #[derive(Deserialize)]
+        struct Call {
+            login: String,
+            field: LoginField,
+        }
+        let call: Call =
+            serde_json::from_value(Value::Object(arguments.clone())).map_err(|error| {
+                FillError::Refused(format!("fill needs `login` and `field`: {error}"))
+            })?;
+        let (_, rule) =
+            target(&self.logins, &call.login, call.field).map_err(FillError::Refused)?;
+        let Some(mac) = &self.mac else {
+            return Err(FillError::Unavailable(
+                "filling needs the Mac's screen, which this process cannot reach".to_owned(),
+            ));
+        };
+        let focused = mac.focused_field().await?;
+        let host = rule.check(&focused)?;
+        let browser = focused.browser.clone().unwrap_or_default();
+        let unchecked = focused.unchecked();
+
+        let mut summary = format!(
+            "{} for {} into {host} in {browser}",
+            call.field.label(),
+            call.login
+        );
+        for note in &unchecked {
+            summary.push_str("; ");
+            summary.push_str(note);
+        }
+        let checked = Checked {
+            host,
+            browser,
+            unchecked,
+        };
+        arguments.insert(
+            CHECKED.to_owned(),
+            serde_json::to_value(&checked).unwrap_or(Value::Null),
+        );
+
+        Ok(Some(summary))
+    }
 }
 
 /// One fill at a time across every `logins` server and reconnect, so two
@@ -295,49 +512,39 @@ impl LoginsServer {
         description = "Types a login's username or password into the field that has keyboard \
                           focus, without returning it. Click an empty field first. A password goes \
                           only into a password field, a username only into a text field, and \
-                          either only on an https page of one of the login's sites."
+                          either only on an https page of one of the login's sites, in a browser \
+                          known by its code signature."
     )]
     async fn fill(
         &self,
         Parameters(params): Parameters<FillParams>,
     ) -> Result<Json<Filled>, CallToolResult> {
-        let Some(login) = self.0.logins.get(&params.login) else {
-            return Err(failed(format!(
-                "no login named `{}`; call list for the names",
-                params.login
-            )));
+        let (reference, mut rule) =
+            target(&self.0.logins, &params.login, params.field).map_err(failed)?;
+        // the gateway sets this after its own check and the owner approves
+        // that host; a call that skipped it has nothing approved to type on
+        let Some(checked) = params.checked else {
+            return Err(failed(
+                "fill runs only through the gateway's approval, which checks the field first",
+            ));
         };
-        let reference = match params.field {
-            LoginField::Username => login.username.as_deref(),
-            LoginField::Password => login.password.as_deref(),
-        };
-        let Some(reference) = reference else {
-            return Err(failed(format!(
-                "the login `{}` has no {}",
-                params.login,
-                params.field.name()
-            )));
-        };
+        rule.approved_host = Some(checked.host);
         let Some(mac) = &self.0.mac else {
             return Err(failed(
                 "filling needs the Mac's screen, which this process cannot reach",
             ));
         };
-        let rule = FieldRule {
-            field: params.field,
-            sites: login.sites.clone(),
-        };
 
         let _turn = TURN.lock().await;
-        // before the read, so a wrong field never puts a prompt in front of
-        // the owner; the Mac checks again right before typing
+        // again before the read: the page may have moved on while the owner
+        // decided, and the Mac checks again before each character
         let focused = mac.focused_field().await.map_err(failed)?;
         rule.check(&focused).map_err(failed)?;
 
         let value = self
             .0
             .onepassword
-            .read_reference(reference)
+            .read_reference(&reference)
             .await
             .map_err(failed)?;
         // a line break or tab would act on the page, such as submitting the
@@ -346,7 +553,7 @@ impl LoginsServer {
             return Err(failed(format!(
                 "the {} in 1Password is empty or holds a control character such as a line \
                  break, so it was not typed",
-                params.field.name()
+                params.field.label()
             )));
         }
         // a username such as an email address also appears in other
@@ -367,8 +574,8 @@ impl LoginsServer {
 
 #[tool_handler]
 impl ServerHandler for LoginsServer {
-    fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> McpServerConfig {
+        McpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
     }
 }
@@ -381,6 +588,7 @@ mod tests {
         FieldRule {
             field,
             sites: vec!["github.com".to_owned(), "*.github.io".to_owned()],
+            approved_host: None,
         }
     }
 
@@ -388,6 +596,8 @@ mod tests {
         FocusedField {
             kind,
             pages: vec![url.to_owned()],
+            browser: Some("Safari".to_owned()),
+            ..FocusedField::default()
         }
     }
 
@@ -425,16 +635,16 @@ mod tests {
             ),
             page(FieldKind::Secure, "https://github.com@evil.example/"),
             FocusedField {
-                kind: FieldKind::Secure,
                 pages: Vec::new(),
+                ..page(FieldKind::Secure, "https://github.com/login")
             },
             // a frame on the site inside a page that is not
             FocusedField {
-                kind: FieldKind::Secure,
                 pages: vec![
                     "https://github.com/login".to_owned(),
                     "https://evil.example/".to_owned(),
                 ],
+                ..page(FieldKind::Secure, "https://github.com/login")
             },
         ] {
             assert!(host(refused.clone()).is_none(), "{refused:?}");
