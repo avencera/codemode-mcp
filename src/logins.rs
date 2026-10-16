@@ -9,6 +9,8 @@
 //! reader as server secrets, so a companion Mac or a phone can answer it,
 //! and the tool answers with the host it filled on, never the value
 
+pub mod totp;
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use rmcp::{
