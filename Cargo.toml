@@ -85,8 +85,9 @@ webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialis
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 # 0.2.190 limits `in6_ifreq` and the routing socket constants to macOS,
-# which breaks iroh's netdev and netwatch on iOS; held back for the phone
-libc = "0.2.189"
+# which breaks iroh's netdev and netwatch on iOS; pinned exactly, since the
+# workspace shares one lockfile and the phone gets this version too
+libc = "=0.2.189"
 objc2 = "0.6.5"
 objc2-event-kit = { version = "0.3.2", default-features = false, features = [
     "std",

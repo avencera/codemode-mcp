@@ -69,7 +69,9 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
     let sh = xshell::Shell::new()?;
-    // every path below is relative to the workspace root
+    // every path below is relative to the workspace root; the shell's
+    // directory is its own, so paths the caller gives resolve against the
+    // process's, which stays where `cargo xtask` ran
     sh.change_dir(env!("CARGO_MANIFEST_DIR"));
     sh.change_dir("..");
 
@@ -85,7 +87,11 @@ fn main() -> Result<()> {
             api_issuer_id,
         } => {
             let key = match (api_key_path, api_key_id, api_issuer_id) {
-                (Some(path), Some(id), Some(issuer)) => Some(ios::ApiKey { path, id, issuer }),
+                (Some(path), Some(id), Some(issuer)) => Some(ios::ApiKey {
+                    path: std::path::absolute(path)?,
+                    id,
+                    issuer,
+                }),
                 _ => None,
             };
             ios::run(&sh, &udid, release, without_push, key.as_ref())
@@ -97,7 +103,7 @@ fn main() -> Result<()> {
         } => ios::testflight(
             &sh,
             &ios::ApiKey {
-                path: api_key_path,
+                path: std::path::absolute(api_key_path)?,
                 id: api_key_id,
                 issuer: api_issuer_id,
             },
