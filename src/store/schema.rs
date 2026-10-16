@@ -3,18 +3,19 @@
 use super::{StoreError, sql::Connection};
 
 /// Version a fully migrated database reports
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 type Migration = fn(&Connection) -> Result<(), turso::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     create_tables,
     create_oauth_tables,
     create_sessions,
     add_call_output,
     create_durable_state,
+    create_phone_tables,
 ];
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
@@ -33,6 +34,33 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
 
     Ok(())
+}
+
+/// What the gateway keeps for its phones: each value it read, sealed to the
+/// phone's Secure Enclave key (never the value itself), and where to push
+///
+/// Rows are keyed by the phone's endpoint id, so a phone paired again under
+/// a new id starts empty
+fn create_phone_tables(connection: &Connection) -> Result<(), turso::Error> {
+    connection.execute_batch(
+        r#"
+        -- `sealed` is the JSON of companion_wire::mobile::Sealed
+        CREATE TABLE phone_seals (
+            phone TEXT NOT NULL,
+            reference TEXT NOT NULL,
+            sealed TEXT NOT NULL,
+            sealed_ms INTEGER NOT NULL,
+            PRIMARY KEY (phone, reference)
+        );
+        -- `environment` is `development` or `production`
+        CREATE TABLE phone_push (
+            phone TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            environment TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );
+        "#,
+    )
 }
 
 /// State a daemon restart must not lose: execution results, approvals with

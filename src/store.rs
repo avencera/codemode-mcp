@@ -5,6 +5,7 @@ pub mod approvals;
 pub mod enrollments;
 pub mod executions;
 pub mod parked;
+pub mod phones;
 pub mod schema;
 pub mod sessions;
 pub mod sql;

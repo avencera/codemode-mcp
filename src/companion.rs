@@ -7,19 +7,21 @@
 //! 1Password stays the only source of truth, and no value is stored on
 //! either side beyond the gateway's in-memory cache
 
+mod apns;
 mod client;
 mod identity;
 mod invite;
 mod join;
 mod pair;
+mod phone;
 mod server;
 
 /// The wire types, shared with the phone's core
 pub use companion_wire::{mobile, ticket, wire};
 
 pub use client::{CheckOutcome, CompanionFailure, Companions};
-pub use identity::{IdentityError, Role, load_or_create};
 pub use companion_wire::{ALPN, ASK_TIMEOUT, MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN};
+pub use identity::{IdentityError, Role, load_or_create};
 pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
 pub use pair::{PairError, Paired, Pairing, companion_id, pair};
@@ -51,7 +53,6 @@ pub const DIRECT_PORT: u16 = 7678;
 
 /// How long a peer may take to finish the handshake
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
 
 /// Closes its connection when dropped
 ///

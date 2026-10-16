@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use companion_wire::mobile::SealKey;
 use iroh::EndpointId;
 use serde::Deserialize;
 
@@ -306,9 +307,22 @@ pub struct SecretsConfig {
     /// when missing; unset, the login keychain holds it
     #[serde(default)]
     pub identity_file: Option<PathBuf>,
+    /// Fixed address for the gateway's iroh endpoint instead of a random
+    /// port; with discovery off a phone dials it, so it must stay the same
+    /// across restarts
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
     /// Other Macs that can read references for this one
     #[serde(default)]
     pub companions: Vec<CompanionPeer>,
+    /// Phones that answer reads by opening values sealed to them; the
+    /// gateway accepts phone connections only from these ids
+    #[serde(default)]
+    pub phones: Vec<PhonePeer>,
+    /// The APNs key that wakes the phones; without it a phone answers only
+    /// while its app is open
+    #[serde(default)]
+    pub apns: Option<ApnsConfig>,
 }
 
 impl Default for SecretsConfig {
@@ -317,7 +331,10 @@ impl Default for SecretsConfig {
             op: default_op(),
             discovery: default_discovery(),
             identity_file: None,
+            listen: None,
             companions: Vec::new(),
+            phones: Vec::new(),
+            apns: None,
         }
     }
 }
@@ -338,6 +355,8 @@ impl SecretsConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         require_absolute_identity("secrets", self.identity_file.as_deref())?;
 
+        // companions and phones share one namespace: read errors name the
+        // source that failed
         let mut names = std::collections::BTreeSet::new();
         for companion in &self.companions {
             if !is_mac_name(&companion.name) {
@@ -358,9 +377,83 @@ impl SecretsConfig {
                 )));
             }
         }
+        for phone in &self.phones {
+            if !is_mac_name(&phone.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.phones names must be 1 to {MAX_MAC_NAME_CHARS} characters on one line"
+                )));
+            }
+            if !names.insert(phone.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "secrets.phones has the name \"{}\", which another phone or companion has",
+                    phone.name
+                )));
+            }
+        }
+        if let Some(apns) = &self.apns {
+            apns.validate()?;
+        }
 
         Ok(())
     }
+}
+
+/// A phone the gateway wakes with a push and that dials back to answer
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhonePeer {
+    /// Name shown in logs and errors
+    pub name: String,
+    /// The phone's iroh endpoint id; connections from any other id are
+    /// refused
+    pub id: EndpointId,
+    /// The phone's Secure Enclave P-256 public key (base64 of the
+    /// uncompressed point), which values are sealed to
+    pub seal_key: SealKey,
+}
+
+/// The App Store Connect key the gateway signs APNs requests with
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApnsConfig {
+    /// The `.p8` file Apple issued (PKCS#8 PEM); read on each new token, so
+    /// a replaced file is used without a restart
+    pub key_file: PathBuf,
+    /// The key's id, as App Store Connect shows it
+    pub key_id: String,
+    /// The team the key and the app belong to
+    pub team_id: String,
+    /// The app's bundle id
+    #[serde(default = "default_apns_topic")]
+    pub topic: String,
+    /// Base URL used for both environments instead of Apple's hosts, e.g. a
+    /// test double; unset in normal use
+    #[serde(default)]
+    pub server: Option<String>,
+}
+
+impl ApnsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let is_id =
+            |text: &str| text.len() == 10 && text.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        if !is_id(&self.key_id) || !is_id(&self.team_id) {
+            return Err(ConfigError::Invalid(
+                "secrets.apns key_id and team_id are 10 letters or digits".into(),
+            ));
+        }
+        if !expand_home(&self.key_file).is_absolute() {
+            return Err(ConfigError::Invalid(format!(
+                "secrets.apns.key_file must be an absolute path (or start with ~/), got {}",
+                self.key_file.display()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+fn default_apns_topic() -> String {
+    "com.avencera.codemode-mcp.companion".to_owned()
 }
 
 /// A companion Mac the gateway asks to read references

@@ -110,7 +110,10 @@ mod tests {
             key.open(&gateway, "op://Dev/a/credential", &sealed)?,
             b"hunter22"
         );
-        assert!(key.open(&gateway, "op://Dev/b/credential", &sealed).is_err());
+        assert!(
+            key.open(&gateway, "op://Dev/b/credential", &sealed)
+                .is_err()
+        );
         assert!(
             key.open(&other_gateway, "op://Dev/a/credential", &sealed)
                 .is_err()

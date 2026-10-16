@@ -166,4 +166,7 @@ pub enum PairCheck {
     },
     /// No server uses a reference, so there is nothing to read
     Skipped,
+    /// A new phone has nothing to open yet: no reference was read since the
+    /// gateway started, so nothing is sealed to it
+    NothingSealed,
 }

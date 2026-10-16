@@ -282,11 +282,15 @@ mod tests {
         assert!(RequestId::try_from("00".to_owned()).is_err());
 
         let mut point = [7_u8; 65];
-        assert!(SealKey::from_bytes(&point).is_none(), "compressed or odd tags are refused");
+        assert!(
+            SealKey::from_bytes(&point).is_none(),
+            "compressed or odd tags are refused"
+        );
         point[0] = 0x04;
         let key = SealKey::from_bytes(&point);
         assert_eq!(
-            key.as_ref().and_then(|key| SealKey::from_base64(&key.to_base64())),
+            key.as_ref()
+                .and_then(|key| SealKey::from_base64(&key.to_base64())),
             key
         );
         assert!(SealKey::from_bytes(&point[..64]).is_none());

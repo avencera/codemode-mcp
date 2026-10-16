@@ -21,6 +21,7 @@ use crate::{
     companion::Companions,
     config::{Config, SecretsConfig},
     mac::OnMac,
+    store::Store,
 };
 
 /// How long one `op read` may take; long enough for the 1Password app's
@@ -52,13 +53,15 @@ impl Secrets {
     /// runs the local `op`
     ///
     /// The companions are attached even when there are none yet, since one
-    /// registering with an invite is used without a restart
+    /// registering with an invite is used without a restart. Values sealed
+    /// to the phones are kept in `store`; without one no phone is asked
     pub fn new(
         config: &SecretsConfig,
         config_path: Option<PathBuf>,
         presence: Option<OnMac>,
+        store: Option<Store>,
     ) -> Self {
-        let companions = Arc::new(Companions::new(config, config_path));
+        let companions = Arc::new(Companions::new(config, config_path, store));
         let onepassword =
             OnePassword::new(config.op.clone()).with_companions(Arc::clone(&companions), presence);
 
@@ -238,6 +241,7 @@ impl OnePassword {
     /// is away keeps a 1Password prompt from waiting on an unattended screen
     #[must_use]
     pub fn with_companions(mut self, companions: Arc<Companions>, on_mac: Option<OnMac>) -> Self {
+        companions.share_cache(Arc::clone(&self.known));
         self.companions = Some(companions);
         self.on_mac = on_mac;
 
@@ -287,20 +291,50 @@ impl OnePassword {
     }
 
     async fn read(&self, reference: &str) -> Result<String, SecretError> {
+        let (value, from_phone) = self.race(reference).await?;
+        // a phone's answer came from its sealed copy; anything else is a
+        // fresh read, which replaces the phones' copies
+        if !from_phone && let Some(companions) = &self.companions {
+            companions.seal_for_phones(reference, &value).await;
+        }
+
+        Ok(value)
+    }
+
+    /// Reads `reference` from every source at once; the first value wins,
+    /// with whether a phone sent it
+    async fn race(&self, reference: &str) -> Result<(String, bool), SecretError> {
         let peers = self
             .companions
             .as_ref()
             .map(|companions| companions.peers())
             .unwrap_or_default();
-        let Some(companions) = self.companions.as_ref().filter(|_| !peers.is_empty()) else {
-            return self.read_local(reference).await;
+        // a phone can only answer with a copy sealed to it earlier
+        let phones: Vec<String> = self
+            .companions
+            .as_ref()
+            .map(|companions| {
+                companions
+                    .phones()
+                    .into_iter()
+                    .filter(|phone| companions.has_seal(&phone.name, reference))
+                    .map(|phone| phone.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(companions) = self
+            .companions
+            .as_ref()
+            .filter(|_| !peers.is_empty() || !phones.is_empty())
+        else {
+            return Ok((self.read_local(reference).await?, false));
         };
 
         let local = match &self.on_mac {
             Some(on_mac) => on_mac.mac.present(on_mac.config.idle()).await,
             None => true,
         };
-        let mut sources: JoinSet<(String, Result<String, String>)> = JoinSet::new();
+        let mut sources: JoinSet<(String, bool, Result<String, String>)> = JoinSet::new();
         if local {
             let onepassword = self.clone();
             let reference = reference.to_owned();
@@ -310,7 +344,7 @@ impl OnePassword {
                     .await
                     .map_err(|error| error.reason());
 
-                ("local".to_owned(), value)
+                ("local".to_owned(), false, value)
             });
         }
         for peer in peers {
@@ -323,12 +357,25 @@ impl OnePassword {
                     .await
                     .map_err(|error| error.to_string());
 
-                (name, value)
+                (name, false, value)
+            });
+        }
+        for name in phones {
+            let companions = Arc::clone(companions);
+            let reference = reference.to_owned();
+            sources.spawn(async move {
+                let value = companions
+                    .read_phone(&name, &reference)
+                    .await
+                    .map_err(|error| error.to_string());
+
+                (name, true, value)
             });
         }
 
         // dropping the set on any exit aborts what is still running, which
-        // kills the local `op` child and hangs up on the companions
+        // kills the local `op` child, hangs up on the companions and stops
+        // the phones' streams
         let first_success = async {
             // named, so a failure with the owner away says why `op` never ran
             let mut failures = Vec::new();
@@ -337,8 +384,8 @@ impl OnePassword {
             }
             while let Some(finished) = sources.join_next().await {
                 match finished {
-                    Ok((_, Ok(value))) => return Ok(value),
-                    Ok((source, Err(reason))) => failures.push(format!("{source}: {reason}")),
+                    Ok((_, from_phone, Ok(value))) => return Ok((value, from_phone)),
+                    Ok((source, _, Err(reason))) => failures.push(format!("{source}: {reason}")),
                     Err(error) => failures.push(format!("a read stopped unexpectedly: {error}")),
                 }
             }
@@ -347,7 +394,7 @@ impl OnePassword {
         };
 
         match tokio::time::timeout(READ_TIMEOUT, first_success).await {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(won)) => Ok(won),
             Ok(Err(failures)) if failures.is_empty() => Err(SecretError::Read {
                 reference: reference.to_owned(),
                 reason: "no source could read it".to_owned(),

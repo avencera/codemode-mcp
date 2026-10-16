@@ -948,10 +948,11 @@ async fn companion_check(
             "the reference must look like op://vault/item/field",
         );
     }
-    if state.gateway.companions().peers().is_empty() {
+    let companions = state.gateway.companions();
+    if companions.peers().is_empty() && companions.phones().is_empty() {
         return error(
             StatusCode::BAD_REQUEST,
-            "no companions are configured under [secrets]",
+            "no companions or phones are configured under [secrets]",
         );
     }
 
