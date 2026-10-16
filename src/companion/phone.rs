@@ -183,8 +183,9 @@ impl Companions {
         }
     }
 
-    /// Asks the phone called `name` to open its copy of `reference`: pushes
-    /// to wake it, then waits for it to dial in and answer
+    /// Asks the phone called `name` for `reference`, sending its sealed copy
+    /// if there is one: pushes to wake it, then waits for it to dial in and
+    /// answer
     pub async fn read_phone(
         self: &Arc<Self>,
         name: &str,
@@ -213,13 +214,11 @@ impl Companions {
     ) -> Result<String, CompanionFailure> {
         let deadline = Instant::now() + ASK_TIMEOUT;
         let key = phone.id.to_string();
+        // without a copy the owner enters the value on the phone
         let sealed = self
             .store
             .as_ref()
-            .and_then(|store| store.seal(&key, reference).ok().flatten())
-            .ok_or_else(|| CompanionFailure::NotSealed {
-                name: phone.name.clone(),
-            })?;
+            .and_then(|store| store.seal(&key, reference).ok().flatten());
         let endpoint = self.endpoint().await?;
         self.start_accepting(endpoint);
         self.refresh_alpns();

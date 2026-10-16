@@ -503,6 +503,30 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -571,6 +595,13 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * The root object Swift holds for the life of the app
  */
 public protocol FfiAppProtocol: AnyObject, Sendable {
+    
+    /**
+     * Sends `value`, which the owner pasted or filled in, as the answer to
+     * the read `id`; its own call rather than an [`AppAction`], so the value
+     * never sits in a type that derives `Debug`
+     */
+    func answer(id: String, value: String) 
     
     /**
      * Asks for `action`; its effects arrive through the reconciler
@@ -656,6 +687,21 @@ public convenience init(platform: Platform) {
 
     
 
+    
+    /**
+     * Sends `value`, which the owner pasted or filled in, as the answer to
+     * the read `id`; its own call rather than an [`AppAction`], so the value
+     * never sits in a type that derives `Debug`
+     */
+open func answer(id: String, value: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_companion_core_fn_method_ffiapp_answer(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(value),uniffiCallStatus
+    )
+}
+}
     
     /**
      * Asks for `action`; its effects arrive through the reconciler
@@ -1053,6 +1099,11 @@ public struct PendingRead: Equatable, Hashable {
      */
     public var expiresAtMs: Int64
     /**
+     * Whether the gateway sent a copy Face ID can open; without one the
+     * owner enters the value
+     */
+    public var sealed: Bool
+    /**
      * Where it stands
      */
     public var status: ReadStatus
@@ -1073,12 +1124,17 @@ public struct PendingRead: Equatable, Hashable {
          * When the gateway gives up, in ms since the epoch on this phone's clock
          */expiresAtMs: Int64, 
         /**
+         * Whether the gateway sent a copy Face ID can open; without one the
+         * owner enters the value
+         */sealed: Bool, 
+        /**
          * Where it stands
          */status: ReadStatus) {
         self.id = id
         self.reference = reference
         self.gatewayName = gatewayName
         self.expiresAtMs = expiresAtMs
+        self.sealed = sealed
         self.status = status
     }
 
@@ -1102,6 +1158,7 @@ public struct FfiConverterTypePendingRead: FfiConverterRustBuffer {
                 reference: FfiConverterString.read(from: &buf), 
                 gatewayName: FfiConverterString.read(from: &buf), 
                 expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                sealed: FfiConverterBool.read(from: &buf), 
                 status: FfiConverterTypeReadStatus.read(from: &buf)
         )
     }
@@ -1111,6 +1168,7 @@ public struct FfiConverterTypePendingRead: FfiConverterRustBuffer {
         FfiConverterString.write(value.reference, into: &buf)
         FfiConverterString.write(value.gatewayName, into: &buf)
         FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterBool.write(value.sealed, into: &buf)
         FfiConverterTypeReadStatus.write(value.status, into: &buf)
     }
 }
@@ -2676,6 +2734,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_companion_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_companion_core_checksum_method_ffiapp_answer() != 9068) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_companion_core_checksum_method_ffiapp_dispatch() != 44585) {
         return InitializationResult.apiChecksumMismatch

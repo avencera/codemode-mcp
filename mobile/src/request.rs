@@ -1,6 +1,8 @@
 //! The request actor: one per read the gateway sends, from its arrival to
 //! approve, deny, expire or withdraw
 //!
+//! The owner answers by opening the sealed copy with Face ID, or by entering
+//! the value (pasted or filled in) when there is no copy or it is stale.
 //! Face ID blocks until the owner answers, so it runs on a blocking thread
 //! and its result comes back as a message; the actor stays free to take the
 //! prompt down if the read expires or is withdrawn meanwhile
@@ -21,8 +23,9 @@ use crate::{
     record::GatewayRecord,
 };
 
-/// A value Face ID opened; kept out of `Debug`, logs and crash reports
-pub struct Secret(String);
+/// A value Face ID opened or the owner entered; kept out of `Debug`, logs
+/// and crash reports
+pub struct Secret(pub(crate) String);
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,6 +37,8 @@ impl std::fmt::Debug for Secret {
 pub enum RequestMsg {
     /// The owner tapped Approve
     Approve,
+    /// The owner entered the value
+    Answer(Secret),
     /// The owner tapped Deny
     Deny,
     /// The gateway's deadline passed
@@ -110,6 +115,30 @@ impl RequestState {
         }
     }
 
+    /// Sends `value` unless it is over the gateway's limit, and stops once
+    /// it went
+    fn send_value(&mut self, myself: &ActorRef<RequestMsg>, value: String) {
+        let response = CompanionResponse::Value(value);
+        // the gateway reads at most MAX_BODY_BYTES
+        let fits = serde_json::to_vec(&response).is_ok_and(|bytes| bytes.len() <= MAX_BODY_BYTES);
+        let (response, status) = if fits {
+            (response, ReadStatus::Approved)
+        } else {
+            let message = "the value is too large to send";
+            (
+                Self::fault(CompanionErrorCode::ReadFailed, message),
+                ReadStatus::Failed {
+                    message: message.to_owned(),
+                },
+            )
+        };
+        let sent = self.respond(response);
+        self.set(status);
+        if sent {
+            myself.stop(None);
+        }
+    }
+
     fn fault(code: CompanionErrorCode, message: &str) -> CompanionResponse {
         CompanionResponse::Error(CompanionFault {
             code,
@@ -177,19 +206,23 @@ impl Actor for RequestActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             RequestMsg::Approve => {
+                // without a sealed copy there is nothing for Face ID to open
+                let Some(sealed) = &state.read.sealed else {
+                    return Ok(());
+                };
                 if state.status != ReadStatus::Waiting {
                     return Ok(());
                 }
-                state.set(ReadStatus::Approving);
-
                 let request = OpenRequest {
                     id: state.read.id.to_string(),
                     reference: state.read.reference.clone(),
                     gateway_name: state.record.name.clone(),
                     info: seal_info(&state.record.id, &state.read.reference),
-                    enc: state.read.sealed.enc.clone(),
-                    ciphertext: state.read.sealed.ciphertext.clone(),
+                    enc: sealed.enc.clone(),
+                    ciphertext: sealed.ciphertext.clone(),
                 };
+                state.set(ReadStatus::Approving);
+
                 let platform = std::sync::Arc::clone(&state.platform);
                 let myself = myself.clone();
                 tokio::spawn(async move {
@@ -210,23 +243,9 @@ impl Actor for RequestActor {
                 }
                 let (response, status) = match opened {
                     Ok(Secret(value)) => {
-                        let response = CompanionResponse::Value(value);
-                        // the gateway reads at most MAX_BODY_BYTES
-                        if serde_json::to_vec(&response)
-                            .map_or(true, |bytes| bytes.len() > MAX_BODY_BYTES)
-                        {
-                            (
-                                RequestState::fault(
-                                    CompanionErrorCode::ReadFailed,
-                                    "the value is too large to send",
-                                ),
-                                ReadStatus::Failed {
-                                    message: "the value is too large to send".to_owned(),
-                                },
-                            )
-                        } else {
-                            (response, ReadStatus::Approved)
-                        }
+                        state.send_value(&myself, value);
+
+                        return Ok(());
                     }
                     Err(OpenError::Denied) => (
                         RequestState::fault(
@@ -245,6 +264,16 @@ impl Actor for RequestActor {
                 if sent {
                     myself.stop(None);
                 }
+            }
+            RequestMsg::Answer(Secret(value)) => {
+                if state.status.is_finished() {
+                    return Ok(());
+                }
+                // the entered value wins over a Face ID prompt still up
+                if state.status == ReadStatus::Approving {
+                    state.platform.cancel_open(state.read.id.to_string());
+                }
+                state.send_value(&myself, value);
             }
             RequestMsg::Deny => {
                 if state.status.is_finished() {

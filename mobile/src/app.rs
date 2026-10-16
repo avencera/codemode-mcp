@@ -31,7 +31,7 @@ use crate::{
     },
     pairing,
     record::{GatewayRecord, load_key},
-    request::{RequestActor, RequestArgs, RequestMsg},
+    request::{RequestActor, RequestArgs, RequestMsg, Secret},
 };
 
 /// How long a read opened from a push may take to arrive once the app is up
@@ -63,6 +63,13 @@ pub struct Incoming {
 pub enum AppMsg {
     /// The UI asked for something
     Action(AppAction),
+    /// The owner entered the value of a read
+    Answer {
+        /// The read
+        id: String,
+        /// The value
+        value: Secret,
+    },
     /// The pairing registered, or failed to
     Registered(Result<GatewayRecord, String>),
     /// The gateway's pairing check finished
@@ -407,6 +414,7 @@ impl App {
                         expires_at_ms: now_ms()
                             + i64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(i64::MAX),
                         status: ReadStatus::Connecting,
+                        sealed: false,
                     });
 
                     true
@@ -459,6 +467,7 @@ impl App {
             gateway_name: record.name.clone(),
             expires_at_ms,
             status: ReadStatus::Waiting,
+            sealed: read.sealed.is_some(),
         };
         state.shared.change_reads(|reads| {
             match reads.iter_mut().find(|read| read.id == id) {
@@ -579,6 +588,11 @@ impl Actor for App {
                 }
             }
             AppMsg::Incoming(incoming) => Self::incoming(&myself, state, *incoming).await,
+            AppMsg::Answer { id, value } => {
+                if let Some(request) = state.requests.get(&id) {
+                    let _ = request.cast(RequestMsg::Answer(value));
+                }
+            }
             AppMsg::StreamEnded { id, seq, end } => {
                 if let Some(request) = state.requests.get(id.as_str()) {
                     let _ = request.cast(RequestMsg::StreamEnded { seq, end });

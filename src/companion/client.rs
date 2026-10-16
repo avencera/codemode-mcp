@@ -57,13 +57,6 @@ pub enum CompanionFailure {
         /// Its text
         message: String,
     },
-    /// The phone holds no sealed copy of the reference: the gateway has not
-    /// read it another way since the phone was paired
-    #[error("{name} has no sealed copy of it yet")]
-    NotSealed {
-        /// Phone name
-        name: String,
-    },
     /// No answer within [`ASK_TIMEOUT`]
     #[error("{name} did not answer within {timeout:?}")]
     TimedOut {

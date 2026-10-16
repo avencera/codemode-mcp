@@ -64,6 +64,8 @@ enum Answer {
     Deny,
     /// Leaves the prompt up until the gateway takes it down
     Hang,
+    /// Sends this value, as the owner pasting or filling it in does
+    Enter(&'static str),
 }
 
 /// A read as the fake phone received it
@@ -72,6 +74,8 @@ struct Seen {
     id: String,
     reference: String,
     expires_in_ms: u64,
+    /// The read came with a copy sealed to the phone
+    sealed: bool,
     /// The gateway stopped the stream before the phone answered
     withdrawn: bool,
 }
@@ -303,6 +307,7 @@ impl FakePhone {
                     id: read.id.to_string(),
                     reference: read.reference.clone(),
                     expires_in_ms: read.expires_in_ms,
+                    sealed: read.sealed.is_some(),
                     withdrawn: false,
                 });
 
@@ -320,15 +325,24 @@ impl FakePhone {
             }
 
             let response = match answer {
-                Answer::Open => match self.key.open(&self.gateway, &read.reference, &read.sealed) {
+                Answer::Open => match read
+                    .sealed
+                    .as_ref()
+                    .ok_or_else(|| "no sealed copy".to_owned())
+                    .and_then(|sealed| {
+                        self.key
+                            .open(&self.gateway, &read.reference, sealed)
+                            .map_err(|error| error.to_string())
+                    }) {
                     Ok(value) => {
                         CompanionResponse::Value(String::from_utf8_lossy(&value).into_owned())
                     }
-                    Err(error) => CompanionResponse::Error(CompanionFault {
+                    Err(message) => CompanionResponse::Error(CompanionFault {
                         code: CompanionErrorCode::ReadFailed,
-                        message: error.to_string(),
+                        message,
                     }),
                 },
+                Answer::Enter(value) => CompanionResponse::Value(value.to_owned()),
                 Answer::Deny => CompanionResponse::Error(CompanionFault {
                     code: CompanionErrorCode::Denied,
                     message: "not approved on this phone".to_owned(),
@@ -716,15 +730,16 @@ async fn a_phone_that_answers_first_takes_the_other_prompts_down() -> TestResult
         ..
     } = rig;
     let companion_mac = companion_mac.ok_or("no companion")?;
-    // the first read raised the companion's prompt, and the local read won
-    assert_eq!(
+    let dismissals = || {
         companion_mac
             .shown()
             .iter()
             .filter(|line| *line == "dismissed")
-            .count(),
-        1
-    );
+            .count()
+    };
+    // the boot read's local `op` answers at once, so whether the
+    // companion's prompt came up before it won depends on timing
+    let before = dismissals();
 
     // after a restart the cache is empty: the owner is at the gateway, but
     // its 1Password prompt goes unanswered, and so does the companion's
@@ -743,21 +758,17 @@ async fn a_phone_that_answers_first_takes_the_other_prompts_down() -> TestResult
     assert_eq!(apns.pushes().len(), 1);
     assert_eq!(phone.seen().len(), 1);
 
-    // the losers were taken down: the companion's second prompt and the
-    // local `op`
+    // the losers were taken down: the companion's prompt and the local
+    // `op`
     let mut dismissed = 0;
     for _ in 0..40 {
-        dismissed = companion_mac
-            .shown()
-            .iter()
-            .filter(|line| *line == "dismissed")
-            .count();
-        if dismissed == 2 {
+        dismissed = dismissals();
+        if dismissed == before + 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(dismissed, 2, "{:?}", companion_mac.shown());
+    assert_eq!(dismissed, before + 1, "{:?}", companion_mac.shown());
     let pid = std::fs::read_to_string(&pid)?;
     let mut alive = true;
     for _ in 0..40 {
@@ -820,6 +831,60 @@ async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
     assert!(seen[0].withdrawn, "the phone's prompt stayed up: {seen:?}");
     // the first boot's read; the slow `op` logs elsewhere
     assert_eq!(reads(&local_log, REFERENCE), 1);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_entered_on_the_phone_is_sealed_for_the_next_read() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: false,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let Rig { harness, phone, .. } = rig;
+    let other = "op://Dev/other/credential";
+    let entered = "entered-on-the-phone";
+    let use_other = |config: &mut Config, op: &Path| {
+        config.secrets.op = op.display().to_string();
+        if let Some(server) = config.servers.get_mut("twin") {
+            server
+                .env
+                .insert("FIXTURE_SECRET".to_owned(), format!("{{{{ {other} }}}}"));
+        }
+    };
+
+    // a reference nothing has read yet, and 1Password at the gateway goes
+    // unanswered: the phone is asked without a copy and the owner enters it
+    phone.set_answer(Answer::Enter(entered));
+    let (hanging, _) = hanging_op()?;
+    let harness = harness
+        .restart_with(Stop::Drain, |config| use_other(config, &hanging))
+        .await?;
+    let body = harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], entered, "{body}");
+    let seen = phone.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].reference, other);
+    assert!(!seen[0].sealed, "{seen:?}");
+
+    // after a restart the phone opens the copy of what it entered
+    phone.set_answer(Answer::Open);
+    let (hanging, _) = hanging_op()?;
+    let harness = harness
+        .restart_with(Stop::Drain, |config| use_other(config, &hanging))
+        .await?;
+    let body = harness
+        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
+        .await?;
+    assert_eq!(body["result"], entered, "{body}");
+    let seen = phone.seen();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[1].sealed, "{seen:?}");
 
     harness.stop().await
 }

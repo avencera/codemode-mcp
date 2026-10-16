@@ -219,15 +219,16 @@ How reads work with a companion configured:
 
 ## Approve from an iPhone
 
-The Companion app answers `{{ op://… }}` reads from an iPhone, after Face ID. The phone has no 1Password: each
-time the gateway Mac or a companion Mac reads a reference, the gateway seals the value to a key in the phone's
-Secure Enclave and keeps only that sealed copy. The phone answers by opening the copy, which takes Face ID. So:
+The Companion app answers `{{ op://… }}` reads from an iPhone. The phone does not read 1Password itself: each
+time a reference is read, the gateway seals the value to a key in the phone's Secure Enclave and keeps only that
+sealed copy. The phone answers by opening the copy, which takes Face ID. So:
 
-- A phone answers a reference only after it has been read another way at least once since pairing. Pairing
-  seals what the daemon has already read since its last start.
-- The phone answers with the value from the last time the reference was read another way. After rotating a
-  secret, read it once at the gateway Mac or a companion Mac before relying on the phone.
-- Changing Face ID's enrolled faces voids the phone's key, and every read then fails; pair again.
+- The first time a reference is asked for, the phone has no copy. Paste the value into the read, or fill it in
+  with AutoFill from 1Password or Passwords, and send it. The gateway seals whatever value wins, so the next
+  read opens with Face ID. Pairing seals what the daemon has already read since its last start.
+- The copy holds the value from the last time the reference was read. After rotating a secret, tap Enter a
+  different value on the phone's next read, or read it once at the gateway Mac or a companion Mac.
+- Changing Face ID's enrolled faces voids the phone's key, and opening a copy then fails; pair again.
 
 Install the app from TestFlight, or build it onto a connected iPhone with `just ios-run` (needs Xcode, xcodegen,
 and the phone's UDID in `IOS_DEVICE_UDID`).
@@ -255,14 +256,14 @@ and the phone's UDID in `IOS_DEVICE_UDID`).
 
 How reads work with a phone paired:
 
-- Each phone that holds a sealed copy of the reference is asked alongside the gateway's own `op` and the
-  companion Macs, and the first value wins. When another source answers first, the phone's prompt is taken
+- Every listed phone is asked alongside the gateway's own `op` and the companion Macs, and the first value
+  wins, so a read at the gateway Mac also pushes to the phone. When another source answers first, the phone's prompt is taken
   down; when the phone answers first, the other prompts are.
 - The phone dials the gateway, since iOS does not let a suspended app accept connections. The gateway sends
   each read over that connection and waits up to 120 seconds; the phone shows a countdown and marks the read
   expired when the gateway stops waiting.
 - The phone shows one read at a time, naming the reference, and refuses anything off the allow list it got
-  when it paired. The values it opens never leave its memory except in the answer, which is at most 64 KiB.
+  when it paired. The values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.
 - The phone keeps its iroh key, the gateway's address and its allow list in its Keychain, readable only while
   it is unlocked. Deleting the app forgets the pairing.
 - With `discovery = false`, set `listen` under `[secrets]` to a fixed address such as `"0.0.0.0:7679"`, so the

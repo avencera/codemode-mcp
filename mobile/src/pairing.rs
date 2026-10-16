@@ -163,8 +163,8 @@ pub fn describe(check: &PairCheck) -> String {
             format!("Paired, but reading {reference} through this phone failed: {message}")
         }
         PairCheck::Skipped => "Paired. The gateway uses no op:// reference yet.".to_owned(),
-        PairCheck::NothingSealed => "Paired. This phone can answer a reference once the gateway \
-             or a companion Mac has read it."
+        PairCheck::NothingSealed => "Paired. Nothing has been read yet: the first time a \
+             reference is asked for, enter its value here; after that Face ID opens it."
             .to_owned(),
     }
 }

@@ -14,7 +14,8 @@
 //! phone's Secure Enclave key and keeps only the ciphertext, which it sends
 //! with the read. The seal's `info` binds the gateway and the reference (see
 //! [`seal_info`]), so a gateway cannot show one reference in the prompt and
-//! have the phone open another's value
+//! have the phone open another's value. A read the gateway holds no copy of
+//! comes without one, and the owner enters the value on the phone
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use iroh_base::EndpointId;
@@ -173,8 +174,10 @@ pub struct PhoneRead {
     /// The `op://` reference, shown in the prompt and matched exactly
     /// against the phone's allow list
     pub reference: String,
-    /// The value, sealed to this phone
-    pub sealed: Sealed,
+    /// The value, sealed to this phone; `None` when the gateway has no copy
+    /// yet, so the owner pastes or fills it in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<Sealed>,
     /// Milliseconds until the gateway gives up on this read
     pub expires_in_ms: u64,
 }

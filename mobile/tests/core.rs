@@ -18,7 +18,7 @@ use companion_core::ffi::{
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
-    mobile::{PhoneRead, PhoneRequest, PhoneResponse, PushToken, RequestId, SealKey},
+    mobile::{PhoneRead, PhoneRequest, PhoneResponse, PushToken, RequestId, SealKey, Sealed},
     seal::{SoftwareKey, seal},
     ticket::{InviteSecret, InviteTicket},
     wire::{
@@ -369,7 +369,8 @@ impl FakeGateway {
         }
     }
 
-    /// Reads `reference` through the phone, as the gateway's race does
+    /// Reads `reference` through the phone with a copy sealed to it, as the
+    /// gateway's race does
     async fn read(&self, reference: &str, expires_in_ms: u64) -> Result<CompanionResponse, String> {
         let key = self
             .seal_key
@@ -379,6 +380,17 @@ impl FakeGateway {
             .ok_or("no phone registered")?;
         let sealed = seal(&key, &self.id(), reference, VALUE.as_bytes())
             .map_err(|error| error.to_string())?;
+
+        self.offer(reference, Some(sealed), expires_in_ms).await
+    }
+
+    /// Sends one read over the phone's link and waits for its answer
+    async fn offer(
+        &self,
+        reference: &str,
+        sealed: Option<Sealed>,
+        expires_in_ms: u64,
+    ) -> Result<CompanionResponse, String> {
         let connection = self
             .link
             .subscribe()
@@ -573,6 +585,67 @@ async fn a_denied_or_cancelled_read_sends_no_value() -> TestResult {
         return Err("a value was sent".into());
     };
     assert_eq!(fault.code, CompanionErrorCode::Denied);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entered_value_answers_a_read_with_or_without_a_sealed_copy() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, platform, recorder) = paired(&gateway).await?;
+    let entered = "pasted-from-autofill";
+
+    // no copy: Approve has nothing to open, and the entered value goes
+    let reading = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.offer(REFERENCE, None, 30_000).await }
+    });
+    let state = until(&app, |state| waiting(state).is_some()).await?;
+    let id = waiting(&state).ok_or("no read")?;
+    assert!(state.reads.iter().any(|read| read.id == id && !read.sealed));
+    app.dispatch(AppAction::Approve { id: id.clone() });
+    app.answer(id.clone(), entered.to_owned());
+    assert_eq!(
+        reading.await??,
+        CompanionResponse::Value(entered.to_owned())
+    );
+    until(&app, |state| {
+        state
+            .reads
+            .iter()
+            .any(|read| read.id == id && read.status == ReadStatus::Approved)
+    })
+    .await?;
+    // only the pairing's check asked Face ID
+    assert_eq!(platform.prompts().len(), 1);
+
+    // a stale copy: the entered value takes the Face ID prompt down and wins
+    platform.set_face_id(FaceId::Hold);
+    let reading = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.read(REFERENCE, 30_000).await }
+    });
+    let state = until(&app, |state| waiting(state).is_some()).await?;
+    let id = waiting(&state).ok_or("no read")?;
+    assert!(state.reads.iter().any(|read| read.id == id && read.sealed));
+    app.dispatch(AppAction::Approve { id: id.clone() });
+    until(&app, |state| {
+        state
+            .reads
+            .iter()
+            .any(|read| read.id == id && read.status == ReadStatus::Approving)
+    })
+    .await?;
+    app.answer(id.clone(), entered.to_owned());
+    assert_eq!(
+        reading.await??,
+        CompanionResponse::Value(entered.to_owned())
+    );
+    assert!(platform.cancelled().contains(&id));
+
+    // the entered value is in no state, update or Debug output
+    let updates = recorder.0.lock().map(|u| u.clone()).unwrap_or_default();
+    assert!(!format!("{:?}{updates:?}", app.state()).contains(entered));
 
     Ok(())
 }

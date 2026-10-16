@@ -732,9 +732,9 @@ async fn wait_for_registration(config: &Config, invite: &str) -> Result<()> {
                     }
                     Some(PairCheck::NothingSealed) => {
                         println!(
-                            "Paired, with nothing to check yet: {name} can answer a reference once \
-                             this Mac or a companion Mac has read it, which seals a copy to the \
-                             phone."
+                            "Paired, with nothing to check yet: nothing has been read since the \
+                             daemon started. {name} opens a reference with Face ID once it has \
+                             been read, and until then you enter its value there."
                         );
 
                         Ok(())

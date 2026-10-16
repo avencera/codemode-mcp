@@ -12,6 +12,7 @@ use ractor::{Actor, ActorRef};
 use crate::{
     app::{App, AppArgs, AppMsg, Shared},
     record::GatewayRecord,
+    request::Secret,
 };
 
 /// What the app shows
@@ -71,6 +72,9 @@ pub struct PendingRead {
     pub gateway_name: String,
     /// When the gateway gives up, in ms since the epoch on this phone's clock
     pub expires_at_ms: i64,
+    /// Whether the gateway sent a copy Face ID can open; without one the
+    /// owner enters the value
+    pub sealed: bool,
     /// Where it stands
     pub status: ReadStatus,
 }
@@ -361,6 +365,18 @@ impl FfiApp {
     /// Asks for `action`; its effects arrive through the reconciler
     pub fn dispatch(&self, action: AppAction) {
         if let Err(error) = self.actor.cast(AppMsg::Action(action)) {
+            tracing::error!(%error, "the app actor is gone");
+        }
+    }
+
+    /// Sends `value`, which the owner pasted or filled in, as the answer to
+    /// the read `id`; its own call rather than an [`AppAction`], so the value
+    /// never sits in a type that derives `Debug`
+    pub fn answer(&self, id: String, value: String) {
+        if let Err(error) = self.actor.cast(AppMsg::Answer {
+            id,
+            value: Secret(value),
+        }) {
             tracing::error!(%error, "the app actor is gone");
         }
     }

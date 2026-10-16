@@ -21,6 +21,11 @@ final class AppManager: Reconciler, @unchecked Sendable {
         rust.dispatch(action: action)
     }
 
+    /// Sends a value the owner pasted or filled in as the read's answer
+    func answer(id: String, value: String) {
+        rust.answer(id: id, value: value)
+    }
+
     /// The read the request screen shows: the first one still waiting on
     /// the owner, else the newest finished one until it is dismissed
     var shownRead: PendingRead? {

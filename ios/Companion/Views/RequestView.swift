@@ -1,10 +1,14 @@
 import CompanionCore
 import SwiftUI
 
-/// One read: what it is for, how long the gateway waits, Approve and Deny
+/// One read: what it is for, how long the gateway waits, and the answers:
+/// Face ID opens the copy the gateway sealed to this phone, or the owner
+/// pastes or fills in the value when there is no copy or it is stale
 struct RequestView: View {
     @Environment(AppManager.self) private var manager
     let read: PendingRead
+    @State private var entering = false
+    @State private var value = ""
     /// Approve waits a moment after a read appears, and Done after it ends:
     /// each takes the other's place, so a tap meant for one must not land on
     /// the next, and the result stays readable before it can be dismissed
@@ -31,7 +35,10 @@ struct RequestView: View {
         }
         .padding(24)
         .task(id: "\(read.id) \(read.status.isFinished)") {
+            // a new read, or one that just finished, starts with no value
             armed = false
+            value = ""
+            entering = false
             try? await Task.sleep(for: .seconds(1.5))
             armed = true
         }
@@ -75,15 +82,25 @@ struct RequestView: View {
                 .disabled(!armed)
         } else {
             VStack(spacing: 12) {
-                Button {
-                    manager.dispatch(.approve(id: read.id))
-                } label: {
-                    Label("Approve with Face ID", systemImage: "faceid")
-                        .frame(maxWidth: .infinity)
+                // opened from a push: whether a copy came is not known yet
+                if read.status == .connecting {
+                    EmptyView()
+                } else if read.sealed && !entering {
+                    Button {
+                        manager.dispatch(.approve(id: read.id))
+                    } label: {
+                        Label("Approve with Face ID", systemImage: "faceid")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(read.status != .waiting || !armed)
+
+                    Button("Enter a different value") { entering = true }
+                        .disabled(read.status != .waiting)
+                } else {
+                    entry
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(read.status != .waiting || !armed)
 
                 Button(role: .destructive) {
                     manager.dispatch(.deny(id: read.id))
@@ -94,6 +111,46 @@ struct RequestView: View {
                 .controlSize(.large)
             }
         }
+    }
+
+    /// The value field: paste it, or fill it from 1Password or Passwords
+    /// through AutoFill
+    @ViewBuilder
+    private var entry: some View {
+        if !read.sealed {
+            Text("This iPhone has no copy of the value yet. Paste it, or fill it in from your password manager.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        HStack {
+            SecureField("Value", text: $value)
+                .textContentType(.password)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .privacySensitive()
+                .textFieldStyle(.roundedBorder)
+                .submitLabel(.send)
+                .onSubmit(send)
+            PasteButton(payloadType: String.self) { strings in
+                let pasted = strings.first ?? ""
+                DispatchQueue.main.async { value = pasted }
+            }
+            .labelStyle(.iconOnly)
+        }
+        Button(action: send) {
+            Label("Send value", systemImage: "paperplane")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .disabled(value.isEmpty || !armed || read.status.isFinished)
+    }
+
+    private func send() {
+        guard !value.isEmpty, armed, !read.status.isFinished else { return }
+        manager.answer(id: read.id, value: value)
+        value = ""
     }
 
     private var icon: String {

@@ -295,25 +295,24 @@ impl OnePassword {
     }
 
     async fn read(&self, reference: &str) -> Result<String, SecretError> {
-        let (value, from_phone) = self.race(reference).await?;
-        // a phone's answer came from its sealed copy; anything else is a
-        // fresh read, which replaces the phones' copies
-        if !from_phone && let Some(companions) = &self.companions {
+        let value = self.race(reference).await?;
+        // whichever source won, its value replaces the phones' copies: a
+        // value the owner entered on a phone is opened with Face ID next time
+        if let Some(companions) = &self.companions {
             companions.seal_for_phones(reference, &value).await;
         }
 
         Ok(value)
     }
 
-    /// Reads `reference` from every source at once; the first value wins,
-    /// with whether a phone sent it
-    async fn race(&self, reference: &str) -> Result<(String, bool), SecretError> {
+    /// Reads `reference` from every source at once; the first value wins
+    async fn race(&self, reference: &str) -> Result<String, SecretError> {
         let peers = self
             .companions
             .as_ref()
             .map(|companions| companions.peers())
             .unwrap_or_default();
-        // a phone can only answer with a copy sealed to it earlier
+        // a phone opens its sealed copy, or the owner enters the value there
         let phones: Vec<String> = self
             .companions
             .as_ref()
@@ -321,7 +320,6 @@ impl OnePassword {
                 companions
                     .phones()
                     .into_iter()
-                    .filter(|phone| companions.has_seal(&phone.name, reference))
                     .map(|phone| phone.name)
                     .collect()
             })
@@ -331,14 +329,14 @@ impl OnePassword {
             .as_ref()
             .filter(|_| !peers.is_empty() || !phones.is_empty())
         else {
-            return Ok((self.read_local(reference).await?, false));
+            return self.read_local(reference).await;
         };
 
         let local = match &self.on_mac {
             Some(on_mac) => on_mac.mac.present(on_mac.config.idle()).await,
             None => true,
         };
-        let mut sources: JoinSet<(String, bool, Result<String, String>)> = JoinSet::new();
+        let mut sources: JoinSet<(String, Result<String, String>)> = JoinSet::new();
         if local {
             let onepassword = self.clone();
             let reference = reference.to_owned();
@@ -348,7 +346,7 @@ impl OnePassword {
                     .await
                     .map_err(|error| error.reason());
 
-                ("local".to_owned(), false, value)
+                ("local".to_owned(), value)
             });
         }
         for peer in peers {
@@ -361,7 +359,7 @@ impl OnePassword {
                     .await
                     .map_err(|error| error.to_string());
 
-                (name, false, value)
+                (name, value)
             });
         }
         for name in phones {
@@ -373,7 +371,7 @@ impl OnePassword {
                     .await
                     .map_err(|error| error.to_string());
 
-                (name, true, value)
+                (name, value)
             });
         }
 
@@ -388,8 +386,8 @@ impl OnePassword {
             }
             while let Some(finished) = sources.join_next().await {
                 match finished {
-                    Ok((_, from_phone, Ok(value))) => return Ok((value, from_phone)),
-                    Ok((source, _, Err(reason))) => failures.push(format!("{source}: {reason}")),
+                    Ok((_, Ok(value))) => return Ok(value),
+                    Ok((source, Err(reason))) => failures.push(format!("{source}: {reason}")),
                     Err(error) => failures.push(format!("a read stopped unexpectedly: {error}")),
                 }
             }

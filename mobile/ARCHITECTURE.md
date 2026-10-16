@@ -51,7 +51,9 @@ App (supervisor)
   link, and a push or the user brings it back.
 - **Request** starts `Waiting` and expires on the gateway's deadline. A reference off the allow list is refused
   before it is shown. Approve calls `Platform::open_sealed` on a blocking thread; the actor stays free, so an
-  expiry, a withdrawal or Deny can take the Face ID prompt down through `cancel_open`. An answer made while the
+  expiry, a withdrawal, Deny or an entered value can take the Face ID prompt down through `cancel_open`. A read
+  without a sealed copy can only be answered with a value the owner enters; `FfiApp::answer` carries it, apart
+  from `AppAction`, so it never sits in a type that derives `Debug`. An answer made while the
   link is down is sent once the gateway offers the read again, unless the read has expired.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
@@ -59,7 +61,7 @@ second, and a failed request marks its read failed.
 
 ## Values
 
-The gateway sends each read with the value HPKE-sealed to the phone's Secure Enclave key (P-256, HKDF-SHA256,
+The gateway sends each read with the value, when it has one, HPKE-sealed to the phone's Secure Enclave key (P-256, HKDF-SHA256,
 AES-256-GCM; the info binds the gateway's id and the reference). The core never holds the private key: Swift opens
 the value inside `open_sealed`, after Face ID, and returns the plaintext, which goes straight into the answer.
 `Secret` wraps it with a redacting `Debug`, and nothing logs it. An answer over 64 KiB is refused, matching the
