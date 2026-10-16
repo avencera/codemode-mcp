@@ -651,7 +651,7 @@ async fn an_entered_value_answers_a_read_with_or_without_a_sealed_copy() -> Test
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reference_off_the_allow_list_waits_until_the_owner_allows_it() -> TestResult {
+async fn a_new_reference_waits_until_allowed_and_can_be_removed_again() -> TestResult {
     let gateway = FakeGateway::start().await?;
     let (app, platform, _) = paired(&gateway).await?;
     let other = "op://Dev/other/credential";
@@ -696,6 +696,22 @@ async fn a_reference_off_the_allow_list_waits_until_the_owner_allows_it() -> Tes
     let relaunched = FfiApp::start(Arc::new(Shared(Arc::clone(&platform)))).await?;
     let allow = relaunched.state().gateway.ok_or("no gateway")?.allow;
     assert_eq!(allow, [REFERENCE, other]);
+
+    // removing it from the list sticks too
+    relaunched.dispatch(AppAction::Disallow {
+        reference: other.to_owned(),
+    });
+    until(&relaunched, |state| {
+        state
+            .gateway
+            .as_ref()
+            .is_some_and(|gateway| gateway.allow == [REFERENCE])
+    })
+    .await?;
+    drop(relaunched);
+    let relaunched = FfiApp::start(Arc::new(Shared(Arc::clone(&platform)))).await?;
+    let allow = relaunched.state().gateway.ok_or("no gateway")?.allow;
+    assert_eq!(allow, [REFERENCE]);
 
     Ok(())
 }

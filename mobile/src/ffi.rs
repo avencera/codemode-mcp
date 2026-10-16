@@ -159,6 +159,12 @@ pub enum AppAction {
         /// The read
         id: String,
     },
+    /// Take `reference` off the allow list, so a later read of it waits
+    /// for the owner to allow it again
+    Disallow {
+        /// The reference, as the allow list shows it
+        reference: String,
+    },
     /// Open the read's value with Face ID and send it
     Approve {
         /// The read

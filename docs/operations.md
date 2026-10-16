@@ -264,7 +264,7 @@ How reads work with a phone paired:
   expired when the gateway stops waiting.
 - The phone shows one read at a time, naming the reference. It answers the references the gateway used when
   it paired, matched exactly; any other reference waits for you to tap Allow this reference, after which the
-  phone answers it like the rest. The gateway screen lists the allowed references. The values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.
+  phone answers it like the rest. The gateway screen lists the allowed references; swipe one to remove it. The values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.
 - The phone keeps its iroh key, the gateway's address and its allow list in its Keychain, readable only while
   it is unlocked. Deleting the app forgets the pairing.
 - With `discovery = false`, set `listen` under `[secrets]` to a fixed address such as `"0.0.0.0:7679"`, so the

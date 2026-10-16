@@ -20,12 +20,18 @@ struct GatewayView: View {
                 }
                 Section {
                     ForEach(gateway.allow, id: \.self) { reference in
-                        Text(reference).font(.system(.footnote, design: .monospaced))
+                        Text(reference)
+                            .font(.system(.footnote, design: .monospaced))
+                            .swipeActions {
+                                Button("Remove", role: .destructive) {
+                                    manager.dispatch(.disallow(reference: reference))
+                                }
+                            }
                     }
                 } header: {
                     Text("Allowed references")
                 } footer: {
-                    Text("This iPhone answers these without asking first. A reference that is not listed waits until you allow it.")
+                    Text("This iPhone answers these without asking first. A reference that is not listed waits until you allow it. Swipe to remove one.")
                 }
                 Section {
                     Button("Unpair", role: .destructive) { confirmingUnpair = true }

@@ -328,7 +328,19 @@ impl App {
                     Err(message) => state.shared.set_pairing(PairingState::Failed { message }),
                 }
             }
-            AppAction::Allow { id } => Self::allow(state, &id).await,
+            AppAction::Allow { id } => {
+                let reference = state
+                    .shared
+                    .state()
+                    .reads
+                    .into_iter()
+                    .find(|read| read.id == id && !read.status.is_finished())
+                    .map(|read| read.reference);
+                if let Some(reference) = reference {
+                    Self::list(state, &reference, true).await;
+                }
+            }
+            AppAction::Disallow { reference } => Self::list(state, &reference, false).await,
             AppAction::Approve { id } => {
                 // one Face ID prompt at a time
                 let prompting = state
@@ -450,47 +462,46 @@ impl App {
 
     /// Starts a request actor for a new read, or hands a read offered again
     /// after a reconnect to the one it already has
-    /// Adds the reference of read `id` to the allow list and keeps it in
-    /// the Keychain, then lets every read of it be answered
-    async fn allow(state: &mut AppActorState, id: &str) {
-        let Some(reference) = state
-            .shared
-            .state()
-            .reads
-            .into_iter()
-            .find(|read| read.id == id && !read.status.is_finished())
-            .map(|read| read.reference)
-        else {
-            return;
-        };
+    /// Puts `reference` on the allow list or takes it off, keeps the list
+    /// in the Keychain, and tells the reads of it still open
+    async fn list(state: &mut AppActorState, reference: &str, listed: bool) {
+        let reference = reference.trim();
         let Some(record) = state.record.as_mut() else {
             return;
         };
 
-        if !record.allows(&reference) {
-            record.allow.push(reference.trim().to_owned());
+        if record.allows(reference) != listed {
+            if listed {
+                record.allow.push(reference.to_owned());
+            } else {
+                record.allow.retain(|allowed| allowed.trim() != reference);
+            }
             let platform = Arc::clone(&state.platform);
             let saved = record.clone();
             let kept = tokio::task::spawn_blocking(move || saved.save(platform.as_ref())).await;
-            // the read goes ahead either way; only remembering it failed
+            // the change holds until the app quits either way; only keeping
+            // it failed
             if let Ok(Err(error)) = kept {
-                tracing::warn!(%error, "could not keep the allowed reference");
+                tracing::warn!(%error, "could not keep the allow list");
             }
             state.shared.set_gateway(Some(record));
         }
 
-        let mut allowed = Vec::new();
+        let mut changed = Vec::new();
         state.shared.change_reads(|reads| {
-            for read in reads.iter_mut().filter(|read| read.reference == reference) {
-                read.listed = true;
-                allowed.push(read.id.clone());
+            let open = reads
+                .iter_mut()
+                .filter(|read| read.reference.trim() == reference && !read.status.is_finished());
+            for read in open {
+                read.listed = listed;
+                changed.push(read.id.clone());
             }
 
-            !allowed.is_empty()
+            !changed.is_empty()
         });
-        for id in allowed {
+        for id in changed {
             if let Some(request) = state.requests.get(&id) {
-                let _ = request.cast(RequestMsg::Allow);
+                let _ = request.cast(RequestMsg::Listed(listed));
             }
         }
     }

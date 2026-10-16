@@ -38,8 +38,8 @@ impl std::fmt::Debug for Secret {
 pub enum RequestMsg {
     /// The owner tapped Approve
     Approve,
-    /// The owner allowed the reference, which was off the allow list
-    Allow,
+    /// The owner put the reference on the allow list, or took it off
+    Listed(bool),
     /// The owner entered the value
     Answer(Secret),
     /// The owner tapped Deny
@@ -201,7 +201,7 @@ impl Actor for RequestActor {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
-            RequestMsg::Allow => state.listed = true,
+            RequestMsg::Listed(listed) => state.listed = listed,
             RequestMsg::Approve => {
                 // without a sealed copy there is nothing for Face ID to open
                 let Some(sealed) = &state.read.sealed else {

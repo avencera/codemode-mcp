@@ -1228,6 +1228,15 @@ public enum AppAction: Equatable, Hashable {
          */id: String
     )
     /**
+     * Take `reference` off the allow list, so a later read of it waits
+     * for the owner to allow it again
+     */
+    case disallow(
+        /**
+         * The reference, as the allow list shows it
+         */reference: String
+    )
+    /**
      * Open the read's value with Face ID and send it
      */
     case approve(
@@ -1315,25 +1324,28 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 2: return .allow(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 3: return .approve(id: try FfiConverterString.read(from: &buf)
+        case 3: return .disallow(reference: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .deny(id: try FfiConverterString.read(from: &buf)
+        case 4: return .approve(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .dismiss(id: try FfiConverterString.read(from: &buf)
+        case 5: return .deny(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 6: return .unpair
-        
-        case 7: return .foreground
-        
-        case 8: return .background
-        
-        case 9: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf)
+        case 6: return .dismiss(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 10: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
+        case 7: return .unpair
+        
+        case 8: return .foreground
+        
+        case 9: return .background
+        
+        case 10: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 11: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1354,42 +1366,47 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterString.write(id, into: &buf)
             
         
-        case let .approve(id):
+        case let .disallow(reference):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(id, into: &buf)
+            FfiConverterString.write(reference, into: &buf)
             
         
-        case let .deny(id):
+        case let .approve(id):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(id, into: &buf)
             
         
-        case let .dismiss(id):
+        case let .deny(id):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(id, into: &buf)
             
         
-        case .unpair:
+        case let .dismiss(id):
             writeInt(&buf, Int32(6))
+            FfiConverterString.write(id, into: &buf)
+            
         
-        
-        case .foreground:
+        case .unpair:
             writeInt(&buf, Int32(7))
         
         
-        case .background:
+        case .foreground:
             writeInt(&buf, Int32(8))
         
         
-        case let .openedFromPush(id,reference,gateway):
+        case .background:
             writeInt(&buf, Int32(9))
+        
+        
+        case let .openedFromPush(id,reference,gateway):
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(reference, into: &buf)
             FfiConverterString.write(gateway, into: &buf)
             
         
         case let .pushToken(token,environment):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
             FfiConverterOptionString.write(token, into: &buf)
             FfiConverterTypePushEnvironment.write(environment, into: &buf)
             
