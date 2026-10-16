@@ -165,7 +165,7 @@ The 1Password Environments server is not covered; it only signs in through the g
      no restart, so a Mac whose setup fails is never asked in place of the gateway's own `op`; `invite` then
      says so and exits with an error.
    - writes a `[companion]` section to this Mac's config, with the references the gateway's servers use as the
-     allow list.
+     allow list. Other references can still be read; each is asked for by name.
    - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
    - asks the gateway to read one of those references through this Mac. Approve the one Touch ID prompt. While
      1Password has authorized `op` on that Mac, the prompt is the companion's and names the reference;
@@ -241,10 +241,12 @@ How reads work with a companion configured:
 - The gateway runs its own `op read` only while you are at the gateway Mac (input within `notify.mac.idle_secs`),
   and asks every companion at the same time. The first value wins and the other reads are cancelled, so working
   over remote desktop, which makes the gateway Mac look in use, still reaches the companion.
-- A companion answers only the gateway it was paired with, and only references on its `allow` list. 1Password's
-  own prompt does not name the item, and one approval lets `op` read anything for about ten minutes, so the
-  companion asks Touch ID itself, naming the reference, on every request. Edit `allow` in its `[companion]`
-  section to change what the gateway may read, then `codemode-mcp companion install` again to restart it.
+- A companion answers only the gateway it was paired with, and every read waits for your fingerprint. While
+  1Password has authorized `op`, the companion asks Touch ID itself, naming the reference. Otherwise 1Password
+  asks, but its prompt does not name the item and one approval lets `op` read anything for about ten minutes, so
+  only references on the `allow` list are approved through it alone, with a notification naming the reference.
+  Any other reference gets the companion's own Touch ID prompt first, which adds "which is not on this Mac's allow
+  list", so you choose each one by name as it comes and never edit the config to read something new.
 - The gateway accepts nothing over iroh unless a peer is listed or an invite is open. While an invite is open it
   accepts pairing; while a phone is listed under `[[secrets.phones]]` it accepts that phone's id, and refuses
   every other id. The rest of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again

@@ -815,32 +815,61 @@ async fn mac_notifications_off_still_skip_the_local_read_while_the_owner_is_away
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reference_off_the_allow_list_is_refused_before_anyone_is_asked() -> TestResult {
+async fn a_reference_off_the_allow_list_is_asked_for_by_name() -> TestResult {
+    // signed out, a listed reference would be approved through 1Password's
+    // own prompt, which does not name the item
     let Some(rig) = Rig::start(Options {
         allow: &["op://Dev/other/credential"],
+        signed_in: false,
+        touch: Some(TouchId::Review),
         ..Options::default()
     })
     .await?
     else {
         return Ok(());
     };
+    let check = json!({ "reference": REFERENCE });
+    let prompt = format!(
+        "touch_id codemode-mcp on main wants to read {REFERENCE}, which is not on this Mac's \
+         allow list"
+    );
+    // only the companion's own prompt, never a notification standing in
+    // for it
+    let only_prompted = || {
+        let shown = rig.companion_mac.shown();
+        assert!(
+            !shown.is_empty() && shown.iter().all(|entry| *entry == prompt),
+            "{shown:?}"
+        );
+    };
 
-    let error = rig.twin_error().await?;
-    assert!(error.contains("mba: not_allowed"), "{error}");
-    assert!(!error.contains(VALUE), "{error}");
-
+    // refusing that prompt reads nothing, though 1Password is still signed
+    // out and would have asked
     let (_, checked) = rig
         .harness
-        .admin_json("/admin/companion/check", &json!({ "reference": REFERENCE }))
+        .admin_json("/admin/companion/check", &check)
         .await?;
     let message = checked["companions"][0]["result"]["error"]["message"].as_str();
     assert!(
-        message.is_some_and(|message| message.contains("not_allowed")),
+        message.is_some_and(|message| message.contains("denied")),
         "{checked}"
     );
-
+    only_prompted();
     assert_eq!(reads(&rig.companion_log, REFERENCE), 0);
-    assert!(rig.companion_mac.shown().is_empty());
+
+    // approving it reads the value without any config change
+    rig.companion_mac.set_answer(Some(TouchId::Approved));
+    let (status, checked) = rig
+        .harness
+        .admin_json("/admin/companion/check", &check)
+        .await?;
+    assert_eq!(status, 200, "{checked}");
+    assert!(
+        checked["companions"][0]["result"]["ok"].is_object(),
+        "{checked}"
+    );
+    only_prompted();
+    assert_eq!(reads(&rig.companion_log, REFERENCE), 1);
     assert_eq!(reads(&rig.local_log, REFERENCE), 0);
 
     rig.stop().await

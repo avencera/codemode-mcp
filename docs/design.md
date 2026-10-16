@@ -590,10 +590,14 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   who registered and the check. `invite --manual` keeps the older `cmcp1` JSON ticket that carries the
   references, for a gateway the companion cannot reach; the gateway's entry is then added by hand
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
-  only references on its own `allow` list, one request at a time, each request no longer than the gateway's
-  120 s deadline (a gateway that stops the stream or never gives up loses the prompt), and only after its own Touch ID prompt naming
-  the reference and the gateway (its other button says Deny). 1Password's prompt does not name the item and one approval lets `op` read
-  anything for about ten minutes, so without these a compromised gateway could read any item
+  one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
+  stream or never gives up loses the prompt), and only after a fingerprint given to a prompt naming the
+  reference: its own Touch ID prompt naming the reference and the gateway (its other button says Deny), or, for
+  a reference on its `allow` list while `op` is signed out, 1Password's prompt beside a notification naming it.
+  1Password's prompt does not name the item and one approval lets `op` read anything for about ten minutes, so
+  an unlisted reference always gets the companion's own prompt first; otherwise a compromised gateway could
+  slip any item behind 1Password's unnamed prompt. The owner chooses unlisted references one read at a time
+  instead of editing the config
 - The prompt shows the gateway name and reference as the ticket or registration gave them, so config loading refuses names over
   63 characters, references over 256, and either with line breaks or control, invisible or direction-changing
   characters; a crafted ticket cannot make the prompt say something else. Host names are cleaned the same way

@@ -580,7 +580,9 @@ pub struct CompanionConfig {
     /// Name of the gateway Mac, shown in the Touch ID prompt
     #[serde(default = "default_gateway_name")]
     pub gateway_name: String,
-    /// The references this companion may read, matched exactly
+    /// References matched exactly that may be approved through 1Password's
+    /// own prompt alone; any other reference is still readable, after a
+    /// Touch ID prompt on this Mac that names it
     #[serde(default)]
     pub allow: Vec<String>,
     /// The vaults this companion creates items in for the gateway; empty, it
