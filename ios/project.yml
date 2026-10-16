@@ -35,11 +35,10 @@ targets:
     info:
       path: Companion/Info.plist
       properties:
-        # only the App Store Connect record name must be unique, and
-        # "Companion" is taken there, so TestFlight shows that record's name
-        # while the home screen shows this one
-        CFBundleDisplayName: Companion
-        CFBundleName: Companion
+        # App Store Connect refuses a name another app has taken, as
+        # "Companion" is
+        CFBundleDisplayName: CMCP Companion
+        CFBundleName: CMCP Companion
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         NSCameraUsageDescription: Companion scans the QR code `codemode-mcp companion invite` shows, to pair with the gateway.
