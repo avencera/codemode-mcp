@@ -1,5 +1,6 @@
 //! The real Mac: CoreGraphics for presence, LocalAuthentication for Touch
-//! ID, `terminal-notifier` for notifications and `open` for the page
+//! ID, `terminal-notifier` for notifications, `open` for the page, and
+//! Accessibility with keyboard events for the `logins` server
 
 use std::{
     ffi::c_void,
@@ -18,8 +19,11 @@ use objc2_foundation::{NSError, NSString};
 use objc2_local_authentication::{LAContext, LAError, LAPolicy};
 use tokio::{process::Command, sync::oneshot};
 
-use super::{Mac, MacError, MacNotification, TouchId};
-use crate::notify::BoxFuture;
+use super::{Mac, MacError, MacNotification, TouchId, screen};
+use crate::{
+    logins::{FieldRule, FillError, FocusedField},
+    notify::BoxFuture,
+};
 
 /// Where Homebrew installs `terminal-notifier` on Apple silicon and Intel;
 /// a LaunchAgent's `PATH` holds neither
@@ -250,6 +254,30 @@ impl Mac for MacOs {
             Ok(())
         })
     }
+    fn focused_field(&self) -> BoxFuture<'_, Result<FocusedField, FillError>> {
+        Box::pin(blocking(screen::focused_field))
+    }
+
+    fn fill<'a>(
+        &'a self,
+        text: &'a str,
+        rule: &'a FieldRule,
+    ) -> BoxFuture<'a, Result<String, FillError>> {
+        let text = text.to_owned();
+        let rule = rule.clone();
+
+        Box::pin(blocking(move || screen::fill(&text, &rule)))
+    }
+}
+
+/// Runs Accessibility work off the async workers, since each request waits
+/// on the app it asks
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, FillError> + Send + 'static,
+) -> Result<T, FillError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| FillError::Failed(format!("the Accessibility call failed: {error}")))?
 }
 
 #[cfg(test)]

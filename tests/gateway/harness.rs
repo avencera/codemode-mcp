@@ -12,6 +12,7 @@ use codemode_mcp::{
     app::App,
     config::Config,
     durable::{Durable, Sensitivity},
+    logins::{FieldRule, FillError, FocusedField},
     mac::{Mac, MacError, MacNotification, TouchId},
     notify::{BoxFuture, Notification, Notifier, NotifyError},
     server::{RunningServer, serve},
@@ -280,6 +281,10 @@ pub struct FakeMac {
     on_notify: Mutex<Option<PathBuf>>,
     shown: Mutex<Vec<String>>,
     cancel_titles: Mutex<Vec<String>>,
+    /// The field with keyboard focus; `None` is a screen with none
+    focused: Mutex<Option<FocusedField>>,
+    /// Everything `fill` typed, in order
+    typed: Mutex<String>,
 }
 
 impl FakeMac {
@@ -340,6 +345,29 @@ impl FakeMac {
             .lock()
             .map(|titles| titles.clone())
             .unwrap_or_default()
+    }
+
+    /// Gives `field` keyboard focus
+    pub fn set_focused(&self, field: FocusedField) {
+        if let Ok(mut slot) = self.focused.lock() {
+            *slot = Some(field);
+        }
+    }
+
+    /// What `fill` typed so far
+    pub fn typed(&self) -> String {
+        self.typed
+            .lock()
+            .map(|typed| typed.clone())
+            .unwrap_or_default()
+    }
+
+    fn focused(&self) -> Result<FocusedField, FillError> {
+        self.focused
+            .lock()
+            .ok()
+            .and_then(|focused| focused.clone())
+            .ok_or_else(|| FillError::Refused("no element has keyboard focus".to_owned()))
     }
 
     fn record(&self, entry: String) {
@@ -422,6 +450,25 @@ impl Mac for FakeMac {
         self.record(format!("open {url}"));
 
         Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn focused_field(&self) -> BoxFuture<'_, Result<FocusedField, FillError>> {
+        Box::pin(std::future::ready(self.focused()))
+    }
+
+    fn fill<'a>(
+        &'a self,
+        text: &'a str,
+        rule: &'a FieldRule,
+    ) -> BoxFuture<'a, Result<String, FillError>> {
+        let filled = self.focused().and_then(|field| rule.check(&field));
+        if filled.is_ok()
+            && let Ok(mut typed) = self.typed.lock()
+        {
+            typed.push_str(text);
+        }
+
+        Box::pin(std::future::ready(filled))
     }
 }
 

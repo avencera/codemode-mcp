@@ -1,5 +1,6 @@
 //! Asking the owner on the Mac the daemon runs on: whether they are at it,
-//! a Touch ID prompt, a local notification and the approval page
+//! a Touch ID prompt, a local notification and the approval page; and the
+//! screen the `logins` server types into
 //!
 //! Presence only decides where a request is shown first. Approval still
 //! takes something an agent on the same Mac cannot produce: a fingerprint
@@ -7,13 +8,19 @@
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod screen;
 
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 pub use macos::MacOs;
 
-use crate::{config::MacConfig, notify::BoxFuture};
+use crate::{
+    config::MacConfig,
+    logins::{FieldRule, FillError, FocusedField},
+    notify::BoxFuture,
+};
 
 /// Why something could not be shown on the Mac
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +71,32 @@ pub trait Mac: Send + Sync + 'static {
 
     /// Opens `url` in the default browser
     fn open<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<(), MacError>>;
+
+    /// The element with keyboard focus in the frontmost app
+    fn focused_field(&self) -> BoxFuture<'_, Result<FocusedField, FillError>> {
+        Box::pin(std::future::ready(Err(FillError::Unavailable(
+            "this Mac cannot read the focused field".to_owned(),
+        ))))
+    }
+
+    /// Types `text` into the focused field once `rule` passes it, and
+    /// answers the page's host
+    ///
+    /// Focus is checked again before each character, and typing stops with
+    /// [`FillError::Interrupted`] once it has left the field. Keys already
+    /// sent may still land, so a few characters can reach a field in the
+    /// same app that took focus
+    fn fill<'a>(
+        &'a self,
+        text: &'a str,
+        rule: &'a FieldRule,
+    ) -> BoxFuture<'a, Result<String, FillError>> {
+        let _ = (text, rule);
+
+        Box::pin(std::future::ready(Err(FillError::Unavailable(
+            "this Mac cannot type into the focused field".to_owned(),
+        ))))
+    }
 }
 
 /// The Mac and how requests are asked on it

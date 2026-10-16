@@ -24,12 +24,13 @@ use crate::{
     convert::json_to_monty,
     durable::Sensitivity,
     executor::Executor,
+    mac::Mac,
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
     policy::Policy,
     secrets::{Redactor, Secrets},
     store::Store,
-    upstream::{ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
+    upstream::{Builtins, ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
     usage::{Caller, Classification, Outcome, UpstreamRecord, UsageLog},
 };
 
@@ -229,6 +230,18 @@ struct Published {
     catalog: Arc<Catalog>,
 }
 
+/// What upstream connections reach beyond the config
+pub struct UpstreamAccess {
+    /// Logins for `oauth = true` servers
+    pub oauth: Arc<OAuth>,
+    /// Where tool lists are kept for the next start
+    pub store: Store,
+    /// The 1Password reader and the companions it asks
+    pub secrets: Secrets,
+    /// The Mac the `logins` server types on
+    pub mac: Option<Arc<dyn Mac>>,
+}
+
 impl Gateway {
     /// Starts connecting to every configured server and keeps the catalog
     /// current as they come and go
@@ -237,22 +250,31 @@ impl Gateway {
         executor: Arc<Executor>,
         approvals: Arc<Approvals>,
         log: UsageLog,
-        oauth: Arc<OAuth>,
-        store: &Store,
-        secrets: Secrets,
+        access: UpstreamAccess,
     ) -> Arc<Self> {
         let redactor = Redactor::shared(&config);
-        let Secrets {
-            onepassword,
-            companions,
-        } = secrets;
+        let UpstreamAccess {
+            oauth,
+            store,
+            secrets:
+                Secrets {
+                    onepassword,
+                    companions,
+                },
+            mac,
+        } = access;
+        let builtins = Builtins {
+            logins: Arc::new(config.logins.clone()),
+            mac,
+        };
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
             Some(Arc::clone(&oauth)),
-            store,
+            &store,
             &onepassword,
             &redactor,
+            &builtins,
         );
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {

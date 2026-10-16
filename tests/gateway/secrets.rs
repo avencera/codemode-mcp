@@ -72,6 +72,7 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/shortkey/credential) printf '%s' '9f3a71c2d8b4e6f' ;;\n\
                op://Dev/encodedkey/credential) printf '%s' 'zk%2B9f3a71c2%3Dd8b4e6' ;;\n\
                op://Dev/hexkey/credential) printf '%s' '{HEX_KEY}' ;;\n\
+               op://Dev/linebreak/credential) printf 'first-line\\nsecond-line' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
