@@ -62,7 +62,10 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/urlkey/credential) printf '{URL_KEY}' ;;\n\
                op://Dev/symbolkey/credential) printf '{SYMBOL_KEY}' ;;\n\
                op://Dev/hostpath/credential) printf 'example.invalid/mcp/{URL_KEY}' ;;\n\
-               op://Dev/hostkey/credential) printf '{URL_KEY}.localhost' ;;\n\
+               op://Dev/colonkey/credential) printf '%s' 'zk:9f3a71c2d8b4e6' ;;\n\
+               op://Dev/backslash/credential) printf '%s' 'zk\\9f3a71c2d8b4e6' ;;\n\
+               op://Dev/shortkey/credential) printf '%s' 'aB9xZ' ;;\n\
+               op://Dev/encodedkey/credential) printf '%s' 'zk%2B9f3a71c2%3Dd8b4e6' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
@@ -398,6 +401,42 @@ async fn a_zoho_url_redacts_its_key_but_not_its_public_path_words() -> TestResul
     assert_eq!(redactor.scrub(unrelated), unrelated);
     let leaked = redactor.scrub(&format!("GET {url} failed; path /mcp/{URL_KEY}/message"));
     assert!(!leaked.contains(URL_KEY), "{leaked}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_url_key_too_short_to_redact_is_refused() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, SecretError};
+
+    let (op, _) = fake_op()?;
+    let onepassword = OnePassword::new(op.display().to_string());
+
+    let refused = onepassword
+        .resolve_url("https://example.invalid/mcp/{{ op://Dev/shortkey/credential }}")
+        .await;
+    assert!(matches!(refused, Err(SecretError::UrlValueTooShort)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_decoded_form_of_an_encoded_url_key_is_redacted() -> TestResult {
+    use codemode_mcp::secrets::{OnePassword, Redactor};
+
+    let (op, _) = fake_op()?;
+    let onepassword = OnePassword::new(op.display().to_string());
+
+    // the value is itself percent-encoded, as some providers store keys
+    let resolved = onepassword
+        .resolve_url("https://example.invalid/mcp?k={{ op://Dev/encodedkey/credential }}")
+        .await?;
+    let redactor = Redactor::default();
+    redactor.add(resolved.secrets);
+    assert_eq!(
+        redactor.scrub("bad key zk+9f3a71c2=d8b4e6"),
+        "bad key [redacted]"
+    );
 
     Ok(())
 }

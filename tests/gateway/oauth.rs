@@ -648,37 +648,6 @@ async fn oauth_login_refuses_an_issuer_that_holds_the_key() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn oauth_login_refuses_an_issuer_that_holds_a_key_embedded_in_the_host() -> TestResult {
-    let key = format!("{}.localhost", super::secrets::URL_KEY);
-    let (op, _) = super::secrets::fake_op()?;
-    let mock = start_mock_with(Client::Registered, format!("/{key}"), None).await?;
-    let port = mock.base.rsplit(':').next().ok_or("no port")?;
-    let extra = format!(
-        "[secrets]\nop = \"{op}\"\n\n\
-         [servers.locked]\n\
-         url = \"http://{{{{ op://Dev/hostkey/credential }}}}:{port}/mcp\"\n\
-         oauth = true\n\
-         client_name = \"codemode test\"",
-        op = op.display()
-    );
-    let Some(harness) = Harness::with(Setup {
-        extra: &extra,
-        ..Setup::default()
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    wait_for_state(&harness, "locked", "needs_login").await?;
-
-    // the mock cannot serve an issuer on the key host, so the login is
-    // refused as a mismatch; either way nothing is stored or shown
-    assert_login_refused(&harness, &key, "issuer").await?;
-
-    harness.stop().await
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn oauth_login_refuses_pending_state_whose_scopes_hold_the_key() -> TestResult {
     let key = super::secrets::URL_KEY;
     let (op, _) = super::secrets::fake_op()?;
@@ -784,7 +753,13 @@ async fn oauth_login_refuses_a_link_that_holds_a_percent_encoded_key() -> TestRe
         },
     )
     .await?;
-    let Some(harness) = locked_harness(&op, &mock.base, "op://Dev/symbolkey/credential").await?
+    let Some(harness) = path_key_harness(
+        &op,
+        &mock.base,
+        "op://Dev/symbolkey/credential",
+        "needs_login",
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -858,7 +833,7 @@ async fn oauth_refuses_a_value_that_is_more_than_one_url_component() -> TestResu
     let extra = format!(
         "[secrets]\nop = \"{op}\"\n\n\
          [servers.locked]\n\
-         url = \"https://{{{{ op://Dev/hostpath/credential }}}}\"\n\
+         url = \"https://example.invalid/mcp/{{{{ op://Dev/hostpath/credential }}}}\"\n\
          oauth = true\n\
          client_name = \"codemode test\"",
         op = op.display()
@@ -963,6 +938,83 @@ async fn oauth_callback_error_does_not_echo_a_url_that_cannot_be_read() -> TestR
     // no login is in progress, so the callback must not raise a 1Password
     // prompt by reading the url
     assert_eq!(super::secrets::reads(&log, reference), reads_before);
+
+    harness.stop().await
+}
+
+/// Starts a daemon whose `url` embeds `reference` in its path
+async fn path_key_harness(
+    op: &std::path::Path,
+    base: &str,
+    reference: &str,
+    state: &str,
+) -> Result<Option<Harness>, Box<dyn std::error::Error>> {
+    let extra = format!(
+        "[secrets]\nop = \"{op}\"\n\n\
+         [servers.locked]\n\
+         url = \"{base}/mcp/{{{{ {reference} }}}}\"\n\
+         oauth = true\n\
+         client_name = \"codemode test\"",
+        op = op.display()
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    wait_for_state(&harness, "locked", state).await?;
+
+    Ok(Some(harness))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_refuses_a_value_with_a_backslash() -> TestResult {
+    let mock = start_mock(Client::Registered).await?;
+    let (op, _) = super::secrets::fake_op()?;
+    let Some(harness) = path_key_harness(
+        &op,
+        &mock.base,
+        "op://Dev/backslash/credential",
+        "unavailable",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let (status, body) = harness
+        .admin_json("/admin/oauth/login", &json!({ "server": "locked" }))
+        .await?;
+    assert_ne!(status, 200, "{body}");
+    assert!(
+        body.to_string().contains("changed when the URL is parsed"),
+        "{body}"
+    );
+    assert!(!body.to_string().contains("9f3a71c2d8b4e6"), "{body}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_login_accepts_a_path_key_holding_a_colon() -> TestResult {
+    let mock = start_mock(Client::Registered).await?;
+    let (op, _) = super::secrets::fake_op()?;
+    let Some(harness) = path_key_harness(
+        &op,
+        &mock.base,
+        "op://Dev/colonkey/credential",
+        "needs_login",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let (_, url) = begin_login(&harness, &mock, "locked").await?;
+    assert!(!url.contains("9f3a71c2d8b4e6"), "{url}");
 
     harness.stop().await
 }

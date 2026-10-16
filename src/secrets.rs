@@ -89,6 +89,16 @@ pub enum SecretError {
     /// A resolved `url` is not a URL; the value is left out of the message
     #[error("the `url` is not a valid URL once its references are read")]
     NotAUrl,
+    /// A value read for a `url` is shorter than the redactor can match
+    #[error(
+        "a value read for the `url` is too short to be protected; use a key of at least {MIN_SECRET_LEN} bytes"
+    )]
+    UrlValueTooShort,
+    /// A value read for a `url` is not what the URL holds once parsed
+    #[error(
+        "a value read for the `url` is changed when the URL is parsed (a backslash, a space or an uppercase host, for example), so it could not be kept out of logs; store it as the URL holds it"
+    )]
+    UrlValueChanged,
     /// `op` could not be started
     #[error("failed to start `{program}`: {source}")]
     Spawn {
@@ -220,6 +230,18 @@ fn variants(secret: &str) -> Vec<String> {
     variants
 }
 
+/// The byte a `%XX` escape at the start of `bytes` stands for, in either case
+fn escaped_byte(bytes: &[u8]) -> Option<u8> {
+    match bytes {
+        [b'%', high, low, ..] => {
+            let digit = |byte: &u8| char::from(*byte).to_digit(16);
+
+            Some(u8::try_from(digit(high)? * 16 + digit(low)?).ok()?)
+        }
+        _ => None,
+    }
+}
+
 /// `text` with its `%XX` escapes decoded; `plus_is_space` also decodes the
 /// `+` of form encoding
 fn percent_decode(text: &str, plus_is_space: bool) -> String {
@@ -227,12 +249,7 @@ fn percent_decode(text: &str, plus_is_space: bool) -> String {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        let escaped = bytes
-            .get(index + 1..index + 3)
-            .filter(|_| bytes[index] == b'%')
-            .and_then(|digits| std::str::from_utf8(digits).ok())
-            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
-        match escaped {
+        match escaped_byte(&bytes[index..]) {
             Some(byte) => {
                 decoded.push(byte);
                 index += 3;
@@ -249,6 +266,60 @@ fn percent_decode(text: &str, plus_is_space: bool) -> String {
     }
 
     String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// `text` with its `%XX` escapes decoded, and for each decoded byte the span
+/// of `text` it came from
+fn decoded_with_spans(text: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut spans = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let (byte, width) = match escaped_byte(&bytes[index..]) {
+            Some(byte) => (byte, 3),
+            None => (bytes[index], 1),
+        };
+        decoded.push(byte);
+        spans.push((index, index + width));
+        index += width;
+    }
+
+    (decoded, spans)
+}
+
+/// `text` with every part that decodes to one of `secrets` replaced, however
+/// its escapes are cased or mixed with plain characters
+fn scrub_decoded<'a>(text: &str, secrets: impl Iterator<Item = &'a String>) -> String {
+    let (decoded, spans) = decoded_with_spans(text);
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for secret in secrets {
+        let needle = secret.as_bytes();
+        for (start, window) in decoded.windows(needle.len()).enumerate() {
+            if window == needle {
+                hits.push((spans[start].0, spans[start + needle.len() - 1].1));
+            }
+        }
+    }
+    hits.sort_unstable();
+
+    let mut scrubbed = Vec::with_capacity(text.len());
+    let mut copied = 0;
+    for (start, end) in hits {
+        if start < copied {
+            // overlaps a span already replaced; extend it
+            if end > copied {
+                copied = end;
+            }
+            continue;
+        }
+        scrubbed.extend_from_slice(&text.as_bytes()[copied..start]);
+        scrubbed.extend_from_slice(REDACTED.as_bytes());
+        copied = end;
+    }
+    scrubbed.extend_from_slice(&text.as_bytes()[copied..]);
+
+    String::from_utf8_lossy(&scrubbed).into_owned()
 }
 
 /// Whether a value starts with a reference, so the value read is the whole of
@@ -283,6 +354,16 @@ pub struct ResolvedUrl {
     /// The values read from 1Password, with their encodings: what nothing an
     /// authorization server returns may hold when it is stored or shown
     pub keys: Vec<String>,
+    /// The values read, as 1Password returned them
+    pub read: Vec<UrlValue>,
+}
+
+/// A value read for a `url` reference
+pub struct UrlValue {
+    /// What 1Password returned
+    pub text: String,
+    /// Whether the reference sits after the `?` of the template
+    pub in_query: bool,
 }
 
 /// Values with their references replaced, and the secrets that were read
@@ -368,14 +449,59 @@ impl OnePassword {
     /// The keys are exactly the values read. A URL that is a reference
     /// alone is a secret as a whole, so the redactor also learns its
     /// normalized form, path and query, which HTTP clients print in errors
+    ///
+    /// A value shorter than the redactor can match is refused, and so is one
+    /// the parsed URL does not hold as read (a part of a URL, not the whole
+    /// of it), since logs print the parsed form
     pub async fn resolve_url(&self, template: &str) -> Result<ResolvedUrl, SecretError> {
+        let whole = is_whole_reference(template);
+        let mut url = String::with_capacity(template.len());
         let mut read = Vec::new();
-        let url = self.resolve_text(template, &mut read).await?;
+        for piece in pieces(template)? {
+            match piece {
+                Piece::Text(literal) => url.push_str(literal),
+                Piece::Reference(reference) => {
+                    let value = self.value(reference).await?;
+                    if value.len() < MIN_SECRET_LEN {
+                        return Err(SecretError::UrlValueTooShort);
+                    }
+                    url.push_str(&value);
+                    read.push(UrlValue {
+                        in_query: url[..url.len() - value.len()].contains('?'),
+                        text: value,
+                    });
+                }
+            }
+        }
         let url = url.trim().to_owned();
         let parsed = reqwest::Url::parse(&url).map_err(|_| SecretError::NotAUrl)?;
-        let keys: Vec<String> = read.iter().flat_map(|value| variants(value)).collect();
+        if !whole
+            && read
+                .iter()
+                .any(|value| !parsed.as_str().contains(&value.text))
+        {
+            return Err(SecretError::UrlValueChanged);
+        }
+
+        // lowercase too, since a host is lowercased when parsed; a value that
+        // is percent-encoded is echoed decoded by some providers
+        let forms = read.iter().flat_map(|value| {
+            let decoded = percent_decode(&value.text, false);
+            let decoded = (decoded != value.text).then_some(decoded);
+
+            [Some(value.text.clone()), decoded]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        });
+        let keys: Vec<String> = forms.flat_map(|value| variants(&value)).collect();
         let mut secrets = keys.clone();
-        if is_whole_reference(template) {
+        secrets.extend(
+            read.iter()
+                .map(|value| value.text.to_lowercase())
+                .flat_map(|value| variants(&value)),
+        );
+        if whole {
             let path = parsed.path();
             let parts = [
                 url.as_str(),
@@ -388,7 +514,12 @@ impl OnePassword {
             secrets.extend(parts.flat_map(variants));
         }
 
-        Ok(ResolvedUrl { url, secrets, keys })
+        Ok(ResolvedUrl {
+            url,
+            secrets,
+            keys,
+            read,
+        })
     }
 
     async fn resolve_text(
@@ -661,13 +792,21 @@ impl Redactor {
     pub fn scrub(&self, text: &str) -> String {
         let known = self.0.read().unwrap_or_else(PoisonError::into_inner);
 
-        known.iter().fold(text.to_owned(), |text, secret| {
+        let text = known.iter().fold(text.to_owned(), |text, secret| {
             if text.contains(secret.as_str()) {
                 text.replace(secret.as_str(), REDACTED)
             } else {
                 text
             }
-        })
+        });
+
+        // escapes in any case, or only some of a secret escaped; the view is
+        // built only for text that has an escape
+        if text.contains('%') {
+            scrub_decoded(&text, known.iter())
+        } else {
+            text
+        }
     }
 
     /// `text` with every known secret replaced, cut to a length fit for a
@@ -736,6 +875,20 @@ mod tests {
 
         for text in ["zk%2B9f3a71c2%3Dd8b4e6", "zk%2b9f3a71c2%3dd8b4e6"] {
             assert_eq!(redactor.scrub(text), REDACTED, "{text}");
+        }
+    }
+
+    #[test]
+    fn mixed_case_and_partly_encoded_secrets_are_scrubbed() {
+        let redactor = Redactor::default();
+        redactor.add(["zk+9f3a71c2=d8b4e6".to_owned()]);
+
+        for text in [
+            "key zk%2b9f3a71c2%3Dd8b4e6 end",
+            "key zk%2B9f3a71c2=d8b4e6 end",
+            "key %7ak%2B9f3a71c2%3d%64%38b4e6 end",
+        ] {
+            assert_eq!(redactor.scrub(text), "key [redacted] end", "{text}");
         }
     }
 }

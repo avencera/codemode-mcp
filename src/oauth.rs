@@ -79,7 +79,7 @@ pub enum OAuthError {
     HoldsKey(String),
     /// A value read for the server's `url` is more than one URL component
     #[error(
-        "a value read for the `url` of `{0}` holds `/`, `?`, `#`, `@` or `:`; with `oauth = true` store only the key in 1Password and put the rest of the url in the config"
+        "a value read for the `url` of `{0}` holds `/`, `\\`, `?`, `#`, `%`, whitespace or a control character (or `&` or `+` in the query); with `oauth = true` store only the key in 1Password and put the rest of the url in the config"
     )]
     UrlValueNotAKey(String),
     /// The authorization link holds part of a secret `url` outside the
@@ -402,13 +402,19 @@ impl OAuth {
     ) -> Result<(String, Vec<String>), OAuthError> {
         let resolved = self.onepassword.resolve_url(&server.url).await?;
         self.redactor.add(resolved.secrets);
-        // the whole value is the key only when it is a single component; a
-        // value that carries the host or path could be echoed in part
-        if resolved
-            .keys
-            .iter()
-            .any(|key| key.contains(['/', '?', '#', '@', ':']))
-        {
+        // a value is the key only when it is one URL component that parsing
+        // leaves as it is; anything else could be echoed in part or changed
+        // into a form the redactor does not know
+        let refused = resolved.read.iter().any(|value| {
+            value.text.chars().any(|c| {
+                matches!(c, '/' | '\\' | '?' | '#' | '%')
+                    || c.is_whitespace()
+                    || c.is_control()
+                    // form decoding turns `+` into a space and `&` splits
+                    || (value.in_query && matches!(c, '&' | '+'))
+            })
+        });
+        if refused {
             return Err(OAuthError::UrlValueNotAKey(name.to_owned()));
         }
 
