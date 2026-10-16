@@ -5,9 +5,9 @@ import SwiftUI
 struct RequestView: View {
     @Environment(AppManager.self) private var manager
     let read: PendingRead
-    /// Approve waits a moment after a read appears: it takes the place of
-    /// the last read's Done button, and a tap meant for that must not
-    /// approve the new one
+    /// Approve waits a moment after a read appears, and Done after it ends:
+    /// each takes the other's place, so a tap meant for one must not land on
+    /// the next, and the result stays readable before it can be dismissed
     @State private var armed = false
 
     var body: some View {
@@ -30,7 +30,7 @@ struct RequestView: View {
             actions
         }
         .padding(24)
-        .task(id: read.id) {
+        .task(id: "\(read.id) \(read.status.isFinished)") {
             armed = false
             try? await Task.sleep(for: .seconds(1.5))
             armed = true
@@ -72,6 +72,7 @@ struct RequestView: View {
             Button("Done") { manager.dispatch(.dismiss(id: read.id)) }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .disabled(!armed)
         } else {
             VStack(spacing: 12) {
                 Button {
