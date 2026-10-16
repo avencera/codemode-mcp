@@ -702,7 +702,8 @@ async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestRe
     let prompts = platform.prompts().len();
     let id = RequestId::generate();
 
-    // tapped from the push, then denied while the read is on its way
+    // tapped from the push, denied and dismissed while the read is on its
+    // way
     app.dispatch(AppAction::OpenedFromPush {
         id: id.to_string(),
         reference: REFERENCE.to_owned(),
@@ -714,6 +715,11 @@ async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestRe
             .reads
             .iter()
             .any(|read| read.id == id.as_str() && read.status == ReadStatus::Denied)
+    })
+    .await?;
+    app.dispatch(AppAction::Dismiss { id: id.to_string() });
+    until(&app, |state| {
+        state.reads.iter().all(|read| read.id != id.as_str())
     })
     .await?;
 
@@ -728,6 +734,32 @@ async fn a_read_denied_before_it_arrives_is_answered_with_the_denial() -> TestRe
     assert_eq!(platform.prompts().len(), prompts);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn turning_notifications_off_clears_the_gateways_token() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, platform, _) = paired(&gateway).await?;
+    app.dispatch(AppAction::Background);
+    until(&app, |state| state.connection == ConnectionState::Offline).await?;
+    drop(app);
+
+    // relaunched with notifications off: iOS reports no token, which the
+    // gateway must hear even though the phone never had one this launch
+    let relaunched = FfiApp::start(Arc::new(Shared(Arc::clone(&platform)))).await?;
+    relaunched.dispatch(AppAction::PushToken {
+        token: None,
+        environment: PushEnvironment::Development,
+    });
+    relaunched.dispatch(AppAction::Foreground);
+    for _ in 0..200 {
+        if gateway.requests().contains(&PhoneRequest::PushToken(None)) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    Err(format!("the gateway never heard: {:?}", gateway.requests()).into())
 }
 
 #[tokio::test(flavor = "multi_thread")]

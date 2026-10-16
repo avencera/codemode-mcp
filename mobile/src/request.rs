@@ -339,7 +339,9 @@ impl Actor for RequestActor {
             RequestMsg::Replace { seq, responder } => {
                 state.seq = seq;
                 state.responder = Some(responder);
-                if let Some(response) = state.unsent.take() {
+                // an answer the old stream never confirmed goes again: the
+                // gateway offers a read anew only when it did not get one
+                if let Some(response) = state.unsent.take().or_else(|| state.in_flight.take()) {
                     state.respond(response);
                 }
             }

@@ -9,7 +9,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, PoisonError, RwLock, mpsc},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use companion_wire::{
@@ -243,7 +243,12 @@ pub struct AppActorState {
     /// The read whose Face ID prompt is up; one at a time
     approving: Option<String>,
     foreground: bool,
-    push: Option<PushToken>,
+    /// Where the gateway pushes: `None` until iOS has said, `Some(None)`
+    /// once notifications are off, so that is sent too
+    push: Option<Option<PushToken>>,
+    /// Reads denied while still on their way from a push, kept until they
+    /// arrive or the gateway's deadline has passed
+    denied: HashMap<String, Instant>,
     pairing: bool,
 }
 
@@ -303,7 +308,7 @@ impl App {
         let Some(connection) = state.connection.clone() else {
             return;
         };
-        let token = state.push.clone();
+        let token = state.push.clone().flatten();
         tokio::spawn(async move {
             let sent = ractor::call_t!(
                 connection,
@@ -329,7 +334,7 @@ impl App {
                         tokio::spawn(pairing::run(
                             Arc::clone(&state.platform),
                             ticket,
-                            state.push.clone(),
+                            state.push.clone().flatten(),
                             myself.clone(),
                         ));
                     }
@@ -367,15 +372,23 @@ impl App {
                 Some(request) => {
                     let _ = request.cast(RequestMsg::Deny);
                 }
-                // opened from a push and never arrived; the gateway's own
-                // deadline ends it there
-                None => state.shared.change_reads(|reads| {
-                    reads
-                        .iter_mut()
-                        .find(|read| read.id == id && read.status == ReadStatus::Connecting)
-                        .map(|read| read.status = ReadStatus::Denied)
-                        .is_some()
-                }),
+                // opened from a push and not here yet: the read is answered
+                // with the denial when it arrives
+                None => {
+                    if state.shared.read_status(&id) != Some(ReadStatus::Connecting) {
+                        return;
+                    }
+                    // kept apart from the row, which Done removes
+                    state.denied.retain(|_, at| at.elapsed() < ASK_TIMEOUT);
+                    state.denied.insert(id.clone(), Instant::now());
+                    state.shared.change_reads(|reads| {
+                        reads
+                            .iter_mut()
+                            .find(|read| read.id == id)
+                            .map(|read| read.status = ReadStatus::Denied)
+                            .is_some()
+                    });
+                }
             },
             AppAction::Dismiss { id } => state.shared.change_reads(|reads| {
                 let before = reads.len();
@@ -458,7 +471,7 @@ impl App {
                     PushEnvironment::Development => WirePushEnvironment::Development,
                     PushEnvironment::Production => WirePushEnvironment::Production,
                 };
-                let push = token.map(|token| PushToken { token, environment });
+                let push = Some(token.map(|token| PushToken { token, environment }));
                 if push == state.push {
                     return;
                 }
@@ -529,7 +542,7 @@ impl App {
             return;
         }
         // denied while it was still on its way from a push
-        if state.shared.read_status(&id) == Some(ReadStatus::Denied) {
+        if state.denied.remove(&id).is_some() {
             let _ = responder.send(CompanionResponse::Error(CompanionFault {
                 code: CompanionErrorCode::Denied,
                 message: "not approved on this phone".to_owned(),
@@ -606,6 +619,7 @@ impl Actor for App {
             approving: None,
             foreground: false,
             push: None,
+            denied: HashMap::new(),
             pairing: false,
         })
     }
