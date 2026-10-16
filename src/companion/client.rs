@@ -89,7 +89,7 @@ pub struct Companions {
     peers: RwLock<Vec<CompanionPeer>>,
     pub(super) phones: RwLock<Vec<PhonePeer>>,
     /// Where values sealed to the phones and their push tokens are kept;
-    /// `None` outside the daemon, which then never asks a phone
+    /// without one no phone is asked
     pub(super) store: Option<Store>,
     pub(super) apns: Option<Apns>,
     pub(super) links: Links,

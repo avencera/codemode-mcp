@@ -27,6 +27,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use codemode_mcp::{
+    app::App,
     companion::{
         self, CompanionErrorCode, CompanionFault, CompanionResponse, InviteTicket, MOBILE_ALPN,
         PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registration, Role,
@@ -850,6 +851,45 @@ async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
     assert_eq!(reads(&local_log, REFERENCE), 1);
 
     harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_off_run_beside_the_daemon_asks_the_macs_but_not_the_phone() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: true,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let companion_mac = rig.companion_mac.clone().ok_or("no companion")?;
+    let asked = || {
+        companion_mac
+            .shown()
+            .iter()
+            .filter(|line| line.starts_with("touch_id"))
+            .count()
+    };
+    let before = asked();
+
+    // an `exec` while the daemon holds `secrets.listen`; its own `op` is
+    // slow enough that the companion is asked first, and that a phone
+    // would be pushed once its grace ran out
+    let slow = slow_op(PHONE_GRACE.as_secs() + 2)?;
+    let mut config = (**rig.harness.app.config()).clone();
+    config.secrets.op = slow.display().to_string();
+    let one_off = App::start_without_approvals(config).await?;
+    one_off.gateway().wait_ready(Duration::from_secs(30)).await;
+    let report = serde_json::to_value(one_off.gateway().report())?;
+    one_off.shutdown().await;
+
+    // the twin server started with the value the run's own `op` read
+    assert!(report[0]["tools"].as_u64() > Some(0), "{report}");
+    assert_eq!(asked(), before + 1, "{:?}", companion_mac.shown());
+    assert!(rig.apns.pushes().is_empty(), "{:?}", rig.apns.pushes());
+    assert!(rig.phone.seen().is_empty(), "{:?}", rig.phone.seen());
+
+    rig.stop().await
 }
 
 #[tokio::test(flavor = "multi_thread")]

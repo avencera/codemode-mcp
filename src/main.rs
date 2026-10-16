@@ -1410,7 +1410,7 @@ async fn shutdown_signal() {
 }
 
 async fn tools_command(config: Config, stubs: bool) -> Result<()> {
-    let app = App::start(config).await?;
+    let app = App::start_without_approvals(config).await?;
     app.gateway().wait_ready(SETTLE_LIMIT).await;
 
     for report in app.gateway().report() {

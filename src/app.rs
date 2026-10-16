@@ -118,7 +118,15 @@ impl App {
 
     /// For one-off runs outside the daemon: nobody can reach an approval
     /// page, so `ask` calls are refused with a reason saying so
-    pub async fn start_without_approvals(config: Config) -> Result<Self, AppError> {
+    ///
+    /// The run leaves the daemon its fixed iroh address and its phones:
+    /// binding `secrets.listen` would fail while the daemon holds it, and a
+    /// phone dials only the daemon, so one asked from here could never
+    /// answer, while the push would still wake it
+    pub async fn start_without_approvals(mut config: Config) -> Result<Self, AppError> {
+        config.secrets.listen = None;
+        config.secrets.phones.clear();
+
         Self::build(config, None, None, NO_APPROVAL_PAGE).await
     }
 
