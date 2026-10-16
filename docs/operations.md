@@ -181,7 +181,16 @@ The 1Password Environments server is not covered; it only signs in through the g
    codemode-mcp companion check op://Dev/Context7/credential
    ```
 
-   It prints each companion's answer and the value's length, never the value.
+   It asks every companion and phone at once, waits for each, and prints each one's answer and the value's length,
+   never the value. A device you do not touch keeps its prompt up until the 120-second limit, so to test one,
+   name it, and nothing else is asked:
+
+   ```sh
+   codemode-mcp companion check op://Dev/Context7/credential --companion mba
+   ```
+
+   `--companion` takes a name from `[[secrets.companions]]` or `[[secrets.phones]]` and returns as soon as that
+   device answers. An unknown name is refused with the list of configured ones.
 
 If the other Mac cannot reach the gateway, pair by hand. `codemode-mcp companion invite --manual` prints a ticket
 holding the gateway's id and references. `codemode-mcp companion pair <ticket>` on the other Mac writes its
@@ -299,7 +308,8 @@ and the phone's UDID in `IOS_DEVICE_UDID`).
    the phone: approve it with Face ID. If nothing has been read since the daemon started, there is nothing
    sealed to check yet, and pairing says so. A phone must register the iroh id it connects with, so a leaked invite
    cannot list a phone for another device's id.
-3. Check it later from the gateway Mac with `codemode-mcp companion check <reference>`; the phone shows the read.
+3. Check it later from the gateway Mac with `codemode-mcp companion check <reference> --companion <phone name>`;
+   the phone shows the read, and no other device is asked.
 
 How reads work with a phone paired:
 

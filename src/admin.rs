@@ -421,6 +421,9 @@ pub struct InviteStatusRequest {
 pub struct CompanionCheckRequest {
     /// The reference to ask the companions for
     pub reference: String,
+    /// Ask only this companion or phone; every one when absent
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion: Option<String>,
 }
 
 /// What one companion did with a check; never the value
@@ -1046,17 +1049,28 @@ async fn companion_check(
         );
     }
     let companions = state.gateway.companions();
-    if companions.peers().is_empty() && companions.phones().is_empty() {
+    let names = companions.names();
+    if names.is_empty() {
         return error(
             StatusCode::BAD_REQUEST,
             "no companions or phones are configured under [secrets]",
+        );
+    }
+    let only = request.companion.as_deref();
+    if let Some(only) = only.filter(|only| !names.iter().any(|name| name == only)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "no companion or phone named {only}; configured: {}",
+                names.join(", ")
+            ),
         );
     }
 
     let companions = state
         .gateway
         .companions()
-        .check(reference)
+        .check(reference, only)
         .await
         .into_iter()
         .map(|outcome| CompanionCheckEntry {

@@ -235,11 +235,16 @@ enum CompanionCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// On the gateway Mac: ask the companions, and only them, to read a
-    /// reference, and report whether each could; the value is never shown
+    /// On the gateway Mac: ask the companions and phones, and only them, to
+    /// read a reference, and report whether each could; the value is never
+    /// shown
     Check {
         /// An op://vault/item/field reference
         reference: String,
+        /// Ask only this companion or phone, and finish when it answers;
+        /// without it every one is asked and the others are waited for
+        #[arg(long)]
+        companion: Option<String>,
     },
     /// On the gateway Mac: have a companion Mac create a 1Password item from
     /// the secret on stdin; it asks Touch ID there and never edits or
@@ -611,16 +616,28 @@ async fn companion_command(
             let plan = service::companion_uninstall_plan(&paths, service::current_uid()?);
             run_plan(&plan, dry_run)?;
         }
-        CompanionCommand::Check { reference } => {
+        CompanionCommand::Check {
+            reference,
+            companion,
+        } => {
             let config = load_or_default(path)?;
-            println!(
-                "Asking the companions to read the reference. Touch ID is asked on their Macs; \
-                 approve there."
-            );
+            match &companion {
+                Some(name) => println!(
+                    "Asking {name} to read the reference. Approve on that device; no other is \
+                     asked."
+                ),
+                None => println!(
+                    "Asking the companions to read the reference. Touch ID is asked on their \
+                     Macs; approve there."
+                ),
+            }
             let response: CompanionCheckResponse = admin_post(
                 &config,
                 "/admin/companion/check",
-                &CompanionCheckRequest { reference },
+                &CompanionCheckRequest {
+                    reference,
+                    companion,
+                },
             )
             .await?;
 

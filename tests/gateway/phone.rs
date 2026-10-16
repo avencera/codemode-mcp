@@ -854,6 +854,58 @@ async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_check_can_ask_one_device_and_finishes_when_it_answers() -> TestResult {
+    // the Mac companion's prompt stays up until the 120 s limit, so a check
+    // that asked it too would not return
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: true,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let companion_mac = rig.companion_mac.clone().ok_or("no companion")?;
+    let asked = companion_mac.shown().len();
+
+    let started = std::time::Instant::now();
+    let (status, checked) = rig
+        .harness
+        .admin_json(
+            "/admin/companion/check",
+            &json!({ "reference": REFERENCE, "companion": "iphone" }),
+        )
+        .await?;
+    assert_eq!(status, 200, "{checked}");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the check waited for the Mac"
+    );
+    let entries = checked["companions"].as_array().ok_or("no entries")?;
+    assert_eq!(entries.len(), 1, "{checked}");
+    assert!(entries[0]["result"]["ok"].is_object(), "{checked}");
+    assert_eq!(entries[0]["name"], "iphone", "{checked}");
+    assert_eq!(companion_mac.shown().len(), asked, "the Mac was asked too");
+
+    // an unknown name is refused before anyone is asked, naming the real ones
+    let (status, refused) = rig
+        .harness
+        .admin_json(
+            "/admin/companion/check",
+            &json!({ "reference": REFERENCE, "companion": "ipad" }),
+        )
+        .await?;
+    assert_eq!(status, 400, "{refused}");
+    let message = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ipad") && message.contains("mba, iphone"),
+        "{refused}"
+    );
+    assert_eq!(companion_mac.shown().len(), asked, "{refused}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_one_off_run_beside_the_daemon_asks_the_macs_but_not_the_phone() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: true,
