@@ -91,6 +91,12 @@ pub enum SecretError {
     /// message
     #[error("the `url` is not a valid http(s) URL with a literal host")]
     NotAUrl,
+    /// A `url` is a reference alone, so codemode cannot tell which part of
+    /// it is the key
+    #[error(
+        "a `url` must start with a literal http:// or https:// and a literal host, and hold references only in path segments and query names or values; e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}\""
+    )]
+    UrlReferenceWhole,
     /// A reference in a `url` sits outside the path and the query
     #[error(
         "references in a `url` may appear only in path segments and query names or values, not in the scheme, credentials, host, port or fragment; e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}/message\""
@@ -247,32 +253,6 @@ fn escaped_byte(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-/// `text` with its `%XX` escapes decoded; `plus_is_space` also decodes the
-/// `+` of form encoding
-fn percent_decode(text: &str, plus_is_space: bool) -> String {
-    let bytes = text.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match escaped_byte(&bytes[index..]) {
-            Some(byte) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            None => {
-                decoded.push(if plus_is_space && bytes[index] == b'+' {
-                    b' '
-                } else {
-                    bytes[index]
-                });
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
 /// The character a JSON string escape at the start of `bytes` stands for, and
 /// the escape's width; `\uXXXX` pairs of surrogates stand for one character
 fn json_escape(bytes: &[u8]) -> Option<(char, usize)> {
@@ -357,11 +337,43 @@ impl Unescape {
     ];
 }
 
-/// `text` with the escapes `mode` names decoded in one pass, and for each
-/// decoded byte the span of `text` it came from; the bytes of a character an
+/// Decoded bytes with, for each, the span of the original text it came from
+type Decoded = (Vec<u8>, Vec<(usize, usize)>);
+
+/// How many times a view decodes its own output; a client's `Debug` output
+/// escapes the JSON escapes of a body, and each layer may nest in another
+const MAX_UNESCAPE_PASSES: usize = 4;
+
+/// `text` with the escapes `mode` names decoded, repeatedly until the text
+/// stops changing or [`MAX_UNESCAPE_PASSES`] passes have run, and for each
+/// decoded byte the span of `text` it came from
+///
+/// Returns every layer after the first pass, so a key is found whichever
+/// layer it shows in
+fn unescaped_layers(text: &str, mode: Unescape) -> Vec<Decoded> {
+    let mut layers: Vec<Decoded> = Vec::new();
+    let mut current = unescaped_with_spans(text.as_bytes(), mode);
+    for _ in 1..MAX_UNESCAPE_PASSES {
+        let (next, next_spans) = unescaped_with_spans(&current.0, mode);
+        if next == current.0 {
+            break;
+        }
+        // a byte of the next layer spans what its source bytes span
+        let spans = next_spans
+            .into_iter()
+            .map(|(start, end)| (current.1[start].0, current.1[end - 1].1))
+            .collect();
+        layers.push(std::mem::replace(&mut current, (next, spans)));
+    }
+    layers.push(current);
+
+    layers
+}
+
+/// `bytes` with the escapes `mode` names decoded in one pass, and for each
+/// decoded byte the span of `bytes` it came from; the bytes of a character an
 /// escape stands for share its span
-fn unescaped_with_spans(text: &str, mode: Unescape) -> (Vec<u8>, Vec<(usize, usize)>) {
-    let bytes = text.as_bytes();
+fn unescaped_with_spans(bytes: &[u8], mode: Unescape) -> Decoded {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut spans = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -412,8 +424,7 @@ pub fn references(value: &str) -> Result<Vec<&str>, SecretError> {
 pub struct ResolvedUrl {
     /// The URL to connect to; never to be logged or stored
     pub url: String,
-    /// What the redactor learns: the keys and, when the whole URL was read
-    /// from 1Password, the URL's normalized form, path and query
+    /// What the redactor learns: the keys in the encodings text prints them in
     pub secrets: Vec<String>,
     /// The values read from 1Password, with their encodings: what nothing an
     /// authorization server returns may hold when it is stored or shown
@@ -421,15 +432,6 @@ pub struct ResolvedUrl {
     /// The keys whose fragments the redactor also replaces, since a client
     /// may print only part of a key when it cuts a response short
     pub fragile: Vec<String>,
-}
-
-/// Where a `url` template's references sit
-enum UrlShape {
-    /// The template is one reference, so the value read is the whole URL
-    Whole,
-    /// References sit in path segments and query names or values; the URL
-    /// is the template parsed with `tag`-based placeholders in their place
-    Embedded { parsed: reqwest::Url, tag: String },
 }
 
 /// A server `url` template with its references checked for where they sit
@@ -440,22 +442,22 @@ enum UrlShape {
 /// data, so a value can never become URL structure
 pub struct UrlTemplate<'a> {
     pieces: Vec<Piece<'a>>,
-    shape: UrlShape,
+    /// The template parsed with `tag`-based placeholders in the references'
+    /// places
+    parsed: reqwest::Url,
+    tag: String,
 }
 
 impl<'a> UrlTemplate<'a> {
     /// Checks `template` without reading anything: the references must
-    /// close, and unless the template is one reference, it must be an
-    /// `http(s)` URL with a literal host that holds references only in path
-    /// segments and query names or values
+    /// close, and the template must be an `http(s)` URL with a literal host
+    /// that holds references only in path segments and query names or
+    /// values; a template that is one reference is refused
     pub fn parse(template: &'a str) -> Result<Self, SecretError> {
         let template = template.trim();
         let pieces = pieces(template)?;
         if matches!(pieces.as_slice(), [Piece::Reference(_)]) {
-            return Ok(Self {
-                pieces,
-                shape: UrlShape::Whole,
-            });
+            return Err(SecretError::UrlReferenceWhole);
         }
 
         // lowercase, since a host is lowercased when parsed
@@ -507,13 +509,9 @@ impl<'a> UrlTemplate<'a> {
 
         Ok(Self {
             pieces,
-            shape: UrlShape::Embedded { parsed, tag },
+            parsed,
+            tag,
         })
-    }
-
-    /// Whether the template is one reference, whose value is the whole URL
-    pub fn is_whole(&self) -> bool {
-        matches!(self.shape, UrlShape::Whole)
     }
 
     /// The template's references, in order
@@ -532,81 +530,32 @@ impl<'a> UrlTemplate<'a> {
         // only characters that no URL parser, escape or logger rewrites
         // leave nothing for IDNA, `+`-as-space, percent-decoding, backslash
         // normalization or JSON escaping to turn into an unmatched form
-        if !matches!(self.shape, UrlShape::Whole)
-            && values
-                .iter()
-                .any(|value| !value.bytes().all(is_embeddable_byte))
+        if values
+            .iter()
+            .any(|value| !value.bytes().all(is_embeddable_byte))
         {
             return Err(SecretError::UrlValueUnprotectable);
         }
 
-        match &self.shape {
-            UrlShape::Whole => {
-                let [value] = values else {
-                    return Err(SecretError::NotAUrl);
-                };
-                let url = reqwest::Url::parse(value.trim()).map_err(|_| SecretError::NotAUrl)?;
-                if !matches!(url.scheme(), "http" | "https")
-                    || url.host_str().is_none_or(str::is_empty)
-                {
-                    return Err(SecretError::NotAUrl);
-                }
-
-                // clients print the normalized form, the path and the query
-                let mut secrets = url_keys(value);
-                let path = url.path();
-                let parts = [value.trim(), url.as_str(), path, path.trim_end_matches('/')]
-                    .into_iter()
-                    .chain(url.query());
-                secrets.extend(parts.flat_map(variants));
-
-                // servers echo the decoded path and query, and each query
-                // value, which is where such a URL keeps its key
-                let decoded_query = url.query().map(|query| percent_decode(query, false));
-                let form_query = url.query().map(|query| percent_decode(query, true));
-                let values: Vec<String> =
-                    url.query_pairs().map(|(_, value)| value.into()).collect();
-                let decoded = [
-                    percent_decode(path, false),
-                    percent_decode(path.trim_end_matches('/'), false),
-                ]
-                .into_iter()
-                .chain(decoded_query)
-                .chain(form_query)
-                .chain(values.iter().cloned());
-                secrets.extend(decoded.flat_map(|text| variants(&text)));
-                let fragile = values.iter().flat_map(|value| url_keys(value)).collect();
-
-                Ok(ResolvedUrl {
-                    keys: url_keys(value),
-                    secrets,
-                    fragile,
-                    url: url.into(),
-                })
-            }
-            UrlShape::Embedded { parsed, tag } => {
-                let mut url = parsed.clone();
-                let path =
-                    fill_placeholders(parsed.path(), tag, |index| path_encoded(&values[index]));
-                url.set_path(&path);
-                if let Some(query) = parsed.query() {
-                    let query =
-                        fill_placeholders(query, tag, |index| query_encoded(&values[index]));
-                    url.set_query(Some(&query));
-                }
-                let keys: Vec<String> = values
-                    .iter()
-                    .flat_map(|value| embedded_keys(value))
-                    .collect();
-
-                Ok(ResolvedUrl {
-                    url: url.into(),
-                    secrets: keys.clone(),
-                    fragile: keys.clone(),
-                    keys,
-                })
-            }
+        let Self { parsed, tag, .. } = self;
+        let mut url = parsed.clone();
+        let path = fill_placeholders(parsed.path(), tag, |index| path_encoded(&values[index]));
+        url.set_path(&path);
+        if let Some(query) = parsed.query() {
+            let query = fill_placeholders(query, tag, |index| query_encoded(&values[index]));
+            url.set_query(Some(&query));
         }
+        let keys: Vec<String> = values
+            .iter()
+            .flat_map(|value| embedded_keys(value))
+            .collect();
+
+        Ok(ResolvedUrl {
+            url: url.into(),
+            secrets: keys.clone(),
+            fragile: keys.clone(),
+            keys,
+        })
     }
 }
 
@@ -695,27 +644,6 @@ fn lower_hex(text: &str) -> String {
     }
 
     lowered
-}
-
-/// A value read for a `url` as text may print it: as read, with its escapes
-/// decoded, with `+` as a space (form decoding), in the encodings the URL
-/// holds it in, and each of those escaped the ways `variants` knows
-fn url_keys(value: &str) -> Vec<String> {
-    let decoded = percent_decode(value, false);
-    let mut forms = vec![value.to_owned(), decoded, value.replace('+', " ")];
-    forms.extend([path_encoded(value), query_encoded(value)]);
-    let encoded = forms.split_off(3);
-    let mut keys: Vec<String> = forms.iter().flat_map(|form| variants(form)).collect();
-    keys.extend(
-        encoded
-            .iter()
-            .flat_map(|form| [form.clone(), lower_hex(form)]),
-    );
-    keys.retain(|key| !key.is_empty());
-    keys.sort();
-    keys.dedup();
-
-    keys
 }
 
 /// An allowed-character value read for an embedded `url` reference as text may
@@ -822,8 +750,7 @@ impl OnePassword {
     /// match is refused
     ///
     /// The keys are exactly the values read, in the encodings the URL and
-    /// clients print them. A URL that is a reference alone is a secret as a
-    /// whole, so the redactor also learns its normalized form, path and query
+    /// clients print them
     pub async fn resolve_url(&self, template: &str) -> Result<ResolvedUrl, SecretError> {
         let template = UrlTemplate::parse(template)?;
         let mut values = Vec::new();
@@ -1173,7 +1100,7 @@ impl Redactor {
     }
 
     /// Whether `text` holds any of `keys`, ignoring ASCII case, as is or once
-    /// its percent and JSON string escapes are decoded
+    /// its percent and JSON string escapes are decoded, however deeply nested
     ///
     /// A provider may change the case of what it echoes, e.g. by putting a
     /// key in a host name
@@ -1194,9 +1121,11 @@ impl Redactor {
 
         holds(text.as_bytes())
             || (text.contains(['%', '+', '\\'])
-                && Unescape::VIEWS
-                    .into_iter()
-                    .any(|mode| holds(&unescaped_with_spans(text, mode).0)))
+                && Unescape::VIEWS.into_iter().any(|mode| {
+                    unescaped_layers(text, mode)
+                        .iter()
+                        .any(|(decoded, _)| holds(decoded))
+                }))
     }
 
     /// `text` with every known secret replaced, ignoring ASCII case and
@@ -1212,15 +1141,16 @@ impl Redactor {
                 .into_iter()
                 .filter(|mode| !mode.plus_is_space)
             {
-                let (mut decoded, spans) = unescaped_with_spans(text, mode);
-                // an escape can stand for an uppercase letter
-                decoded.make_ascii_lowercase();
-                hits.extend(
-                    known
-                        .spans(&decoded)
-                        .into_iter()
-                        .map(|(start, end)| (spans[start].0, spans[end - 1].1)),
-                );
+                for (mut decoded, spans) in unescaped_layers(text, mode) {
+                    // an escape can stand for an uppercase letter
+                    decoded.make_ascii_lowercase();
+                    hits.extend(
+                        known
+                            .spans(&decoded)
+                            .into_iter()
+                            .map(|(start, end)| (spans[start].0, spans[end - 1].1)),
+                    );
+                }
             }
         }
         hits.sort_unstable();
@@ -1461,6 +1391,39 @@ mod tests {
             assert!(UrlTemplate::parse(template).is_err(), "{template}");
         }
         assert!(UrlTemplate::parse("https://h.example?k={{ op://a/b/c }}").is_ok());
+    }
+
+    #[test]
+    fn a_url_that_is_one_reference_is_refused() {
+        for template in ["{{ op://a/b/c }}", "  {{ op://a/b/c }}  "] {
+            assert!(
+                matches!(
+                    UrlTemplate::parse(template),
+                    Err(SecretError::UrlReferenceWhole)
+                ),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_in_a_debug_formatted_error_is_redacted_through_nested_escapes() {
+        let redactor = Redactor::default();
+        redactor.add(["aB7cD/Ef8gH/Jk9L".to_owned()]);
+
+        // the body holds the key as `aB7cD\/Ef8gH\/Jk9L` once JSON and
+        // `Debug` have each escaped it
+        let body = r#"{"echo":"aB7cD\/Ef8gH\/Jk9L"}"#;
+        let logged = format!("{body:?}");
+        assert!(logged.contains(r"aB7cD\\/Ef8gH"), "{logged}");
+
+        let scrubbed = redactor.scrub(&logged);
+        assert!(!scrubbed.contains("Ef8gH"), "{scrubbed}");
+        assert!(scrubbed.contains("[redacted]"), "{scrubbed}");
+        assert!(Redactor::holds_any(
+            &logged,
+            &["aB7cD/Ef8gH/Jk9L".to_owned()]
+        ));
     }
 
     #[test]

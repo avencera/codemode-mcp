@@ -358,20 +358,14 @@ async fn a_url_held_in_1password_connects_and_stays_out_of_every_surface() -> Te
         op.with_file_name("url"),
         format!("http://{address}/mcp/{URL_KEY}/rpc"),
     )?;
-    std::fs::write(
-        op.with_file_name("dead-url"),
-        format!("http://{closed}/mcp/{URL_KEY}/rpc"),
-    )?;
     let extra = format!(
         "[secrets]\n\
          op = \"{op}\"\n\
          identity_file = \"{identity}\"\n\n\
-         [servers.whole]\n\
-         url = \"{{{{ op://Dev/mcpurl/credential }}}}\"\n\n\
          [servers.embedded]\n\
          url = \"http://{address}/mcp/{{{{ op://Dev/urlkey/credential }}}}/rpc\"\n\n\
          [servers.dead]\n\
-         url = \"{{{{ op://Dev/deadurl/credential }}}}\"\n",
+         url = \"http://{closed}/mcp/{{{{ op://Dev/urlkey/credential }}}}/rpc\"\n",
         op = op.display(),
         identity = op.with_file_name("gateway.key").display(),
     );
@@ -384,22 +378,17 @@ async fn a_url_held_in_1password_connects_and_stays_out_of_every_surface() -> Te
         return Ok(());
     };
 
-    // both forms reach the endpoint that exists at the resolved URL only
+    // the embedded reference reaches the endpoint that exists at the resolved URL only
     let mut called = Value::Null;
     for _ in 0..40 {
-        let result = execute(
-            &harness.client,
-            "[await whole_hello(), await embedded_hello()]",
-        )
-        .await?;
+        let result = execute(&harness.client, "await embedded_hello()").await?;
         called = serde_json::from_str(&text_of(&result)).unwrap_or(Value::Null);
-        if called["result"] == json!(["hello", "hello"]) {
+        if called["result"] == json!("hello") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert_eq!(called["result"], json!(["hello", "hello"]), "{called}");
-    assert_eq!(reads(&log, "op://Dev/mcpurl/credential"), 1);
+    assert_eq!(called["result"], json!("hello"), "{called}");
     assert_eq!(reads(&log, "op://Dev/urlkey/credential"), 1);
 
     // a refused connection prints the URL in the client's own error text,
@@ -427,14 +416,7 @@ async fn a_url_held_in_1password_connects_and_stays_out_of_every_surface() -> Te
         .admin_json("/admin/companion/invite", &Value::Null)
         .await?;
     assert_eq!(status, 200, "{invite}");
-    assert_eq!(
-        invite["references"],
-        json!([
-            "op://Dev/deadurl/credential",
-            "op://Dev/mcpurl/credential",
-            "op://Dev/urlkey/credential"
-        ])
-    );
+    assert_eq!(invite["references"], json!(["op://Dev/urlkey/credential"]));
     assert!(!invite.to_string().contains(URL_KEY), "{invite}");
 
     let logged = logs.text();
@@ -497,18 +479,6 @@ async fn a_zoho_url_redacts_its_key_but_not_its_public_path_words() -> TestResul
         &embedded.keys
     ));
 
-    // a url that is a reference alone is a secret whole
-    let url = format!("https://srv-1234.zohomcp.com/mcp/{URL_KEY}/message");
-    std::fs::write(op.with_file_name("url"), &url)?;
-    let whole = onepassword
-        .resolve_url("{{ op://Dev/mcpurl/credential }}")
-        .await?;
-    let redactor = Redactor::default();
-    redactor.add(whole.secrets);
-    assert_eq!(redactor.scrub(unrelated), unrelated);
-    let leaked = redactor.scrub(&format!("GET {url} failed; path /mcp/{URL_KEY}/message"));
-    assert!(!leaked.contains(URL_KEY), "{leaked}");
-
     Ok(())
 }
 
@@ -517,44 +487,6 @@ fn holds_run(text: &str, key: &str, len: usize) -> bool {
     key.as_bytes()
         .windows(len)
         .any(|run| text.as_bytes().windows(len).any(|window| window == run))
-}
-
-#[tokio::test]
-async fn a_whole_url_with_an_encoded_query_keeps_its_decoded_value_out_of_logs() -> TestResult {
-    use codemode_mcp::secrets::{OnePassword, Redactor};
-    use std::io::Write;
-
-    let (op, _) = fake_op()?;
-    let onepassword = OnePassword::new(op.display().to_string());
-    std::fs::write(
-        op.with_file_name("url"),
-        "https://host.example/mcp?api_key=acct%3Asecret-1234",
-    )?;
-    let whole = onepassword
-        .resolve_url("{{ op://Dev/mcpurl/credential }}")
-        .await?;
-    let redactor = Redactor::default();
-    redactor.add(whole.secrets.clone());
-    redactor.add_keys(whole.fragile.clone());
-
-    let echoed = "invalid query api_key=acct:secret-1234";
-    let scrubbed = redactor.scrub(echoed);
-    assert!(!scrubbed.contains("acct:secret-1234"), "{scrubbed}");
-    assert!(!scrubbed.contains("api_key=acct"), "{scrubbed}");
-
-    // the process's redactor also scrubs the daemon's logs
-    let shared = Redactor::shared(&codemode_mcp::config::Config::default());
-    shared.add(whole.secrets);
-    shared.add_keys(whole.fragile);
-    let capture = LogCapture::default();
-    let logs = codemode_mcp::secrets::redacting_logs(capture.clone());
-    let mut writer = logs.make_writer();
-    writeln!(writer, "{echoed}")?;
-    writer.flush()?;
-    let written = capture.text();
-    assert!(!written.contains("acct:secret-1234"), "{written}");
-
-    Ok(())
 }
 
 #[tokio::test]

@@ -504,16 +504,18 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   `#`, `?`, `%`, `&`, `$`, `(`, `)`, space, control or non-ASCII character, which URL parsers, JSON escaping or
   IDNA could turn into a form the redactor does not know; anything else is refused
   (`SecretError::UrlValueUnprotectable`) with an error naming the allowed set. A literal `%` just before a placeholder is written as `%25`, so a value can never
-  complete an escape. A value under six bytes is refused. A whole-URL reference keeps its own rules. The URL a template yields is reported as a
+  complete an escape. A value under six bytes is refused. The URL a template yields is reported as a
   `configuration` failure when it does not parse (`SecretError::NotAUrl`)
 - The secrets of a `url` are exactly the values read from 1Password plus the forms text may print them in: the
   encodings the URL holds them in, uppercase and lowercase
   percent escapes, and JSON escaping. Nothing in a URL is guessed to be a key from its shape, so embed the
   reference where the key sits, e.g.
   `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. A `url`
-  that is one whole reference still works without OAuth, and the redactor then also learns the resolved URL's
-  normalized form, full path (with and without its trailing `/`) and full query, each also percent-decoded, and
-  each decoded query value, and nothing finer. The redactor matches ASCII case-insensitively, also through the percent-decoded view of the text, so a
+  that is one whole reference is refused at config load, with or without OAuth: codemode would have to guess which
+  part of the URL is the key, and matching fragments of the whole URL would redact public text such as `https://`.
+  The redactor matches ASCII case-insensitively, also through the percent- and JSON-escape-decoded views of the text
+  (decoded repeatedly, up to 4 passes, keeping a span map back to the original, since a client's `Debug` output
+  escapes the JSON escapes of a body again), so a
   provider that lowercases a key into a host name cannot slip past. rmcp cuts an invalid response to 256 bytes
   before codemode sees it, so a key at the cut leaves a prefix that no longer matches whole; for a key of at
   least 16 bytes the redactor therefore also replaces any run of 8 or more consecutive bytes that is a substring
@@ -522,8 +524,7 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   daemon's log writer
   (`secrets::redacting_logs`) scrubs with the same redactor, buffering each writer's bytes until `flush` or drop,
   because rmcp and reqwest print the URL in their own log events
-- With `oauth = true` a `url` cannot be one whole reference (refused at config load): codemode can only keep the
-  key out of OAuth state when it knows which part is the key. Everything OAuth writes to `codemode.sqlite`
+- Everything OAuth writes to `codemode.sqlite`
   (credentials at login and on every refresh, pending state, the client registration) passes one check that
   serializes the value and refuses it when it holds a key, raw or percent-decoded, ignoring case; unused vendor
   token fields are dropped. The authorization link is checked whole the same way, and its `resource` parameter is

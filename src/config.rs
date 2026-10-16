@@ -1053,15 +1053,8 @@ impl ServerConfig {
             })?;
         }
         if let Some(url) = &self.url {
-            let template = crate::secrets::UrlTemplate::parse(url)
+            crate::secrets::UrlTemplate::parse(url)
                 .map_err(|error| ConfigError::Invalid(format!("servers.{name}.url: {error}")))?;
-            // the key must be known exactly to keep it out of OAuth state,
-            // which holds only when it sits inside literal text
-            if self.oauth && template.is_whole() {
-                return Err(ConfigError::Invalid(format!(
-                    "servers.{name}.url: with `oauth = true`, the url cannot be a single reference, because codemode can only keep the key out of OAuth state when it knows which part of the url is the key; embed the reference, e.g. url = \"https://host/mcp/{{{{ op://Vault/Item/key }}}}/message\""
-                )));
-            }
         }
 
         match (&self.command, &self.url) {
@@ -1197,11 +1190,17 @@ mod tests {
         assert!(parse("[servers.a]\ncommand = \"x\"\nurl = \"http://y\"").is_err());
         assert!(parse("[servers.a]\npolicy = \"allow\"").is_err());
         assert!(parse("[servers.a]\nurl = \"not a url\"").is_err());
-        assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho/credential }}\"").is_ok());
+        // a url that is one reference is refused, with or without oauth
+        for oauth in ["", "\noauth = true"] {
+            let refused = parse(&format!(
+                "[servers.a]\nurl = \"{{{{ op://Dev/zoho/credential }}}}\"{oauth}"
+            ));
+            assert!(
+                matches!(&refused, Err(ConfigError::Invalid(message)) if message.contains("https://host/mcp/{{ op://Vault/Item/key }}")),
+                "{refused:?}"
+            );
+        }
         assert!(parse("[servers.a]\nurl = \"{{ op://Dev/zoho\"").is_err());
-        assert!(
-            parse("[servers.a]\nurl = \"{{ op://Dev/zoho/credential }}\"\noauth = true").is_err()
-        );
         assert!(
             parse("[servers.a]\nurl = \"https://h/{{ op://Dev/zoho/key }}/m\"\noauth = true")
                 .is_ok()
