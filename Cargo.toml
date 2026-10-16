@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/companion-wire"]
+resolver = "3"
+
 [package]
 name = "codemode-mcp"
 version = "0.3.0"
@@ -11,6 +15,7 @@ async-trait = "0.1.92"
 axum = "0.8.9"
 base64 = "0.22.1"
 clap = { version = "4.6.7", features = ["derive"] }
+companion-wire = { path = "crates/companion-wire", features = ["seal"] }
 color-eyre = "0.6"
 # turso's futures finish on the calling thread, so the store blocks on them
 # without a runtime
@@ -75,7 +80,9 @@ webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialis
 # pull in AppKit, MapKit and CoreLocation bindings nothing here uses
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
-libc = "0.2.190"
+# 0.2.190 limits `in6_ifreq` and the routing socket constants to macOS,
+# which breaks iroh's netdev and netwatch on iOS; held back for the phone
+libc = "0.2.189"
 objc2 = "0.6.5"
 objc2-event-kit = { version = "0.3.2", default-features = false, features = [
     "std",

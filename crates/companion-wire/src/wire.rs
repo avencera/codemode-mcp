@@ -1,10 +1,15 @@
 //! What gateway and companion send each other: one JSON request and one JSON
 //! response per bidirectional stream
+//!
+//! A phone answers the same [`CompanionResponse`]; its own request and
+//! registration are in [`crate::mobile`]
 
 use std::net::SocketAddr;
 
-use iroh::EndpointId;
+use iroh_base::EndpointId;
 use serde::{Deserialize, Serialize};
+
+use crate::mobile::PhoneRegistration;
 
 /// Asks a companion to read one reference
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +77,7 @@ impl std::fmt::Debug for CompanionResponse {
 #[serde(rename_all = "snake_case")]
 pub enum PairRequest {
     /// List this Mac under `secrets.companions`
-    Register(Registration),
+    Register(Box<Registration>),
     /// Read one reference through this Mac, to show the pairing works
     Check,
 }
@@ -91,6 +96,10 @@ pub struct Registration {
     /// discovery off
     #[serde(default)]
     pub addrs: Vec<SocketAddr>,
+    /// Set by a phone, which dials the gateway instead of being dialed and
+    /// opens sealed values instead of running `op`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<PhoneRegistration>,
 }
 
 impl std::fmt::Debug for Registration {
@@ -101,6 +110,7 @@ impl std::fmt::Debug for Registration {
             .field("id", &self.id)
             .field("name", &self.name)
             .field("addrs", &self.addrs)
+            .field("phone", &self.phone)
             .finish_non_exhaustive()
     }
 }
@@ -123,7 +133,8 @@ pub enum PairResponse {
 /// What the companion's config needs from the gateway
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Registered {
-    /// Short host name of the gateway Mac, shown in Touch ID prompts
+    /// Short host name of the gateway Mac, shown in Touch ID and Face ID
+    /// prompts
     pub gateway_name: String,
     /// The name the gateway lists the companion under
     pub name: String,

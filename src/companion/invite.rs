@@ -14,16 +14,12 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::{
-    CompanionFailure, Companions, HANDSHAKE_TIMEOUT, Hangup, InviteSecret, InviteTicket, PairCheck,
-    PairRequest, PairResponse, Registered, Registration, answer,
+    CompanionFailure, Companions, HANDSHAKE_TIMEOUT, Hangup, InviteSecret, InviteTicket, PAIR_ALPN,
+    PairCheck, PairRequest, PairResponse, Registered, Registration, answer,
     pair::{append_section, gateway_entry, read_config},
     read_request,
 };
 use crate::config::{CompanionPeer, Config, MAX_MAC_NAME_CHARS, is_mac_name};
-
-/// Protocol name of pairing; the gateway offers it only while an invite is
-/// open
-pub const PAIR_ALPN: &[u8] = b"codemode-mcp/pair/1";
 
 /// Longest an invite stays open
 pub const MAX_INVITE_LIFETIME: Duration = Duration::from_secs(600);
@@ -371,7 +367,7 @@ impl Companions {
             return;
         };
 
-        let (invite, registered, references, mut pending) = match self.register(registration).await
+        let (invite, registered, references, mut pending) = match self.register(*registration).await
         {
             Ok(registration) => registration,
             Err(message) => {
