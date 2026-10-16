@@ -1,0 +1,51 @@
+# The Xcode project is generated from this file (`just ios-project`) and not
+# checked in, so the two never drift
+name: Companion
+options:
+  bundleIdPrefix: com.avencera.codemode-mcp
+  deploymentTarget:
+    # must match DEPLOYMENT_TARGET in xtask/src/ios.rs
+    iOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  CompanionCore:
+    path: CompanionCore
+settings:
+  base:
+    DEVELOPMENT_TEAM: Q8UP8C53Y8
+    CODE_SIGN_STYLE: Automatic
+    # the generated bindings predate Swift 6's concurrency checks
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Companion:
+    type: application
+    platform: iOS
+    sources:
+      - Companion
+    dependencies:
+      - package: CompanionCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.avencera.codemode-mcp.companion
+        PRODUCT_NAME: Companion
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: Companion/Info.plist
+      properties:
+        CFBundleDisplayName: Companion
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSCameraUsageDescription: Companion scans the QR code `codemode-mcp companion invite` shows, to pair with the gateway.
+        NSFaceIDUsageDescription: Face ID approves each 1Password read the gateway asks this iPhone for.
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    entitlements:
+      path: Companion/Companion.entitlements
+      properties:
+        # an App Store export switches this to production
+        aps-environment: development
+        com.apple.developer.usernotifications.time-sensitive: true

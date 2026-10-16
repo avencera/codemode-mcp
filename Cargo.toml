@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/companion-wire", "mobile"]
+members = [".", "crates/companion-wire", "crates/uniffi_cli", "mobile", "xtask"]
 resolver = "3"
 
 [package]
