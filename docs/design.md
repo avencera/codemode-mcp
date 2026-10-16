@@ -715,11 +715,12 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   present an Accessibility tree claiming any page. The pid is read once per check, so a process that exits
   and whose pid is reused between the two reads would be judged by its successor's signature
 - Browsers that other programs can script are refused, decided in `FieldRule::check` from facts the screen
-  gathers (`Exposure`): the process's arguments from `sysctl` `KERN_PROCARGS2` must not turn on
-  `--remote-debugging-port`, `--remote-debugging-pipe`, Marionette or Firefox's debugger server, and "Allow
-  JavaScript from Apple Events" must be off: Safari's `AllowJavaScriptFromAppleEvents` in its container's
-  preferences plist, Chromium browsers' `browser.allow_javascript_apple_events` in any profile's `Preferences`
-  under the user data directory (`--user-data-dir` when given). A setting that cannot be read, usually
+  gathers (`Exposure`): the process's arguments and environment from `sysctl` `KERN_PROCARGS2` must not turn
+  on `--remote-debugging-port`, `--remote-debugging-pipe`, Marionette (by flag or `MOZ_MARIONETTE`) or
+  Firefox's debugger server, with switches read as the browsers read them (one dash or two, the last one
+  winning), and "Allow JavaScript from Apple Events" must be off: Safari's `AllowJavaScriptFromAppleEvents`
+  in its container's preferences plist, Chromium browsers' `browser.allow_javascript_apple_events` in any
+  profile's `Preferences` under the user data directory (`--user-data-dir` when given). A setting that cannot be read, usually
   Safari's without Full Disk Access, does not refuse; it becomes a note the owner sees with the request.
   These are read once per check, not per character
 - The gateway checks a `logins` `fill` before asking anyone (`FillCheck`, called from `Gateway::prepare`,
@@ -729,8 +730,9 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   github.com in Safari; could not check …`) that the Touch ID prompt and the Mac's own notification carry; the
   phone notification, which crosses ntfy, still names only the tool. `checked` is skipped in the tool's
   schema, so the stub does not offer it, and any value the agent passes is dropped. The server refuses a call
-  without it and sets the rule's `approved_host`, so the check before the read and the one before each
-  character also require the page to still be on the approved host
+  without it and sets the rule's `approved`, so the check before the read and the one before each character
+  also require the field to still be on the approved host, in the approved browser, with no unreadable
+  setting the owner was not shown
 - Where a value may go is decided from Accessibility, not from the agent: the system-wide focused element, its
   role and subrole (`AXSecureTextField` for a password, `AXTextField` or `AXComboBox` for a username), and the
   `AXURL` of every `AXWebArea` above it, innermost first, so a field in a frame lists the frame's document and

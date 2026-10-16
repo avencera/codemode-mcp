@@ -344,24 +344,22 @@ fn browser(pid: libc::pid_t) -> Option<&'static Browser> {
 }
 
 fn exposure(pid: libc::pid_t, browser: &Browser) -> Exposure {
-    let arguments = match browser.scripting {
+    let started = match browser.scripting {
         Scripting::Safari(_) => None,
-        Scripting::Chromium(_) | Scripting::Firefox => Some(arguments(pid)),
+        Scripting::Chromium(_) | Scripting::Firefox => Some(command_line(pid)),
     };
-    let remote_debugging = match &arguments {
+    let remote_debugging = match &started {
         None => Setting::Off,
         Some(None) => Setting::Unknown,
-        Some(Some(arguments)) if arguments.iter().any(|argument| remote_debugging(argument)) => {
-            Setting::On
-        }
+        Some(Some(started)) if started.remote_debugging() => Setting::On,
         Some(Some(_)) => Setting::Off,
     };
     let apple_events_javascript = match browser.scripting {
         Scripting::Safari(bundle) => safari_javascript(bundle),
         Scripting::Chromium(directory) => {
-            let flagged = arguments
+            let flagged = started
                 .flatten()
-                .and_then(|arguments| user_data_dir(&arguments));
+                .and_then(|started| started.switch("user-data-dir").map(PathBuf::from));
             match flagged
                 .or_else(|| home().map(|home| home.join(APPLICATION_SUPPORT).join(directory)))
             {
@@ -385,34 +383,65 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Whether a command line argument turns on a debugging protocol: Chromium's
-/// port or pipe, which Firefox also takes for its own protocol, or Firefox's
-/// Marionette and devtools server
-fn remote_debugging(argument: &str) -> bool {
-    let name = argument.trim_start_matches('-');
-    let name = name.split_once('=').map_or(name, |(name, _)| name);
-    // Firefox takes its flags with one dash as well as two
-    argument.starts_with('-')
-        && matches!(
-            name,
-            "remote-debugging-port"
-                | "remote-debugging-pipe"
-                | "marionette"
-                | "start-debugger-server"
-        )
+/// What a process was started with
+#[derive(Debug, PartialEq, Eq)]
+struct CommandLine {
+    arguments: Vec<String>,
+    /// `NAME=value` entries
+    environment: Vec<String>,
 }
 
-/// A `--user-data-dir` the browser was started with, which moves its
-/// profiles and so the setting
-fn user_data_dir(arguments: &[String]) -> Option<PathBuf> {
-    arguments
-        .iter()
-        .find_map(|argument| argument.strip_prefix("--user-data-dir=").map(PathBuf::from))
+impl CommandLine {
+    /// Whether it turns on a debugging protocol: Chromium's port or pipe,
+    /// which Firefox also takes for its own protocol, or Firefox's
+    /// Marionette, by flag or environment, and devtools server
+    fn remote_debugging(&self) -> bool {
+        self.arguments.iter().any(|argument| {
+            switch_name(argument).is_some_and(|(name, _)| {
+                matches!(
+                    name,
+                    "remote-debugging-port"
+                        | "remote-debugging-pipe"
+                        | "marionette"
+                        | "start-debugger-server"
+                )
+            })
+        }) || self.environment.iter().any(|entry| {
+            entry
+                .split_once('=')
+                .is_some_and(|(name, _)| name == "MOZ_MARIONETTE")
+        })
+    }
+
+    /// The value of switch `name`, read as Chromium reads it: with one dash
+    /// or two, and the last one given winning
+    fn switch(&self, name: &str) -> Option<&str> {
+        self.arguments
+            .iter()
+            .rev()
+            .map(String::as_str)
+            .filter_map(switch_name)
+            .find(|(switch, _)| *switch == name)
+            .map(|(_, value)| value.unwrap_or_default())
+    }
+}
+
+/// A switch's name and value, for an argument that starts with one dash or
+/// two, as Chromium and Firefox both take them
+fn switch_name(argument: &str) -> Option<(&str, Option<&str>)> {
+    let switch = argument
+        .strip_prefix("--")
+        .or_else(|| argument.strip_prefix('-'))?;
+
+    Some(match switch.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (switch, None),
+    })
 }
 
 /// The command line of process `pid`, from `KERN_PROCARGS2`; `None` when
 /// the kernel will not say, as for another user's process
-fn arguments(pid: libc::pid_t) -> Option<Vec<String>> {
+fn command_line(pid: libc::pid_t) -> Option<CommandLine> {
     let mut max: libc::c_int = 0;
     let mut size = std::mem::size_of::<libc::c_int>();
     let mut name = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -454,20 +483,27 @@ fn arguments(pid: libc::pid_t) -> Option<Vec<String>> {
     procargs(&buffer)
 }
 
-/// The arguments in a `KERN_PROCARGS2` answer: the argument count, the
-/// executable's path, padding, then the arguments, each ending in a NUL
-fn procargs(buffer: &[u8]) -> Option<Vec<String>> {
+/// The arguments and environment in a `KERN_PROCARGS2` answer: the
+/// argument count, the executable's path, padding, then the arguments and
+/// the environment, each ending in a NUL, until an empty one
+fn procargs(buffer: &[u8]) -> Option<CommandLine> {
     let (count, rest) = buffer.split_first_chunk::<4>()?;
     let count = usize::try_from(i32::from_ne_bytes(*count)).ok()?;
     let rest = &rest[rest.iter().position(|byte| *byte == 0)?..];
     let rest = &rest[rest.iter().position(|byte| *byte != 0)?..];
-    let arguments: Vec<String> = rest
+    let mut entries = rest
         .split(|byte| *byte == 0)
-        .take(count)
-        .map(|argument| String::from_utf8_lossy(argument).into_owned())
-        .collect();
+        .map(|entry| String::from_utf8_lossy(entry).into_owned());
+    let arguments: Vec<String> = entries.by_ref().take(count).collect();
+    if arguments.len() != count {
+        return None;
+    }
+    let environment = entries.take_while(|entry| !entry.is_empty()).collect();
 
-    (arguments.len() == count).then_some(arguments)
+    Some(CommandLine {
+        arguments,
+        environment,
+    })
 }
 
 /// Safari's "Allow JavaScript from Apple Events", from its container, which
@@ -617,7 +653,7 @@ mod tests {
     use core_foundation::url::CFURL;
     use security_framework::os::macos::code_signing::{Flags, SecRequirement, SecStaticCode};
 
-    use super::{BROWSERS, arguments, procargs, remote_debugging};
+    use super::{BROWSERS, CommandLine, command_line, procargs};
 
     #[test]
     fn every_requirement_compiles_and_matches_its_installed_browser() {
@@ -656,24 +692,41 @@ mod tests {
         }
     }
 
+    fn started(arguments: &[&str], environment: &[&str]) -> CommandLine {
+        CommandLine {
+            arguments: arguments.iter().map(|text| (*text).to_owned()).collect(),
+            environment: environment.iter().map(|text| (*text).to_owned()).collect(),
+        }
+    }
+
     #[test]
     fn the_kernel_reports_this_process_s_own_arguments() {
         let expected: Vec<String> = std::env::args().collect();
+        let own = command_line(std::process::id() as libc::pid_t);
+        assert_eq!(own.as_ref().map(|own| &own.arguments), Some(&expected));
+        assert!(
+            own.is_some_and(|own| own
+                .environment
+                .iter()
+                .any(|entry| entry.starts_with("PATH="))),
+            "no environment"
+        );
 
-        assert_eq!(arguments(std::process::id() as libc::pid_t), Some(expected));
         let mut answer = 2_i32.to_ne_bytes().to_vec();
-        answer.extend_from_slice(b"/bin/x\0\0\0x\0--remote-debugging-port=9222\0HOME=/u\0");
+        answer.extend_from_slice(
+            b"/bin/x\0\0\0x\0--remote-debugging-port=9222\0MOZ_MARIONETTE=1\0\0junk\0",
+        );
         assert_eq!(
             procargs(&answer),
-            Some(vec![
-                "x".to_owned(),
-                "--remote-debugging-port=9222".to_owned()
-            ])
+            Some(started(
+                &["x", "--remote-debugging-port=9222"],
+                &["MOZ_MARIONETTE=1"]
+            ))
         );
     }
 
     #[test]
-    fn debugging_flags_are_found_in_either_form() {
+    fn debugging_and_profile_switches_are_read_as_the_browser_reads_them() {
         for flag in [
             "--remote-debugging-port=9222",
             "--remote-debugging-port=0",
@@ -683,14 +736,30 @@ mod tests {
             "-marionette",
             "--start-debugger-server=6000",
         ] {
-            assert!(remote_debugging(flag), "{flag}");
+            assert!(started(&["x", flag], &[]).remote_debugging(), "{flag}");
         }
+        assert!(started(&["x"], &["MOZ_MARIONETTE="]).remote_debugging());
         for other in [
             "https://example.com/--remote-debugging-port",
             "--remote-allow-origins=*",
             "marionette",
         ] {
-            assert!(!remote_debugging(other), "{other}");
+            assert!(
+                !started(&["x", other], &["HOME=/u"]).remote_debugging(),
+                "{other}"
+            );
         }
+
+        // the last one wins, with either dash, as in Chromium
+        let profiles = started(
+            &[
+                "x",
+                "--user-data-dir=/a",
+                "-user-data-dir=/b",
+                "--user-data-dirx=/c",
+            ],
+            &[],
+        );
+        assert_eq!(profiles.switch("user-data-dir"), Some("/b"));
     }
 }

@@ -150,9 +150,10 @@ pub struct FieldRule {
     /// Hosts a page must be on: `github.com` is that host only, and
     /// `*.github.com` any host under it
     pub sites: Vec<String>,
-    /// The host the owner approved, which the page must still be on; `None`
+    /// What the owner approved: the field must still be on that host, in
+    /// that browser, with nothing unchecked they were not told of; `None`
     /// before the owner was asked
-    pub approved_host: Option<String>,
+    pub approved: Option<Checked>,
 }
 
 /// Whether `host` is `site`, or under it for a `*.` site
@@ -234,13 +235,27 @@ impl FieldRule {
         for page in outer {
             self.page_host(page)?;
         }
-        if let Some(approved) = &self.approved_host
-            && *approved != host
-        {
-            return refuse(format!(
-                "the focused field is now on {host}, but the owner approved filling on \
-                 {approved}; fill again to ask for {host}"
-            ));
+        if let Some(approved) = &self.approved {
+            if approved.host != host {
+                return refuse(format!(
+                    "the focused field is now on {host}, but the owner approved filling on {}; \
+                     fill again to ask for {host}",
+                    approved.host
+                ));
+            }
+            // the same host in another browser, or one whose settings could
+            // no longer be read, is not what the owner saw
+            let unseen = focused
+                .unchecked()
+                .into_iter()
+                .any(|note| !approved.unchecked.contains(&note));
+            if approved.browser != *browser || unseen {
+                return refuse(format!(
+                    "the focused field is now in {browser}, not as the owner approved in {}; \
+                     fill again to ask",
+                    approved.browser
+                ));
+            }
         }
 
         Ok(host)
@@ -365,7 +380,7 @@ fn target(
     let rule = FieldRule {
         field,
         sites: login.sites.clone(),
-        approved_host: None,
+        approved: None,
     };
 
     Ok((reference.clone(), rule))
@@ -543,7 +558,7 @@ impl LoginsServer {
                 "fill runs only through the gateway's approval, which checks the field first",
             ));
         };
-        rule.approved_host = Some(checked.host);
+        rule.approved = Some(checked);
         let Some(mac) = &self.0.mac else {
             return Err(failed(
                 "filling needs the Mac's screen, which this process cannot reach",
@@ -620,7 +635,7 @@ mod tests {
         FieldRule {
             field,
             sites: vec!["github.com".to_owned(), "*.github.io".to_owned()],
-            approved_host: None,
+            approved: None,
         }
     }
 
