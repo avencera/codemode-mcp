@@ -438,16 +438,21 @@ impl Companions {
                 ),
             },
             PhoneRequest::Unpair => {
+                // first, and refused when it fails: the id is dead, so pairing
+                // it again must be approved again, and a record left behind
+                // would trust it at the next start while the config lists it
+                if let Err(error) = self.trust.forget(phone.id) {
+                    tracing::warn!(phone = %phone.name, %error, "could not drop its trust record");
+                    let refused = PhoneResponse::Refused { message: error };
+
+                    return (refused, false);
+                }
                 if let Err(error) = store.forget_phone(&key) {
                     let refused = PhoneResponse::Refused {
                         message: error.to_string(),
                     };
 
                     return (refused, false);
-                }
-                // the id is dead, so pairing it again must be approved again
-                if let Err(error) = self.trust.forget(phone.id) {
-                    tracing::warn!(phone = %phone.name, %error, "could not drop its trust record");
                 }
                 self.phones
                     .write()

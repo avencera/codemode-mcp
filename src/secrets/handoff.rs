@@ -101,16 +101,7 @@ impl Consumers {
         let mut consumers = Self::default();
         for (name, server) in &config.servers {
             let digest = consumer_digest(name, server);
-            let texts = server
-                .env
-                .values()
-                .chain(server.headers.values())
-                .chain(&server.url)
-                .chain(&server.client_secret);
-            // a malformed value fails the server's own read, which reads
-            // nothing; it has no reference to bind here
-            let references = texts.flat_map(|text| super::references(text).unwrap_or_default());
-            for reference in references {
+            for reference in server_references(server) {
                 consumers
                     .0
                     .entry(reference.to_owned())
@@ -134,6 +125,29 @@ impl Consumers {
             .get(reference)
             .is_some_and(|before| now.is_subset(before))
     }
+}
+
+/// The names of `config`'s servers that fill `reference` in
+pub fn servers_using(config: &Config, reference: &str) -> Vec<String> {
+    config
+        .servers
+        .iter()
+        .filter(|(_, server)| server_references(server).any(|used| used == reference))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Every reference `server` fills in, wherever its config holds one
+fn server_references(server: &ServerConfig) -> impl Iterator<Item = &str> {
+    server
+        .env
+        .values()
+        .chain(server.headers.values())
+        .chain(&server.url)
+        .chain(&server.client_secret)
+        // a malformed value fails the server's own read, which reads
+        // nothing; it has no reference to bind here
+        .flat_map(|text| super::references(text).unwrap_or_default())
 }
 
 /// Hex SHA-256 of what decides where `server`'s values go
@@ -227,8 +241,11 @@ pub fn hand_off(
 /// What [`take_over`] found
 #[derive(Debug, Default)]
 pub struct TakenOver {
-    /// The values `consumers` may have
+    /// The values `consumers` may have; [`crate::secrets::OnePassword`]
+    /// moves them into its cache, leaving the count
     pub values: HashMap<String, String>,
+    /// How many values were taken
+    pub taken: usize,
     /// References whose value was dropped, since a server now using it was
     /// changed or added since the handoff
     pub dropped: Vec<String>,
@@ -291,6 +308,7 @@ pub fn take_over(
                 serde_json::from_slice(opened).map_err(|error| error.to_string())?;
 
             return Ok(TakenOver {
+                taken: values.len(),
                 values,
                 dropped: Vec::new(),
             });
@@ -308,6 +326,7 @@ pub fn take_over(
         }
     }
     taken.dropped.sort();
+    taken.taken = taken.values.len();
 
     Ok(taken)
 }

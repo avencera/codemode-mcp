@@ -24,7 +24,7 @@ use tokio::{sync::Mutex, task::JoinSet};
 use crate::{
     companion::{Companions, CreatedItem, DeviceTrust, NewItem},
     config::{Config, SecretsConfig},
-    mac::OnMac,
+    mac::{OnMac, TouchId},
     store::Store,
 };
 
@@ -858,6 +858,11 @@ pub struct OnePassword {
     /// Values a program read with a keep window, by destination and
     /// reference, until it ends; never handed to the next daemon
     kept: Arc<Mutex<KeptValues>>,
+    /// References the last daemon held but a server now using them was
+    /// changed or added since, with those servers' names: this Mac reads
+    /// one only after its own Touch ID prompt names them, since 1Password
+    /// may answer `op` unprompted for minutes after any earlier approval
+    reapprove: Arc<std::sync::Mutex<HashMap<String, Vec<String>>>>,
     companions: Option<Arc<Companions>>,
     on_mac: Option<OnMac>,
 }
@@ -900,6 +905,7 @@ impl OnePassword {
             program: program.into(),
             known: Arc::default(),
             kept: Arc::default(),
+            reapprove: Arc::default(),
             companions: None,
             on_mac: None,
         }
@@ -947,6 +953,14 @@ impl OnePassword {
             .lock()
             .await
             .extend(std::mem::take(&mut taken.values));
+        self.reapprove
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                taken.dropped.iter().map(|reference| {
+                    (reference.clone(), handoff::servers_using(config, reference))
+                }),
+            );
 
         Ok(taken)
     }
@@ -1114,6 +1128,10 @@ impl OnePassword {
 
     async fn read(&self, reference: &str) -> Result<String, SecretError> {
         let value = self.race(reference).await?;
+        self.reapprove
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(reference);
         // whichever source won, its value replaces the phones' copies: a
         // value the owner entered on a phone is opened with Face ID next time
         if let Some(companions) = &self.companions {
@@ -1147,7 +1165,7 @@ impl OnePassword {
             .as_ref()
             .filter(|_| !peers.is_empty() || !phones.is_empty())
         else {
-            return self.read_local(reference).await;
+            return self.read_for_config(reference).await;
         };
 
         let local = match &self.on_mac {
@@ -1160,7 +1178,7 @@ impl OnePassword {
             let reference = reference.to_owned();
             sources.spawn(async move {
                 let value = onepassword
-                    .read_local(&reference)
+                    .read_for_config(&reference)
                     .await
                     .map_err(|error| error.reason());
 
@@ -1231,6 +1249,45 @@ impl OnePassword {
                 timeout: READ_TIMEOUT,
             }),
         }
+    }
+
+    /// Reads `reference` for a configured server on this Mac, after a Touch
+    /// ID prompt when a server using it changed since the last daemon read
+    /// it; any source's value clears that, as the owner approved it there
+    async fn read_for_config(&self, reference: &str) -> Result<String, SecretError> {
+        let servers = self
+            .reapprove
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(reference)
+            .cloned();
+        // without a Mac to ask on there is no prompt of codemode's own,
+        // as for every config read there
+        if let (Some(servers), Some(on_mac)) = (servers, &self.on_mac) {
+            let text = crate::prompt::one_line(
+                &format!(
+                    "Read {reference} for {}, changed since it was last given this value",
+                    servers.join(", ")
+                ),
+                usize::MAX,
+            );
+            let refused = |reason: &str| SecretError::Read {
+                reference: reference.to_owned(),
+                reason: format!("this Mac: {reason}"),
+            };
+            // a prompt nobody answers gives up with the read
+            let answer = tokio::time::timeout(READ_TIMEOUT, on_mac.mac.touch_id(&text, "Deny"))
+                .await
+                .unwrap_or(TouchId::Away);
+            match answer {
+                TouchId::Approved => {}
+                TouchId::Review => return Err(refused("not approved")),
+                TouchId::Away => return Err(refused("the prompt was taken down")),
+                TouchId::Unavailable => return Err(refused("Touch ID is unavailable")),
+            }
+        }
+
+        self.read_local(reference).await
     }
 
     /// Runs `op read` on this Mac, with no cache and no companions

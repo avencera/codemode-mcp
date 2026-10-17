@@ -195,16 +195,14 @@ impl App {
         };
         match taken {
             Ok(taken) => {
-                if !taken.values.is_empty() {
-                    tracing::info!(
-                        count = taken.values.len(),
-                        "took over the last daemon's secrets"
-                    );
+                if taken.taken > 0 {
+                    tracing::info!(count = taken.taken, "took over the last daemon's secrets");
                 }
                 if !taken.dropped.is_empty() {
                     tracing::warn!(
                         references = ?taken.dropped,
-                        "a server using these changed since the last daemon; asking for them again"
+                        "a server using these changed since the last daemon; asking for them \
+                         again, with Touch ID first on this Mac"
                     );
                 }
             }

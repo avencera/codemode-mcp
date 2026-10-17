@@ -17,8 +17,10 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing_subscriber::fmt::MakeWriter;
 
+use codemode_mcp::mac::TouchId;
+
 use super::{
-    harness::{Harness, Setup, Stop, TestResult, execute, temp_state_dir, text_of},
+    harness::{FakeMac, Harness, Setup, Stop, TestResult, execute, temp_state_dir, text_of},
     oauth::Locked,
 };
 
@@ -591,14 +593,24 @@ async fn a_url_key_that_breaks_the_rules_is_a_configuration_error() -> TestResul
 async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() -> TestResult {
     let (op, log) = fake_op()?;
     let extra = format!("[secrets]\nop = \"{op}\"\n", op = op.display());
+    let mac = Arc::new(FakeMac::default());
+    mac.set_present(true);
+    mac.set_answer(Some(TouchId::Approved));
     let Some(harness) = Harness::with(Setup {
         server: "env = { FIXTURE_SECRET = \"{{ op://Dev/fixture/credential }}\" }",
         extra: &extra,
+        mac: Some(Arc::clone(&mac)),
         ..Setup::default()
     })
     .await?
     else {
         return Ok(());
+    };
+    let touch_prompts = || {
+        mac.shown()
+            .into_iter()
+            .filter(|shown| shown.starts_with("touch_id "))
+            .collect::<Vec<_>>()
     };
     // the length only, so the value is not in the stored result
     let script = r#"len(str(await fixture_env(name="FIXTURE_SECRET")))"#;
@@ -630,7 +642,10 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
     assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
 
     // but a server whose environment changed, which could send the value
-    // anywhere, asks again instead of getting it from the last daemon
+    // anywhere, asks again instead of getting it from the last daemon, and
+    // this Mac reads it only after a Touch ID prompt naming the server,
+    // since 1Password may answer `op` unprompted for a while
+    assert_eq!(touch_prompts(), Vec::<String>::new());
     let harness = harness
         .restart_with(Stop::Drain, |config| {
             if let Some(server) = config.servers.get_mut("fixture") {
@@ -642,6 +657,13 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
         .await?;
     assert!(value(&harness.execute_json(script).await?));
     assert_eq!(reads(&log, "op://Dev/fixture/credential"), 3);
+    assert_eq!(
+        touch_prompts(),
+        [
+            "touch_id Read op://Dev/fixture/credential for fixture, changed since it was last \
+             given this value"
+        ]
+    );
 
     // forgetting, as `service restart --fresh` does, hands nothing over
     let (status, forgot) = harness

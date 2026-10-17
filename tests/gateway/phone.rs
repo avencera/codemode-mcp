@@ -1408,7 +1408,17 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
     assert_eq!(status, 403, "{refused}");
     assert_eq!(untrusted_in_health(&harness).await?, json!(["stranger"]));
 
+    // the file as it is now decides: taken out of it since the start, the
+    // phone is not offered for trust at all
+    let listed_text = std::fs::read_to_string(&path)?;
+    std::fs::write(&path, listed_text.replacen(&entry, "", 1))?;
+    let prompts = touch_prompts(&gateway_mac).len();
     gateway_mac.set_answer(Some(TouchId::Approved));
+    let (status, refused) = trust().await?;
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(touch_prompts(&gateway_mac).len(), prompts);
+    std::fs::write(&path, listed_text)?;
+
     let (status, trusted_now) = trust().await?;
     assert_eq!(status, 200, "{trusted_now}");
     assert_eq!(trusted_now["device"]["kind"], "phone", "{trusted_now}");

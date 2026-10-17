@@ -575,8 +575,11 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   the SHA-256 digests of the servers filling it in (name, command, args, cwd, env, url, headers, OAuth client),
   and the next daemon drops it when one of its own servers using that reference has another digest, so
   something able to edit the config file cannot redirect a value to a new command across a restart without a
-  prompt. Policy and tool settings stay out of the digest, so editing them asks nothing. Format 1 handoffs from
-  0.6 carry no digests and are taken whole, so the upgrade itself asks nothing. The owner-only
+  prompt. A dropped reference is read on this Mac only after a codemode Touch ID prompt naming the servers
+  (`OnePassword.reapprove`), as 1Password can answer `op` unprompted for minutes after any approval; a phone or
+  companion Mac asks as always, and any approved read clears it. Policy and tool settings stay out of the
+  digest, so editing them asks nothing. Format 1 handoffs from 0.6 carry no digests and are taken whole, so
+  the upgrade itself asks nothing; a config edited before that one restart is not caught. The owner-only
   `POST /admin/secrets/forget` (`service restart --fresh`) empties the cache first, for a rotated key. Program
   reads never enter the cache, so never the handoff. Trade-off: for the seconds of a restart the values are at
   rest on the gateway Mac, encrypted, with the key in the keychain; anything running as the signed binary could
@@ -714,7 +717,10 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   key it creates a key and trusts nothing, so deleting the keychain item alone does not re-trust the config.
   One-off runs never create the key and trust nothing without it. A same-user process that deletes both the
   keychain item and `devices.trust` still gets the migration on the next start; nothing in reach of this user
-  can tell that apart from a first start
+  can tell that apart from a first start. Records carry no generation, so a copy of `devices.trust` saved
+  before an unpair and put back restores that phone's trust; it is still useless without that phone's Secure
+  Enclave key. Unpairing drops the record before anything else and fails when it cannot. `companion trust`
+  takes the device from the config file as it is now and checks it is still listed the same once approved
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
   stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt

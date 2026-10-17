@@ -444,7 +444,16 @@ impl Companions {
         .await?;
 
         let _turn = self.registering.lock().await;
-        // the list may have changed while the prompt was up
+        // the list may have changed while the prompt was up: the device must
+        // still be listed exactly as the prompt named it
+        if !self
+            .trust_candidate(name)
+            .is_ok_and(|listed| listed.identity() == device.identity())
+        {
+            return Err(CompanionFailure::Trust(format!(
+                "{name} changed or was removed while the prompt was up; try again"
+            )));
+        }
         if self.devices().iter().any(|listed| {
             listed.trusted && (listed.device.name() == name || listed.device.id() == device.id())
         }) {
@@ -479,7 +488,10 @@ impl Companions {
                 "{name} is already trusted"
             )));
         }
-        let in_file = match &self.config_path {
+        // the file as it is now decides, so a device removed from it since
+        // the daemon started cannot be trusted; without a file, what the
+        // daemon started with
+        let listed = match &self.config_path {
             Some(path) => {
                 let text = read_config(path).map_err(|error| {
                     CompanionFailure::Trust(format!("cannot read {}: {error}", path.display()))
@@ -489,16 +501,15 @@ impl Companions {
 
                 Device::listed(&config.secrets)
             }
-            None => Vec::new(),
+            None => self.untrusted(),
         };
 
-        let mut named: Vec<Device> = in_file
+        let mut named: Vec<Device> = listed
             .into_iter()
-            .chain(self.untrusted())
             .filter(|device| device.name() == name)
             .collect();
-        // the same device can come from both the file and the untrusted
-        // list; only the full identity says two entries are one device
+        // one device listed twice is still one device; only the full
+        // identity says two entries are the same
         let mut seen = std::collections::HashSet::new();
         named.retain(|device| seen.insert(device.identity()));
         // the prompt names one device, so a name standing for two is refused
