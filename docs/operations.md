@@ -460,11 +460,13 @@ codemode-mcp companion trust mba
 ```
 
 `companion trust` reads the config again, so a block appended since the daemon started is found too. It asks Touch
-ID on the gateway Mac naming the device ("Trust the Mac “mba” to answer and receive codemode-mcp secrets"), and is refused
-at once while you are not there. Once approved, the daemon uses the device without a restart; a phone gets copies
+ID on the gateway Mac naming the device and its fingerprint ("Trust the Mac “mba” (1a2b-3c4d-5e6f-7a8b) to answer and receive
+codemode-mcp secrets"); check it against the fingerprint `companion list` shows. It is refused at once while you
+are not there, and when two listed devices share the name. Once approved, the daemon uses the device without a restart; a phone gets copies
 of what was read since the daemon started, as at pairing. An unexpected device in the list, or a pairing or trust
 prompt you did not ask for, means another program edited the config or holds the admin token; deny it and remove
-the entry.
+the entry. If the trust key goes missing while its records remain, the daemon trusts no device until you run
+`companion trust` for each again, rather than trusting whatever the config then lists.
 
 ## Calendar and Reminders access
 

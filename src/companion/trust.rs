@@ -18,8 +18,11 @@
 //! since a config edit that moved the key to a file would leave no key and
 //! so trust the whole config again
 //!
-//! A daemon that finds no key makes one and trusts every device the config
-//! lists at that moment, so upgrading changes nothing for the owner
+//! A daemon that finds no key and no records makes a key and trusts every
+//! device the config lists at that moment, so upgrading changes nothing for
+//! the owner. With records but no key, the key was lost or removed, which
+//! must not trust the config as it now stands: that daemon makes a new key
+//! and trusts nothing until the owner trusts each device again
 
 use std::{
     io::Write,
@@ -31,7 +34,7 @@ use std::{
 use hmac::{Hmac, KeyInit, Mac as _};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 use super::{ASK_TIMEOUT, CompanionFailure, Companions, pair::read_config};
 use crate::{
@@ -90,6 +93,20 @@ impl Device {
             Self::Mac(_) => "mac",
             Self::Phone(_) => "phone",
         }
+    }
+
+    /// A digest of what a record covers, shown wherever the owner approves
+    /// or reviews a device, so two devices listed under one name read
+    /// differently; 64 bits, too many to grind a matching key for, in four
+    /// groups so it can be compared by eye
+    pub fn fingerprint(&self) -> String {
+        let digest = Sha256::digest(self.identity().as_bytes());
+
+        digest[..8]
+            .chunks(2)
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join("-")
     }
 
     /// What a record covers; the name and a Mac's addresses are left out,
@@ -173,7 +190,15 @@ impl DeviceTrust {
             Ok(None) if may_create => {
                 let key: [u8; 32] = rand::random();
                 let trust = with_key(&key);
-                let devices = Device::listed(listed);
+                let devices = if trust.load().records.is_empty() {
+                    Device::listed(listed)
+                } else {
+                    tracing::warn!(
+                        "the device trust key is gone but its records are not, so no device is \
+                         trusted; approve each with `codemode-mcp companion trust <name>`"
+                    );
+                    Vec::new()
+                };
                 // records first: a key stored without them would leave every
                 // device untrusted, while records without a key are redone
                 for device in &devices {
@@ -417,7 +442,10 @@ impl Companions {
             Device::Phone(_) => "phone",
         };
         self.ask_owner(
-            &format!("Trust the {kind} “{name}” to answer and receive codemode-mcp secrets"),
+            &format!(
+                "Trust the {kind} “{name}” ({}) to answer and receive codemode-mcp secrets",
+                device.fingerprint()
+            ),
             "trusting a device",
         )
         .await?;
@@ -471,15 +499,26 @@ impl Companions {
             None => Vec::new(),
         };
 
-        in_file
+        let mut named: Vec<Device> = in_file
             .into_iter()
             .chain(self.untrusted())
-            .find(|device| device.name() == name)
-            .ok_or_else(|| {
-                CompanionFailure::Trust(format!(
-                    "no companion or phone named {name} is listed under [secrets]"
-                ))
-            })
+            .filter(|device| device.name() == name)
+            .collect();
+        // the same device can come from both the file and the untrusted
+        // list; only the full identity says two entries are one device
+        let mut seen = std::collections::HashSet::new();
+        named.retain(|device| seen.insert(device.identity()));
+        // the prompt names one device, so a name standing for two is refused
+        // rather than trusting whichever comes first
+        match named.len() {
+            0 => Err(CompanionFailure::Trust(format!(
+                "no companion or phone named {name} is listed under [secrets]"
+            ))),
+            1 => Ok(named.remove(0)),
+            _ => Err(CompanionFailure::Trust(format!(
+                "several devices are listed as {name}; rename all but one"
+            ))),
+        }
     }
 }
 
@@ -529,9 +568,22 @@ mod tests {
         let forged = std::fs::read_to_string(directory.join("forged"))
             .unwrap_or_else(|error| panic!("{error}"));
         std::fs::write(&records, forged).unwrap_or_else(|error| panic!("{error}"));
-        let reopened = DeviceTrust::open_with(&store, records, &none, true);
+        let reopened = DeviceTrust::open_with(&store, records.clone(), &none, true);
         assert!(!reopened.is_trusted(&phone(2)));
         assert!(!reopened.is_trusted(&phone(1)));
+
+        // with records left, a lost key trusts nothing the config lists
+        let _ = std::fs::remove_file(directory.join(KEY_FILE));
+        let listed = SecretsConfig {
+            phones: vec![match phone(3) {
+                Device::Phone(peer) => peer,
+                Device::Mac(_) => unreachable!("a phone"),
+            }],
+            ..SecretsConfig::default()
+        };
+        let rekeyed = DeviceTrust::open_with(&store, records, &listed, true);
+        assert!(rekeyed.has_key());
+        assert!(!rekeyed.is_trusted(&phone(3)));
 
         let _ = std::fs::remove_dir_all(&directory);
     }

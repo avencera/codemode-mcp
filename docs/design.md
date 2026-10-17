@@ -703,15 +703,18 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   and serves checkout builds and tests. Unlike the handoff it ignores `secrets.identity_file`: a config edit
   that moved the key to a file would leave no key and trigger the migration below. A record is written after
   the owner approves: a registration with an approved invite gets one before it is listed, used or backfilled,
-  and `companion trust <name>` (`POST /admin/companion/trust`, owner proof) asks Touch ID naming the device,
-  then writes it and activates the device with no restart, reading the config file again so an entry appended
+  and `companion trust <name>` (`POST /admin/companion/trust`, owner proof) asks Touch ID naming the device
+  and a 64-bit fingerprint of what its record covers (also in `companion list`), refuses a name two listed
+  devices share, then writes it and activates the device with no restart, reading the config file again so an entry appended
   since start is found. Listed devices without a valid record are kept apart: never asked, sealed to or
   backfilled, refused at the phone handshake, logged at start, and shown in `/healthz` (`untrusted_devices`)
   and `companion list` (`POST /admin/companion/list`). An unpairing phone's record is dropped. Migration: a
-  daemon that finds no key creates one and trusts everything the config lists then (records first, then the
-  key, so a crash between them redoes it), so upgrading changes nothing. One-off runs never create the key and
-  trust nothing without it. A same-user process able to delete the keychain item would get that migration again on
-  the next start
+  daemon that finds no key and no records creates a key and trusts everything the config lists then (records
+  first, then the key, so a crash between them redoes it), so upgrading changes nothing. With records but no
+  key it creates a key and trusts nothing, so deleting the keychain item alone does not re-trust the config.
+  One-off runs never create the key and trust nothing without it. A same-user process that deletes both the
+  keychain item and `devices.trust` still gets the migration on the next start; nothing in reach of this user
+  can tell that apart from a first start
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
   stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt

@@ -1412,9 +1412,18 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
     let (status, trusted_now) = trust().await?;
     assert_eq!(status, 200, "{trusted_now}");
     assert_eq!(trusted_now["device"]["kind"], "phone", "{trusted_now}");
+    // the prompt shows the fingerprint `companion list` gives, so the owner
+    // can tell this phone from another listed under the same name
+    let fingerprint = trusted_now["device"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(fingerprint.len(), 19, "{trusted_now}");
     assert_eq!(
-        touch_prompts(&gateway_mac).last().map(String::as_str),
-        Some("touch_id Trust the phone “stranger” to answer and receive codemode-mcp secrets")
+        touch_prompts(&gateway_mac).last().cloned(),
+        Some(format!(
+            "touch_id Trust the phone “stranger” ({fingerprint}) to answer and receive \
+             codemode-mcp secrets"
+        ))
     );
     assert_eq!(untrusted_in_health(&harness).await?, json!([]));
 

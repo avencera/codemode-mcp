@@ -425,6 +425,9 @@ pub struct DeviceEntry {
     pub kind: String,
     /// Its iroh endpoint id
     pub id: EndpointId,
+    /// Short digest of what its trust record covers, as the Touch ID prompt
+    /// that trusts it shows
+    pub fingerprint: String,
     /// Whether the gateway uses it; an untrusted one waits for
     /// `codemode-mcp companion trust <name>`
     pub trusted: bool,
@@ -457,6 +460,7 @@ impl From<companion::ListedDevice> for DeviceEntry {
             name: listed.device.name().to_owned(),
             kind: listed.device.kind().to_owned(),
             id: listed.device.id(),
+            fingerprint: listed.device.fingerprint(),
             trusted: listed.trusted,
         }
     }

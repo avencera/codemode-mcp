@@ -952,12 +952,18 @@ async fn companion_command(
                         device.name
                     )
                 };
-                println!("{} ({}, {}): {state}", device.name, device.kind, device.id);
+                println!(
+                    "{} ({}, {}, fingerprint {}): {state}",
+                    device.name, device.kind, device.id, device.fingerprint
+                );
             }
         }
         CompanionCommand::Trust { name } => {
             let config = load_or_default(path)?;
-            println!("Approve trusting {name} with Touch ID on this Mac.");
+            println!(
+                "Approve trusting {name} with Touch ID on this Mac; check that the prompt shows \
+                 the fingerprint `codemode-mcp companion list` gives for it."
+            );
             let trusted: CompanionTrustResponse = admin_post_as_owner(
                 &config,
                 "/admin/companion/trust",
@@ -965,8 +971,8 @@ async fn companion_command(
             )
             .await?;
             println!(
-                "{} ({}) is trusted; the daemon uses it from now on.",
-                trusted.device.name, trusted.device.kind
+                "{} ({}, fingerprint {}) is trusted; the daemon uses it from now on.",
+                trusted.device.name, trusted.device.kind, trusted.device.fingerprint
             );
         }
         CompanionCommand::Id { identity_file } => {
