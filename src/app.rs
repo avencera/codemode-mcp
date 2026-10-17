@@ -8,6 +8,7 @@ use std::{
 use crate::{
     admin::attach_action,
     approvals::{Approvals, NO_APPROVAL_PAGE, NO_NOTIFIER},
+    companion::DeviceTrust,
     config::{Config, ConfigError},
     executions::Executions,
     executor::{Executor, ExecutorError},
@@ -16,7 +17,11 @@ use crate::{
     notify::{Notifier, Ntfy},
     oauth::OAuth,
     passkeys::{PasskeyError, Passkeys},
-    secrets::{Secrets, handoff::KeyStore},
+    secrets::{
+        Secrets,
+        approved::{self, Approved},
+        handoff,
+    },
     snapshot::Sealer,
     store::{Store, StoreError},
     usage::UsageLog,
@@ -165,17 +170,31 @@ impl App {
         // turning Mac notifications off stops approvals asking at the Mac,
         // not secret reads checking whether the owner is there
         let on_mac = presence.clone().filter(|_| config.notify.mac.enabled);
+        // only the daemon sets trust up: a one-off run without the key trusts
+        // nothing rather than whatever the config lists
+        // with the servers the config lists approved for their values as
+        // part of the same set-up, so upgrading asks nothing
+        let trust = DeviceTrust::open(&state_dir, &config.secrets, role == Role::Daemon, |trust| {
+            Approved::approve_config(&state_dir, trust.derived_key(approved::KEY_DOMAIN), &config)
+        });
+        // a one-off run reads as `op` itself would, so it gates nothing
+        let approved = match role {
+            Role::Daemon => Approved::open(&state_dir, trust.derived_key(approved::KEY_DOMAIN)),
+            Role::OneOff => Approved::ungated(),
+        };
         let secrets = Secrets::new(
             &config.secrets,
             config.path().map(Path::to_owned),
             presence,
             Some(store.clone()),
+            trust,
+            Arc::new(approved),
         );
         // before any upstream connects, so none asks for what the last
         // daemon already had
         // only by the daemon, which has bound its listeners by now: a one-off
         // run would use up what the next daemon is owed
-        let handoff_keys = KeyStore::for_state(&state_dir, config.secrets.identity_file.is_none());
+        let handoff_keys = handoff::key_store(&state_dir, config.secrets.identity_file.is_none());
         let taken = match role {
             Role::Daemon => {
                 secrets
@@ -298,8 +317,7 @@ impl App {
 
             return;
         }
-        let keys =
-            KeyStore::for_state(&self.state_dir, self.config.secrets.identity_file.is_none());
+        let keys = handoff::key_store(&self.state_dir, self.config.secrets.identity_file.is_none());
         // a read still waiting on a prompt holds the values; the stop does
         // not wait it out, and the next daemon asks instead
         let handing = self

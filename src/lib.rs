@@ -41,3 +41,4 @@ pub mod update;
 pub mod upstream;
 pub mod usage;
 pub mod web;
+pub mod words;

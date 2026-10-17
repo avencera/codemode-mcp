@@ -183,7 +183,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   passkeys would reopen first enrollment to any local caller; enroll a replacement first. `passkey list` reads the
   database directly
 - Every enrollment request and every removal request sends an ntfy notification (urgent priority), so an
-  unexpected one shows up on the phone. Admin requests carry a six-character confirmation code that the CLI
+  unexpected one shows up on the phone. Admin requests carry a confirmation code of three BIP39 words that the CLI
   prints and the page and notification repeat, labels may not contain quotes, and a removal is pinned to the
   passkey's enrollment time so a reused row id cannot be hit. The CLI warns when no notifier is configured.
   Agent `notify` titles are prefixed `agent:` so they cannot pass for these The first-passkey notification carries no link, because the
@@ -235,8 +235,12 @@ approved wherever the owner is
   (destination, reference) until then. A later program read with the same destination whose targets are all
   references held for it is answered without asking anyone; any other destination asks. `forget()` clears
   them and bumps a counter, so a read approved after the forget began keeps nothing, and the restart handoff
-  never carries them. A destination longer than 256 characters or holding a control character is refused,
-  never cut, and `op inject` / `op read --out-file` name the file with its directory resolved
+  never carries them. A destination longer than 256 characters, holding a control character, or starting or
+  ending with whitespace is refused, never cut or trimmed, and `op inject` / `op read --out-file` name the file
+  with its directory resolved. `op run` refuses a quoted command line over 200 characters or spanning lines
+  rather than eliding its middle, and the phone shows the destination whole
+- Every codemode-mcp process sets its soft `RLIMIT_CORE` to 0 at start, since the daemon and the `op`
+  commands hold values in memory; the hard limit stays, so a command `op run` starts may raise its own
 - A batch holding a description goes to phones only, since a Mac prompt has no text field
 - Wire: a companion Mac gets `{"program_read": {references, reason, destination, keep_secs}}` and answers
   `{"values": [...]}` in order. A phone gets `{"program_read": {id, items, reason, destination, keep_secs,
@@ -502,7 +506,8 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   - confused agents with a shell: the CLI cannot approve anything. Enrolling a second passkey or removing one
     needs an existing passkey's approval, and every such request is announced on the phone. A first passkey
     can still be enrolled from the CLI while none exists
-- Not defended against: hostile code running as the same macOS user. Such code can edit the SQLite file
+- Not defended against: hostile code running as the same macOS user, beyond pairing a device to receive secrets,
+  which takes the owner's Touch ID at the gateway Mac (see Companions). Such code can edit the SQLite file
   (insert a passkey, read OAuth tokens), edit the config (set a tool to `allow`), replace the binary, or talk to
   upstreams directly. Defending against it needs OS-user separation (daemon and state under another account)
 - The admin listener is loopback-only and refuses proxied requests and non-loopback `Host` headers; its JSON
@@ -571,6 +576,16 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   reads never enter the cache, so never the handoff. Trade-off: for the seconds of a restart the values are at
   rest on the gateway Mac, encrypted, with the key in the keychain; anything running as the signed binary could
   read them, as it could read the daemon's memory
+- Approved consumers (`src/secrets/approved.rs`): a config value goes to a server only while (reference,
+  consumer digest) is approved, where the digest is SHA-256 of the server's name, command, args, cwd, env, url,
+  headers and OAuth client. Otherwise `OnePassword::value` reads again, cached or not, and this Mac's `op` runs
+  only after a codemode Touch ID prompt naming the server, since 1Password can answer `op` unprompted for
+  minutes after any approval; phones and companion Macs ask as for any read (the phone's prompt names the
+  reference, not the server). A successful read approves the pair. Pairs live in `secrets.approved`, each
+  with an HMAC under a key derived from the device trust key, so they survive restarts and crashes and nothing
+  without that key adds one. The start that sets device trust up approves every server the config lists then,
+  before it keeps the trust key, so upgrading asks nothing and a stop part way redoes the whole set-up; a config edited just before that start is taken as approved. One-off runs gate
+  nothing, reading as `op` itself would. Logins and program reads have their own prompts and pass no consumer
 - Reads go through the 1Password app integration, so the Mac prompts. A service account token
   (`OP_SERVICE_ACCOUNT_TOKEN`) would read without prompting, but it is a reusable credential on the Mac that
   supply-chain malware could copy, so the daemon is not set up with one
@@ -678,7 +693,39 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   at 8 and ignored with discovery on, and expiry is checked on both the uptime and wall clocks, since `Instant`
   stops while the Mac sleeps. `companion invite` polls the invite's status through the admin listener and prints
   who registered and the check. `invite --manual` keeps the older `cmcp1` JSON ticket that carries the
-  references, for a gateway the companion cannot reach; the gateway's entry is then added by hand
+  references, for a gateway the companion cannot reach; the gateway's entry is then added by hand and trusted
+  with `companion trust`. Opening an invite (not the manual one, which hands out only the gateway's id and
+  references) first asks Touch ID at the gateway Mac through `Mac::touch_id`, refused at once while
+  `Mac::present` says the owner is away, so the admin token alone cannot pair a device
+- Device trust (`src/companion/trust.rs`): the config is writable by any process of the user, and a listed phone
+  gets every value sealed to it, so the gateway uses only devices with a trust record. A record is HMAC-SHA256
+  under a 32-byte trust key of the kind (`mac`/`phone`), the endpoint id and, for a phone, its seal key; the name
+  and a Mac's `addrs` are left out, since iroh proves the id at any address. Records are a JSON list in
+  `devices.trust` in the state directory, readable by anyone and unforgeable without the key; records made under
+  another key (a checkout build's) sit beside them and do not verify. The key is a `secrets::key_store::KeyStore`
+  like the handoff's: the login keychain (`dev.praveen.codemode-mcp.device-trust`) for the installed binary,
+  where other programs get a prompt, else `devices.trust.key` (0600), which guards nothing against the same user
+  and serves checkout builds and tests. Unlike the handoff it ignores `secrets.identity_file`: a config edit
+  that moved the key to a file would leave no key and trigger the migration below. A record is written after
+  the owner approves: a registration with an approved invite gets one before it is listed, used or backfilled,
+  and `companion trust <name>` (`POST /admin/companion/trust`, owner proof) asks Touch ID naming the device
+  and a fingerprint of what its record covers, six BIP39 words (66 bits of SHA-256) (also in `companion list`), refuses a name two listed
+  devices share, then writes it and activates the device with no restart, reading the config file again so an entry appended
+  since start is found. Listed devices without a valid record are kept apart: never asked, sealed to or
+  backfilled, refused at the phone handshake, logged at start, and shown in `/healthz` (`untrusted_devices`)
+  and `companion list` (`POST /admin/companion/list`). An unpairing phone's record is dropped. Migration: a
+  daemon that finds no key and no records creates a key and trusts everything the config lists then (records
+  first, then the key, then a `committed` mark, so a stop anywhere before the mark redoes it), so upgrading
+  changes nothing. With committed records but no
+  key it creates a key and trusts nothing, so deleting the keychain item alone does not re-trust the config.
+  One-off runs never create the key and trust nothing without it. A same-user process that deletes both the
+  keychain item and `devices.trust` (or clears its `committed` mark) still gets the migration on the next start; nothing in reach of this user
+  can tell that apart from a first start. Records carry no generation, so a copy of `devices.trust` saved
+  before an unpair and put back restores that phone's trust; it is still useless without that phone's Secure
+  Enclave key. Unpairing drops the record before anything else and fails when it cannot. `companion trust`
+  takes the device from the config file as it is now and checks it is still listed the same once approved, and
+  `companion list` shows devices appended to the file since the start as untrusted, with their fingerprints,
+  and an untrusted device under the name the file gives it now
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
   stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt

@@ -416,6 +416,56 @@ pub struct InviteStatusRequest {
     pub invite: String,
 }
 
+/// One listed companion or phone in the answer of `POST /admin/companion/list`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    /// Name from `secrets.companions` or `secrets.phones`
+    pub name: String,
+    /// `mac` or `phone`
+    pub kind: String,
+    /// Its iroh endpoint id
+    pub id: EndpointId,
+    /// Short digest of what its trust record covers, as the Touch ID prompt
+    /// that trusts it shows
+    pub fingerprint: String,
+    /// Whether the gateway uses it; an untrusted one waits for
+    /// `codemode-mcp companion trust <name>`
+    pub trusted: bool,
+}
+
+/// Answer of `POST /admin/companion/list`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionListResponse {
+    /// Trusted devices first, in configuration order
+    pub devices: Vec<DeviceEntry>,
+}
+
+/// Body of `POST /admin/companion/trust`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionTrustRequest {
+    /// The listed device to trust, by name
+    pub name: String,
+}
+
+/// Answer of `POST /admin/companion/trust`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompanionTrustResponse {
+    /// The device now trusted and in use
+    pub device: DeviceEntry,
+}
+
+impl From<companion::ListedDevice> for DeviceEntry {
+    fn from(listed: companion::ListedDevice) -> Self {
+        Self {
+            name: listed.device.name().to_owned(),
+            kind: listed.device.kind().to_owned(),
+            id: listed.device.id(),
+            fingerprint: listed.device.fingerprint(),
+            trusted: listed.trusted,
+        }
+    }
+}
+
 /// Body of `POST /admin/companion/check`, which asks every companion and phone
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompanionCheckRequest {
@@ -617,6 +667,8 @@ pub fn router(app: &App) -> Router {
             "/admin/companion/invite/status",
             post(companion_invite_status),
         )
+        .route("/admin/companion/list", post(companion_list))
+        .route("/admin/companion/trust", post(companion_trust))
         .route("/admin/companion/check", post(companion_check))
         .route("/admin/companion/check/one", post(companion_check_one))
         .route("/admin/companion/create", post(companion_create))
@@ -1030,11 +1082,58 @@ async fn companion_invite_open(
             valid_secs: opened.lifetime.as_secs(),
         })
         .into_response(),
+        Err(failure @ CompanionFailure::NotApproved(_)) => {
+            tracing::warn!(error = %failure, "an invite was not approved");
+
+            error(StatusCode::FORBIDDEN, &failure.to_string())
+        }
         Err(failure) => {
             tracing::warn!(error = %failure, "could not open an invite");
 
             error(StatusCode::INTERNAL_SERVER_ERROR, &failure.to_string())
         }
+    }
+}
+
+/// The listed companions and phones and whether each is trusted, with any
+/// the config file lists that the daemon has not met yet
+async fn companion_list(State(state): State<AdminState>) -> Response {
+    let devices = state
+        .gateway
+        .companions()
+        .devices_now()
+        .into_iter()
+        .map(DeviceEntry::from)
+        .collect();
+
+    Json(CompanionListResponse { devices }).into_response()
+}
+
+/// Trusts a listed device once the owner approves with Touch ID at this Mac,
+/// and starts using it
+async fn companion_trust(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<CompanionTrustRequest>,
+) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/companion/trust") {
+        return refused;
+    }
+
+    match state.gateway.companions().trust_device(&request.name).await {
+        Ok(device) => Json(CompanionTrustResponse {
+            device: DeviceEntry::from(companion::ListedDevice {
+                device,
+                trusted: true,
+            }),
+        })
+        .into_response(),
+        Err(failure @ CompanionFailure::NotApproved(_)) => {
+            tracing::warn!(error = %failure, device = %request.name, "trusting a device was not approved");
+
+            error(StatusCode::FORBIDDEN, &failure.to_string())
+        }
+        Err(failure) => error(StatusCode::BAD_REQUEST, &failure.to_string()),
     }
 }
 
@@ -1210,7 +1309,28 @@ async fn check_companions(state: &AdminState, reference: &str, only: Option<&str
     }
     let companions = state.gateway.companions();
     let names = companions.names();
+    let untrusted: Vec<String> = companions
+        .untrusted()
+        .iter()
+        .map(|device| device.name().to_owned())
+        .collect();
+    let not_trusted = |which: &str| {
+        error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "not trusted, so not asked: {which}; approve one with `codemode-mcp companion \
+                 trust <name>`"
+            ),
+        )
+    };
+    if let Some(only) = only.filter(|only| untrusted.iter().any(|name| name == only)) {
+        return not_trusted(only);
+    }
     if names.is_empty() {
+        if !untrusted.is_empty() {
+            return not_trusted(&untrusted.join(", "));
+        }
+
         return error(
             StatusCode::BAD_REQUEST,
             "no companions or phones are configured under [secrets]",

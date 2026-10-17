@@ -42,7 +42,7 @@ use crate::{
     logins::LoginsServer,
     mac::Mac,
     oauth::OAuth,
-    secrets::{OnePassword, Redactor},
+    secrets::{OnePassword, Redactor, approved::Consumer},
     store::Store,
 };
 
@@ -1016,10 +1016,12 @@ impl Upstream {
             }
             error => UpstreamError::Secret(error.to_string()),
         };
+        // the server as configured now, which must be approved for each value
+        let consumer = Consumer::of(&self.name, &self.config);
         let url = match &self.config.url {
             Some(template) => Some(
                 self.onepassword
-                    .resolve_url(template)
+                    .resolve_url(Some(&consumer), template)
                     .await
                     .map_err(secret)?,
             ),
@@ -1027,12 +1029,12 @@ impl Upstream {
         };
         let headers = self
             .onepassword
-            .resolve(&self.config.headers)
+            .resolve(Some(&consumer), &self.config.headers)
             .await
             .map_err(secret)?;
         let env = self
             .onepassword
-            .resolve(&self.config.env)
+            .resolve(Some(&consumer), &self.config.env)
             .await
             .map_err(secret)?;
         self.redactor.add(

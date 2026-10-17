@@ -13,10 +13,10 @@ use codemode_mcp::{
     adapters::apple::Entity,
     admin::{
         self, CompanionCheckOneRequest, CompanionCheckRequest, CompanionCheckResponse,
-        CompanionCheckResult, EnrollRequest, EnrollResponse, InviteOpenRequest, InviteOpenResponse,
-        InviteResponse, InviteStatusRequest, OAuthLoginResponse, OAuthLogoutResponse,
-        OAuthServerRequest, OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest,
-        WarmResponse,
+        CompanionCheckResult, CompanionListResponse, CompanionTrustRequest, CompanionTrustResponse,
+        EnrollRequest, EnrollResponse, InviteOpenRequest, InviteOpenResponse, InviteResponse,
+        InviteStatusRequest, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
+        OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
     },
     app::App,
     catalog::function_prefix,
@@ -275,6 +275,19 @@ enum CompanionCommand {
         #[arg(long)]
         companion: Option<String>,
     },
+    /// On the gateway Mac: list the companion Macs and phones in the config
+    /// and whether the daemon trusts each; an untrusted one is never used
+    List,
+    /// On the gateway Mac: trust a companion or phone the config lists, once
+    /// Touch ID on this Mac approves it, so the daemon starts using it
+    ///
+    /// A device paired with an invite is trusted already; this is for one
+    /// added to the config by hand, or one listed while the daemon could not
+    /// vouch for it
+    Trust {
+        /// Its name under `secrets.companions` or `secrets.phones`
+        name: String,
+    },
     /// Print this Mac's companion endpoint id, creating its key if needed
     Id {
         /// Read the key from this file instead of the login keychain
@@ -482,6 +495,18 @@ fn parse_mode(text: &str) -> Result<u32, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // the daemon and the `op` commands hold secret values in memory, which a
+    // crash must not write to disk; the hard limit stays, so a command `op
+    // run` starts can still turn its own dumps back on
+    let core = rustix::process::getrlimit(rustix::process::Resource::Core);
+    let _ = rustix::process::setrlimit(
+        rustix::process::Resource::Core,
+        rustix::process::Rlimit {
+            current: Some(0),
+            ..core
+        },
+    );
+
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -911,6 +936,45 @@ async fn companion_command(
                 }
             }
         }
+        CompanionCommand::List => {
+            let config = load_or_default(path)?;
+            let listed: CompanionListResponse =
+                admin_post(&config, "/admin/companion/list", &()).await?;
+            if listed.devices.is_empty() {
+                println!("No companion Mac or phone is listed under [secrets].");
+            }
+            for device in listed.devices {
+                let state = if device.trusted {
+                    "trusted".to_owned()
+                } else {
+                    format!(
+                        "NOT TRUSTED, not used; run `codemode-mcp companion trust {}`",
+                        device.name
+                    )
+                };
+                println!(
+                    "{} ({}, {}, fingerprint {}): {state}",
+                    device.name, device.kind, device.id, device.fingerprint
+                );
+            }
+        }
+        CompanionCommand::Trust { name } => {
+            let config = load_or_default(path)?;
+            println!(
+                "Approve trusting {name} with Touch ID on this Mac; check that the prompt shows \
+                 the fingerprint `codemode-mcp companion list` gives for it."
+            );
+            let trusted: CompanionTrustResponse = admin_post_as_owner(
+                &config,
+                "/admin/companion/trust",
+                &CompanionTrustRequest { name },
+            )
+            .await?;
+            println!(
+                "{} ({}, fingerprint {}) is trusted; the daemon uses it from now on.",
+                trusted.device.name, trusted.device.kind, trusted.device.fingerprint
+            );
+        }
         CompanionCommand::Id { identity_file } => {
             let file = match identity_file {
                 Some(file) => Some(file),
@@ -928,6 +992,7 @@ async fn companion_command(
 /// Opens an invite on the daemon, prints the command that uses it, and
 /// reports the Mac that registers with it
 async fn invite(config: &Config, valid_for: Option<u64>) -> Result<()> {
+    println!("Approve the pairing with Touch ID on this Mac.");
     let opened: InviteOpenResponse = admin_post_as_owner(
         config,
         "/admin/companion/invite/open",
@@ -1120,6 +1185,10 @@ async fn manual_invite(config: &Config) -> Result<()> {
     println!("On the other Mac (the one that has 1Password and the owner), run:");
     println!("  codemode-mcp companion pair {ticket}");
     println!("It prints a block to append to the config on this Mac ({name}).");
+    println!(
+        "Once it is appended, run `codemode-mcp companion trust <its name>` here; the daemon \
+         uses no device the config lists until Touch ID on this Mac approves it."
+    );
 
     Ok(())
 }
@@ -1313,8 +1382,9 @@ fn pair_by_hand(
     );
     println!("\n{}\n", pairing.gateway_entry());
     println!(
-        "then run `codemode-mcp service restart` there, and `codemode-mcp companion check \
-         <reference>` to try it.\n"
+        "then run `codemode-mcp companion trust {}` there, which asks Touch ID and starts using \
+         this Mac, and `codemode-mcp companion check <reference>` to try it.\n",
+        pairing.name
     );
 
     install_companion(path, explicit_config, false)
@@ -2067,18 +2137,20 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                 .map(|argument| shell_word(argument))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let shown = shown_command(&line);
-            // a grant is keyed by what the prompt shows, which for a long
-            // command is not all of it, so another command could share it
-            if keep.is_some() && shown != line {
+            // refused rather than cut, since a part the prompt leaves out
+            // could change what the command does with the values, and a
+            // grant keyed by a cut line could answer another command
+            if line.chars().count() > MAX_COMMAND_CHARS
+                || codemode_mcp::prompt::one_line(&line, usize::MAX) != line
+            {
                 bail!(
-                    "--keep needs a command line short enough to show whole, at most \
-                     {COMMAND_SHOWN_CHARS} characters on one line; put a long script in a file"
+                    "a command line must fit one line of at most {MAX_COMMAND_CHARS} \
+                     characters so its prompt shows it whole; put a long script in a file"
                 );
             }
             let context = OpContext {
                 reason,
-                destination: Some(format!("the environment of {shown}")),
+                destination: Some(format!("the environment of {line}")),
                 keep_secs: keep,
             };
             let code = op_run(config, &env_file, no_masking, context, &command).await?;
@@ -2180,9 +2252,9 @@ async fn op_run(
 /// How long `op run` passes on output after its command exits
 const PIPE_DRAIN: Duration = Duration::from_secs(2);
 
-/// How much of `op run`'s command line its prompts show, leaving room for
-/// the words around it within the destination's limit
-const COMMAND_SHOWN_CHARS: usize = 200;
+/// The longest command line `op run` takes, leaving room for the words
+/// around it within the destination's limit
+const MAX_COMMAND_CHARS: usize = 200;
 
 /// `argument` as a shell would need it typed: as is when it holds only
 /// characters a shell leaves alone, otherwise in single quotes
@@ -2196,27 +2268,6 @@ fn shell_word(argument: &str) -> String {
     } else {
         format!("'{}'", argument.replace('\'', r"'\''"))
     }
-}
-
-/// `line` as one line that fits [`COMMAND_SHOWN_CHARS`]: a long one keeps
-/// its start, which names the program, and its end, where an argument that
-/// changes what it does could otherwise hide, and says how much is left out
-fn shown_command(line: &str) -> String {
-    let line = codemode_mcp::prompt::one_line(line, usize::MAX);
-    let characters: Vec<char> = line.chars().collect();
-    if characters.len() <= COMMAND_SHOWN_CHARS {
-        return line;
-    }
-    let (head, tail) = (120, 50);
-    let skipped = characters.len() - head - tail;
-
-    format!(
-        "{} …{skipped} characters… {}",
-        characters[..head].iter().collect::<String>(),
-        characters[characters.len() - tail..]
-            .iter()
-            .collect::<String>()
-    )
 }
 
 /// Passes the signals that stop a terminal command on to the child `pid`,

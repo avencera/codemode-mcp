@@ -37,6 +37,7 @@ use codemode_mcp::{
         },
     },
     config::Config,
+    mac::TouchId,
     secrets::PHONE_GRACE,
 };
 use companion_wire::seal::SoftwareKey;
@@ -1087,8 +1088,11 @@ async fn a_value_entered_on_the_phone_is_sealed_for_the_next_read() -> TestResul
     harness.stop().await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResult {
+/// A gateway with no phone yet, listening at a fixed address, whose `twin`
+/// server read [`REFERENCE`] at boot; the owner is at its Mac, which leaves
+/// Touch ID prompts up until a test sets an answer
+async fn inviting_gateway()
+-> Result<Option<(Harness, EndpointId, SocketAddr, Arc<FakeMac>)>, Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
     let gateway_key = directory.join("gateway.key");
@@ -1110,15 +1114,73 @@ async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResu
         key = gateway_key.display(),
         fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
     );
-    let Some(harness) = Harness::with(Setup {
+    let harness = Harness::with(Setup {
         extra: &extra,
-        mac: Some(gateway_mac),
+        mac: Some(Arc::clone(&gateway_mac)),
         ..Setup::default()
     })
-    .await?
-    else {
+    .await?;
+
+    Ok(harness.map(|harness| (harness, gateway, listen, gateway_mac)))
+}
+
+/// The Touch ID prompts the gateway's Mac showed
+fn touch_prompts(mac: &FakeMac) -> Vec<String> {
+    mac.shown()
+        .into_iter()
+        .filter(|shown| shown.starts_with("touch_id "))
+        .collect()
+}
+
+const PAIRING_PROMPT: &str = "touch_id Let a new phone or Mac pair with codemode-mcp";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_is_opened_only_with_touch_id_at_the_gateway() -> TestResult {
+    let Some((harness, _, _, gateway_mac)) = inviting_gateway().await? else {
         return Ok(());
     };
+    let body = json!({ "valid_secs": 60 });
+    let open = || harness.admin_json("/admin/companion/invite/open", &body);
+
+    // the owner is away: refused at once, without a prompt anyone could
+    // approve by accident
+    gateway_mac.set_present(false);
+    let (status, refused) = open().await?;
+    assert_eq!(status, 403, "{refused}");
+    let message = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("pairing needs Touch ID at the gateway Mac"),
+        "{refused}"
+    );
+    assert!(touch_prompts(&gateway_mac).is_empty());
+
+    // the owner is there but denies
+    gateway_mac.set_present(true);
+    gateway_mac.set_answer(Some(TouchId::Review));
+    let (status, refused) = open().await?;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(touch_prompts(&gateway_mac), [PAIRING_PROMPT]);
+
+    // the prompt is taken down, as when the screen locks
+    gateway_mac.set_answer(Some(TouchId::Away));
+    let (status, refused) = open().await?;
+    assert_eq!(status, 403, "{refused}");
+
+    // no ticket was handed out, and pairing was never even offered
+    assert!(refused.get("ticket").is_none(), "{refused}");
+    assert!(harness.app.gateway().companions().bound_addrs().is_empty());
+    let path = harness.app.config().path().ok_or("no config file")?;
+    assert!(Config::load(path)?.secrets.phones.is_empty());
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResult {
+    let Some((harness, gateway, listen, gateway_mac)) = inviting_gateway().await? else {
+        return Ok(());
+    };
+    gateway_mac.set_answer(Some(TouchId::Approved));
 
     let (status, opened) = harness
         .admin_json("/admin/companion/invite/open", &json!({ "valid_secs": 60 }))
@@ -1127,6 +1189,7 @@ async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResu
     let ticket = InviteTicket::decode(opened["ticket"].as_str().ok_or("no ticket")?)?;
     assert_eq!(ticket.gateway, gateway);
     let invite = opened["invite"].as_str().ok_or("no invite id")?.to_owned();
+    assert_eq!(touch_prompts(&gateway_mac), [PAIRING_PROMPT]);
 
     // what the app does with the scanned ticket
     let phone = FakePhone::start(gateway, listen).await?;
@@ -1212,6 +1275,216 @@ async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResu
     assert_eq!(status["state"], "done", "{status}");
     assert_eq!(status["phone"], true, "{status}");
     assert_eq!(status["in_use"], true, "{status}");
+
+    // pairing wrote its trust record, so the next daemon, reading the
+    // config file it was listed in, uses it too
+    let reloaded = Config::load(path)?;
+    let harness = harness
+        .restart_with(Stop::Drain, move |config| *config = reloaded)
+        .await?;
+    let companions = harness.app.gateway().companions();
+    assert_eq!(companions.phones().len(), 1);
+    assert!(companions.untrusted().is_empty());
+
+    harness.stop().await
+}
+
+/// What `/healthz` lists as untrusted
+async fn untrusted_in_health(harness: &Harness) -> Result<Value, Box<dyn Error>> {
+    let health: Value = harness
+        .http
+        .get(format!("{}/healthz", harness.base()))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    Ok(health["untrusted_devices"].clone())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> TestResult {
+    // the rig lists its phone before the daemon has a trust key, so that
+    // phone is trusted as the config stood then
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: false,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let Rig {
+        harness,
+        phone,
+        gateway_mac,
+        ..
+    } = rig;
+
+    // another process of this user lists its own phone and waits for a
+    // restart
+    let stranger = FakePhone::start(phone.gateway, phone.gateway_address).await?;
+    let path = harness
+        .app
+        .config()
+        .path()
+        .ok_or("no config file")?
+        .to_owned();
+    let text = std::fs::read_to_string(&path)?;
+    let entry = format!(
+        "{{ name = \"stranger\", id = \"{}\", seal_key = \"{}\" }}, ",
+        stranger.id(),
+        stranger.key.public().to_base64()
+    );
+    std::fs::write(
+        &path,
+        text.replacen("phones = [", &format!("phones = [{entry}"), 1),
+    )?;
+    // `companion list` shows it at once, untrusted, so its fingerprint can
+    // be checked before anyone trusts it
+    let (status, listed_now) = harness
+        .admin_json("/admin/companion/list", &Value::Null)
+        .await?;
+    assert_eq!(status, 200, "{listed_now}");
+    let appended = listed_now["devices"]
+        .as_array()
+        .and_then(|devices| devices.iter().find(|device| device["name"] == "stranger"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(appended["trusted"], false, "{listed_now}");
+    assert!(appended["fingerprint"].is_string(), "{listed_now}");
+
+    let reloaded = Config::load(&path)?;
+    assert_eq!(reloaded.secrets.phones.len(), 2);
+    let harness = harness
+        .restart_with(Stop::Drain, move |config| *config = reloaded)
+        .await?;
+
+    // listed but not used: named as untrusted, refused at the handshake,
+    // never asked and never sealed to
+    assert_eq!(untrusted_in_health(&harness).await?, json!(["stranger"]));
+    let (status, listed) = harness
+        .admin_json("/admin/companion/list", &Value::Null)
+        .await?;
+    assert_eq!(status, 200, "{listed}");
+    let trusted = |name: &str| {
+        listed["devices"]
+            .as_array()
+            .and_then(|devices| devices.iter().find(|device| device["name"] == name))
+            .map(|device| device["trusted"].clone())
+    };
+    assert_eq!(trusted("iphone"), Some(json!(true)), "{listed}");
+    assert_eq!(trusted("stranger"), Some(json!(false)), "{listed}");
+
+    // renamed in the file, an untrusted phone is listed under the name
+    // `companion trust` would take
+    let listed_text = std::fs::read_to_string(&path)?;
+    std::fs::write(
+        &path,
+        listed_text.replacen("name = \"stranger\"", "name = \"renamed\"", 1),
+    )?;
+    let (_, renamed) = harness
+        .admin_json("/admin/companion/list", &Value::Null)
+        .await?;
+    let names: Vec<&str> = renamed["devices"]
+        .as_array()
+        .map(|devices| {
+            devices
+                .iter()
+                .filter_map(|device| device["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(names, ["iphone", "renamed"], "{renamed}");
+    std::fs::write(&path, listed_text)?;
+    let refused = match stranger.dial(MOBILE_ALPN).await {
+        Ok(connection) => stranger
+            .request(
+                &connection,
+                &PhoneRequest::PushToken(Some(FakePhone::push_token())),
+            )
+            .await
+            .is_err(),
+        Err(_) => true,
+    };
+    assert!(refused, "an untrusted phone was served");
+    let (status, checked) = harness
+        .admin_json("/admin/companion/check", &json!({ "reference": REFERENCE }))
+        .await?;
+    assert_eq!(status, 200, "{checked}");
+    let names: Vec<&str> = checked["companions"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(names, ["iphone"], "{checked}");
+    assert!(
+        Rig::phone_entry(&checked)["result"]["ok"].is_object(),
+        "{checked}"
+    );
+    let one = json!({ "reference": REFERENCE, "companion": "stranger" });
+    let check_stranger = || harness.admin_json("/admin/companion/check/one", &one);
+    let (status, refused) = check_stranger().await?;
+    assert_eq!(status, 400, "{refused}");
+    assert!(stranger.seen().is_empty());
+
+    // trusting it takes the owner's Touch ID at the gateway Mac
+    let name = json!({ "name": "stranger" });
+    let trust = || harness.admin_json("/admin/companion/trust", &name);
+    gateway_mac.set_present(false);
+    let (status, refused) = trust().await?;
+    assert_eq!(status, 403, "{refused}");
+    assert!(touch_prompts(&gateway_mac).is_empty());
+    gateway_mac.set_present(true);
+    gateway_mac.set_answer(Some(TouchId::Review));
+    let (status, refused) = trust().await?;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(untrusted_in_health(&harness).await?, json!(["stranger"]));
+
+    // the file as it is now decides: taken out of it since the start, the
+    // phone is not offered for trust at all
+    let listed_text = std::fs::read_to_string(&path)?;
+    std::fs::write(&path, listed_text.replacen(&entry, "", 1))?;
+    let prompts = touch_prompts(&gateway_mac).len();
+    gateway_mac.set_answer(Some(TouchId::Approved));
+    let (status, refused) = trust().await?;
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(touch_prompts(&gateway_mac).len(), prompts);
+    std::fs::write(&path, listed_text)?;
+
+    let (status, trusted_now) = trust().await?;
+    assert_eq!(status, 200, "{trusted_now}");
+    assert_eq!(trusted_now["device"]["kind"], "phone", "{trusted_now}");
+    // the prompt shows the fingerprint `companion list` gives, so the owner
+    // can tell this phone from another listed under the same name
+    let fingerprint = trusted_now["device"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(fingerprint.split(' ').count(), 6, "{trusted_now}");
+    assert_eq!(
+        touch_prompts(&gateway_mac).last().cloned(),
+        Some(format!(
+            "touch_id Trust the phone “stranger” ({fingerprint}) to answer and receive \
+             codemode-mcp secrets"
+        ))
+    );
+    assert_eq!(untrusted_in_health(&harness).await?, json!([]));
+
+    // in use without a restart, holding a copy of what was read before
+    let _mobile = stranger.connect().await?;
+    let (status, checked) = check_stranger().await?;
+    assert_eq!(status, 200, "{checked}");
+    assert_eq!(
+        checked["companions"][0]["result"]["ok"]["bytes"],
+        VALUE.len(),
+        "{checked}"
+    );
+    let seen = stranger.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].sealed, "{seen:?}");
 
     harness.stop().await
 }

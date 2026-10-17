@@ -16,6 +16,7 @@ mod pair;
 mod phone;
 mod program;
 mod server;
+mod trust;
 
 /// The wire types, shared with the phone's core
 pub use companion_wire::{mobile, ticket, wire};
@@ -33,6 +34,7 @@ pub use server::{CompanionHandle, ServeError, serve};
 pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
 };
+pub use trust::{Device, DeviceTrust, ListedDevice};
 pub use wire::{
     CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode, CompanionFault,
     CompanionProgramRequest, CompanionRequest, CompanionResponse, CreatedItem, MALFORMED_REQUEST,

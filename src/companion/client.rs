@@ -17,11 +17,17 @@ use tokio::{
 use super::{
     ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
     CompanionRequest, CompanionResponse, CreatedItem, Hangup, IdentityError, MALFORMED_REQUEST,
-    MAX_BODY_BYTES, NewItem, Role, apns::Apns, bind_endpoint, invite::Invites, load_or_create,
+    MAX_BODY_BYTES, NewItem, Role,
+    apns::Apns,
+    bind_endpoint,
+    invite::Invites,
+    load_or_create,
     phone::Links,
+    trust::{Device, DeviceTrust},
 };
 use crate::{
     config::{CompanionPeer, PhonePeer, SecretsConfig},
+    mac::OnMac,
     store::Store,
 };
 
@@ -89,6 +95,12 @@ pub enum CompanionFailure {
     /// An invite could not be opened
     #[error("{0}")]
     Invite(String),
+    /// The owner did not approve with Touch ID at the gateway Mac
+    #[error("{0}")]
+    NotApproved(String),
+    /// A device could not be trusted
+    #[error("{0}")]
+    Trust(String),
 }
 
 /// What a companion said to `companion check`; never the value itself
@@ -106,9 +118,18 @@ pub struct CheckOutcome {
 /// gateway without companions never touches the keychain unless asked for
 /// its id. A companion registering with an invite joins the list while the
 /// daemon runs
+///
+/// Only devices with a trust record are used (see [`super::trust`]); the
+/// others the config lists are kept apart until the owner trusts them
 pub struct Companions {
     peers: RwLock<Vec<CompanionPeer>>,
     pub(super) phones: RwLock<Vec<PhonePeer>>,
+    /// Listed devices without a valid trust record: never asked, sealed to
+    /// or let in
+    pub(super) untrusted: RwLock<Vec<Device>>,
+    pub(super) trust: DeviceTrust,
+    /// Where pairing and trusting a device are approved
+    pub(super) on_mac: Option<OnMac>,
     /// Where values sealed to the phones and their push tokens are kept;
     /// without one no phone is asked
     pub(super) store: Option<Store>,
@@ -132,13 +153,55 @@ pub struct Companions {
 }
 
 impl Companions {
-    /// The companions and phones named in `config`; one registering with an
-    /// invite is appended to `config_path`. Values sealed to the phones are
-    /// kept in `store`
-    pub fn new(config: &SecretsConfig, config_path: Option<PathBuf>, store: Option<Store>) -> Self {
+    /// The companions and phones named in `config` that `trust` vouches
+    /// for; one registering with an invite is appended to `config_path`.
+    /// Values sealed to the phones are kept in `store`, and pairing is
+    /// approved on `on_mac`
+    pub fn new(
+        config: &SecretsConfig,
+        config_path: Option<PathBuf>,
+        store: Option<Store>,
+        trust: DeviceTrust,
+        on_mac: Option<OnMac>,
+    ) -> Self {
+        let (peers, untrusted_peers): (Vec<_>, Vec<_>) = config
+            .companions
+            .iter()
+            .cloned()
+            .partition(|peer| trust.is_trusted(&Device::Mac(peer.clone())));
+        let (phones, untrusted_phones): (Vec<_>, Vec<_>) = config
+            .phones
+            .iter()
+            .cloned()
+            .partition(|phone| trust.is_trusted(&Device::Phone(phone.clone())));
+        let untrusted: Vec<Device> = untrusted_peers
+            .into_iter()
+            .map(Device::Mac)
+            .chain(untrusted_phones.into_iter().map(Device::Phone))
+            .collect();
+        if !untrusted.is_empty() && !trust.has_key() {
+            tracing::warn!(
+                count = untrusted.len(),
+                "without the device trust key no companion or phone is used"
+            );
+        } else {
+            for device in &untrusted {
+                tracing::warn!(
+                    device = %device.name(),
+                    kind = device.kind(),
+                    "listed in the config but not trusted, so not used; approve it with \
+                     `codemode-mcp companion trust {}`",
+                    device.name()
+                );
+            }
+        }
+
         Self {
-            peers: RwLock::new(config.companions.clone()),
-            phones: RwLock::new(config.phones.clone()),
+            peers: RwLock::new(peers),
+            phones: RwLock::new(phones),
+            untrusted: RwLock::new(untrusted),
+            trust,
+            on_mac,
             store,
             apns: config.apns.clone().map(Apns::new),
             links: Links::default(),
@@ -169,8 +232,9 @@ impl Companions {
             .clone()
     }
 
-    /// Starts using a newly registered companion
+    /// Starts using a newly registered or trusted companion
     pub(super) fn add_peer(&self, peer: CompanionPeer) {
+        self.drop_untrusted(peer.id);
         self.peers
             .write()
             .unwrap_or_else(PoisonError::into_inner)

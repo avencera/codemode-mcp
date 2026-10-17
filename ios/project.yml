@@ -41,6 +41,9 @@ targets:
         CFBundleName: CMCP Companion
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # answers App Store Connect's export compliance question for every
+        # build, which otherwise holds each upload until it is answered
+        ITSAppUsesNonExemptEncryption: false
         NSCameraUsageDescription: Companion scans the QR code `codemode-mcp companion invite` shows, to pair with the gateway.
         NSFaceIDUsageDescription: Face ID approves each 1Password read the gateway asks this iPhone for.
         UILaunchScreen: {}

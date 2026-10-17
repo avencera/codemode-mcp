@@ -148,14 +148,14 @@ wherever you are.
 While you are at the gateway Mac it asks first, and the phone and companion Macs are asked 5 seconds later. While
 you are away they are all asked at once. The first approval sends every value, and the other prompts are taken
 down. A Deny on any device stops the request. Every prompt names the file the values go to, or the command whose
-environment gets them. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
+environment gets them, always in full: `op run` refuses a command line longer than 200 characters or spanning
+lines (put a long script in a file), and a file path that starts or ends with a space is refused. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
 A phone keeps a copy of each value sealed to its Face ID, as for config reads.
 
 When the next few commands need the same values, add `--keep 15m` to the first. Its prompt says the values will
 be handed out again without asking for that long, at most 60 minutes, and later requests for only those
 references going to the same file, or the same command's environment, are answered from memory until then.
-A request going anywhere else asks again. `op run --keep` needs a command line of at most 200 characters on
-one line, since a longer one is shortened in the prompt and could not be told apart from another. `codemode-mcp service restart --fresh` or
+A request going anywhere else asks again. `codemode-mcp service restart --fresh` or
 `POST /admin/secrets/forget` drops them early, and a restart never carries them over.
 
 Write a secrets file, the usual case:
@@ -257,7 +257,10 @@ The 1Password Environments server is not covered; it only signs in through the g
    codemode-mcp companion invite
    ```
 
-   It prints a command for the other Mac, also as a QR code, and waits until that Mac is done. The command holds
+   It first asks Touch ID on the gateway Mac ("Let a new phone or Mac pair with codemode-mcp"); approve it. It is
+   refused at once while you are not at the gateway Mac, and when the prompt is denied or taken down, since the
+   device that registers is trusted (see [Trusted devices](#trusted-devices)). Then it prints a command for the
+   other Mac, also as a QR code, and waits until that Mac is done. The command holds
    a single-use invite that expires after ten minutes (`--valid-for <seconds>` shortens it). Until it is used,
    treat it like a password: whoever runs it first is registered, so check that the name and id `invite` prints
    are the other Mac's. Stopping `invite` with Ctrl-C does not cancel the invite; it stays valid until it is
@@ -304,7 +307,8 @@ The 1Password Environments server is not covered; it only signs in through the g
 If the other Mac cannot reach the gateway, pair by hand. `codemode-mcp companion invite --manual` prints a ticket
 holding the gateway's id and references. `codemode-mcp companion pair <ticket>` on the other Mac writes its
 `[companion]` section, starts the agent and prints a `[[secrets.companions]]` block. Append that block to the end
-of the gateway Mac's config, then run `codemode-mcp service restart` there. The block is printed before the
+of the gateway Mac's config, then run `codemode-mcp companion trust <name>` there, which asks Touch ID and starts
+using the Mac without a restart. The block is printed before the
 agent is installed; if the install fails, fix the cause and run the same `pair` command again, which installs
 again and prints the block again.
 
@@ -363,9 +367,9 @@ How reads work with a companion configured:
   Touch ID prompt, which names the reference. While `op` on that Mac is signed out, 1Password asks too. Its
   prompt names no item and one approval lets `op` read anything for about ten minutes, so it never replaces the
   companion's own.
-- The gateway accepts nothing over iroh unless a peer is listed or an invite is open. While an invite is open it
-  accepts pairing; while a phone is listed under `[[secrets.phones]]` it accepts that phone's id, and refuses
-  every other id. The rest of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
+- The gateway accepts nothing over iroh unless a peer is listed and trusted, or an invite is open. While an invite
+  is open it accepts pairing; while a trusted phone is listed under `[[secrets.phones]]` it accepts that phone's
+  id, and refuses every other id. The rest of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
   keeps its existing entry, and a different Mac with a name that is already taken is listed as `name-2`.
 - Each Mac's iroh key is created on first use and kept in its login keychain. The binary that creates it reads it
   without a prompt, and so does any build signed with the same identity; any other program gets a keychain
@@ -409,8 +413,8 @@ and the phone's UDID in `IOS_DEVICE_UDID`).
    Without it, the phone answers only while Companion is open on screen. The push goes through Apple and
    names the reference and the gateway Mac, never the value. It is marked time-sensitive, so it can break
    through a Focus that allows time-sensitive notifications.
-2. With the daemon running, run `codemode-mcp companion invite` on the gateway Mac. Open Companion and point it at
-   the QR code, or copy the command and tap Paste invite. The phone registers, the gateway
+2. With the daemon running, run `codemode-mcp companion invite` on the gateway Mac and approve its Touch ID
+   prompt there. Open Companion and point it at the QR code, or copy the command and tap Paste invite. The phone registers, the gateway
    appends a `[[secrets.phones]]` entry to the end of its config, and the gateway reads one reference through
    the phone: approve it with Face ID. If nothing has been read since the daemon started, there is nothing
    sealed to check yet, and pairing says so. A phone must register the iroh id it connects with, so a leaked invite
@@ -435,9 +439,34 @@ How reads work with a phone paired:
   address the invite gives the phone stays valid across restarts. The phone must then reach that address
   directly, for example over the tailnet.
 
-To unpair, tap Unpair in Companion. The gateway forgets the phone's sealed copies and push token and stops
-accepting it, and the phone forgets its keys. Remove its `[[secrets.phones]]` entry from the gateway's config by
-hand; until then a restarted daemon accepts the old id again, though no device holds its key any more.
+To unpair, tap Unpair in Companion. The gateway forgets the phone's sealed copies, push token and trust record
+and stops accepting it, and the phone forgets its keys. Remove its `[[secrets.phones]]` entry from the gateway's
+config by hand; until then a restarted daemon lists it as untrusted.
+
+## Trusted devices
+
+Any program running as your user can edit the gateway's config, so a listed companion or phone is used only with a
+trust record the daemon wrote after you approved it with Touch ID at the gateway Mac: when you opened the invite it
+paired with, or with `codemode-mcp companion trust <name>`. Devices listed when the daemon first set trust up, on
+the upgrade to this version, were trusted then.
+
+A listed device without a record is untrusted: the gateway never asks it, never seals a value to it, and refuses
+its connections. The daemon logs a warning naming it, `/healthz` lists it under `untrusted_devices`, and
+`codemode-mcp companion list` marks it:
+
+```sh
+codemode-mcp companion list
+codemode-mcp companion trust mba
+```
+
+`companion trust` reads the config again, so a block appended since the daemon started is found too. It asks Touch
+ID on the gateway Mac naming the device and its fingerprint, six words ("Trust the Mac “mba” (legal winner thank year
+wave sausage) to answer and receive codemode-mcp secrets"); check it against the fingerprint `companion list` shows. It is refused at once while you
+are not there, and when two listed devices share the name. Once approved, the daemon uses the device without a restart; a phone gets copies
+of what was read since the daemon started, as at pairing. An unexpected device in the list, or a pairing or trust
+prompt you did not ask for, means another program edited the config or holds the admin token; deny it and remove
+the entry. If the trust key goes missing while its records remain, the daemon trusts no device until you run
+`companion trust` for each again, rather than trusting whatever the config then lists.
 
 ## Calendar and Reminders access
 
@@ -681,6 +710,13 @@ What a restart does:
   daemon reads each again, as after rotating a key. A daemon run from anything but the installed binary, or
   with `secrets.identity_file` set, keeps the key in `<state_dir>/secrets.handoff.key` instead. Values a program
   asked for with `codemode-mcp op` are never kept or handed over.
+- A config value goes only to a server you approved it for, as that server stands. A server that is new, or
+  whose `command`, `args`, `cwd`, `env`, `url`, `headers`, `client_id` or `client_secret` changed, is asked for
+  once, cached value or not, restart or crash; changing a policy or tool setting asks nothing. At the gateway
+  Mac a Touch ID prompt names the server first ("Give op://… to the server “name”, new or changed since it was
+  last approved"), even while 1Password would answer without one; the phone and companion Macs ask as for any
+  read. A Deny keeps it unapproved. The approvals sit in `<state_dir>/secrets.approved`, each signed with a key
+  derived from the device trust key. Upgrading approves every server the config lists at that moment.
 - Finished results stay available to `wait` for 30 minutes (`limits.result_ttl_secs`).
 - Pending approvals stay pending; the phone link keeps working and the timer continues from the original
   deadline. An ntfy that had failed is sent again at boot.

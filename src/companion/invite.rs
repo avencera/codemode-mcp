@@ -1,7 +1,8 @@
-//! The gateway's side of an invite: within its lifetime one Mac may
-//! register, which lists it under `secrets.companions` in the config file
-//! and in the running daemon, then ask for a check that reads one reference
-//! through it
+//! The gateway's side of an invite: within its lifetime one Mac or phone
+//! may register, which trusts it, lists it under `secrets.companions` or
+//! `secrets.phones` in the config file and in the running daemon, then ask
+//! for a check that reads one reference through it. Opening an invite takes
+//! the owner's Touch ID at the gateway Mac
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -20,6 +21,7 @@ use super::{
     mobile::PhoneRegistration,
     pair::{append_section, gateway_entry, phone_entry, read_config},
     read_request,
+    trust::Device,
 };
 use crate::config::{CompanionPeer, Config, MAX_MAC_NAME_CHARS, PhonePeer, is_mac_name};
 
@@ -263,8 +265,13 @@ impl Invites {
 }
 
 impl Companions {
-    /// Opens an invite that lets one Mac register within `lifetime` (at most
-    /// [`MAX_INVITE_LIFETIME`]); `references` are what the pairing check reads
+    /// Opens an invite that lets one Mac or phone register within
+    /// `lifetime` (at most [`MAX_INVITE_LIFETIME`]); `references` are what
+    /// the pairing check reads
+    ///
+    /// The device that registers is trusted, so the owner approves the
+    /// invite with Touch ID at this Mac first: the admin token alone would
+    /// let any process of this user pair a phone and receive every value
     pub async fn open_invite(
         self: &Arc<Self>,
         gateway_name: String,
@@ -277,6 +284,8 @@ impl Companions {
                     .to_owned(),
             ));
         }
+        self.ask_owner("Let a new phone or Mac pair with codemode-mcp", "pairing")
+            .await?;
         let lifetime = lifetime.min(MAX_INVITE_LIFETIME);
         let endpoint = self.endpoint().await?;
         // without discovery the companion can only find this Mac by address
@@ -576,8 +585,11 @@ impl Companions {
             .map_err(|error| error.to_string())?
             .secrets;
         let (in_file, in_file_phones) = (in_file_secrets.companions, in_file_secrets.phones);
-        // listed by an earlier pairing whose check never reached it
+        // listed by an earlier pairing whose check never reached it, or by
+        // hand; the approved invite trusts it either way
         if let Some(peer) = in_file.iter().find(|peer| peer.id == registration.id) {
+            self.trust_registered(&Device::Mac(peer.clone()))?;
+
             return Ok((registered(&peer.name, true), Some(peer.clone())));
         }
 
@@ -590,7 +602,13 @@ impl Companions {
             .chain(in_file_phones.iter().map(|phone| phone.name.as_str()))
             .collect();
         let name = unique_name(&registration.name, &taken);
-        let entry = gateway_entry(&name, registration.id, &addrs);
+        let peer = CompanionPeer {
+            name: name.clone(),
+            id: registration.id,
+            addrs,
+        };
+        self.trust_registered(&Device::Mac(peer.clone()))?;
+        let entry = gateway_entry(&name, registration.id, &peer.addrs);
         append_section(path, &existing, &entry).map_err(|error| {
             format!(
                 "could not add the companion to {}: {error}; pair by hand with \
@@ -598,11 +616,6 @@ impl Companions {
                 path.display()
             )
         })?;
-        let peer = CompanionPeer {
-            name: name.clone(),
-            id: registration.id,
-            addrs,
-        };
 
         Ok((registered(&name, false), Some(peer)))
     }
@@ -670,6 +683,7 @@ impl Companions {
             .find(|listed| listed.id == registration.id)
         {
             same_key(listed)?;
+            self.trust_registered(&Device::Phone(listed.clone()))?;
             remember_push()?;
             self.add_phone(listed.clone());
             self.backfill(listed).await;
@@ -691,19 +705,28 @@ impl Companions {
             )
             .collect();
         let name = unique_name(&registration.name, &taken);
-        let entry = phone_entry(&name, registration.id, &phone.seal_key);
-        append_section(path, &existing, &entry)
-            .map_err(|error| format!("could not add the phone to {}: {error}", path.display()))?;
-        remember_push()?;
         let listed = PhonePeer {
             name: name.clone(),
             id: registration.id,
             seal_key: phone.seal_key.clone(),
         };
+        self.trust_registered(&Device::Phone(listed.clone()))?;
+        let entry = phone_entry(&name, registration.id, &phone.seal_key);
+        append_section(path, &existing, &entry)
+            .map_err(|error| format!("could not add the phone to {}: {error}", path.display()))?;
+        remember_push()?;
         self.add_phone(listed.clone());
         self.backfill(&listed).await;
 
         Ok(registered(&name, false))
+    }
+
+    /// Writes the record of a device that registered with an invite the
+    /// owner approved, before it is listed, used or sealed to
+    fn trust_registered(&self, device: &Device) -> Result<(), String> {
+        self.trust
+            .trust(device)
+            .map_err(|error| format!("could not trust {}: {error}", device.name()))
     }
 
     /// Reads the first reference sealed to the new phone through it; the

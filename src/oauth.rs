@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use crate::{
     config::Config,
-    secrets::{OnePassword, Redactor, SecretError},
+    secrets::{OnePassword, Redactor, SecretError, approved::Consumer},
     store::{Store, StoreError},
 };
 
@@ -287,6 +287,8 @@ enum ClientSource {
 /// OAuth settings of one configured server
 #[derive(Debug, Clone)]
 struct OAuthServer {
+    /// The server as configured, which its values must be approved for
+    consumer: Consumer,
     /// As configured: it may hold references and is read only when used
     url: String,
     scopes: Vec<String>,
@@ -363,6 +365,7 @@ impl OAuth {
                 Some((
                     name.clone(),
                     OAuthServer {
+                        consumer: Consumer::of(name, server),
                         url: server.url.clone()?,
                         scopes: server.scopes.clone(),
                         client,
@@ -428,7 +431,10 @@ impl OAuth {
         &self,
         server: &OAuthServer,
     ) -> Result<(String, Vec<String>), OAuthError> {
-        let resolved = self.onepassword.resolve_url(&server.url).await?;
+        let resolved = self
+            .onepassword
+            .resolve_url(Some(&server.consumer), &server.url)
+            .await?;
         self.redactor.add(resolved.secrets);
         self.redactor.add_keys(resolved.fragile);
 
@@ -508,7 +514,7 @@ impl OAuth {
                 let mut config = OAuthClientConfig::new(id, &redirect_uri)
                     .with_scopes(scopes.iter().map(|scope| (*scope).to_owned()).collect());
                 if let Some(secret) = secret {
-                    config = config.with_client_secret(self.read_secret(secret).await?);
+                    config = config.with_client_secret(self.read_secret(&server, secret).await?);
                 }
                 manager.configure_client(config.clone())?;
 
@@ -572,10 +578,14 @@ impl OAuth {
         }
     }
 
-    /// `secret` with its `op://` references read from 1Password
-    async fn read_secret(&self, secret: &str) -> Result<String, OAuthError> {
+    /// `server`'s client `secret` with its `op://` references read from
+    /// 1Password
+    async fn read_secret(&self, server: &OAuthServer, secret: &str) -> Result<String, OAuthError> {
         let values = BTreeMap::from([(String::new(), secret.to_owned())]);
-        let mut resolved = self.onepassword.resolve(&values).await?;
+        let mut resolved = self
+            .onepassword
+            .resolve(Some(&server.consumer), &values)
+            .await?;
 
         resolved
             .values
