@@ -6,6 +6,7 @@
 //! and references, e.g. `Bearer {{ op://Dev/Context7/credential }}`
 
 pub mod handoff;
+pub mod key_store;
 mod logs;
 mod spawn;
 
@@ -21,7 +22,7 @@ use std::{
 use tokio::{sync::Mutex, task::JoinSet};
 
 use crate::{
-    companion::{Companions, CreatedItem, NewItem},
+    companion::{Companions, CreatedItem, DeviceTrust, NewItem},
     config::{Config, SecretsConfig},
     mac::OnMac,
     store::Store,
@@ -68,15 +69,23 @@ impl Secrets {
     /// runs the local `op`
     ///
     /// The companions are attached even when there are none yet, since one
-    /// registering with an invite is used without a restart. Values sealed
-    /// to the phones are kept in `store`; without one no phone is asked
+    /// registering with an invite is used without a restart. Only those
+    /// `trust` vouches for are used. Values sealed to the phones are kept in
+    /// `store`; without one no phone is asked
     pub fn new(
         config: &SecretsConfig,
         config_path: Option<PathBuf>,
         presence: Option<OnMac>,
         store: Option<Store>,
+        trust: DeviceTrust,
     ) -> Self {
-        let companions = Arc::new(Companions::new(config, config_path, store));
+        let companions = Arc::new(Companions::new(
+            config,
+            config_path,
+            store,
+            trust,
+            presence.clone(),
+        ));
         let onepassword =
             OnePassword::new(config.op.clone()).with_companions(Arc::clone(&companions), presence);
 
@@ -916,7 +925,7 @@ impl OnePassword {
     pub async fn hand_off(
         &self,
         state_dir: &Path,
-        store: &handoff::KeyStore,
+        store: &key_store::KeyStore,
         config: &Config,
     ) -> Result<usize, String> {
         let known = self.known.lock().await;
@@ -930,7 +939,7 @@ impl OnePassword {
     pub async fn take_over(
         &self,
         state_dir: &Path,
-        store: &handoff::KeyStore,
+        store: &key_store::KeyStore,
         config: &Config,
     ) -> Result<handoff::TakenOver, String> {
         let mut taken = handoff::take_over(state_dir, store, &handoff::Consumers::of(config))?;

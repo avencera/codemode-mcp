@@ -506,7 +506,8 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   - confused agents with a shell: the CLI cannot approve anything. Enrolling a second passkey or removing one
     needs an existing passkey's approval, and every such request is announced on the phone. A first passkey
     can still be enrolled from the CLI while none exists
-- Not defended against: hostile code running as the same macOS user. Such code can edit the SQLite file
+- Not defended against: hostile code running as the same macOS user, beyond pairing a device to receive secrets,
+  which takes the owner's Touch ID at the gateway Mac (see Companions). Such code can edit the SQLite file
   (insert a passkey, read OAuth tokens), edit the config (set a tool to `allow`), replace the binary, or talk to
   upstreams directly. Defending against it needs OS-user separation (daemon and state under another account)
 - The admin listener is loopback-only and refuses proxied requests and non-loopback `Host` headers; its JSON
@@ -687,7 +688,30 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   at 8 and ignored with discovery on, and expiry is checked on both the uptime and wall clocks, since `Instant`
   stops while the Mac sleeps. `companion invite` polls the invite's status through the admin listener and prints
   who registered and the check. `invite --manual` keeps the older `cmcp1` JSON ticket that carries the
-  references, for a gateway the companion cannot reach; the gateway's entry is then added by hand
+  references, for a gateway the companion cannot reach; the gateway's entry is then added by hand and trusted
+  with `companion trust`. Opening an invite (not the manual one, which hands out only the gateway's id and
+  references) first asks Touch ID at the gateway Mac through `Mac::touch_id`, refused at once while
+  `Mac::present` says the owner is away, so the admin token alone cannot pair a device
+- Device trust (`src/companion/trust.rs`): the config is writable by any process of the user, and a listed phone
+  gets every value sealed to it, so the gateway uses only devices with a trust record. A record is HMAC-SHA256
+  under a 32-byte trust key of the kind (`mac`/`phone`), the endpoint id and, for a phone, its seal key; the name
+  and a Mac's `addrs` are left out, since iroh proves the id at any address. Records are a JSON list in
+  `devices.trust` in the state directory, readable by anyone and unforgeable without the key; records made under
+  another key (a checkout build's) sit beside them and do not verify. The key is a `secrets::key_store::KeyStore`
+  like the handoff's: the login keychain (`dev.praveen.codemode-mcp.device-trust`) for the installed binary,
+  where other programs get a prompt, else `devices.trust.key` (0600), which guards nothing against the same user
+  and serves checkout builds and tests. Unlike the handoff it ignores `secrets.identity_file`: a config edit
+  that moved the key to a file would leave no key and trigger the migration below. A record is written after
+  the owner approves: a registration with an approved invite gets one before it is listed, used or backfilled,
+  and `companion trust <name>` (`POST /admin/companion/trust`, owner proof) asks Touch ID naming the device,
+  then writes it and activates the device with no restart, reading the config file again so an entry appended
+  since start is found. Listed devices without a valid record are kept apart: never asked, sealed to or
+  backfilled, refused at the phone handshake, logged at start, and shown in `/healthz` (`untrusted_devices`)
+  and `companion list` (`POST /admin/companion/list`). An unpairing phone's record is dropped. Migration: a
+  daemon that finds no key creates one and trusts everything the config lists then (records first, then the
+  key, so a crash between them redoes it), so upgrading changes nothing. One-off runs never create the key and
+  trust nothing without it. A same-user process able to delete the keychain item would get that migration again on
+  the next start
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
   stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt

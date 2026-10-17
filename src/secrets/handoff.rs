@@ -37,6 +37,7 @@ use aws_lc_rs::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::key_store::{KeyStore, KeychainItem};
 use crate::config::{Config, ServerConfig};
 
 /// The sealed values, in the state directory
@@ -51,15 +52,11 @@ pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// disagree by moments
 const CLOCK_SKEW_MS: u64 = 60_000;
 
-/// Keychain service of the key
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "dev.praveen.codemode-mcp.handoff";
-/// Keychain account of the key
-#[cfg(target_os = "macos")]
-const KEYCHAIN_ACCOUNT: &str = "daemon";
-/// `errSecItemNotFound`
-#[cfg(target_os = "macos")]
-const KEYCHAIN_NOT_FOUND: i32 = -25300;
+/// The key's keychain item
+const KEYCHAIN_ITEM: KeychainItem = KeychainItem {
+    service: "dev.praveen.codemode-mcp.handoff",
+    account: "daemon",
+};
 
 /// Bound into the ciphertext with the format version and the time it was
 /// written, so a handoff cannot be passed off as another format or a later
@@ -172,68 +169,10 @@ fn consumer_digest(name: &str, server: &ServerConfig) -> String {
     hex::encode(digest(&SHA256, &bytes))
 }
 
-/// Where the key is kept
-#[derive(Debug, Clone)]
-pub enum KeyStore {
-    /// The login keychain
-    Keychain,
-    /// A file, for systems without a keychain
-    File(PathBuf),
-}
-
-impl KeyStore {
-    /// The keychain for the installed service binary using it for its
-    /// identity too, otherwise a file in `state_dir`
-    pub fn for_state(state_dir: &Path, identity_in_keychain: bool) -> Self {
-        let installed = crate::service::ServicePaths::from_env(state_dir).is_ok_and(|paths| {
-            let running = std::env::current_exe().and_then(std::fs::canonicalize);
-            let installed = std::fs::canonicalize(&paths.binary);
-
-            matches!((running, installed), (Ok(running), Ok(installed)) if running == installed)
-        });
-        if identity_in_keychain && installed {
-            Self::Keychain
-        } else {
-            Self::File(state_dir.join(KEY_FILE))
-        }
-    }
-
-    fn put(&self, key: &[u8; 32]) -> Result<(), String> {
-        match self {
-            Self::Keychain => keychain_put(key),
-            Self::File(path) => {
-                let _ = std::fs::remove_file(path);
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(path)
-                    .map_err(|error| error.to_string())?;
-
-                file.write_all(key).map_err(|error| error.to_string())
-            }
-        }
-    }
-
-    /// The key, removed from the store
-    fn take(&self) -> Result<Option<[u8; 32]>, String> {
-        match self {
-            Self::Keychain => keychain_take(),
-            Self::File(path) => {
-                let bytes = match std::fs::read(path) {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => return Err(error.to_string()),
-                };
-                let _ = std::fs::remove_file(path);
-
-                bytes
-                    .try_into()
-                    .map(Some)
-                    .map_err(|_| "the key is not 32 bytes".to_owned())
-            }
-        }
-    }
+/// Where the key is kept: the keychain for the installed service binary
+/// using it for its identity too, otherwise a file in `state_dir`
+pub fn key_store(state_dir: &Path, identity_in_keychain: bool) -> KeyStore {
+    KeyStore::for_state(state_dir, identity_in_keychain, KEYCHAIN_ITEM, KEY_FILE)
 }
 
 /// Seals `values` for the next daemon on `state_dir`, each with the
@@ -393,38 +332,4 @@ fn now_ms() -> u64 {
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         })
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_put(key: &[u8; 32]) -> Result<(), String> {
-    use security_framework::passwords::set_generic_password;
-
-    set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key).map_err(|error| error.to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_take() -> Result<Option<[u8; 32]>, String> {
-    use security_framework::passwords::{delete_generic_password, get_generic_password};
-
-    let stored = match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
-        Ok(stored) => stored,
-        Err(error) if error.code() == KEYCHAIN_NOT_FOUND => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    let _ = delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
-
-    stored
-        .try_into()
-        .map(Some)
-        .map_err(|_| "the key is not 32 bytes".to_owned())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_put(_key: &[u8; 32]) -> Result<(), String> {
-    Err("this system has no login keychain".to_owned())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_take() -> Result<Option<[u8; 32]>, String> {
-    Ok(None)
 }

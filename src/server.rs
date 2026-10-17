@@ -1138,10 +1138,19 @@ async fn healthz(State(gateway): State<Arc<Gateway>>) -> Json<Value> {
         .filter(|upstream| upstream.state == "connected")
         .count();
 
+    // listed in the config but never used until the owner trusts them
+    let untrusted: Vec<String> = gateway
+        .companions()
+        .untrusted()
+        .iter()
+        .map(|device| device.name().to_owned())
+        .collect();
+
     Json(json!({
         "status": "ok",
         "tools": gateway.catalog().entries().len(),
         "upstreams_connected": connected,
         "upstreams": upstreams,
+        "untrusted_devices": untrusted,
     }))
 }

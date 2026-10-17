@@ -1238,7 +1238,8 @@ fn companion_install_dry_run_shows_the_agent_and_changes_nothing() -> TestResult
 }
 
 /// A gateway with no companions yet whose `twin` server uses [`REFERENCE`],
-/// and the key file of its iroh identity
+/// and the key file of its iroh identity; the owner is at its Mac and
+/// approves opening invites
 async fn inviting_gateway() -> Result<Option<(Harness, PathBuf)>, Box<dyn Error>> {
     let directory = temp_state_dir();
     std::fs::create_dir_all(&directory)?;
@@ -1257,7 +1258,8 @@ async fn inviting_gateway() -> Result<Option<(Harness, PathBuf)>, Box<dyn Error>
         fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
     );
     let gateway_mac = Arc::new(FakeMac::default());
-    gateway_mac.set_present(false);
+    gateway_mac.set_present(true);
+    gateway_mac.set_answer(Some(TouchId::Approved));
     let harness = Harness::with(Setup {
         extra: &extra,
         mac: Some(gateway_mac),

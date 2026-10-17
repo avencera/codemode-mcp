@@ -4,8 +4,8 @@
 //! A phone cannot be dialed while its app is suspended, so a read pushes a
 //! notification naming the request, waits for the phone to dial in on
 //! [`MOBILE_ALPN`], and opens a stream carrying the request on that
-//! connection. Only phones listed in `secrets.phones` get past the handshake;
-//! the protocol is not even offered while none is listed
+//! connection. Only phones listed in `secrets.phones` and trusted get past
+//! the handshake; the protocol is not even offered while none is
 
 use std::{
     collections::HashMap,
@@ -77,8 +77,9 @@ impl Companions {
             .clone()
     }
 
-    /// Starts answering a newly paired phone
+    /// Starts answering a newly paired or trusted phone
     pub(super) fn add_phone(&self, phone: PhonePeer) {
+        self.drop_untrusted(phone.id);
         self.phones
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -443,6 +444,10 @@ impl Companions {
                     };
 
                     return (refused, false);
+                }
+                // the id is dead, so pairing it again must be approved again
+                if let Err(error) = self.trust.forget(phone.id) {
+                    tracing::warn!(phone = %phone.name, %error, "could not drop its trust record");
                 }
                 self.phones
                     .write()

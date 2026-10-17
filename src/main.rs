@@ -13,10 +13,10 @@ use codemode_mcp::{
     adapters::apple::Entity,
     admin::{
         self, CompanionCheckOneRequest, CompanionCheckRequest, CompanionCheckResponse,
-        CompanionCheckResult, EnrollRequest, EnrollResponse, InviteOpenRequest, InviteOpenResponse,
-        InviteResponse, InviteStatusRequest, OAuthLoginResponse, OAuthLogoutResponse,
-        OAuthServerRequest, OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest,
-        WarmResponse,
+        CompanionCheckResult, CompanionListResponse, CompanionTrustRequest, CompanionTrustResponse,
+        EnrollRequest, EnrollResponse, InviteOpenRequest, InviteOpenResponse, InviteResponse,
+        InviteStatusRequest, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
+        OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
     },
     app::App,
     catalog::function_prefix,
@@ -274,6 +274,19 @@ enum CompanionCommand {
         /// Companion to ask; needed when several are listed
         #[arg(long)]
         companion: Option<String>,
+    },
+    /// On the gateway Mac: list the companion Macs and phones in the config
+    /// and whether the daemon trusts each; an untrusted one is never used
+    List,
+    /// On the gateway Mac: trust a companion or phone the config lists, once
+    /// Touch ID on this Mac approves it, so the daemon starts using it
+    ///
+    /// A device paired with an invite is trusted already; this is for one
+    /// added to the config by hand, or one listed while the daemon could not
+    /// vouch for it
+    Trust {
+        /// Its name under `secrets.companions` or `secrets.phones`
+        name: String,
     },
     /// Print this Mac's companion endpoint id, creating its key if needed
     Id {
@@ -923,6 +936,39 @@ async fn companion_command(
                 }
             }
         }
+        CompanionCommand::List => {
+            let config = load_or_default(path)?;
+            let listed: CompanionListResponse =
+                admin_post(&config, "/admin/companion/list", &()).await?;
+            if listed.devices.is_empty() {
+                println!("No companion Mac or phone is listed under [secrets].");
+            }
+            for device in listed.devices {
+                let state = if device.trusted {
+                    "trusted".to_owned()
+                } else {
+                    format!(
+                        "NOT TRUSTED, not used; run `codemode-mcp companion trust {}`",
+                        device.name
+                    )
+                };
+                println!("{} ({}, {}): {state}", device.name, device.kind, device.id);
+            }
+        }
+        CompanionCommand::Trust { name } => {
+            let config = load_or_default(path)?;
+            println!("Approve trusting {name} with Touch ID on this Mac.");
+            let trusted: CompanionTrustResponse = admin_post_as_owner(
+                &config,
+                "/admin/companion/trust",
+                &CompanionTrustRequest { name },
+            )
+            .await?;
+            println!(
+                "{} ({}) is trusted; the daemon uses it from now on.",
+                trusted.device.name, trusted.device.kind
+            );
+        }
         CompanionCommand::Id { identity_file } => {
             let file = match identity_file {
                 Some(file) => Some(file),
@@ -940,6 +986,7 @@ async fn companion_command(
 /// Opens an invite on the daemon, prints the command that uses it, and
 /// reports the Mac that registers with it
 async fn invite(config: &Config, valid_for: Option<u64>) -> Result<()> {
+    println!("Approve the pairing with Touch ID on this Mac.");
     let opened: InviteOpenResponse = admin_post_as_owner(
         config,
         "/admin/companion/invite/open",
@@ -1132,6 +1179,10 @@ async fn manual_invite(config: &Config) -> Result<()> {
     println!("On the other Mac (the one that has 1Password and the owner), run:");
     println!("  codemode-mcp companion pair {ticket}");
     println!("It prints a block to append to the config on this Mac ({name}).");
+    println!(
+        "Once it is appended, run `codemode-mcp companion trust <its name>` here; the daemon \
+         uses no device the config lists until Touch ID on this Mac approves it."
+    );
 
     Ok(())
 }
@@ -1325,8 +1376,9 @@ fn pair_by_hand(
     );
     println!("\n{}\n", pairing.gateway_entry());
     println!(
-        "then run `codemode-mcp service restart` there, and `codemode-mcp companion check \
-         <reference>` to try it.\n"
+        "then run `codemode-mcp companion trust {}` there, which asks Touch ID and starts using \
+         this Mac, and `codemode-mcp companion check <reference>` to try it.\n",
+        pairing.name
     );
 
     install_companion(path, explicit_config, false)

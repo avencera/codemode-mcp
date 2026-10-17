@@ -799,6 +799,7 @@ impl Harness {
         // as the CLI makes it
         if path.starts_with("/admin/companion/invite")
             || path == "/admin/companion/create"
+            || path == "/admin/companion/trust"
             || path == "/admin/op/read"
             || path == "/admin/secrets/forget"
         {
