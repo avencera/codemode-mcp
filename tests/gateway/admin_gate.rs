@@ -90,7 +90,7 @@ async fn a_second_passkey_needs_approval_from_the_first() -> TestResult {
     );
     // the code the CLI printed is on the page and in the notification
     let code = enrolled["code"].as_str().ok_or("no code")?;
-    assert_eq!(code.len(), 6);
+    assert_eq!(code.split(' ').count(), 3, "{code}");
     assert!(html.contains(code), "{html}");
     assert!(
         harness

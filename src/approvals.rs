@@ -1600,9 +1600,9 @@ pub fn random_id() -> String {
     hex(&rand::random::<[u8; 16]>())
 }
 
-/// Six characters for a person to compare between the CLI and the phone
+/// Three random words for a person to compare between the CLI and the phone
 pub fn confirmation_code() -> String {
-    random_id()[..6].to_uppercase()
+    crate::words::words(&rand::random::<[u8; 5]>(), 3)
 }
 
 /// 256 random bits as hex, for one-time tokens

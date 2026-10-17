@@ -1417,7 +1417,7 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
     let fingerprint = trusted_now["device"]["fingerprint"]
         .as_str()
         .unwrap_or_default();
-    assert_eq!(fingerprint.len(), 19, "{trusted_now}");
+    assert_eq!(fingerprint.split(' ').count(), 6, "{trusted_now}");
     assert_eq!(
         touch_prompts(&gateway_mac).last().cloned(),
         Some(format!(

@@ -183,7 +183,7 @@ idempotent. `tools/list_changed` refreshes the catalog
   passkeys would reopen first enrollment to any local caller; enroll a replacement first. `passkey list` reads the
   database directly
 - Every enrollment request and every removal request sends an ntfy notification (urgent priority), so an
-  unexpected one shows up on the phone. Admin requests carry a six-character confirmation code that the CLI
+  unexpected one shows up on the phone. Admin requests carry a confirmation code of three BIP39 words that the CLI
   prints and the page and notification repeat, labels may not contain quotes, and a removal is pinned to the
   passkey's enrollment time so a reused row id cannot be hit. The CLI warns when no notifier is configured.
   Agent `notify` titles are prefixed `agent:` so they cannot pass for these The first-passkey notification carries no link, because the
@@ -704,7 +704,7 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   that moved the key to a file would leave no key and trigger the migration below. A record is written after
   the owner approves: a registration with an approved invite gets one before it is listed, used or backfilled,
   and `companion trust <name>` (`POST /admin/companion/trust`, owner proof) asks Touch ID naming the device
-  and a 64-bit fingerprint of what its record covers (also in `companion list`), refuses a name two listed
+  and a fingerprint of what its record covers, six BIP39 words (66 bits of SHA-256) (also in `companion list`), refuses a name two listed
   devices share, then writes it and activates the device with no restart, reading the config file again so an entry appended
   since start is found. Listed devices without a valid record are kept apart: never asked, sealed to or
   backfilled, refused at the phone handshake, logged at start, and shown in `/healthz` (`untrusted_devices`)

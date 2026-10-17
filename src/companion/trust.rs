@@ -97,16 +97,9 @@ impl Device {
 
     /// A digest of what a record covers, shown wherever the owner approves
     /// or reviews a device, so two devices listed under one name read
-    /// differently; 64 bits, too many to grind a matching key for, in four
-    /// groups so it can be compared by eye
+    /// differently; six words, 66 bits, too many to grind a matching key for
     pub fn fingerprint(&self) -> String {
-        let digest = Sha256::digest(self.identity().as_bytes());
-
-        digest[..8]
-            .chunks(2)
-            .map(hex::encode)
-            .collect::<Vec<_>>()
-            .join("-")
+        crate::words::words(&Sha256::digest(self.identity().as_bytes()), 6)
     }
 
     /// What a record covers; the name and a Mac's addresses are left out,
