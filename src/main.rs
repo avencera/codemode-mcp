@@ -2060,7 +2060,13 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
             keep,
             command,
         } => {
-            let line = command.join(" ");
+            // quoted, so different argument lists never read the same, and
+            // a grant for one never answers another
+            let line = command
+                .iter()
+                .map(|argument| shell_word(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
             let shown = shown_command(&line);
             // a grant is keyed by what the prompt shows, which for a long
             // command is not all of it, so another command could share it
@@ -2177,6 +2183,20 @@ const PIPE_DRAIN: Duration = Duration::from_secs(2);
 /// How much of `op run`'s command line its prompts show, leaving room for
 /// the words around it within the destination's limit
 const COMMAND_SHOWN_CHARS: usize = 200;
+
+/// `argument` as a shell would need it typed: as is when it holds only
+/// characters a shell leaves alone, otherwise in single quotes
+fn shell_word(argument: &str) -> String {
+    let plain = !argument.is_empty()
+        && argument
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.,:/=+@%".contains(character));
+    if plain {
+        argument.to_owned()
+    } else {
+        format!("'{}'", argument.replace('\'', r"'\''"))
+    }
+}
 
 /// `line` as one line that fits [`COMMAND_SHOWN_CHARS`]: a long one keeps
 /// its start, which names the program, and its end, where an argument that
