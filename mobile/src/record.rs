@@ -14,6 +14,9 @@ const GATEWAY_ITEM: &str = "gateway";
 const IROH_KEY_ITEM: &str = "iroh-key";
 
 /// The paired gateway
+///
+/// Records from before the allow list went also carry `allow`; serde skips
+/// the unknown field, so they still load
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayRecord {
     /// The only endpoint this phone dials and answers
@@ -22,8 +25,6 @@ pub struct GatewayRecord {
     pub name: String,
     /// The name the gateway lists this phone under
     pub phone_name: String,
-    /// References this phone answers, matched exactly
-    pub allow: Vec<String>,
     /// Where to dial; empty when the gateway uses discovery
     pub addrs: Vec<SocketAddr>,
 }
@@ -52,14 +53,6 @@ impl GatewayRecord {
         platform.delete_seal_key();
     }
 
-    /// Whether `reference` is on the allow list; both sides are trimmed, as
-    /// the Mac companion does
-    pub fn allows(&self, reference: &str) -> bool {
-        let reference = reference.trim();
-
-        self.allow.iter().any(|allowed| allowed.trim() == reference)
-    }
-
     /// Whether to use n0's relays and DNS: only when the gateway does,
     /// which its invite shows by carrying no addresses
     pub fn discovery(&self) -> bool {
@@ -77,7 +70,6 @@ impl GatewayRecord {
             name: self.name.clone(),
             id: self.id.to_string(),
             phone_name: self.phone_name.clone(),
-            allow: self.allow.clone(),
         }
     }
 }

@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::{
-    harness::{Harness, Setup, TestResult, execute, temp_state_dir, text_of},
+    harness::{Harness, Setup, Stop, TestResult, execute, temp_state_dir, text_of},
     oauth::Locked,
 };
 
@@ -415,7 +415,7 @@ async fn a_url_held_in_1password_connects_and_stays_out_of_every_surface() -> Te
     assert!(!error.is_empty(), "{dead}");
     assert!(!error.contains(URL_KEY), "{dead}");
 
-    // the companion allow list names the references, never their values
+    // an invite names the references, never their values
     let (status, invite) = harness
         .admin_json("/admin/companion/invite", &Value::Null)
         .await?;
@@ -583,6 +583,50 @@ async fn a_url_key_that_breaks_the_rules_is_a_configuration_error() -> TestResul
     }
     assert_eq!(short["state"], "unavailable", "{short}");
     assert_eq!(short["error"], "configuration", "{short}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() -> TestResult {
+    let (op, log) = fake_op()?;
+    let extra = format!("[secrets]\nop = \"{op}\"\n", op = op.display());
+    let Some(harness) = Harness::with(Setup {
+        server: "env = { FIXTURE_SECRET = \"{{ op://Dev/fixture/credential }}\" }",
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    // the length only, so the value is not in the stored result
+    let script = r#"len(str(await fixture_env(name="FIXTURE_SECRET")))"#;
+    let value = |body: &Value| body["result"] == VALUE.len();
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 1);
+
+    // a clean stop seals the value for the next daemon, which reads nothing,
+    // and nothing it leaves on disk holds the value in the clear
+    let harness = harness.restart(Stop::Drain).await?;
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 1);
+    assert!(!harness.state_holds(VALUE));
+
+    // the handoff is used once: a crash leaves none, so that daemon asks
+    let harness = harness.restart(Stop::Crash).await?;
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
+
+    // forgetting, as `service restart --fresh` does, hands nothing over
+    let (status, forgot) = harness
+        .admin_json("/admin/secrets/forget", &Value::Null)
+        .await?;
+    assert_eq!(status, 200, "{forgot}");
+    assert_eq!(forgot["forgotten"], 1, "{forgot}");
+    let harness = harness.restart(Stop::Drain).await?;
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 3);
 
     harness.stop().await
 }

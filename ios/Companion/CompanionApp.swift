@@ -90,19 +90,29 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     ) async {
         let info = response.notification.request.content.userInfo
         guard let id = info["request"] as? String,
-              let reference = info["reference"] as? String,
               let gateway = info["gateway"] as? String
         else { return }
         // JSON numbers arrive as NSNumber; a push from an older gateway has
         // no deadline
         let expires = (info["expires"] as? NSNumber)?.int64Value
 
-        AppManager.shared.dispatch(.openedFromPush(
-            id: id,
-            reference: reference,
-            gateway: gateway,
-            expiresAtMs: expires
-        ))
+        // a program's batch names its items in a summary, not a reference
+        if info["kind"] as? String == "program" {
+            guard let summary = info["summary"] as? String else { return }
+            AppManager.shared.dispatch(.openedFromProgramPush(
+                id: id,
+                summary: summary,
+                gateway: gateway,
+                expiresAtMs: expires
+            ))
+        } else if let reference = info["reference"] as? String {
+            AppManager.shared.dispatch(.openedFromPush(
+                id: id,
+                reference: reference,
+                gateway: gateway,
+                expiresAtMs: expires
+            ))
+        }
     }
 
     /// While the app is open the read shows on screen, so the push stays

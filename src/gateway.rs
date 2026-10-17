@@ -222,6 +222,8 @@ pub struct Gateway {
     oauth: Arc<OAuth>,
     redactor: Arc<Redactor>,
     companions: Arc<Companions>,
+    /// The 1Password reader, for reads programs on this Mac ask for
+    secrets: Secrets,
     /// The `logins` server's check of the focused field before a `fill`
     /// is put to the owner
     fill_check: FillCheck,
@@ -260,11 +262,7 @@ impl Gateway {
         let UpstreamAccess {
             oauth,
             store,
-            secrets:
-                Secrets {
-                    onepassword,
-                    companions,
-                },
+            secrets,
             mac,
         } = access;
         let logins = Arc::new(config.logins.clone());
@@ -275,13 +273,14 @@ impl Gateway {
             config.tool_timeout(),
             Some(Arc::clone(&oauth)),
             &store,
-            &onepassword,
+            &secrets.onepassword,
             &redactor,
             &builtins,
         );
         let changed = upstreams.changed();
         let gateway = Arc::new(Self {
-            companions,
+            companions: Arc::clone(&secrets.companions),
+            secrets,
             redactor,
             fill_check,
             max_tool_result_bytes: config.limits.max_tool_result_bytes,
@@ -385,6 +384,11 @@ impl Gateway {
         &self.companions
     }
 
+    /// The 1Password reader and the companions it asks
+    pub fn secrets(&self) -> &Secrets {
+        &self.secrets
+    }
+
     /// OAuth logins of remote upstreams
     pub fn oauth(&self) -> &Arc<OAuth> {
         &self.oauth
@@ -444,6 +448,17 @@ impl Gateway {
         if let Err(error) = upstream.ensure_available() {
             return Err(self.refuse(context, &call, error.into()));
         }
+        if server_config.is_some_and(|server| server.needs_owner_here) && !self.owner_here().await {
+            let error = ToolCallError::ToolFailed(format!(
+                "`{}` works only while the user is at this Mac, and they are away, so the call was \
+                 not run or sent for approval. For a 1Password vault item's value, run \
+                 `codemode-mcp op inject`, `op run` or `op read` in a shell instead; the user \
+                 approves those on their phone (`codemode-mcp op --help`)",
+                call.server
+            ));
+
+            return Err(self.refuse(context, &call, error));
+        }
         let summary = match self
             .fill_check
             .prepare(server_config, &call.tool, &mut call.arguments)
@@ -490,6 +505,15 @@ impl Gateway {
 
                 Err(self.refuse(context, &call, error))
             }
+        }
+    }
+
+    /// Whether the owner is at this Mac; true when presence cannot be read,
+    /// so a Mac without it never refuses a call it might run
+    async fn owner_here(&self) -> bool {
+        match self.secrets.onepassword.on_mac() {
+            Some(on_mac) => on_mac.mac.present(on_mac.config.idle()).await,
+            None => true,
         }
     }
 

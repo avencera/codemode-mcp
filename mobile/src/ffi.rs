@@ -5,7 +5,10 @@
 //! [`FfiApp::dispatch`] and renders what comes back through its
 //! [`Reconciler`]
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use ractor::{Actor, ActorRef};
 
@@ -38,9 +41,6 @@ pub struct GatewayInfo {
     pub id: String,
     /// The name the gateway lists this phone under
     pub phone_name: String,
-    /// The references this phone answers without asking first, matched
-    /// exactly: the gateway's at pairing, plus each one the owner allowed
-    pub allow: Vec<String>,
 }
 
 /// The link to the gateway
@@ -67,20 +67,67 @@ pub enum ConnectionState {
 pub struct PendingRead {
     /// The id the push named
     pub id: String,
-    /// The `op://` reference
+    /// The `op://` reference; for a program read, one line naming its items
     pub reference: String,
     /// The gateway Mac's short name
     pub gateway_name: String,
     /// When the gateway gives up, in ms since the epoch on this phone's clock
     pub expires_at_ms: i64,
     /// Whether the gateway sent a copy Face ID can open; without one the
-    /// owner enters the value
+    /// owner enters the value. For a program read, whether every item has
+    /// one
     pub sealed: bool,
-    /// Whether the reference is on the allow list; one that is not can be
-    /// answered only once the owner allows it
-    pub listed: bool,
     /// Where it stands
     pub status: ReadStatus,
+    /// Set when a program on the gateway Mac asked, rather than the
+    /// gateway's own config; its values go to that program
+    pub program: Option<ProgramRead>,
+}
+
+/// What a program on the gateway Mac asked for, as the prompt shows it
+///
+/// Every text here is cleaned to one line: line breaks show as `⏎`, and
+/// control, invisible and direction-changing characters as `?`
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ProgramRead {
+    /// Why the program wants the values, in its own words; a claim to show
+    /// quoted, not a fact
+    pub reason: Option<String>,
+    /// Where the program says the values go, such as a file it writes or
+    /// the environment of a command it runs
+    pub destination: Option<String>,
+    /// How long, in seconds, programs on the gateway may get the same values
+    /// again without asking, at most an hour; `None` when every request asks
+    pub keep_secs: Option<u64>,
+    /// The values asked for, in the order they are sent; empty while a read
+    /// opened from a push has not arrived
+    pub items: Vec<ProgramItem>,
+}
+
+/// One value of a [`ProgramRead`]
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ProgramItem {
+    /// An `op://` reference
+    Reference {
+        /// The reference
+        reference: String,
+        /// Whether the gateway sent a copy Face ID can open; without one the
+        /// owner enters the value
+        sealed: bool,
+    },
+    /// Only the program's description of the item; the owner picks it in
+    /// 1Password and enters the value
+    Describe {
+        /// The description
+        description: String,
+    },
+}
+
+impl ProgramItem {
+    /// Whether Face ID can open this item's value
+    pub fn is_sealed(&self) -> bool {
+        matches!(self, Self::Reference { sealed: true, .. })
+    }
 }
 
 /// Where one read stands
@@ -153,19 +200,9 @@ pub enum AppAction {
         /// What the camera read
         scanned: String,
     },
-    /// Add the read's reference to the allow list, so it can be answered
-    /// now and is not asked about again
-    Allow {
-        /// The read
-        id: String,
-    },
-    /// Take `reference` off the allow list, so a later read of it waits
-    /// for the owner to allow it again
-    Disallow {
-        /// The reference, as the allow list shows it
-        reference: String,
-    },
-    /// Open the read's value with Face ID and send it
+    /// Open the read's value with Face ID and send it; for a program read,
+    /// open every item with one Face ID, which answers only when each item
+    /// has a sealed copy (see [`FfiApp::answer_program`])
     Approve {
         /// The read
         id: String,
@@ -192,6 +229,18 @@ pub enum AppAction {
         id: String,
         /// The reference in the push
         reference: String,
+        /// The gateway name in the push
+        gateway: String,
+        /// When the gateway stops waiting, in Unix milliseconds, if the
+        /// push says
+        expires_at_ms: Option<i64>,
+    },
+    /// The app was opened from a push for a program read
+    OpenedFromProgramPush {
+        /// The request id in the push
+        id: String,
+        /// The push's one line naming the items
+        summary: String,
         /// The gateway name in the push
         gateway: String,
         /// When the gateway stops waiting, in Unix milliseconds, if the
@@ -249,10 +298,13 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for PlatformError {
 /// Why a sealed value was not opened
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum OpenError {
-    /// The owner cancelled Face ID, or it was taken down
+    /// The owner tapped Deny on the Face ID prompt; only this answers
+    /// `Denied`, which ends the read on every device
     #[error("not approved on this phone")]
     Denied,
-    /// The key is gone or the ciphertext does not open
+    /// Anything else: Face ID was interrupted, did not match or is
+    /// unavailable, the key is gone, or the ciphertext does not open. The
+    /// gateway hears `ReadFailed` and keeps asking its other sources
     #[error("{message}")]
     Failed {
         /// What failed
@@ -297,6 +349,57 @@ impl std::fmt::Debug for OpenRequest {
     }
 }
 
+/// One sealed value of an [`OpenBatch`]
+#[derive(Clone, uniffi::Record)]
+pub struct SealedItem {
+    /// The reference the value was sealed under
+    pub reference: String,
+    /// HPKE `info`, binding the reference and gateway
+    pub info: Vec<u8>,
+    /// The encapsulated key
+    pub enc: Vec<u8>,
+    /// The sealed value
+    pub ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for SealedItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SealedItem")
+            .field("reference", &self.reference)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything one Face ID needs to open the sealed values of a program read
+#[derive(Clone, uniffi::Record)]
+pub struct OpenBatch {
+    /// The read, so [`Platform::cancel_open`] can name it
+    pub id: String,
+    /// The gateway the program runs on
+    pub gateway_name: String,
+    /// How many values go to the program, entered ones included, for the
+    /// reason Face ID shows
+    pub total: u32,
+    /// How long, in seconds, the gateway may hand the values out again
+    /// without asking, for the reason Face ID shows
+    pub keep_secs: Option<u64>,
+    /// The values to open, answered in this order
+    pub items: Vec<SealedItem>,
+}
+
+impl std::fmt::Debug for OpenBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenBatch")
+            .field("id", &self.id)
+            .field("total", &self.total)
+            .field("keep_secs", &self.keep_secs)
+            .field("items", &self.items)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The calls only the app can make; Rust never sees the Secure Enclave key
 ///
 /// Every call may block (Face ID waits for the owner), so Rust makes them
@@ -318,6 +421,10 @@ pub trait Platform: Send + Sync + 'static {
     /// Asks Face ID with a reason naming the reference and gateway, then
     /// opens the value with the Secure Enclave key
     fn open_sealed(&self, request: OpenRequest) -> Result<String, OpenError>;
+    /// Asks Face ID once, with a reason saying the values go to a program on
+    /// the gateway, then opens every item with the Secure Enclave key; the
+    /// values come back in the order of `batch.items`
+    fn open_sealed_batch(&self, batch: OpenBatch) -> Result<Vec<String>, OpenError>;
     /// Takes down the Face ID prompt of read `id`, if it is up
     fn cancel_open(&self, id: String);
     /// This phone's name, as the gateway lists it
@@ -393,6 +500,21 @@ impl FfiApp {
             id,
             value: Secret(value),
         }) {
+            tracing::error!(%error, "the app actor is gone");
+        }
+    }
+
+    /// Approves the program read `id`: sends `entered`, the values the owner
+    /// pasted or filled in keyed by item index, and opens every other item
+    /// with one Face ID. Nothing is sent unless each item has an entered
+    /// value or a sealed copy. Its own call for the same reason as
+    /// [`FfiApp::answer`]
+    pub fn answer_program(&self, id: String, entered: HashMap<u32, String>) {
+        let entered = entered
+            .into_iter()
+            .map(|(index, value)| (index, Secret(value)))
+            .collect();
+        if let Err(error) = self.actor.cast(AppMsg::AnswerProgram { id, entered }) {
             tracing::error!(%error, "the app actor is gone");
         }
     }

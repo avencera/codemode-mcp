@@ -264,7 +264,7 @@ impl Invites {
 
 impl Companions {
     /// Opens an invite that lets one Mac register within `lifetime` (at most
-    /// [`MAX_INVITE_LIFETIME`]); `references` become its allow list
+    /// [`MAX_INVITE_LIFETIME`]); `references` are what the pairing check reads
     pub async fn open_invite(
         self: &Arc<Self>,
         gateway_name: String,

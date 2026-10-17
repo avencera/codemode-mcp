@@ -105,7 +105,6 @@ struct Section<'a> {
 struct SectionBody<'a> {
     gateway: String,
     gateway_name: &'a str,
-    allow: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_file: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,7 +122,6 @@ fn render(
         companion: SectionBody {
             gateway: ticket.gateway.to_string(),
             gateway_name: &ticket.gateway_name,
-            allow: &ticket.references,
             identity_file,
             listen: listen.map(|listen| listen.to_string()),
             discovery: listen.map(|_| false),

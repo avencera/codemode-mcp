@@ -10,6 +10,8 @@
 pub const THREAD_CHARS: usize = 60;
 /// Longest reason shown
 pub const REASON_CHARS: usize = 160;
+/// Longest destination shown
+const DESTINATION_CHARS: usize = 256;
 /// Longest client name shown
 const CLIENT_CHARS: usize = 40;
 /// Longest tool name shown
@@ -47,6 +49,68 @@ pub fn prompt_text(calls: &[(String, usize)], grant: &str, asker: Asker<'_>) -> 
             text.push_str(&quoted(reason.trim(), REASON_CHARS));
         }
         None => text.push_str(", no reason given"),
+    }
+
+    text
+}
+
+/// What a program-read prompt names
+#[derive(Debug, Clone, Copy)]
+pub struct ProgramPrompt<'a> {
+    /// The references, all shown whole
+    pub items: &'a [String],
+    /// Where the program runs, such as `this Mac` or `main`
+    pub place: &'a str,
+    /// Why, in the program's words
+    pub reason: Option<&'a str>,
+    /// Where the values go, such as a file path
+    pub destination: Option<&'a str>,
+    /// How long the gateway may hand them out again without asking
+    pub keep_secs: Option<u64>,
+}
+
+/// Text of the Touch ID prompt approving a program read
+///
+/// macOS shows it as "codemode-mcp is trying to …", so it starts with a verb.
+/// Every reference is shown whole, since one fingerprint releases each of
+/// them; they are checked references, one line each. The reason and the
+/// destination are the program's claims and are quoted
+pub fn program_prompt_text(prompt: &ProgramPrompt<'_>) -> String {
+    let items = prompt.items;
+    let shown: Vec<String> = items
+        .iter()
+        .map(|item| one_line(item, usize::MAX))
+        .collect();
+    let noun = if items.len() == 1 { "value" } else { "values" };
+    let mut text = format!(
+        "send {} 1Password {noun} to a program on {}",
+        items.len(),
+        prompt.place
+    );
+    if let Some(destination) = prompt.destination.filter(|text| !text.trim().is_empty()) {
+        text.push_str(" for ");
+        text.push_str(&quoted(destination.trim(), DESTINATION_CHARS));
+    }
+    text.push_str(": ");
+    text.push_str(&shown.join(", "));
+    match prompt.reason.filter(|reason| !reason.trim().is_empty()) {
+        Some(reason) => {
+            text.push_str(", for ");
+            text.push_str(&quoted(reason.trim(), REASON_CHARS));
+        }
+        None => text.push_str(", no reason given"),
+    }
+    if let Some(keep_secs) = prompt.keep_secs {
+        // a grant answers only reads for the same destination
+        let place = if prompt.destination.is_some() {
+            " for the same destination"
+        } else {
+            ""
+        };
+        text.push_str(&format!(
+            ", and again{place} without asking for {} min",
+            keep_secs.div_ceil(60)
+        ));
     }
 
     text

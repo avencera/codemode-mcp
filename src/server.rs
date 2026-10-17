@@ -42,7 +42,7 @@ use crate::{
     executions::{Executions, StartError, WaitResult},
     executor::{CompletedCall, ExecutionOutcome, InterruptReason},
     gateway::Gateway,
-    guidance::{INSTRUCTIONS, SESSION_RULE, TOOL_CALL_RULE, script_rules, session_rule},
+    guidance::{self, INSTRUCTIONS, SESSION_RULE, TOOL_CALL_RULE, script_rules, session_rule},
     host::{HostPolicy, host_guard, is_direct_local},
     prompt::{REASON_CHARS, THREAD_CHARS, one_line},
     store::Store,
@@ -493,10 +493,13 @@ impl CodeModeServer {
             outcome: Outcome::Ok,
             detail: Some(format!("results: {}", hits.len())),
         };
-        let result = text_result(
-            &tagged(session.as_ref(), &Value::Array(hits).to_string()),
-            false,
-        );
+        let mut text = Value::Array(hits).to_string();
+        // agents look here first for a secret, and the tools found cannot
+        // read a vault item
+        if guidance::asks_for_secrets(&params.query) {
+            text = format!("note: {}\n{text}", guidance::ONEPASSWORD_RULE);
+        }
+        let result = text_result(&tagged(session.as_ref(), &text), false);
         self.record(
             Logged {
                 caller,

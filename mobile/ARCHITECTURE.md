@@ -41,22 +41,32 @@ App (supervisor)
 
 - **App** takes UI actions and its children's reports. Slow work (pairing, unpairing, Keychain writes) runs in a
   spawned task that reports back as a message, so the mailbox keeps moving. It allows one Face ID prompt at a
-  time: Approve is ignored while another read is approving. The UI shows the oldest read still open, or the last
-  finished one until it is dismissed.
+  time: an Approve or program answer made while another read is approving is queued and runs once that prompt
+  ends. The UI shows the oldest read still open, or the last finished one until it is dismissed.
 - **Connection** dials the gateway on the mobile ALPN with the phone's iroh key and backs off 1, 2, 4… up to 30
   seconds. Each bi-stream the gateway opens is one read; it hands the read and a responder to the app, which
   starts or updates a request actor. The stream's end tells a withdrawn read (the gateway stopped the stream:
   another source answered or it gave up) from a lost link (the gateway offers the read again after a reconnect).
   The phone dials because iOS does not let a suspended app accept connections; going to the background drops the
   link, and a push or the user brings it back.
-- **Request** starts `Waiting` and expires on the gateway's deadline. A reference off the allow list cannot be
-  answered until the owner allows it; the app actor then adds it to the list in the Keychain. Approve calls
+- **Request** starts `Waiting` and expires on the gateway's deadline. The prompt names the reference, and one
+  approval answers it; the phone keeps no allow list, and ignores the references the gateway names at pairing.
+  The seal's `info` binds the reference, so the value Face ID opens is the one the prompt shows. Approve calls
   `Platform::open_sealed` on a blocking thread; the actor stays free, so an expiry, a withdrawal, Deny or an
   entered value can take the Face ID prompt down through `cancel_open`. A read without a sealed copy can only be
   answered with a value the owner enters; `FfiApp::answer` carries it, apart from `AppAction`, so it never sits in
   a type that derives `Debug`. An answer stays with its request until the stream reports it delivered; one made
   while the link is down, or lost with it, is sent once the gateway offers the read again, unless the read has
-  expired. Approve asks the request and waits for its reply, so only one Face ID prompt starts at a time.
+  expired. Approve asks the request and waits for its reply, so only one Face ID prompt starts at a time. Only
+  the owner's Deny (the button, or Deny on the Face ID prompt) answers `Denied`, which ends the read on every
+  device; an interrupted, unmatched or unavailable Face ID answers `ReadFailed`, so the gateway's other sources
+  can still answer.
+- **Program reads** ride the same request actor. A `PhoneProgramRequest` lists several items for a program on the
+  gateway Mac: each a reference, with or without a sealed copy, or only a description. Approve opens every sealed
+  item with one Face ID through `Platform::open_sealed_batch`, and `FfiApp::answer_program` carries the values
+  entered for the other items, by index. The answer is `CompanionResponse::Values` in item order. The prompt
+  shows the program's destination, cleaned to one line, and its keep (at most an hour), which Face ID's reason
+  names too.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
 second, and a failed request marks its read failed. A connection actor that cannot start, say because its endpoint

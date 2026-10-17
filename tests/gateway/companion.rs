@@ -20,6 +20,9 @@ use super::{
 };
 
 const REFERENCE: &str = "op://Dev/fixture/credential";
+/// A second item only the companion's `op` knows
+const SECOND_REFERENCE: &str = "op://Dev/second/credential";
+const SECOND_VALUE: &str = "second-value-from-companion";
 
 /// A gateway and one companion wired together over loopback
 struct Rig {
@@ -27,6 +30,8 @@ struct Rig {
     companion: CompanionHandle,
     /// The companion's Mac
     companion_mac: Arc<FakeMac>,
+    /// The gateway's own Mac
+    gateway_mac: Arc<FakeMac>,
     /// `op` reads the gateway made itself
     local_log: PathBuf,
     /// `op` reads the companion made
@@ -37,8 +42,6 @@ struct Rig {
 /// Mac and approves, the companion allows the reference and expects this
 /// gateway
 struct Options<'a> {
-    /// The companion's allow list
-    allow: &'a [&'a str],
     /// The vaults the companion creates items in
     create_vaults: &'a [&'a str],
     /// Whether the companion expects this gateway's id
@@ -54,22 +57,18 @@ struct Options<'a> {
     /// Whether the companion's `op` is already authorized, so it would read
     /// without 1Password asking
     signed_in: bool,
-    /// Whether the companion's notifications fail to show
-    notify_fails: bool,
-    /// Whether another `op` on the companion's Mac is approved each time a
-    /// notification shows, so its `op` is no longer signed out
-    authorized_on_notify: bool,
     /// Whether the companion's `op item create` pauses, so its answer can be lost
     slow_create: bool,
     /// Whether the gateway's own `op` takes a second to read, so the
     /// companion is asked first and a prompt is up when the local read wins
     slow_local: bool,
+    /// More gateway config, such as a server's table
+    extra: &'a str,
 }
 
 impl Default for Options<'_> {
     fn default() -> Self {
         Self {
-            allow: &[REFERENCE],
             create_vaults: &["Personal"],
             paired: true,
             touch: Some(TouchId::Approved),
@@ -77,10 +76,9 @@ impl Default for Options<'_> {
             mac_notifications: true,
             local_hangs: false,
             signed_in: true,
-            notify_fails: false,
-            authorized_on_notify: false,
             slow_create: false,
             slow_local: false,
+            extra: "",
         }
     }
 }
@@ -88,7 +86,6 @@ impl Default for Options<'_> {
 impl Rig {
     async fn start(options: Options<'_>) -> Result<Option<Self>, Box<dyn Error>> {
         let Options {
-            allow,
             create_vaults,
             paired,
             touch,
@@ -96,10 +93,9 @@ impl Rig {
             mac_notifications,
             local_hangs,
             signed_in,
-            notify_fails,
-            authorized_on_notify,
             slow_create,
             slow_local,
+            extra: more,
         } = options;
         let directory = temp_state_dir();
         std::fs::create_dir_all(&directory)?;
@@ -115,24 +111,15 @@ impl Rig {
         let companion_mac = Arc::new(FakeMac::default());
         companion_mac.set_answer(touch);
         companion_mac.set_one_prompt(true);
-        companion_mac.set_notify_fails(notify_fails);
-        if authorized_on_notify {
-            let directory = companion_log
-                .parent()
-                .ok_or("the fake op has no directory")?;
-            companion_mac.set_on_notify(directory.join("authorized"));
-        }
         let text = format!(
             "[companion]\n\
              gateway = \"{expected}\"\n\
              gateway_name = \"main\"\n\
-             allow = {allow}\n\
              create_vaults = {create_vaults}\n\
              listen = \"127.0.0.1:0\"\n\
              discovery = false\n\
              identity_file = \"{key}\"\n\
              op = \"{op}\"\n",
-            allow = serde_json::to_string(allow)?,
             create_vaults = serde_json::to_string(create_vaults)?,
             key = directory.join("companion.key").display(),
             op = companion_op.display(),
@@ -180,7 +167,8 @@ impl Rig {
              command = \"{fixture}\"\n\
              env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n\n\
              [notify.mac]\n\
-             enabled = {mac_notifications}\n",
+             enabled = {mac_notifications}\n\n\
+             {more}\n",
             op = local_op.display(),
             key = gateway_key.display(),
             id = companion.id(),
@@ -202,6 +190,7 @@ impl Rig {
             harness,
             companion,
             companion_mac,
+            gateway_mac,
             local_log,
             companion_log,
         }))
@@ -262,6 +251,7 @@ fn creating_op(signed_in: bool, slow_create: bool) -> Result<(PathBuf, PathBuf),
                'read --no-newline') echo \"$3\" >> \"$d/reads.log\"\n\
                  touch \"$d/authorized\"\n\
                  [ \"$3\" = {REFERENCE} ] && printf '{VALUE}' && exit 0\n\
+                 [ \"$3\" = {SECOND_REFERENCE} ] && printf '{SECOND_VALUE}' && exit 0\n\
                  [ \"$3\" = op://Dev/big/credential ] && head -c 70000 /dev/zero | tr '\\0' a && exit 0\n\
                  echo \"[ERROR] no item matched\" >&2; exit 1 ;;\n\
                'item list') case \"$*\" in\n\
@@ -701,7 +691,7 @@ async fn every_request_asks_touch_id_again() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_signed_out_1password_is_the_only_fingerprint_asked() -> TestResult {
+async fn a_signed_out_1password_never_stands_in_for_the_companions_prompt() -> TestResult {
     let Some(rig) = Rig::start(Options {
         signed_in: false,
         ..Options::default()
@@ -710,51 +700,10 @@ async fn a_signed_out_1password_is_the_only_fingerprint_asked() -> TestResult {
     else {
         return Ok(());
     };
-    let reason = format!("codemode-mcp on main wants to read {REFERENCE}");
 
-    // 1Password's own prompt approves the first read, so the companion only
-    // names it
-    let body = rig
-        .harness
-        .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
-        .await?;
-    assert_eq!(body["result"], VALUE, "{body}");
-    assert_eq!(rig.companion_mac.shown(), [format!("notify {reason}")]);
-
-    // once `op` is authorized it would read silently, so the companion asks
-    let (status, checked) = rig
-        .harness
-        .admin_json("/admin/companion/check", &json!({ "reference": REFERENCE }))
-        .await?;
-    assert_eq!(status, 200, "{checked}");
-    assert!(
-        checked["companions"][0]["result"]["ok"].is_object(),
-        "{checked}"
-    );
-    assert_eq!(
-        rig.companion_mac.shown(),
-        [format!("notify {reason}"), format!("touch_id {reason}")]
-    );
-    assert_eq!(reads(&rig.companion_log, REFERENCE), 2);
-
-    rig.stop().await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_read_another_op_authorized_meanwhile_still_asks_touch_id() -> TestResult {
-    // another `op` on that Mac is approved while the notification is up,
-    // so 1Password will not ask for this read after all
-    let Some(rig) = Rig::start(Options {
-        signed_in: false,
-        authorized_on_notify: true,
-        ..Options::default()
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    let reason = format!("codemode-mcp on main wants to read {REFERENCE}");
-
+    // 1Password is about to ask too, but its prompt names no item, so the
+    // companion's own prompt naming the reference comes first, and nothing
+    // stands in for it
     let body = rig
         .harness
         .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
@@ -762,44 +711,10 @@ async fn a_read_another_op_authorized_meanwhile_still_asks_touch_id() -> TestRes
     assert_eq!(body["result"], VALUE, "{body}");
     assert_eq!(
         rig.companion_mac.shown(),
-        [format!("notify {reason}"), format!("touch_id {reason}")]
+        [format!(
+            "touch_id codemode-mcp on main wants to read {REFERENCE}"
+        )]
     );
-
-    rig.stop().await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_read_no_notification_could_name_still_asks_touch_id() -> TestResult {
-    let Some(rig) = Rig::start(Options {
-        signed_in: false,
-        notify_fails: true,
-        touch: Some(TouchId::Review),
-        ..Options::default()
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-
-    // with 1Password about to ask but nothing naming the reference, the
-    // companion's own prompt still gates the read, and a refusal reads nothing
-    let (_, checked) = rig
-        .harness
-        .admin_json("/admin/companion/check", &json!({ "reference": REFERENCE }))
-        .await?;
-    let message = checked["companions"][0]["result"]["error"]["message"].as_str();
-    assert!(
-        message.is_some_and(|message| message.contains("not approved")),
-        "{checked}"
-    );
-    // the twin server's read as it connects was asked the same way
-    let shown = rig.companion_mac.shown();
-    let prompt = format!("touch_id codemode-mcp on main wants to read {REFERENCE}");
-    assert!(
-        !shown.is_empty() && shown.iter().all(|entry| *entry == prompt),
-        "{shown:?}"
-    );
-    assert_eq!(reads(&rig.companion_log, REFERENCE), 0);
 
     rig.stop().await
 }
@@ -822,67 +737,6 @@ async fn mac_notifications_off_still_skip_the_local_read_while_the_owner_is_away
     assert_eq!(body["result"], VALUE, "{body}");
     assert_eq!(reads(&rig.local_log, REFERENCE), 0);
     assert_eq!(reads(&rig.companion_log, REFERENCE), 1);
-
-    rig.stop().await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_reference_off_the_allow_list_is_asked_for_by_name() -> TestResult {
-    // signed out, a listed reference would be approved through 1Password's
-    // own prompt, which does not name the item
-    let Some(rig) = Rig::start(Options {
-        allow: &["op://Dev/other/credential"],
-        signed_in: false,
-        touch: Some(TouchId::Review),
-        ..Options::default()
-    })
-    .await?
-    else {
-        return Ok(());
-    };
-    let check = json!({ "reference": REFERENCE });
-    let prompt = format!(
-        "touch_id codemode-mcp on main wants to read {REFERENCE}, which is not on this Mac's \
-         allow list"
-    );
-    // only the companion's own prompt, never a notification standing in
-    // for it
-    let only_prompted = || {
-        let shown = rig.companion_mac.shown();
-        assert!(
-            !shown.is_empty() && shown.iter().all(|entry| *entry == prompt),
-            "{shown:?}"
-        );
-    };
-
-    // refusing that prompt reads nothing, though 1Password is still signed
-    // out and would have asked
-    let (_, checked) = rig
-        .harness
-        .admin_json("/admin/companion/check", &check)
-        .await?;
-    let message = checked["companions"][0]["result"]["error"]["message"].as_str();
-    assert!(
-        message.is_some_and(|message| message.contains("denied")),
-        "{checked}"
-    );
-    only_prompted();
-    assert_eq!(reads(&rig.companion_log, REFERENCE), 0);
-
-    // approving it reads the value without any config change
-    rig.companion_mac.set_answer(Some(TouchId::Approved));
-    let (status, checked) = rig
-        .harness
-        .admin_json("/admin/companion/check", &check)
-        .await?;
-    assert_eq!(status, 200, "{checked}");
-    assert!(
-        checked["companions"][0]["result"]["ok"].is_object(),
-        "{checked}"
-    );
-    only_prompted();
-    assert_eq!(reads(&rig.companion_log, REFERENCE), 1);
-    assert_eq!(reads(&rig.local_log, REFERENCE), 0);
 
     rig.stop().await
 }
@@ -917,12 +771,7 @@ async fn a_touch_id_that_is_not_approved_reads_nothing() -> TestResult {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_value_too_large_to_send_is_refused_by_name() -> TestResult {
     const BIG: &str = "op://Dev/big/credential";
-    let Some(rig) = Rig::start(Options {
-        allow: &[REFERENCE, BIG],
-        ..Options::default()
-    })
-    .await?
-    else {
+    let Some(rig) = Rig::start(Options::default()).await? else {
         return Ok(());
     };
 
@@ -1234,8 +1083,7 @@ async fn an_invite_carries_the_gateway_and_its_references_to_a_pairing() -> Test
         .companion
         .ok_or("no companion section was written")?;
     assert_eq!(paired.gateway, ticket.gateway);
-    assert!(paired.allows("op://Dev/a/credential"));
-    assert!(!paired.allows("op://Dev/c/credential"));
+    assert!(!std::fs::read_to_string(&config)?.contains("allow"));
     assert_eq!(
         pairing.id,
         companion::companion_id(Some(&identity))?,
@@ -1502,7 +1350,6 @@ async fn an_invite_lists_a_companion_once_and_checks_it_with_touch_id() -> TestR
     let text = format!(
         "[companion]\n\
          gateway = \"{gateway}\"\n\
-         allow = [\"{REFERENCE}\"]\n\
          listen = \"127.0.0.1:0\"\n\
          discovery = false\n\
          identity_file = \"{key}\"\n\
@@ -1676,4 +1523,506 @@ async fn an_expired_or_unknown_invite_lists_nothing() -> TestResult {
     assert!(harness.app.gateway().companions().peers().is_empty());
 
     harness.stop().await
+}
+
+/// The program-read prompts the companion Mac showed
+fn program_prompts(mac: &FakeMac) -> Vec<String> {
+    mac.shown()
+        .into_iter()
+        .filter(|prompt| prompt.contains("to a program on"))
+        .collect()
+}
+
+async fn program_read(rig: &Rig, targets: Value) -> Result<(u16, Value), Box<dyn Error>> {
+    rig.harness
+        .admin_json(
+            "/admin/op/read",
+            &json!({ "targets": targets, "reason": "deploy lookout" }),
+        )
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_read_is_approved_on_the_companion_with_one_prompt() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    // without the owner's proof nothing is asked
+    let response = reqwest::Client::new()
+        .post(format!("{}/admin/op/read", rig.harness.admin_base()))
+        .json(&json!({ "targets": [{ "reference": REFERENCE }] }))
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 403);
+    assert!(program_prompts(&rig.companion_mac).is_empty());
+
+    let (status, body) = program_read(
+        &rig,
+        json!([{ "reference": REFERENCE }, { "reference": SECOND_REFERENCE }]),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "values": { "source": "mba", "values": [VALUE, SECOND_VALUE] } })
+    );
+    // one prompt names both items, where they go and why, beside the
+    // gateway's own boot read
+    let prompts = program_prompts(&rig.companion_mac);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(
+        prompts[0],
+        format!(
+            "touch_id send 2 1Password values to a program on main: {REFERENCE}, {SECOND_REFERENCE}, for \"deploy lookout\""
+        )
+    );
+    // the owner is away, so the gateway's own `op` never ran for it
+    assert_eq!(reads(&rig.local_log, SECOND_REFERENCE), 0);
+    assert_eq!(reads(&rig.companion_log, SECOND_REFERENCE), 1);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gateway_mac_answers_a_program_read_first_while_the_owner_is_there() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        present: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    rig.gateway_mac.set_answer(Some(TouchId::Approved));
+    let local_reads = reads(&rig.local_log, REFERENCE);
+
+    let (status, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "values": { "source": "this Mac", "values": [VALUE] } })
+    );
+    // the gateway's prompt named the item before its `op` read it, and the
+    // answer came inside the grace, so the companion was never asked
+    let here: Vec<String> = rig
+        .gateway_mac
+        .shown()
+        .into_iter()
+        .filter(|prompt| prompt.contains("to a program on this Mac"))
+        .collect();
+    assert_eq!(
+        here,
+        [format!(
+            "touch_id send 1 1Password value to a program on this Mac: {REFERENCE}, for \"deploy lookout\""
+        )]
+    );
+    assert_eq!(reads(&rig.local_log, REFERENCE), local_reads + 1);
+    tokio::time::sleep(codemode_mcp::secrets::PHONE_GRACE).await;
+    assert!(program_prompts(&rig.companion_mac).is_empty());
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deny_on_the_companion_ends_a_program_read() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    rig.companion_mac.set_answer(Some(TouchId::Review));
+
+    let (status, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["denied"]["message"].is_string(), "{body}");
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+
+    // a description is for a phone, and none is paired
+    let (_, body) = program_read(&rig, json!([{ "describe": "Pushover app token" }])).await?;
+    assert!(
+        body["failed"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("only a phone")),
+        "{body}"
+    );
+
+    rig.stop().await
+}
+
+/// Runs the CLI against the rig's daemon, as a program on the gateway Mac
+/// does; its success, stdout and stderr
+async fn cli(rig: &Rig, args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
+    let directory = rig.harness.state_dir();
+    let config = directory.join("cli.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "admin_listen = \"{admin}\"\nstate_dir = \"{state}\"\n",
+            admin = rig.harness.admin_base().trim_start_matches("http://"),
+            state = directory.display(),
+        ),
+    )?;
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp"))
+        .arg("--config")
+        .arg(&config)
+        .args(args)
+        .output()
+        .await?;
+
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn op_inject_writes_a_private_file_and_op_run_masks_its_values() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    let directory = temp_state_dir();
+    std::fs::create_dir_all(&directory)?;
+    // prompts name the file with its directory resolved
+    let directory = std::fs::canonicalize(&directory)?;
+    let template = directory.join("superalert.env.tpl");
+    std::fs::write(
+        &template,
+        format!(
+            "USER_KEY={{{{ {REFERENCE} }}}}\nAPP_TOKEN={{{{ {SECOND_REFERENCE} }}}}\nAGAIN={{{{{REFERENCE}}}}}\n"
+        ),
+    )?;
+    let out = directory.join("superalert.secrets.env");
+    let template_arg = template.display().to_string();
+    let out_arg = out.display().to_string();
+    let inject = [
+        "op",
+        "inject",
+        "-i",
+        template_arg.as_str(),
+        "-o",
+        out_arg.as_str(),
+        "--reason",
+        "freezerwatch alerts",
+    ];
+
+    let (ok, stdout, stderr) = cli(&rig, &inject).await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&out)?,
+        format!("USER_KEY={VALUE}\nAPP_TOKEN={SECOND_VALUE}\nAGAIN={VALUE}\n")
+    );
+    assert_eq!(std::fs::metadata(&out)?.permissions().mode() & 0o777, 0o600);
+    for text in [&stdout, &stderr] {
+        assert!(
+            !text.contains(VALUE) && !text.contains(SECOND_VALUE),
+            "{text}"
+        );
+    }
+    // the two items, each once, in one prompt naming the file
+    assert_eq!(
+        program_prompts(&rig.companion_mac),
+        [format!(
+            "touch_id send 2 1Password values to a program on main for \"{out_arg}\": {REFERENCE}, {SECOND_REFERENCE}, for \"freezerwatch alerts\""
+        )]
+    );
+
+    // an existing file is replaced only when asked, before anyone is asked
+    let (ok, _, stderr) = cli(&rig, &inject).await?;
+    assert!(!ok && stderr.contains("--force"), "{stderr}");
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+
+    // `op run` hands the value to the command only, and masks its output
+    let env_file = directory.join("run.env");
+    std::fs::write(&env_file, format!("APP_TOKEN={SECOND_REFERENCE}\n"))?;
+    let env_arg = env_file.display().to_string();
+    let check = format!("test \"$APP_TOKEN\" = {SECOND_VALUE} && echo \"token is $APP_TOKEN\"");
+    let (ok, stdout, stderr) = cli(
+        &rig,
+        &[
+            "op",
+            "run",
+            "--env-file",
+            env_arg.as_str(),
+            "--",
+            "sh",
+            "-c",
+            check.as_str(),
+        ],
+    )
+    .await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout, "token is [redacted]\n");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_companion_that_cannot_ask_does_not_deny_a_program_read() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        touch: Some(TouchId::Away),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // a locked or lid-closed Mac fails its part, which leaves a phone free to
+    // answer, instead of refusing for the owner
+    let (status, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["failed"]["message"].is_string(), "{body}");
+    assert!(body.get("denied").is_none(), "{body}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_prompt_names_every_item_however_many() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        touch: Some(TouchId::Review),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let references: Vec<String> = (0..6)
+        .map(|index| format!("op://Dev/item {index}/credential"))
+        .chain([format!("op://Private/{}/password", "Bank".repeat(40))])
+        .collect();
+    let targets: Vec<Value> = references
+        .iter()
+        .map(|reference| json!({ "reference": reference }))
+        .collect();
+
+    let (_, body) = program_read(&rig, json!(targets)).await?;
+    assert!(body["denied"].is_object(), "{body}");
+    let prompts = program_prompts(&rig.companion_mac);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    for reference in &references {
+        assert!(
+            prompts[0].contains(reference.as_str()),
+            "{reference} missing: {}",
+            prompts[0]
+        );
+    }
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deny_at_the_gateway_mac_reads_nothing_and_asks_no_one_else() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        present: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    rig.gateway_mac.set_answer(Some(TouchId::Review));
+    let local_reads = reads(&rig.local_log, REFERENCE);
+
+    let (_, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
+    assert!(body["denied"].is_object(), "{body}");
+    assert_eq!(reads(&rig.local_log, REFERENCE), local_reads);
+    tokio::time::sleep(codemode_mcp::secrets::PHONE_GRACE).await;
+    assert!(program_prompts(&rig.companion_mac).is_empty());
+
+    rig.stop().await
+}
+
+/// Runs `code`, waiting for it when it outlasts the synchronous wait, and
+/// returns its result
+async fn script(rig: &Rig, code: &str) -> Result<Value, Box<dyn Error>> {
+    let mut body = rig.harness.execute_body(code).await?;
+    if body["status"] == "pending" {
+        let id = body["execution_id"].as_str().ok_or("no execution id")?;
+        let done = rig.harness.wait_done(id).await?;
+        body = serde_json::from_str(&super::harness::text_of(&done))?;
+    }
+    assert_eq!(body["status"], "completed", "{body}");
+
+    Ok(body["result"].take())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_env_merges_values_into_a_file_and_answers_with_names_only() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        extra: "[servers.secrets]\nbuiltin = \"secrets\"\n",
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let directory = temp_state_dir();
+    std::fs::create_dir_all(&directory)?;
+    let directory = std::fs::canonicalize(&directory)?;
+    let file = directory.join("superalert.secrets.env");
+    std::fs::write(&file, "# pushover\nUSER_KEY=old\nOTHER=kept\n")?;
+    let code = format!(
+        "await secrets_write_env(path=\"{path}\", vars={{\"USER_KEY\": \"{REFERENCE}\", \
+         \"APP_TOKEN\": \"{SECOND_REFERENCE}\"}}, reason=\"freezerwatch alerts\")",
+        path = file.display()
+    );
+
+    let body = script(&rig, &code).await?;
+    assert_eq!(
+        body,
+        json!({
+            "path": file.display().to_string(),
+            "replaced": ["USER_KEY"],
+            "added": ["APP_TOKEN"],
+            "approved_on": "mba",
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file)?,
+        format!("# pushover\nUSER_KEY={VALUE}\nOTHER=kept\nAPP_TOKEN={SECOND_VALUE}\n")
+    );
+    assert_eq!(
+        std::fs::metadata(&file)?.permissions().mode() & 0o777,
+        0o600
+    );
+    // one prompt, naming the file; the gateway itself asked nobody first
+    assert_eq!(
+        program_prompts(&rig.companion_mac),
+        [format!(
+            "touch_id send 2 1Password values to a program on main for \"{}\": {SECOND_REFERENCE}, {REFERENCE}, for \"freezerwatch alerts\"",
+            file.display()
+        )]
+    );
+
+    // a file that is not an env file is refused before anyone is asked
+    let refused = script(
+        &rig,
+        &format!(
+            "try:\n    r = await secrets_write_env(path=\"{}\", vars={{\"A\": \"{REFERENCE}\"}}, \
+             reason=\"x\")\nexcept RuntimeError as error:\n    r = str(error)\nr",
+            directory.join("run.sh").display()
+        ),
+    )
+    .await?;
+    assert!(
+        refused
+            .as_str()
+            .is_some_and(|text| text.contains("not an env file")),
+        "{refused}"
+    );
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_grant_answers_again_without_asking_until_forgotten() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    let read = async |keep: Option<u64>, destination: Option<&str>| {
+        let request = json!({
+            "targets": [{ "reference": REFERENCE }],
+            "reason": "deploy lookout",
+            "destination": destination,
+            "keep_secs": keep,
+        });
+
+        rig.harness.admin_json("/admin/op/read", &request).await
+    };
+
+    let (_, body) = read(Some(600), None).await?;
+    assert_eq!(body["values"]["source"], "mba", "{body}");
+    let prompts = program_prompts(&rig.companion_mac);
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0].ends_with(", and again without asking for 10 min"),
+        "{prompts:?}"
+    );
+
+    let (_, body) = read(None, None).await?;
+    assert_eq!(
+        body,
+        json!({ "values": { "source": "kept from an earlier approval", "values": [VALUE] } })
+    );
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+
+    // a grant answers only the destination it was approved for
+    let (_, body) = read(None, Some("/srv/other.env")).await?;
+    assert_eq!(body["values"]["source"], "mba", "{body}");
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 2);
+
+    let (status, _) = rig
+        .harness
+        .admin_json("/admin/secrets/forget", &Value::Null)
+        .await?;
+    assert_eq!(status, 200);
+    let (_, body) = read(None, None).await?;
+    assert_eq!(body["values"]["source"], "mba", "{body}");
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 3);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn op_read_of_several_references_prints_them_as_json_after_one_approval() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+
+    let (ok, stdout, stderr) = cli(
+        &rig,
+        &[
+            "op",
+            "read",
+            REFERENCE,
+            SECOND_REFERENCE,
+            "--reason",
+            "deploy lookout",
+        ],
+    )
+    .await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout)?,
+        json!({ REFERENCE: VALUE, SECOND_REFERENCE: SECOND_VALUE })
+    );
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+
+    // a keep longer than a grant may last is refused before anyone is asked
+    let (ok, _, stderr) = cli(&rig, &["op", "read", REFERENCE, "--keep", "2h"]).await?;
+    assert!(!ok && stderr.contains("60 minutes"), "{stderr}");
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+
+    // `op run` names its command with each argument quoted, so a grant for
+    // `sh -c 'echo a b'` is never one for `sh -c echo a b`, and refuses to
+    // keep values for a command the prompt cannot show exactly
+    let directory = std::fs::canonicalize(rig.harness.state_dir())?;
+    let env_file = directory.join("run.env");
+    std::fs::write(&env_file, format!("APP_TOKEN={SECOND_REFERENCE}\n"))?;
+    let env_arg = env_file.display().to_string();
+    let run = async |script: &str, keep: bool| {
+        let mut args = vec!["op", "run", "--env-file", env_arg.as_str()];
+        if keep {
+            args.extend(["--keep", "5m"]);
+        }
+        args.extend(["--", "sh", "-c", script]);
+
+        cli(&rig, &args).await
+    };
+    for refused in ["echo one\necho two", "\u{202e}echo hidden"] {
+        let (ok, _, stderr) = run(refused, true).await?;
+        assert!(!ok && stderr.contains("--keep needs"), "{stderr}");
+    }
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+    let (ok, stdout, stderr) = run("echo a b", true).await?;
+    assert!(ok && stdout == "a b\n", "{stderr}");
+    let prompts = program_prompts(&rig.companion_mac);
+    assert!(
+        prompts[1].contains("for \"the environment of sh -c 'echo a b'\""),
+        "{prompts:?}"
+    );
+
+    rig.stop().await
 }

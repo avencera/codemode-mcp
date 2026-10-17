@@ -354,6 +354,10 @@ impl Companions {
                 code: fault.code,
                 message: fault.message,
             }),
+            Ok(CompanionResponse::Values(_)) => Err(CompanionFailure::Exchange {
+                name: peer.name.clone(),
+                detail: "answered one read with several values".to_owned(),
+            }),
             Err(error) => Err(CompanionFailure::Exchange {
                 name: peer.name.clone(),
                 detail: format!("malformed answer: {error}"),
@@ -468,7 +472,7 @@ impl Companions {
 
     /// Sends one request to `peer` on a new connection and returns the
     /// unparsed answer
-    async fn send(
+    pub(super) async fn send(
         &self,
         peer: &CompanionPeer,
         request: &[u8],

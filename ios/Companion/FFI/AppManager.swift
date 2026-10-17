@@ -26,6 +26,12 @@ final class AppManager: Reconciler, @unchecked Sendable {
         rust.answer(id: id, value: value)
     }
 
+    /// Approves a program read: sends the values the owner pasted or filled
+    /// in, by item index, and opens the sealed rest with one Face ID
+    func answerProgram(id: String, entered: [UInt32: String]) {
+        rust.answerProgram(id: id, entered: entered)
+    }
+
     /// The read the request screen shows: the first one still waiting on
     /// the owner, else the newest finished one until it is dismissed
     var shownRead: PendingRead? {
@@ -73,4 +79,9 @@ final class WeakReconciler: Reconciler, @unchecked Sendable {
     func reconcile(update: Update) {
         target?.reconcile(update: update)
     }
+}
+
+/// Whole minutes in a program read's keep, rounded up, as prompts show it
+func keepMinutes(_ secs: UInt64) -> UInt64 {
+    (secs + 59) / 60
 }

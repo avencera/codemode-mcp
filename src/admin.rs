@@ -469,6 +469,76 @@ pub struct CompanionCheckResponse {
     pub companions: Vec<CompanionCheckEntry>,
 }
 
+/// Body of `POST /admin/op/read`: values a program on this Mac asks for,
+/// approved on this Mac, a companion Mac or a phone
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpReadRequest {
+    /// What to read, in order
+    pub targets: Vec<companion::ProgramTarget>,
+    /// Why, shown quoted in every prompt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where the values go, such as the file `op inject` writes; shown in
+    /// every prompt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// How long the daemon may hand the same values out again without
+    /// asking; said in every prompt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_secs: Option<u64>,
+}
+
+/// Answer of `POST /admin/op/read`
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpReadResponse {
+    /// One value per target, in order
+    Values {
+        /// `this Mac`, or the companion or phone that answered
+        source: String,
+        /// The values
+        values: Vec<String>,
+    },
+    /// The request was refused before anyone was asked
+    Invalid {
+        /// Why
+        message: String,
+    },
+    /// The owner said no
+    Denied {
+        /// Where
+        message: String,
+    },
+    /// No device sent the values
+    Failed {
+        /// Each device's reason
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for OpReadResponse {
+    // the values stay out of logs
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Values { source, values } => formatter
+                .debug_struct("Values")
+                .field("source", source)
+                .field("values", &values.len())
+                .finish(),
+            Self::Invalid { message } => formatter.debug_tuple("Invalid").field(message).finish(),
+            Self::Denied { message } => formatter.debug_tuple("Denied").field(message).finish(),
+            Self::Failed { message } => formatter.debug_tuple("Failed").field(message).finish(),
+        }
+    }
+}
+
+/// Answer of `POST /admin/secrets/forget`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ForgetSecretsResponse {
+    /// How many values the daemon held
+    pub forgotten: usize,
+}
+
 /// Body of `POST /admin/companion/create`
 #[derive(Serialize, Deserialize)]
 pub struct CompanionCreateRequest {
@@ -550,6 +620,8 @@ pub fn router(app: &App) -> Router {
         .route("/admin/companion/check", post(companion_check))
         .route("/admin/companion/check/one", post(companion_check_one))
         .route("/admin/companion/create", post(companion_create))
+        .route("/admin/op/read", post(op_read))
+        .route("/admin/secrets/forget", post(forget_secrets))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
         .route("/admin/oauth/logout", post(oauth_logout))
@@ -1045,6 +1117,70 @@ async fn companion_create(
         },
     })
     .into_response()
+}
+
+/// Forgets the values read for the config, so a restart reads them again
+/// instead of carrying them over, as after rotating a key; owner only, since
+/// it makes the next start ask the owner
+async fn forget_secrets(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/secrets/forget") {
+        return refused;
+    }
+    let forgotten = state.gateway.secrets().onepassword.forget().await;
+
+    Json(ForgetSecretsResponse { forgotten }).into_response()
+}
+
+/// Reads values for a program on this Mac, such as `codemode-mcp op inject`
+///
+/// The answer holds the values, so the route needs the owner proof: only the
+/// user that runs the daemon may ask, and each read still waits for that
+/// owner's approval on a device
+async fn op_read(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<OpReadRequest>,
+) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/op/read") {
+        return refused;
+    }
+
+    let answer = state
+        .gateway
+        .secrets()
+        .onepassword
+        .read_for_program(&companion::ProgramAsk {
+            targets: request.targets,
+            reason: request.reason,
+            destination: request.destination,
+            keep: request.keep_secs.map(std::time::Duration::from_secs),
+        })
+        .await;
+    let response = match answer {
+        Ok(read) => {
+            tracing::info!(
+                source = %read.source,
+                values = read.values.len(),
+                "program read answered"
+            );
+
+            OpReadResponse::Values {
+                source: read.source,
+                values: read.values,
+            }
+        }
+        Err(failure) => {
+            tracing::info!(%failure, "program read gave no values");
+            let message = failure.to_string();
+            match failure {
+                companion::ProgramReadError::Invalid(_) => OpReadResponse::Invalid { message },
+                companion::ProgramReadError::Denied(_) => OpReadResponse::Denied { message },
+                companion::ProgramReadError::Failed(_) => OpReadResponse::Failed { message },
+            }
+        }
+    };
+
+    Json(response).into_response()
 }
 
 /// Asks the companions, and only them, to read a reference; local `op` and

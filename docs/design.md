@@ -205,6 +205,83 @@ Each call prints `ok (<n> bytes of output, not shown)` or a failure category; re
 The CLI warns that the 1Password app on the Mac may show prompts to accept. Agent calls then only need the
 phone passkey approval. Unconfirmed: whether a 1Password lock ends the MCP session
 
+### Program reads (`src/companion/program.rs`, `src/op.rs`)
+
+`codemode-mcp op read`, `op inject` and `op run` give 1Password values to a program on the gateway Mac,
+approved wherever the owner is
+
+- `POST /admin/op/read` (owner proof required, since the answer holds values) takes 1 to 20 targets, a
+  reason, an optional destination and an optional `keep_secs`. A target is an `op://` reference or a
+  description (one line, at most 80 characters). The reason is cut to one line of 160 characters and quoted in
+  every prompt as the program's claim. The destination (one line, at most 256 characters) is the absolute path
+  of the file the values go to, or `the environment of <command>` for `op run`, and every prompt names it in
+  full
+- The race holds the grace sender itself, so a local read that succeeds within the grace never releases the
+  other devices, and the losing sources are dropped before the values are sealed to phones
+- Only the daemon takes over and hands off the restart secrets; a one-off run (`tools`, `exec`) leaves them
+- Sources: the gateway Mac while `Mac::present` says the owner is there and Touch ID is on, every companion Mac,
+  and every phone. Companion Macs and phones wait `PHONE_GRACE` (5 s) while the gateway Mac is asked. The first
+  source to send every value wins and the rest are dropped, which takes their prompts down. A `denied` answer
+  from any source ends the read at once; other failures wait for the remaining sources. The whole read gives up
+  after `ASK_TIMEOUT` plus the grace
+- The gateway Mac never runs `op` for a program without its own Touch ID prompt first. 1Password's prompt names
+  no item, and one approval lets `op` read anything for about ten minutes, so without the codemode prompt a
+  program could read silently after any earlier approval. A companion Mac and a phone hold the same rule for
+  every read
+- The config cache is neither read nor filled. Values read for references are sealed to every phone
+  afterwards, as for config reads
+- Keep grants: with `keep_secs` (clamped to 1 s to 60 min) every prompt ends `and again without asking for N
+  min` (`for the same destination` when there is one), and the values are held in `OnePassword.kept` under
+  (destination, reference) until then. A later program read with the same destination whose targets are all
+  references held for it is answered without asking anyone; any other destination asks. `forget()` clears
+  them and bumps a counter, so a read approved after the forget began keeps nothing, and the restart handoff
+  never carries them. A destination longer than 256 characters or holding a control character is refused,
+  never cut, and `op inject` / `op read --out-file` name the file with its directory resolved
+- A batch holding a description goes to phones only, since a Mac prompt has no text field
+- Wire: a companion Mac gets `{"program_read": {references, reason, destination, keep_secs}}` and answers
+  `{"values": [...]}` in order. A phone gets `{"program_read": {id, items, reason, destination, keep_secs,
+  expires_in_ms}}` on the
+  stream a single read would use, with each item a reference and its sealed copy or a description, and answers
+  the same way. The push says `kind = "program"` and carries a one-line `summary` instead of `reference`. A
+  companion or app from before program reads cannot parse the request: a Mac answers `malformed request`, an
+  app closes the stream without an answer, and the gateway reports that it needs updating. There is no fallback
+  to per-value reads
+- Sealed items open together with one Face ID on the phone; items without a copy, and descriptions, take an
+  entered value
+- CLI: values come back to the CLI, which fills the template or environment. `op inject` and `op read
+  --out-file` write through a new file created with the mode (0600 by default) and renamed into place, and
+  refuse an existing file without `--force` before asking anyone. `op run` passes values in the child's
+  environment only and, unless `--no-masking`, masks its stdout and stderr as they stream (`op::Masker`: each
+  value of 3 or more characters and each line of a multi-line one, holding back only a tail that could still
+  grow into a value). It forwards SIGINT, SIGTERM and SIGHUP to the command and exits with its code, or 128
+  plus the signal. Without `--force` the file is linked into place, which fails on a file that appeared while
+  the owner was approving. References are deduplicated, so a template asks once per item
+- `op read` with several references prints a JSON object of each reference and its value. `--keep` takes `90s`,
+  `15m`, `1h` or bare minutes, at most 60 minutes, and is checked before anyone is asked
+- The `secrets` builtin (`src/env_files.rs`) serves `write_env(path, vars, reason, keep_minutes)` in process,
+  like `logins`. It checks the path before asking: absolute, named `.env`, `.env.<name>` or `<name>.env`, in a
+  directory that exists, not an example or template (`example`, `sample`, `template`, `dist` or `tpl` as a
+  dot-separated part), and, when it exists, a regular file after following links, whose canonical path is the
+  destination shown. Every value must be one whole `op://` reference, so the file holds nothing the prompt did
+  not show. It reads through `read_for_program`, adds the values to the redactor, then, holding a
+  process-wide lock, reads the file again (the approval may have taken minutes), replaces the named variables'
+  lines (keeping what precedes the name, such as a BOM or `export`, dropping later duplicates and the rest of a
+  multi-line quoted value, never reading a line inside a quoted value as a variable), appends the rest with the
+  file's own line ending and writes through `op::write_private`, with mode 0600, or, when the existing file gave others
+  none, is owned by the daemon's user and is not in a catch-all group (`staff`, `everyone`, `users`), its
+  group bits with its group set on the new file by `fchown` (dropped if that fails; on macOS a new
+  file's group, staff, holds every user). Cancelling the MCP request drops the read, taking its prompts down,
+  and is checked again before the write Values outside `[A-Za-z0-9_-.:/+=@,%]`, or starting with `=`, are single-quoted, since a
+  shell expands `~` in an assignment and zsh a leading `=`; a line break or a single quote is refused. The answer holds the path, the replaced and added names and the approving
+  device. The device prompt is the approval, so config validation refuses `policy = "ask"` on `write_env`, and
+  the server's call timeout is at least `ASK_TIMEOUT` plus 30 s so a late approval still writes
+- Agents learn the tools from the server instructions and from a note on `search_tools` results for queries
+  about 1Password or secrets: name the env file (asking the user when unclear) and use `write_env` or `op
+  inject`, never fetch a value; `op run` is the opt-in for high-severity secrets, and `op read` the last
+  resort
+- A server with `needs_owner_here = true` (1Password Environments) has its calls refused before approval while
+  the owner is away, with a message pointing to these commands
+
 ### App sessions
 
 The protocol has no session id, so the server issues its own: an app session, passed by the agent as the optional
@@ -479,8 +556,21 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - The first connect runs `op read --no-newline <reference>` for each one (`[secrets] op`, default `op` on `PATH`),
   outside the 30 s connect timeout with its own 120 s limit so a Touch ID prompt can be answered. Each reference
   is read once per process and kept in memory, shared by every server that names it, and reads run one at a
-  time, so servers starting together share one prompt and reconnects never prompt again; a rotated key needs a
-  restart. A literal `{{` cannot be escaped, so a value that needs one cannot go in `headers` or `env`
+  time, so servers starting together share one prompt and reconnects never prompt again. A literal `{{` cannot
+  be escaped, so a value that needs one cannot go in `headers` or `env`
+- Restart handoff (`src/secrets/handoff.rs`): `App::shutdown`, the clean-stop path, seals the cache with
+  AES-256-GCM (aws-lc-rs) under a fresh random 256-bit key and a random nonce, with the format and write time
+  as associated data. The ciphertext goes to `<state_dir>/secrets.handoff` (0600) and the key to the login
+  keychain (service `dev.praveen.codemode-mcp.handoff`), where an item made by the signed binary is readable
+  without a prompt only by that code identity. `App::start` takes both before any upstream connects, deletes
+  both whatever happens next, and seeds the cache only from a handoff under 10 minutes old. The keychain is used
+  only by the installed service binary with no `secrets.identity_file`, since a test or checkout build writing
+  the item would leave the service a keychain prompt; anything else keeps the key in
+  `secrets.handoff.key` beside the ciphertext. A crash or `kill -9` writes nothing. The owner-only
+  `POST /admin/secrets/forget` (`service restart --fresh`) empties the cache first, for a rotated key. Program
+  reads never enter the cache, so never the handoff. Trade-off: for the seconds of a restart the values are at
+  rest on the gateway Mac, encrypted, with the key in the keychain; anything running as the signed binary could
+  read them, as it could read the daemon's memory
 - Reads go through the 1Password app integration, so the Mac prompts. A service account token
   (`OP_SERVICE_ACCOUNT_TOKEN`) would read without prompting, but it is a reusable credential on the Mac that
   supply-chain malware could copy, so the daemon is not set up with one
@@ -591,13 +681,12 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   references, for a gateway the companion cannot reach; the gateway's entry is then added by hand
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
-  stream or never gives up loses the prompt), and only after a fingerprint given to a prompt naming the
-  reference: its own Touch ID prompt naming the reference and the gateway (its other button says Deny), or, for
-  a reference on its `allow` list while `op` is signed out, 1Password's prompt beside a notification naming it.
-  1Password's prompt does not name the item and one approval lets `op` read anything for about ten minutes, so
-  an unlisted reference always gets the companion's own prompt first; otherwise a compromised gateway could
-  slip any item behind 1Password's unnamed prompt. The owner chooses unlisted references one read at a time
-  instead of editing the config
+  stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt
+  naming the reference and the gateway (its other button says Deny). 1Password's prompt, which follows while
+  `op` is signed out, never stands in for it: it names no item and one approval lets `op` read anything for
+  about ten minutes. There is no allow list: a gateway may ask for any reference, and the owner decides each
+  one by name, as for a program read. A `[companion] allow` list from before this is removed from the config
+  when the companion starts or is installed, since the old binary runs `update` and cannot know to
 - The prompt shows the gateway name and reference as the ticket or registration gave them, so config loading refuses names over
   63 characters, references over 256, and either with line breaks or control, invisible or direction-changing
   characters; a crafted ticket cannot make the prompt say something else. Host names are cleaned the same way

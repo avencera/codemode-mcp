@@ -18,13 +18,62 @@ pub struct CompanionRequest {
     pub reference: String,
 }
 
+/// Most values one program read asks for, so one prompt stays readable and
+/// the answer stays well inside [`crate::MAX_BODY_BYTES`]
+pub const MAX_PROGRAM_ITEMS: usize = 20;
+
+/// Longest reason a program may give, in characters; prompts show it quoted
+pub const MAX_REASON_CHARS: usize = 160;
+
+/// Longest description of an item a program cannot name, in characters
+pub const MAX_DESCRIPTION_CHARS: usize = 80;
+
+/// Longest destination a program may name, in characters
+pub const MAX_DESTINATION_CHARS: usize = 256;
+
+/// Longest a program may ask to keep approved values, in seconds
+pub const MAX_KEEP_SECS: u64 = 60 * 60;
+
+/// Asks a companion Mac for values a program on the gateway Mac wants
+/// (`codemode-mcp op read`, `op inject`, `op run`), sent as
+/// `{"program_read": {...}}`; answered with
+/// [`CompanionResponse::Values`] in the order of `references`
+///
+/// One Touch ID prompt covers the batch and names every reference. The value
+/// goes to that program, so the prompt says so. A companion from before this
+/// answers [`MALFORMED_REQUEST`], since the request has no `reference`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionProgramRequest {
+    /// The batch
+    pub program_read: ProgramBatch,
+}
+
+/// The references one program read asks a companion Mac for
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramBatch {
+    /// `op://` references, at most [`MAX_PROGRAM_ITEMS`]
+    pub references: Vec<String>,
+    /// Why the program wants them, in its own words, at most
+    /// [`MAX_REASON_CHARS`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where the values go, such as the file the gateway writes them to or
+    /// the command whose environment gets them; prompts show it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// How long the gateway may hand the same values out again without
+    /// asking, at most [`MAX_KEEP_SECS`]; prompts say so. Unset, every
+    /// request asks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_secs: Option<u64>,
+}
+
 /// Why a companion did not send a value
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionErrorCode {
     /// The request was malformed or named no reference, or asked for an
-    /// item in a vault the companion does not create in; older companions
-    /// also answer it for a reference off their allow list
+    /// item in a vault the companion does not create in
     NotAllowed,
     /// The owner did not approve on the companion Mac
     Denied,
@@ -155,21 +204,25 @@ pub struct CompanionFault {
     pub message: String,
 }
 
-/// A companion's answer: `{"value": "..."}` or `{"error": {...}}`
+/// A companion's answer: `{"value": "..."}`, `{"values": [...]}` or
+/// `{"error": {...}}`
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionResponse {
     /// The value 1Password holds
     Value(String),
+    /// The values of a program read, one per item in the order asked
+    Values(Vec<String>),
     /// Nothing was read
     Error(CompanionFault),
 }
 
 impl std::fmt::Debug for CompanionResponse {
-    // the value stays out of logs
+    // the values stay out of logs
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Value(_) => formatter.write_str("Value(..)"),
+            Self::Values(values) => write!(formatter, "Values({} values)", values.len()),
             Self::Error(fault) => formatter.debug_tuple("Error").field(fault).finish(),
         }
     }
@@ -242,8 +295,9 @@ pub struct Registered {
     pub gateway_name: String,
     /// The name the gateway lists the companion under
     pub name: String,
-    /// References in the gateway's server config, sorted; the companion's
-    /// allow list
+    /// References in the gateway's server config, sorted; the pairing check
+    /// reads one. Companions and phones from before every read was asked
+    /// for by name kept them as an allow list
     pub references: Vec<String>,
     /// Whether the companion was listed before this registration
     pub already_listed: bool,

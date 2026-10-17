@@ -487,6 +487,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
     typealias FfiType = Int64
     typealias SwiftType = Int64
@@ -604,6 +620,15 @@ public protocol FfiAppProtocol: AnyObject, Sendable {
     func answer(id: String, value: String) 
     
     /**
+     * Approves the program read `id`: sends `entered`, the values the owner
+     * pasted or filled in keyed by item index, and opens every other item
+     * with one Face ID. Nothing is sent unless each item has an entered
+     * value or a sealed copy. Its own call for the same reason as
+     * [`FfiApp::answer`]
+     */
+    func answerProgram(id: String, entered: [UInt32: String]) 
+    
+    /**
      * Asks for `action`; its effects arrive through the reconciler
      */
     func dispatch(action: AppAction) 
@@ -699,6 +724,23 @@ open func answer(id: String, value: String)  {try! rustCall() {
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),
         FfiConverterString.lower(value),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Approves the program read `id`: sends `entered`, the values the owner
+     * pasted or filled in keyed by item index, and opens every other item
+     * with one Face ID. Nothing is sent unless each item has an entered
+     * value or a sealed copy. Its own call for the same reason as
+     * [`FfiApp::answer`]
+     */
+open func answerProgram(id: String, entered: [UInt32: String])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_companion_core_fn_method_ffiapp_answer_program(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterDictionaryUInt32String.lower(entered),uniffiCallStatus
     )
 }
 }
@@ -894,11 +936,6 @@ public struct GatewayInfo: Equatable, Hashable {
      * The name the gateway lists this phone under
      */
     public var phoneName: String
-    /**
-     * The references this phone answers without asking first, matched
-     * exactly: the gateway's at pairing, plus each one the owner allowed
-     */
-    public var allow: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -911,15 +948,10 @@ public struct GatewayInfo: Equatable, Hashable {
          */id: String, 
         /**
          * The name the gateway lists this phone under
-         */phoneName: String, 
-        /**
-         * The references this phone answers without asking first, matched
-         * exactly: the gateway's at pairing, plus each one the owner allowed
-         */allow: [String]) {
+         */phoneName: String) {
         self.name = name
         self.id = id
         self.phoneName = phoneName
-        self.allow = allow
     }
 
     
@@ -940,8 +972,7 @@ public struct FfiConverterTypeGatewayInfo: FfiConverterRustBuffer {
             try GatewayInfo(
                 name: FfiConverterString.read(from: &buf), 
                 id: FfiConverterString.read(from: &buf), 
-                phoneName: FfiConverterString.read(from: &buf), 
-                allow: FfiConverterSequenceString.read(from: &buf)
+                phoneName: FfiConverterString.read(from: &buf)
         )
     }
 
@@ -949,7 +980,6 @@ public struct FfiConverterTypeGatewayInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterString.write(value.id, into: &buf)
         FfiConverterString.write(value.phoneName, into: &buf)
-        FfiConverterSequenceString.write(value.allow, into: &buf)
     }
 }
 
@@ -966,6 +996,109 @@ public func FfiConverterTypeGatewayInfo_lift(_ buf: RustBuffer) throws -> Gatewa
 #endif
 public func FfiConverterTypeGatewayInfo_lower(_ value: GatewayInfo) -> RustBuffer {
     return FfiConverterTypeGatewayInfo.lower(value)
+}
+
+
+/**
+ * Everything one Face ID needs to open the sealed values of a program read
+ */
+public struct OpenBatch: Equatable, Hashable {
+    /**
+     * The read, so [`Platform::cancel_open`] can name it
+     */
+    public var id: String
+    /**
+     * The gateway the program runs on
+     */
+    public var gatewayName: String
+    /**
+     * How many values go to the program, entered ones included, for the
+     * reason Face ID shows
+     */
+    public var total: UInt32
+    /**
+     * How long, in seconds, the gateway may hand the values out again
+     * without asking, for the reason Face ID shows
+     */
+    public var keepSecs: UInt64?
+    /**
+     * The values to open, answered in this order
+     */
+    public var items: [SealedItem]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The read, so [`Platform::cancel_open`] can name it
+         */id: String, 
+        /**
+         * The gateway the program runs on
+         */gatewayName: String, 
+        /**
+         * How many values go to the program, entered ones included, for the
+         * reason Face ID shows
+         */total: UInt32, 
+        /**
+         * How long, in seconds, the gateway may hand the values out again
+         * without asking, for the reason Face ID shows
+         */keepSecs: UInt64?, 
+        /**
+         * The values to open, answered in this order
+         */items: [SealedItem]) {
+        self.id = id
+        self.gatewayName = gatewayName
+        self.total = total
+        self.keepSecs = keepSecs
+        self.items = items
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension OpenBatch: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOpenBatch: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OpenBatch {
+        return
+            try OpenBatch(
+                id: FfiConverterString.read(from: &buf), 
+                gatewayName: FfiConverterString.read(from: &buf), 
+                total: FfiConverterUInt32.read(from: &buf), 
+                keepSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                items: FfiConverterSequenceTypeSealedItem.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OpenBatch, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.gatewayName, into: &buf)
+        FfiConverterUInt32.write(value.total, into: &buf)
+        FfiConverterOptionUInt64.write(value.keepSecs, into: &buf)
+        FfiConverterSequenceTypeSealedItem.write(value.items, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOpenBatch_lift(_ buf: RustBuffer) throws -> OpenBatch {
+    return try FfiConverterTypeOpenBatch.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOpenBatch_lower(_ value: OpenBatch) -> RustBuffer {
+    return FfiConverterTypeOpenBatch.lower(value)
 }
 
 
@@ -1089,7 +1222,7 @@ public struct PendingRead: Equatable, Hashable {
      */
     public var id: String
     /**
-     * The `op://` reference
+     * The `op://` reference; for a program read, one line naming its items
      */
     public var reference: String
     /**
@@ -1102,18 +1235,19 @@ public struct PendingRead: Equatable, Hashable {
     public var expiresAtMs: Int64
     /**
      * Whether the gateway sent a copy Face ID can open; without one the
-     * owner enters the value
+     * owner enters the value. For a program read, whether every item has
+     * one
      */
     public var sealed: Bool
-    /**
-     * Whether the reference is on the allow list; one that is not can be
-     * answered only once the owner allows it
-     */
-    public var listed: Bool
     /**
      * Where it stands
      */
     public var status: ReadStatus
+    /**
+     * Set when a program on the gateway Mac asked, rather than the
+     * gateway's own config; its values go to that program
+     */
+    public var program: ProgramRead?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1122,7 +1256,7 @@ public struct PendingRead: Equatable, Hashable {
          * The id the push named
          */id: String, 
         /**
-         * The `op://` reference
+         * The `op://` reference; for a program read, one line naming its items
          */reference: String, 
         /**
          * The gateway Mac's short name
@@ -1132,22 +1266,23 @@ public struct PendingRead: Equatable, Hashable {
          */expiresAtMs: Int64, 
         /**
          * Whether the gateway sent a copy Face ID can open; without one the
-         * owner enters the value
+         * owner enters the value. For a program read, whether every item has
+         * one
          */sealed: Bool, 
         /**
-         * Whether the reference is on the allow list; one that is not can be
-         * answered only once the owner allows it
-         */listed: Bool, 
-        /**
          * Where it stands
-         */status: ReadStatus) {
+         */status: ReadStatus, 
+        /**
+         * Set when a program on the gateway Mac asked, rather than the
+         * gateway's own config; its values go to that program
+         */program: ProgramRead?) {
         self.id = id
         self.reference = reference
         self.gatewayName = gatewayName
         self.expiresAtMs = expiresAtMs
         self.sealed = sealed
-        self.listed = listed
         self.status = status
+        self.program = program
     }
 
     
@@ -1171,8 +1306,8 @@ public struct FfiConverterTypePendingRead: FfiConverterRustBuffer {
                 gatewayName: FfiConverterString.read(from: &buf), 
                 expiresAtMs: FfiConverterInt64.read(from: &buf), 
                 sealed: FfiConverterBool.read(from: &buf), 
-                listed: FfiConverterBool.read(from: &buf), 
-                status: FfiConverterTypeReadStatus.read(from: &buf)
+                status: FfiConverterTypeReadStatus.read(from: &buf), 
+                program: FfiConverterOptionTypeProgramRead.read(from: &buf)
         )
     }
 
@@ -1182,8 +1317,8 @@ public struct FfiConverterTypePendingRead: FfiConverterRustBuffer {
         FfiConverterString.write(value.gatewayName, into: &buf)
         FfiConverterInt64.write(value.expiresAtMs, into: &buf)
         FfiConverterBool.write(value.sealed, into: &buf)
-        FfiConverterBool.write(value.listed, into: &buf)
         FfiConverterTypeReadStatus.write(value.status, into: &buf)
+        FfiConverterOptionTypeProgramRead.write(value.program, into: &buf)
     }
 }
 
@@ -1204,6 +1339,195 @@ public func FfiConverterTypePendingRead_lower(_ value: PendingRead) -> RustBuffe
 
 
 /**
+ * What a program on the gateway Mac asked for, as the prompt shows it
+ *
+ * Every text here is cleaned to one line: line breaks show as `⏎`, and
+ * control, invisible and direction-changing characters as `?`
+ */
+public struct ProgramRead: Equatable, Hashable {
+    /**
+     * Why the program wants the values, in its own words; a claim to show
+     * quoted, not a fact
+     */
+    public var reason: String?
+    /**
+     * Where the program says the values go, such as a file it writes or
+     * the environment of a command it runs
+     */
+    public var destination: String?
+    /**
+     * How long, in seconds, programs on the gateway may get the same values
+     * again without asking, at most an hour; `None` when every request asks
+     */
+    public var keepSecs: UInt64?
+    /**
+     * The values asked for, in the order they are sent; empty while a read
+     * opened from a push has not arrived
+     */
+    public var items: [ProgramItem]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Why the program wants the values, in its own words; a claim to show
+         * quoted, not a fact
+         */reason: String?, 
+        /**
+         * Where the program says the values go, such as a file it writes or
+         * the environment of a command it runs
+         */destination: String?, 
+        /**
+         * How long, in seconds, programs on the gateway may get the same values
+         * again without asking, at most an hour; `None` when every request asks
+         */keepSecs: UInt64?, 
+        /**
+         * The values asked for, in the order they are sent; empty while a read
+         * opened from a push has not arrived
+         */items: [ProgramItem]) {
+        self.reason = reason
+        self.destination = destination
+        self.keepSecs = keepSecs
+        self.items = items
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ProgramRead: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProgramRead: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProgramRead {
+        return
+            try ProgramRead(
+                reason: FfiConverterOptionString.read(from: &buf), 
+                destination: FfiConverterOptionString.read(from: &buf), 
+                keepSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                items: FfiConverterSequenceTypeProgramItem.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ProgramRead, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.reason, into: &buf)
+        FfiConverterOptionString.write(value.destination, into: &buf)
+        FfiConverterOptionUInt64.write(value.keepSecs, into: &buf)
+        FfiConverterSequenceTypeProgramItem.write(value.items, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProgramRead_lift(_ buf: RustBuffer) throws -> ProgramRead {
+    return try FfiConverterTypeProgramRead.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProgramRead_lower(_ value: ProgramRead) -> RustBuffer {
+    return FfiConverterTypeProgramRead.lower(value)
+}
+
+
+/**
+ * One sealed value of an [`OpenBatch`]
+ */
+public struct SealedItem: Equatable, Hashable {
+    /**
+     * The reference the value was sealed under
+     */
+    public var reference: String
+    /**
+     * HPKE `info`, binding the reference and gateway
+     */
+    public var info: Data
+    /**
+     * The encapsulated key
+     */
+    public var enc: Data
+    /**
+     * The sealed value
+     */
+    public var ciphertext: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The reference the value was sealed under
+         */reference: String, 
+        /**
+         * HPKE `info`, binding the reference and gateway
+         */info: Data, 
+        /**
+         * The encapsulated key
+         */enc: Data, 
+        /**
+         * The sealed value
+         */ciphertext: Data) {
+        self.reference = reference
+        self.info = info
+        self.enc = enc
+        self.ciphertext = ciphertext
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SealedItem: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSealedItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SealedItem {
+        return
+            try SealedItem(
+                reference: FfiConverterString.read(from: &buf), 
+                info: FfiConverterData.read(from: &buf), 
+                enc: FfiConverterData.read(from: &buf), 
+                ciphertext: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SealedItem, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.reference, into: &buf)
+        FfiConverterData.write(value.info, into: &buf)
+        FfiConverterData.write(value.enc, into: &buf)
+        FfiConverterData.write(value.ciphertext, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedItem_lift(_ buf: RustBuffer) throws -> SealedItem {
+    return try FfiConverterTypeSealedItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedItem_lower(_ value: SealedItem) -> RustBuffer {
+    return FfiConverterTypeSealedItem.lower(value)
+}
+
+
+/**
  * What the UI asks for
  */
 
@@ -1219,25 +1543,9 @@ public enum AppAction: Equatable, Hashable {
          */scanned: String
     )
     /**
-     * Add the read's reference to the allow list, so it can be answered
-     * now and is not asked about again
-     */
-    case allow(
-        /**
-         * The read
-         */id: String
-    )
-    /**
-     * Take `reference` off the allow list, so a later read of it waits
-     * for the owner to allow it again
-     */
-    case disallow(
-        /**
-         * The reference, as the allow list shows it
-         */reference: String
-    )
-    /**
-     * Open the read's value with Face ID and send it
+     * Open the read's value with Face ID and send it; for a program read,
+     * open every item with one Face ID, which answers only when each item
+     * has a sealed copy (see [`FfiApp::answer_program`])
      */
     case approve(
         /**
@@ -1291,6 +1599,24 @@ public enum AppAction: Equatable, Hashable {
          */expiresAtMs: Int64?
     )
     /**
+     * The app was opened from a push for a program read
+     */
+    case openedFromProgramPush(
+        /**
+         * The request id in the push
+         */id: String, 
+        /**
+         * The push's one line naming the items
+         */summary: String, 
+        /**
+         * The gateway name in the push
+         */gateway: String, 
+        /**
+         * When the gateway stops waiting, in Unix milliseconds, if the
+         * push says
+         */expiresAtMs: Int64?
+    )
+    /**
      * APNs gave this token, or `None` when notifications are off
      */
     case pushToken(
@@ -1325,31 +1651,28 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 1: return .pair(scanned: try FfiConverterString.read(from: &buf)
         )
         
-        case 2: return .allow(id: try FfiConverterString.read(from: &buf)
+        case 2: return .approve(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 3: return .disallow(reference: try FfiConverterString.read(from: &buf)
+        case 3: return .deny(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 4: return .approve(id: try FfiConverterString.read(from: &buf)
+        case 4: return .dismiss(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 5: return .deny(id: try FfiConverterString.read(from: &buf)
+        case 5: return .unpair
+        
+        case 6: return .foreground
+        
+        case 7: return .background
+        
+        case 8: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf), expiresAtMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
-        case 6: return .dismiss(id: try FfiConverterString.read(from: &buf)
+        case 9: return .openedFromProgramPush(id: try FfiConverterString.read(from: &buf), summary: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf), expiresAtMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
-        case 7: return .unpair
-        
-        case 8: return .foreground
-        
-        case 9: return .background
-        
-        case 10: return .openedFromPush(id: try FfiConverterString.read(from: &buf), reference: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf), expiresAtMs: try FfiConverterOptionInt64.read(from: &buf)
-        )
-        
-        case 11: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
+        case 10: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1365,53 +1688,51 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterString.write(scanned, into: &buf)
             
         
-        case let .allow(id):
+        case let .approve(id):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(id, into: &buf)
             
         
-        case let .disallow(reference):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(reference, into: &buf)
-            
-        
-        case let .approve(id):
-            writeInt(&buf, Int32(4))
-            FfiConverterString.write(id, into: &buf)
-            
-        
         case let .deny(id):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(id, into: &buf)
             
         
         case let .dismiss(id):
-            writeInt(&buf, Int32(6))
+            writeInt(&buf, Int32(4))
             FfiConverterString.write(id, into: &buf)
             
         
         case .unpair:
-            writeInt(&buf, Int32(7))
+            writeInt(&buf, Int32(5))
         
         
         case .foreground:
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(6))
         
         
         case .background:
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(7))
         
         
         case let .openedFromPush(id,reference,gateway,expiresAtMs):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(reference, into: &buf)
             FfiConverterString.write(gateway, into: &buf)
             FfiConverterOptionInt64.write(expiresAtMs, into: &buf)
             
         
+        case let .openedFromProgramPush(id,summary,gateway,expiresAtMs):
+            writeInt(&buf, Int32(9))
+            FfiConverterString.write(id, into: &buf)
+            FfiConverterString.write(summary, into: &buf)
+            FfiConverterString.write(gateway, into: &buf)
+            FfiConverterOptionInt64.write(expiresAtMs, into: &buf)
+            
+        
         case let .pushToken(token,environment):
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(10))
             FfiConverterOptionString.write(token, into: &buf)
             FfiConverterTypePushEnvironment.write(environment, into: &buf)
             
@@ -1551,11 +1872,14 @@ enum OpenError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
     
     
     /**
-     * The owner cancelled Face ID, or it was taken down
+     * The owner tapped Deny on the Face ID prompt; only this answers
+     * `Denied`, which ends the read on every device
      */
     case Denied
     /**
-     * The key is gone or the ciphertext does not open
+     * Anything else: Face ID was interrupted, did not match or is
+     * unavailable, the key is gone, or the ciphertext does not open. The
+     * gateway hears `ReadFailed` and keeps asking its other sources
      */
     case Failed(
         /**
@@ -1834,6 +2158,99 @@ public func FfiConverterTypePlatformError_lift(_ buf: RustBuffer) throws -> Plat
 public func FfiConverterTypePlatformError_lower(_ value: PlatformError) -> RustBuffer {
     return FfiConverterTypePlatformError.lower(value)
 }
+
+
+/**
+ * One value of a [`ProgramRead`]
+ */
+
+public enum ProgramItem: Equatable, Hashable {
+    
+    /**
+     * An `op://` reference
+     */
+    case reference(
+        /**
+         * The reference
+         */reference: String, 
+        /**
+         * Whether the gateway sent a copy Face ID can open; without one the
+         * owner enters the value
+         */sealed: Bool
+    )
+    /**
+     * Only the program's description of the item; the owner picks it in
+     * 1Password and enters the value
+     */
+    case describe(
+        /**
+         * The description
+         */description: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ProgramItem: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProgramItem: FfiConverterRustBuffer {
+    typealias SwiftType = ProgramItem
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProgramItem {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .reference(reference: try FfiConverterString.read(from: &buf), sealed: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 2: return .describe(description: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ProgramItem, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .reference(reference,sealed):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(reference, into: &buf)
+            FfiConverterBool.write(sealed, into: &buf)
+            
+        
+        case let .describe(description):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(description, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProgramItem_lift(_ buf: RustBuffer) throws -> ProgramItem {
+    return try FfiConverterTypeProgramItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProgramItem_lower(_ value: ProgramItem) -> RustBuffer {
+    return FfiConverterTypeProgramItem.lower(value)
+}
+
 
 
 /**
@@ -2203,6 +2620,13 @@ public protocol Platform: AnyObject, Sendable {
     func openSealed(request: OpenRequest) throws  -> String
     
     /**
+     * Asks Face ID once, with a reason saying the values go to a program on
+     * the gateway, then opens every item with the Secure Enclave key; the
+     * values come back in the order of `batch.items`
+     */
+    func openSealedBatch(batch: OpenBatch) throws  -> [String]
+    
+    /**
      * Takes down the Face ID prompt of read `id`, if it is up
      */
     func cancelOpen(id: String) 
@@ -2375,6 +2799,31 @@ fileprivate struct UniffiCallbackInterfacePlatform {
 
             
             let writeReturn = { uniffiOutReturn.pointee = FfiConverterString.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeOpenError_lower
+            )
+        },
+        openSealedBatch: { (
+            uniffiHandle: UInt64,
+            batch: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> [String] in
+                guard let uniffiObj = try? FfiConverterCallbackInterfacePlatform.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.openSealedBatch(
+                     batch: try FfiConverterTypeOpenBatch_lift(batch)
+                )
+            }
+
+            
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterSequenceString.lower($0) }
             uniffiTraitInterfaceCallWithError(
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
@@ -2643,6 +3092,30 @@ public func FfiConverterCallbackInterfaceReconciler_lower(_ v: Reconciler) -> UI
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
     typealias SwiftType = Int64?
 
@@ -2739,6 +3212,30 @@ fileprivate struct FfiConverterOptionTypeGatewayInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeProgramRead: FfiConverterRustBuffer {
+    typealias SwiftType = ProgramRead?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeProgramRead.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeProgramRead.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -2786,6 +3283,82 @@ fileprivate struct FfiConverterSequenceTypePendingRead: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSealedItem: FfiConverterRustBuffer {
+    typealias SwiftType = [SealedItem]
+
+    public static func write(_ value: [SealedItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSealedItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SealedItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SealedItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSealedItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeProgramItem: FfiConverterRustBuffer {
+    typealias SwiftType = [ProgramItem]
+
+    public static func write(_ value: [ProgramItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeProgramItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ProgramItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ProgramItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeProgramItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryUInt32String: FfiConverterRustBuffer {
+    public static func write(_ value: [UInt32: String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterUInt32.write(key, into: &buf)
+            FfiConverterString.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32: String] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [UInt32: String]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterUInt32.read(from: &buf)
+            let value = try FfiConverterString.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
+    }
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -2802,6 +3375,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_companion_core_checksum_method_ffiapp_answer() != 9068) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_companion_core_checksum_method_ffiapp_answer_program() != 65112) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_companion_core_checksum_method_ffiapp_dispatch() != 44585) {
@@ -2834,10 +3410,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_companion_core_checksum_method_platform_open_sealed() != 43960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_companion_core_checksum_method_platform_cancel_open() != 10601) {
+    if (uniffi_companion_core_checksum_method_platform_open_sealed_batch() != 40521) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_companion_core_checksum_method_platform_device_name() != 58307) {
+    if (uniffi_companion_core_checksum_method_platform_cancel_open() != 54749) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_companion_core_checksum_method_platform_device_name() != 46741) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_companion_core_checksum_method_reconciler_reconcile() != 34991) {

@@ -133,6 +133,116 @@ codemode-mcp op warm
 Runs the configured warm calls on the daemon so the 1Password app's prompts appear on the Mac now. Accept them
 there; agent calls then only need the phone approval. Results are never printed.
 
+## Give 1Password values to a program on this Mac
+
+`codemode-mcp op read`, `op inject` and `op run` work like the 1Password CLI commands of the same names. The
+difference is who approves: `op` on the gateway Mac waits for its 1Password prompt there, but these commands ask
+wherever you are.
+
+- At the gateway Mac, its own Touch ID prompt names every value and the reason the program gave, and then this
+  Mac's `op` reads them. A 1Password prompt may follow while `op` is signed out.
+- On the phone, Companion shows the same list. Values it holds a sealed copy of open with one Face ID, and you
+  fill in the others with AutoFill or Paste.
+- On a companion Mac, its own Touch ID prompt names every value, and its `op` reads them.
+
+While you are at the gateway Mac it asks first, and the phone and companion Macs are asked 5 seconds later. While
+you are away they are all asked at once. The first approval sends every value, and the other prompts are taken
+down. A Deny on any device stops the request. Every prompt names the file the values go to, or the command whose
+environment gets them. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
+A phone keeps a copy of each value sealed to its Face ID, as for config reads.
+
+When the next few commands need the same values, add `--keep 15m` to the first. Its prompt says the values will
+be handed out again without asking for that long, at most 60 minutes, and later requests for only those
+references going to the same file, or the same command's environment, are answered from memory until then.
+A request going anywhere else asks again. `op run --keep` needs a command line of at most 200 characters on
+one line, since a longer one is shortened in the prompt and could not be told apart from another. `codemode-mcp service restart --fresh` or
+`POST /admin/secrets/forget` drops them early, and a restart never carries them over.
+
+Write a secrets file, the usual case:
+
+```sh
+cat > superalert.env.tpl <<'TEMPLATE'
+PUSHOVER_USER_KEY={{ op://Personal/Pushover/user key }}
+PUSHOVER_APP_TOKEN={{ op://Personal/Pushover/app token }}
+TEMPLATE
+codemode-mcp op inject -i superalert.env.tpl -o superalert.secrets.env --reason "freezerwatch alerts"
+```
+
+All the template's values are asked for in one approval. The file is written with mode 0600 (`--file-mode`
+changes it). An existing file is replaced only with `--force`, which is checked before anyone is asked. Without
+`-i` the template comes from standard input, and without `-o` the filled text goes to standard output.
+
+For a high-severity secret that should never be in a file, keep only the references and run the command with
+the values in its environment:
+
+```sh
+echo 'API_TOKEN=op://Personal/Deploy/token' > deploy.env
+codemode-mcp op run --env-file deploy.env --reason "deploy" -- ./scripts/deploy lookout
+```
+
+A line's value can be a whole `op://` reference or text holding `{{ op://… }}` references, and variables already
+set to an `op://` reference are read too. Any value of 3 or more characters that the command prints, and each line
+of a multi-line value such as a PEM key, is replaced with `[redacted]` as the output arrives; `--no-masking` turns
+that off. A program that wants to leak a value still can, for example by encoding it; masking catches accidents.
+Interrupt, terminate and hang-up signals are passed to the command, and its exit code is passed back.
+
+Read one value with `codemode-mcp op read "op://Personal/Pushover/app token"`. It prints the value, so whatever
+reads the output sees it, such as an agent's context; `--out-file` writes it to a file instead. Several
+references print a JSON object of each reference and its value, after one approval. A program that
+does not know the item can describe it, as in `codemode-mcp op read --describe "Pushover app token"`. Only the
+phone can answer a description: you pick the item there with AutoFill.
+
+Every request carries `--reason`, shown quoted as the program's claim. A request holds 1 to 20 values. Only the
+user that runs the daemon can make one: the CLI proves it holds the owner token in the daemon's state directory.
+
+### Let agents write env files
+
+The `secrets` builtin server lets an agent's script write values into an env file without ever seeing them:
+
+```toml
+[servers.secrets]
+builtin = "secrets"
+```
+
+```python
+await secrets_write_env(
+    path="/Users/me/code/homelab/stacks/lookout/superalert.secrets.env",
+    vars={"PUSHOVER_USER_KEY": "op://Personal/Pushover/user key",
+          "PUSHOVER_APP_TOKEN": "op://Personal/Pushover/app token"},
+    reason="freezerwatch alerts",
+)
+```
+
+It is approved like `op inject`, with one prompt naming the file. The file must be an absolute path named `.env`,
+`.env.<name>` or `<name>.env` in a directory that exists, and not an example or template such as `.env.example`;
+a link is followed to its file. Each variable maps to one whole `op://` reference: anything else would put text
+in the file that the prompt never showed, so write it yourself or use `op inject`. The lines of the variables
+named are replaced, including the rest of a multi-line quoted value, new ones are added at the end, and every
+other line is kept. Values that need it are single-quoted; a value with a line break or a single quote is
+refused, so use `op inject` with a template for those. A new file gets mode 0600, and so does one that others could
+read; one already closed to others, owned by the daemon's user and in a group other than `staff`, `everyone` or
+`users` keeps its group and group bits, so a service's group can still read it; if the new file cannot be put
+in that group, it gets 0600. The file is replaced by a new one, so a container that
+bind-mounts the single file sees the change only after it restarts. The answer names the variables written and the device that approved,
+never a value, and values of 6 or more characters are redacted from every later result; a shorter one, such
+as a PIN, is not. A caller that cancels the call takes the prompts down, and nothing is written after a late
+approval. `keep_minutes` works like `--keep`.
+
+That prompt is the approval, so the gateway runs the call without asking first; a `policy = "ask"` on
+`write_env` is refused at startup. The server's instructions tell agents to name a file and use this tool rather
+than ask for a value.
+
+### 1Password Environments
+
+1Password's Environments server only works through the 1Password app on the gateway Mac. Mark it so its calls
+are refused at once while you are away, instead of being approved on the phone and then waiting for a prompt
+nobody can answer:
+
+```toml
+[servers.onepassword]
+needs_owner_here = true
+```
+
 ## Read 1Password references from another Mac
 
 When you work from another Mac, such as a MacBook Air, the gateway Mac's 1Password prompt for `{{ op://… }}`
@@ -164,12 +274,10 @@ The 1Password Environments server is not covered; it only signs in through the g
      end of its config. The running daemon starts reading through it once the check below reaches it, with
      no restart, so a Mac whose setup fails is never asked in place of the gateway's own `op`; `invite` then
      says so and exits with an error.
-   - writes a `[companion]` section to this Mac's config, with the references the gateway's servers use as the
-     allow list. Other references can still be read; each is asked for by name.
+   - writes a `[companion]` section to this Mac's config.
    - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
-   - asks the gateway to read one of those references through this Mac. Approve the one Touch ID prompt. While
-     1Password has authorized `op` on that Mac, the prompt is the companion's and names the reference;
-     otherwise it is 1Password's, and a notification names the reference. Both Macs print the value's
+   - asks the gateway to read one of those references through this Mac. Approve the companion's Touch ID prompt,
+     which names the reference; while `op` on that Mac is signed out, 1Password asks too. Both Macs print the value's
      length, never the value.
 
    On a Mac that already has codemode-mcp, the second command `invite` prints, `codemode-mcp companion pair
@@ -251,12 +359,10 @@ How reads work with a companion configured:
 - The gateway runs its own `op read` only while you are at the gateway Mac (input within `notify.mac.idle_secs`),
   and asks every companion at the same time. The first value wins and the other reads are cancelled, so working
   over remote desktop, which makes the gateway Mac look in use, still reaches the companion.
-- A companion answers only the gateway it was paired with, and every read waits for your fingerprint. While
-  1Password has authorized `op`, the companion asks Touch ID itself, naming the reference. Otherwise 1Password
-  asks, but its prompt does not name the item and one approval lets `op` read anything for about ten minutes, so
-  only references on the `allow` list are approved through it alone, with a notification naming the reference.
-  Any other reference gets the companion's own Touch ID prompt first, which adds "which is not on this Mac's allow
-  list", so you choose each one by name as it comes and never edit the config to read something new.
+- A companion answers only the gateway it was paired with, and every read waits for your fingerprint on its own
+  Touch ID prompt, which names the reference. While `op` on that Mac is signed out, 1Password asks too. Its
+  prompt names no item and one approval lets `op` read anything for about ten minutes, so it never replaces the
+  companion's own.
 - The gateway accepts nothing over iroh unless a peer is listed or an invite is open. While an invite is open it
   accepts pairing; while a phone is listed under `[[secrets.phones]]` it accepts that phone's id, and refuses
   every other id. The rest of the time it only dials its companions. An invite lets one Mac register, once. Pairing the same Mac again
@@ -321,11 +427,10 @@ How reads work with a phone paired:
 - The phone dials the gateway, since iOS does not let a suspended app accept connections. The gateway sends
   each read over that connection and waits up to 120 seconds; the phone shows a countdown and marks the read
   expired when the gateway stops waiting.
-- The phone shows one read at a time, naming the reference. It answers the references the gateway used when
-  it paired, matched exactly; any other reference waits for you to tap Allow this reference, after which the
-  phone answers it like the rest. The gateway screen lists the allowed references; swipe one to remove it. The values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.
-- The phone keeps its iroh key, the gateway's address and its allow list in its Keychain, readable only while
-  it is unlocked. Deleting the app forgets the pairing.
+- The phone shows one read at a time, naming the reference, and one Face ID or one entered value answers it. The
+  values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.
+- The phone keeps its iroh key and the gateway's address in its Keychain, readable only while it is unlocked.
+  Deleting the app forgets the pairing.
 - With `discovery = false`, set `listen` under `[secrets]` to a fixed address such as `"0.0.0.0:7679"`, so the
   address the invite gives the phone stays valid across restarts. The phone must then reach that address
   directly, for example over the tailnet.
@@ -400,8 +505,6 @@ username or one-time code is typed into a plain field, where the agent can see i
 2. Restart the daemon (`codemode-mcp service restart`). The first fill asks macOS to let codemode-mcp use
    Accessibility; turn it on in System Settings > Privacy & Security > Accessibility and fill again. The grant
    belongs to the signed binary, so updates keep it.
-3. Pair phones and companion Macs again (`companion invite`) if they should answer these references without a
-   tap on Allow this reference; pairing hands them the references in `[logins]` too.
 
 What a fill checks, from Accessibility and the browser's code signature rather than the agent's words:
 
@@ -530,7 +633,7 @@ policy = "deny"
 
 - `oauth = true` on a `url` server enables `oauth login` (optional `scopes`, `client_name`, or `client_id` and `client_secret` for a client registered ahead of time, and `authorization_params`).
 - Rarely used stdio servers: `lazy = true` starts the process on the first call and stops it after `idle_secs` (default 600) without calls; `/healthz` shows it as `idle` meanwhile and its tools stay searchable. A failed start fails that call only, and the next call tries again.
-- Keys stay in 1Password: a `headers`, `env` or `url` value can hold `{{ op://vault/item/field }}` references, as in `op inject`, e.g. `headers = { authorization = "Bearer {{ op://Dev/Context7/credential }}" }`. The daemon runs `op read` the first time the server connects and keeps the value in memory until it exits; to pick up a rotated key, run `codemode-mcp service restart`. With the 1Password app integration the Mac asks once when the daemon starts (a locked or unanswered prompt shows `secret_unavailable` in `/healthz` and retries every 10 minutes). `[secrets] op` names the `op` binary (default `op` on `PATH`). A `url` that carries the key, as Zoho's MCP URLs do, should embed the reference where the key sits: `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. References in a `url` may sit only in path segments and query names or values, never in the scheme, credentials, host, port or fragment, and the `url` needs a literal host; anything else is refused when the config loads. A key embedded in a `url` may hold only ASCII letters, digits and `- . _ ~ + / = : @ ! * , ;` (at least 16 bytes), which covers hex, base64, base64url, JWT-like and colon-separated keys; any other character, such as `\`, quotes, `<`, `>`, `^`, `{`, `}`, `|`, `[`, `]`, `#`, `?`, `%`, `&`, `$`, `(`, `)` or a space, refuses the server with a configuration error. It is encoded as data where it sits, so `/` or `+` in a key stays part of that one segment or query value. The secrets are exactly the values 1Password returns, in the encodings libraries print them in (percent-encoded in either case, JSON-escaped, HTML character references such as `&#43;` or `&plus;`, `+` read as a space), matched ignoring ASCII case, and any run of 8 or more of its bytes is redacted too, since rmcp cuts invalid responses to 256 bytes and can leave only part of a key; nothing else in the URL is guessed to be a key. A `url` that is one whole reference (`url = "{{ op://Personal/Zoho MCP infraops/credential }}"`) is refused when the config loads, with or without OAuth, because codemode cannot tell which part of such a URL is the key; embed the reference instead, e.g. `url = "https://host/mcp/{{ op://Vault/Item/key }}"`. Log text is matched through nested escape layers (a client's `Debug` output escapes the JSON escapes of a response body), up to 4 passes. Only the configured template is ever shown (companion allow lists name the reference, never the value), and the resolved URL is redacted from errors, `/healthz` and the daemon's logs. Whatever OAuth would store (credentials, pending state, the client registration) or print (the authorization link) is refused when it holds a key, and the link's `resource` parameter is left out only when it holds the key.
+- Keys stay in 1Password: a `headers`, `env` or `url` value can hold `{{ op://vault/item/field }}` references, as in `op inject`, e.g. `headers = { authorization = "Bearer {{ op://Dev/Context7/credential }}" }`. The daemon runs `op read` the first time the server connects and keeps the value in memory until it exits. A clean stop (`service restart`, `update`, a reboot) hands the values to the next daemon sealed, so it asks nothing again; to pick up a rotated key, run `codemode-mcp service restart --fresh`. With the 1Password app integration the Mac asks once when the daemon starts (a locked or unanswered prompt shows `secret_unavailable` in `/healthz` and retries every 10 minutes). `[secrets] op` names the `op` binary (default `op` on `PATH`). A `url` that carries the key, as Zoho's MCP URLs do, should embed the reference where the key sits: `url = "https://<server>-<id>.zohomcp.com/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`. References in a `url` may sit only in path segments and query names or values, never in the scheme, credentials, host, port or fragment, and the `url` needs a literal host; anything else is refused when the config loads. A key embedded in a `url` may hold only ASCII letters, digits and `- . _ ~ + / = : @ ! * , ;` (at least 16 bytes), which covers hex, base64, base64url, JWT-like and colon-separated keys; any other character, such as `\`, quotes, `<`, `>`, `^`, `{`, `}`, `|`, `[`, `]`, `#`, `?`, `%`, `&`, `$`, `(`, `)` or a space, refuses the server with a configuration error. It is encoded as data where it sits, so `/` or `+` in a key stays part of that one segment or query value. The secrets are exactly the values 1Password returns, in the encodings libraries print them in (percent-encoded in either case, JSON-escaped, HTML character references such as `&#43;` or `&plus;`, `+` read as a space), matched ignoring ASCII case, and any run of 8 or more of its bytes is redacted too, since rmcp cuts invalid responses to 256 bytes and can leave only part of a key; nothing else in the URL is guessed to be a key. A `url` that is one whole reference (`url = "{{ op://Personal/Zoho MCP infraops/credential }}"`) is refused when the config loads, with or without OAuth, because codemode cannot tell which part of such a URL is the key; embed the reference instead, e.g. `url = "https://host/mcp/{{ op://Vault/Item/key }}"`. Log text is matched through nested escape layers (a client's `Debug` output escapes the JSON escapes of a response body), up to 4 passes. Only the configured template is ever shown (companion prompts name the reference, never the value), and the resolved URL is redacted from errors, `/healthz` and the daemon's logs. Whatever OAuth would store (credentials, pending state, the client registration) or print (the authorization link) is refused when it holds a key, and the link's `resource` parameter is left out only when it holds the key.
 - Per tool: `policy` (`allow`, `ask`, `deny`) and, for `ask`, `grant` (`session` or `per_call`). A `session` grant is given to the calling client, not to one MCP session: it covers every running session of that client name for 15 or 60 minutes.
 - The server is session-less: it issues no `mcp-session-id`, for any protocol version. Clients are told apart by the client name in the request `_meta`, the `initialize` handshake or the `user-agent` header. While `execute` or `wait` is waiting, it sends progress notifications every `limits.progress_interval_ms` (15000) to clients that sent a `progressToken`.
 - Result types. A tool that declares no output schema returns a `JsonValue` that scripts read with the `json_*` accessors. Give it a type in the tool's table: `output = "text"` for prose or markdown (the script gets a `str`, never parsed), or `output_schema` with an inline JSON Schema table for JSON, e.g. `output_schema = { type = "object", required = ["id"], properties = { id = { type = "string" } } }`. An upstream-declared schema wins over `output_schema` unless the table also sets `force_output_schema = true`. Every result is checked against the schema, so write only fields the tool really returns and mark optional ones with a `required` list or a `["string", "null"]` type. Probe it first: `codemode-mcp exec` a script that prints `json.dumps(await server_tool(...))`.
@@ -570,6 +673,14 @@ want a way back (a build older than the schema refuses to open it).
 
 What a restart does:
 
+- The values the daemon read from 1Password for its servers carry over a clean stop. The stopping daemon seals
+  them with AES-256-GCM under a new random key, writes the ciphertext to `<state_dir>/secrets.handoff` (mode
+  0600) and keeps the key in the login keychain, where only the installed, signed binary reads it without a
+  prompt. The next daemon opens both once and deletes both, and ignores a handoff more than 10 minutes old. A
+  crash leaves nothing, so that daemon asks once. `service restart --fresh` drops the values first, so the next
+  daemon reads each again, as after rotating a key. A daemon run from anything but the installed binary, or
+  with `secrets.identity_file` set, keeps the key in `<state_dir>/secrets.handoff.key` instead. Values a program
+  asked for with `codemode-mcp op` are never kept or handed over.
 - Finished results stay available to `wait` for 30 minutes (`limits.result_ttl_secs`).
 - Pending approvals stay pending; the phone link keeps working and the timer continues from the original
   deadline. An ntfy that had failed is sent again at boot.

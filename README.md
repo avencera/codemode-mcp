@@ -41,6 +41,9 @@ before the script sees them.
   the reference where a URL's key sits: `url = "https://host/mcp/{{ op://Personal/Zoho MCP - InfraOps/key }}/message"`
   (the `url` must start with a literal `http://` or `https://` and host; references may sit only in path segments and
   query names or values, so a `url` that is one whole reference is refused)
+- **1Password values for programs.** `codemode-mcp op inject`, `op run` and `op read` work like 1Password's
+  CLI, but the values are approved at the Mac, on the phone, or on another Mac, wherever you are. Agents use
+  the `secrets` server's `write_env` to put values into an env file they name, without ever seeing them
 - **Approvals.** Each tool is `allow`, `ask` or `deny`. An `ask` call waits for approval with Touch ID at the Mac,
   or with a passkey on your phone after an [ntfy](https://ntfy.sh) push. Approvals can cover one call or a 15 or
   60 minute session
