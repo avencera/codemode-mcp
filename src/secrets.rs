@@ -5,6 +5,7 @@
 //! The braces follow `op inject`'s template syntax, so a value can mix text
 //! and references, e.g. `Bearer {{ op://Dev/Context7/credential }}`
 
+pub mod approved;
 pub mod handoff;
 pub mod key_store;
 mod logs;
@@ -21,6 +22,7 @@ use std::{
 
 use tokio::{sync::Mutex, task::JoinSet};
 
+use self::approved::{Approved, Consumer};
 use crate::{
     companion::{Companions, CreatedItem, DeviceTrust, NewItem},
     config::{Config, SecretsConfig},
@@ -78,6 +80,7 @@ impl Secrets {
         presence: Option<OnMac>,
         store: Option<Store>,
         trust: DeviceTrust,
+        approved: Arc<Approved>,
     ) -> Self {
         let companions = Arc::new(Companions::new(
             config,
@@ -86,8 +89,9 @@ impl Secrets {
             trust,
             presence.clone(),
         ));
-        let onepassword =
-            OnePassword::new(config.op.clone()).with_companions(Arc::clone(&companions), presence);
+        let onepassword = OnePassword::new(config.op.clone())
+            .with_companions(Arc::clone(&companions), presence)
+            .with_approved(approved);
 
         Self {
             onepassword,
@@ -858,11 +862,9 @@ pub struct OnePassword {
     /// Values a program read with a keep window, by destination and
     /// reference, until it ends; never handed to the next daemon
     kept: Arc<Mutex<KeptValues>>,
-    /// References the last daemon held but a server now using them was
-    /// changed or added since, with those servers' names: this Mac reads
-    /// one only after its own Touch ID prompt names them, since 1Password
-    /// may answer `op` unprompted for minutes after any earlier approval
-    reapprove: Arc<std::sync::Mutex<HashMap<String, Vec<String>>>>,
+    /// Which servers each config reference was approved for; any other
+    /// server asks first, cached value or not
+    approved: Arc<Approved>,
     companions: Option<Arc<Companions>>,
     on_mac: Option<OnMac>,
 }
@@ -905,7 +907,7 @@ impl OnePassword {
             program: program.into(),
             known: Arc::default(),
             kept: Arc::default(),
-            reapprove: Arc::default(),
+            approved: Arc::new(Approved::ungated()),
             companions: None,
             on_mac: None,
         }
@@ -926,43 +928,40 @@ impl OnePassword {
         self
     }
 
-    /// Seals every value this process read for `config`, the one it runs,
-    /// for the next daemon on `state_dir` (see [`handoff`]); how many
+    /// Gives a cached or read value to a server only while `approved`
+    /// approves it for that server as it stands, asking first otherwise
+    #[must_use]
+    pub fn with_approved(mut self, approved: Arc<Approved>) -> Self {
+        self.approved = approved;
+
+        self
+    }
+
+    /// Seals every value this process read for its config for the next
+    /// daemon on `state_dir` (see [`handoff`]); how many
     pub async fn hand_off(
         &self,
         state_dir: &Path,
         store: &key_store::KeyStore,
-        config: &Config,
     ) -> Result<usize, String> {
         let known = self.known.lock().await;
 
-        handoff::hand_off(state_dir, store, &known, handoff::Consumers::of(config))
+        handoff::hand_off(state_dir, store, &known)
     }
 
     /// Fills the cache from the last daemon's handoff, so its values are not
-    /// asked for again, except those `config` now sends to a server the last
-    /// daemon did not; what it took and dropped
+    /// asked for again; how many it held. Each still goes only to a server
+    /// approved for it (see [`approved`])
     pub async fn take_over(
         &self,
         state_dir: &Path,
         store: &key_store::KeyStore,
-        config: &Config,
-    ) -> Result<handoff::TakenOver, String> {
-        let mut taken = handoff::take_over(state_dir, store, &handoff::Consumers::of(config))?;
-        self.known
-            .lock()
-            .await
-            .extend(std::mem::take(&mut taken.values));
-        self.reapprove
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(
-                taken.dropped.iter().map(|reference| {
-                    (reference.clone(), handoff::servers_using(config, reference))
-                }),
-            );
+    ) -> Result<usize, String> {
+        let values = handoff::take_over(state_dir, store)?;
+        let count = values.len();
+        self.known.lock().await.extend(values);
 
-        Ok(taken)
+        Ok(count)
     }
 
     /// Forgets every value read, and every value kept for programs, so the
@@ -1048,10 +1047,12 @@ impl OnePassword {
         self.on_mac.as_ref()
     }
 
-    /// `values` with every reference replaced by what 1Password holds; a
-    /// map without references is returned as is, without running `op`
+    /// `values` with every reference replaced by what 1Password holds, for
+    /// the server `consumer`; a map without references is returned as is,
+    /// without running `op`
     pub async fn resolve(
         &self,
+        consumer: Option<&Consumer>,
         values: &BTreeMap<String, String>,
     ) -> Result<Resolved, SecretError> {
         let mut resolved = Resolved {
@@ -1060,7 +1061,9 @@ impl OnePassword {
         };
 
         for (key, value) in values {
-            let text = self.resolve_text(value, &mut resolved.secrets).await?;
+            let text = self
+                .resolve_text(consumer, value, &mut resolved.secrets)
+                .await?;
             resolved.values.insert(key.clone(), text);
         }
 
@@ -1077,11 +1080,15 @@ impl OnePassword {
     ///
     /// The keys are exactly the values read, in the encodings the URL and
     /// clients print them
-    pub async fn resolve_url(&self, template: &str) -> Result<ResolvedUrl, SecretError> {
+    pub async fn resolve_url(
+        &self,
+        consumer: Option<&Consumer>,
+        template: &str,
+    ) -> Result<ResolvedUrl, SecretError> {
         let template = UrlTemplate::parse(template)?;
         let mut values = Vec::new();
         for reference in template.references() {
-            values.push(self.value(reference).await?);
+            values.push(self.value(consumer, reference).await?);
         }
 
         template.fill(&values)
@@ -1089,6 +1096,7 @@ impl OnePassword {
 
     async fn resolve_text(
         &self,
+        consumer: Option<&Consumer>,
         value: &str,
         secrets: &mut Vec<String>,
     ) -> Result<String, SecretError> {
@@ -1097,7 +1105,7 @@ impl OnePassword {
             match piece {
                 Piece::Text(literal) => text.push_str(literal),
                 Piece::Reference(reference) => {
-                    let secret = self.value(reference).await?;
+                    let secret = self.value(consumer, reference).await?;
                     text.push_str(&secret);
                     secrets.push(secret);
                 }
@@ -1110,28 +1118,41 @@ impl OnePassword {
     /// What 1Password holds for one `op://` reference, through the cache
     /// and every source a configured value would use
     pub async fn read_reference(&self, reference: &str) -> Result<String, SecretError> {
-        self.value(reference).await
+        self.value(None, reference).await
     }
 
-    async fn value(&self, reference: &str) -> Result<String, SecretError> {
+    /// The value of `reference` for the server `consumer`, from the cache
+    /// while the server is approved for it, otherwise read again from a
+    /// source that asks the owner, which approves it from then on
+    async fn value(
+        &self,
+        consumer: Option<&Consumer>,
+        reference: &str,
+    ) -> Result<String, SecretError> {
         // held across the read on purpose: a second caller waits for the
         // first prompt's answer instead of raising its own
         let mut known = self.known.lock().await;
-        if let Some(value) = known.get(reference) {
+        let ask = consumer.filter(|consumer| !self.approved.allows(consumer, reference));
+        if ask.is_none()
+            && let Some(value) = known.get(reference)
+        {
             return Ok(value.clone());
         }
-        let value = self.read(reference).await?;
+        let value = self.read(reference, ask).await?;
         known.insert(reference.to_owned(), value.clone());
+        if let Some(consumer) = ask {
+            self.approved.approve(consumer, reference);
+        }
 
         Ok(value)
     }
 
-    async fn read(&self, reference: &str) -> Result<String, SecretError> {
-        let value = self.race(reference).await?;
-        self.reapprove
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(reference);
+    /// Reads `reference` from every source; with `ask`, a server not yet
+    /// approved for it, this Mac's `op` runs only after a Touch ID prompt
+    /// naming the server, since 1Password may answer unprompted for minutes
+    /// after any earlier approval, while phones and companion Macs ask always
+    async fn read(&self, reference: &str, ask: Option<&Consumer>) -> Result<String, SecretError> {
+        let value = self.race(reference, ask).await?;
         // whichever source won, its value replaces the phones' copies: a
         // value the owner entered on a phone is opened with Face ID next time
         if let Some(companions) = &self.companions {
@@ -1142,7 +1163,8 @@ impl OnePassword {
     }
 
     /// Reads `reference` from every source at once; the first value wins
-    async fn race(&self, reference: &str) -> Result<String, SecretError> {
+    async fn race(&self, reference: &str, ask: Option<&Consumer>) -> Result<String, SecretError> {
+        let ask = ask.map(|consumer| consumer.name.clone());
         let peers = self
             .companions
             .as_ref()
@@ -1165,7 +1187,7 @@ impl OnePassword {
             .as_ref()
             .filter(|_| !peers.is_empty() || !phones.is_empty())
         else {
-            return self.read_for_config(reference).await;
+            return self.read_on_this_mac(reference, ask).await;
         };
 
         let local = match &self.on_mac {
@@ -1178,7 +1200,7 @@ impl OnePassword {
             let reference = reference.to_owned();
             sources.spawn(async move {
                 let value = onepassword
-                    .read_for_config(&reference)
+                    .read_on_this_mac(&reference, ask)
                     .await
                     .map_err(|error| error.reason());
 
@@ -1251,23 +1273,20 @@ impl OnePassword {
         }
     }
 
-    /// Reads `reference` for a configured server on this Mac, after a Touch
-    /// ID prompt when a server using it changed since the last daemon read
-    /// it; any source's value clears that, as the owner approved it there
-    async fn read_for_config(&self, reference: &str) -> Result<String, SecretError> {
-        let servers = self
-            .reapprove
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(reference)
-            .cloned();
+    /// Reads `reference` with this Mac's `op`, after a Touch ID prompt when
+    /// it goes to the server `ask`, which is not approved for it yet
+    async fn read_on_this_mac(
+        &self,
+        reference: &str,
+        ask: Option<String>,
+    ) -> Result<String, SecretError> {
         // without a Mac to ask on there is no prompt of codemode's own,
         // as for every config read there
-        if let (Some(servers), Some(on_mac)) = (servers, &self.on_mac) {
+        if let (Some(server), Some(on_mac)) = (ask, &self.on_mac) {
             let text = crate::prompt::one_line(
                 &format!(
-                    "Read {reference} for {}, changed since it was last given this value",
-                    servers.join(", ")
+                    "Give {reference} to the server “{server}”, new or changed since it was last \
+                     approved"
                 ),
                 usize::MAX,
             );

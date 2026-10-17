@@ -1339,6 +1339,20 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
         &path,
         text.replacen("phones = [", &format!("phones = [{entry}"), 1),
     )?;
+    // `companion list` shows it at once, untrusted, so its fingerprint can
+    // be checked before anyone trusts it
+    let (status, listed_now) = harness
+        .admin_json("/admin/companion/list", &Value::Null)
+        .await?;
+    assert_eq!(status, 200, "{listed_now}");
+    let appended = listed_now["devices"]
+        .as_array()
+        .and_then(|devices| devices.iter().find(|device| device["name"] == "stranger"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(appended["trusted"], false, "{listed_now}");
+    assert!(appended["fingerprint"].is_string(), "{listed_now}");
+
     let reloaded = Config::load(&path)?;
     assert_eq!(reloaded.secrets.phones.len(), 2);
     let harness = harness

@@ -706,14 +706,17 @@ What a restart does:
   them with AES-256-GCM under a new random key, writes the ciphertext to `<state_dir>/secrets.handoff` (mode
   0600) and keeps the key in the login keychain, where only the installed, signed binary reads it without a
   prompt. The next daemon opens both once and deletes both, and ignores a handoff more than 10 minutes old. A
-  crash leaves nothing, so that daemon asks once. Each value is handed over only to the servers it went to:
-  after a change to a server's `command`, `args`, `cwd`, `env`, `url`, `headers`, `client_id` or
-  `client_secret`, or a new server using the same reference, the next daemon asks for that value once again
-  (changing a policy or tool setting asks nothing). At the gateway Mac that read waits for a Touch ID prompt
-  naming the changed servers, even while 1Password would answer without one. `service restart --fresh` drops the values first, so the next
+  crash leaves nothing, so that daemon asks once. `service restart --fresh` drops the values first, so the next
   daemon reads each again, as after rotating a key. A daemon run from anything but the installed binary, or
   with `secrets.identity_file` set, keeps the key in `<state_dir>/secrets.handoff.key` instead. Values a program
   asked for with `codemode-mcp op` are never kept or handed over.
+- A config value goes only to a server you approved it for, as that server stands. A server that is new, or
+  whose `command`, `args`, `cwd`, `env`, `url`, `headers`, `client_id` or `client_secret` changed, is asked for
+  once, cached value or not, restart or crash; changing a policy or tool setting asks nothing. At the gateway
+  Mac a Touch ID prompt names the server first ("Give op://… to the server “name”, new or changed since it was
+  last approved"), even while 1Password would answer without one; the phone and companion Macs ask as for any
+  read. A Deny keeps it unapproved. The approvals sit in `<state_dir>/secrets.approved`, each signed with a key
+  derived from the device trust key. Upgrading approves every server the config lists at that moment.
 - Finished results stay available to `wait` for 30 minutes (`limits.result_ttl_secs`).
 - Pending approvals stay pending; the phone link keeps working and the timer continues from the original
   deadline. An ntfy that had failed is sent again at boot.

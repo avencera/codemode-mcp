@@ -140,6 +140,11 @@ struct Record {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Records {
     records: Vec<Record>,
+    /// Set once the key that set trust up was stored: records without it
+    /// are a set-up that stopped before its key was kept, and are redone,
+    /// while committed records without a key mean the key was lost
+    #[serde(default)]
+    committed: bool,
 }
 
 /// The trust key and the records it vouches for
@@ -149,6 +154,8 @@ pub struct DeviceTrust {
     records: PathBuf,
     /// One read-modify-write of the records at a time
     writing: std::sync::Mutex<()>,
+    /// Whether this start set trust up, trusting what the config listed
+    set_up: bool,
 }
 
 impl DeviceTrust {
@@ -171,38 +178,46 @@ impl DeviceTrust {
             key: Hmac::<Sha256>::new_from_slice(key).ok(),
             records: records.clone(),
             writing: std::sync::Mutex::new(()),
+            set_up: false,
         };
         let none = || Self {
             key: None,
             records: records.clone(),
             writing: std::sync::Mutex::new(()),
+            set_up: false,
         };
 
         match store.read() {
             Ok(Some(key)) => with_key(&key),
             Ok(None) if may_create => {
                 let key: [u8; 32] = rand::random();
-                let trust = with_key(&key);
-                let devices = if trust.load().records.is_empty() {
-                    Device::listed(listed)
-                } else {
+                let mut trust = with_key(&key);
+                if trust.load().committed {
+                    // a new key, trusting nothing: the config as it now
+                    // stands may not be what the owner trusted
+                    if let Err(error) = store.put(&key) {
+                        tracing::warn!(%error, "could not keep the device trust key");
+
+                        return none();
+                    }
                     tracing::warn!(
                         "the device trust key is gone but its records are not, so no device is \
                          trusted; approve each with `codemode-mcp companion trust <name>`"
                     );
-                    Vec::new()
-                };
-                // records first: a key stored without them would leave every
-                // device untrusted, while records without a key are redone
-                for device in &devices {
-                    if let Err(error) = trust.trust(device) {
-                        tracing::warn!(%error, "could not set up device trust");
 
-                        return none();
-                    }
+                    return trust;
                 }
-                if let Err(error) = store.put(&key) {
-                    tracing::warn!(%error, "could not keep the device trust key");
+
+                // records first, then the key, then the mark that both are
+                // kept: a stop anywhere before the mark is redone next start
+                let devices = Device::listed(listed);
+                let set_up = devices
+                    .iter()
+                    .try_for_each(|device| trust.trust(device))
+                    .and_then(|()| store.put(&key))
+                    .and_then(|()| trust.commit());
+                if let Err(error) = set_up {
+                    tracing::warn!(%error, "could not set up device trust");
 
                     return none();
                 }
@@ -211,6 +226,7 @@ impl DeviceTrust {
                     devices = %names.join(", "),
                     "set up device trust, trusting the companions and phones the config lists"
                 );
+                trust.set_up = true;
 
                 trust
             }
@@ -226,6 +242,30 @@ impl DeviceTrust {
     /// Whether the key could be read, so records can be checked at all
     pub fn has_key(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// Whether this start set trust up, trusting what the config listed;
+    /// what else the config named then is taken as approved too
+    pub fn set_up(&self) -> bool {
+        self.set_up
+    }
+
+    /// A key for `domain`, derived from the trust key so it is as hard to
+    /// get; `None` without the trust key
+    pub fn derived_key(&self, domain: &str) -> Option<[u8; 32]> {
+        let mut mac = self.key.clone()?;
+        mac.update(domain.as_bytes());
+
+        Some(mac.finalize().into_bytes().into())
+    }
+
+    /// Marks the records as set up with a kept key
+    fn commit(&self) -> Result<(), String> {
+        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut records = self.load();
+        records.committed = true;
+
+        self.save(&records)
     }
 
     /// Whether a record vouches for `device` as it is listed now
@@ -371,6 +411,36 @@ impl Companions {
         });
 
         trusted.chain(untrusted).collect()
+    }
+
+    /// [`Self::devices`], plus any device the config file lists now that
+    /// the daemon does not know yet, as untrusted: the owner compares its
+    /// fingerprint here before `companion trust` approves it
+    pub fn devices_now(&self) -> Vec<ListedDevice> {
+        let mut devices = self.devices();
+        let in_file = self
+            .config_path
+            .as_ref()
+            .and_then(|path| {
+                let text = read_config(path).ok()?;
+
+                Config::parse(&text, path).ok()
+            })
+            .map(|config| Device::listed(&config.secrets))
+            .unwrap_or_default();
+        for device in in_file {
+            if !devices
+                .iter()
+                .any(|listed| listed.device.identity() == device.identity())
+            {
+                devices.push(ListedDevice {
+                    device,
+                    trusted: false,
+                });
+            }
+        }
+
+        devices
     }
 
     /// The listed devices without a valid trust record, which are never used
@@ -585,9 +655,17 @@ mod tests {
             }],
             ..SecretsConfig::default()
         };
-        let rekeyed = DeviceTrust::open_with(&store, records, &listed, true);
+        let rekeyed = DeviceTrust::open_with(&store, records.clone(), &listed, true);
         assert!(rekeyed.has_key());
         assert!(!rekeyed.is_trusted(&phone(3)));
+        assert!(!rekeyed.set_up());
+
+        // a set-up that stopped before its key was kept is redone
+        let _ = std::fs::remove_file(directory.join(KEY_FILE));
+        std::fs::write(&records, r#"{"records":[]}"#).unwrap_or_else(|error| panic!("{error}"));
+        let redone = DeviceTrust::open_with(&store, records, &listed, true);
+        assert!(redone.set_up());
+        assert!(redone.is_trusted(&phone(3)));
 
         let _ = std::fs::remove_dir_all(&directory);
     }

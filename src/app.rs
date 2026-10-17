@@ -19,7 +19,8 @@ use crate::{
     passkeys::{PasskeyError, Passkeys},
     secrets::{
         Secrets,
-        handoff::{self, TakenOver},
+        approved::{self, Approved},
+        handoff,
     },
     snapshot::Sealer,
     store::{Store, StoreError},
@@ -172,12 +173,23 @@ impl App {
         // only the daemon sets trust up: a one-off run without the key trusts
         // nothing rather than whatever the config lists
         let trust = DeviceTrust::open(&state_dir, &config.secrets, role == Role::Daemon);
+        // a one-off run reads as `op` itself would, so it gates nothing
+        let approved = match role {
+            Role::Daemon => Approved::open(
+                &state_dir,
+                trust.derived_key(approved::KEY_DOMAIN),
+                &config,
+                trust.set_up(),
+            ),
+            Role::OneOff => Approved::ungated(),
+        };
         let secrets = Secrets::new(
             &config.secrets,
             config.path().map(Path::to_owned),
             presence,
             Some(store.clone()),
             trust,
+            Arc::new(approved),
         );
         // before any upstream connects, so none asks for what the last
         // daemon already had
@@ -188,24 +200,14 @@ impl App {
             Role::Daemon => {
                 secrets
                     .onepassword
-                    .take_over(&state_dir, &handoff_keys, &config)
+                    .take_over(&state_dir, &handoff_keys)
                     .await
             }
-            Role::OneOff => Ok(TakenOver::default()),
+            Role::OneOff => Ok(0),
         };
         match taken {
-            Ok(taken) => {
-                if taken.taken > 0 {
-                    tracing::info!(count = taken.taken, "took over the last daemon's secrets");
-                }
-                if !taken.dropped.is_empty() {
-                    tracing::warn!(
-                        references = ?taken.dropped,
-                        "a server using these changed since the last daemon; asking for them \
-                         again, with Touch ID first on this Mac"
-                    );
-                }
-            }
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "took over the last daemon's secrets"),
             Err(error) => {
                 tracing::warn!(%error, "could not use the last daemon's secrets; reading them again");
             }
@@ -319,11 +321,11 @@ impl App {
         let keys = handoff::key_store(&self.state_dir, self.config.secrets.identity_file.is_none());
         // a read still waiting on a prompt holds the values; the stop does
         // not wait it out, and the next daemon asks instead
-        let handing =
-            self.gateway
-                .secrets()
-                .onepassword
-                .hand_off(&self.state_dir, &keys, &self.config);
+        let handing = self
+            .gateway
+            .secrets()
+            .onepassword
+            .hand_off(&self.state_dir, &keys);
         let handed = tokio::time::timeout(HAND_OFF_WAIT, handing)
             .await
             .unwrap_or_else(|_| Err("a read was still in flight".to_owned()));

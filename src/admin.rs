@@ -1095,12 +1095,13 @@ async fn companion_invite_open(
     }
 }
 
-/// The listed companions and phones and whether each is trusted
+/// The listed companions and phones and whether each is trusted, with any
+/// the config file lists that the daemon has not met yet
 async fn companion_list(State(state): State<AdminState>) -> Response {
     let devices = state
         .gateway
         .companions()
-        .devices()
+        .devices_now()
         .into_iter()
         .map(DeviceEntry::from)
         .collect();

@@ -328,7 +328,10 @@ async fn a_url_value_with_separators_is_redacted_in_every_encoding() -> TestResu
     let (op, _) = fake_op()?;
     let onepassword = OnePassword::new(op.display().to_string());
     let resolved = onepassword
-        .resolve_url("https://example.invalid/mcp/{{ op://Dev/slashkey/credential }}/rpc")
+        .resolve_url(
+            None,
+            "https://example.invalid/mcp/{{ op://Dev/slashkey/credential }}/rpc",
+        )
         .await?;
     assert_eq!(
         resolved.url,
@@ -468,7 +471,10 @@ async fn a_zoho_url_redacts_its_key_but_not_its_public_path_words() -> TestResul
 
     // a key embedded in the url is the only secret
     let embedded = onepassword
-        .resolve_url("https://srv-1234.zohomcp.com/mcp/{{ op://Dev/urlkey/credential }}/message")
+        .resolve_url(
+            None,
+            "https://srv-1234.zohomcp.com/mcp/{{ op://Dev/urlkey/credential }}/message",
+        )
         .await?;
     let redactor = Redactor::default();
     redactor.add(embedded.secrets);
@@ -502,7 +508,10 @@ async fn a_key_cut_short_by_a_truncated_preview_is_still_redacted() -> TestResul
     let (op, _) = fake_op()?;
     let onepassword = OnePassword::new(op.display().to_string());
     let resolved = onepassword
-        .resolve_url("https://example.invalid/mcp/{{ op://Dev/hexkey/credential }}")
+        .resolve_url(
+            None,
+            "https://example.invalid/mcp/{{ op://Dev/hexkey/credential }}",
+        )
         .await?;
     let redactor = Redactor::default();
     redactor.add(resolved.secrets);
@@ -532,7 +541,10 @@ async fn a_url_key_too_short_to_redact_is_refused() -> TestResult {
     let onepassword = OnePassword::new(op.display().to_string());
 
     let refused = onepassword
-        .resolve_url("https://example.invalid/mcp/{{ op://Dev/shortkey/credential }}")
+        .resolve_url(
+            None,
+            "https://example.invalid/mcp/{{ op://Dev/shortkey/credential }}",
+        )
         .await;
     assert!(matches!(refused, Err(SecretError::UrlValueTooShort)));
 
@@ -642,10 +654,11 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
     assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
 
     // but a server whose environment changed, which could send the value
-    // anywhere, asks again instead of getting it from the last daemon, and
-    // this Mac reads it only after a Touch ID prompt naming the server,
-    // since 1Password may answer `op` unprompted for a while
+    // anywhere, is not given it, cached or not, until the owner approves it
+    // for the server as it now stands: this Mac reads only after a Touch ID
+    // prompt naming it, since 1Password may answer `op` unprompted
     assert_eq!(touch_prompts(), Vec::<String>::new());
+    mac.set_answer(Some(TouchId::Review));
     let harness = harness
         .restart_with(Stop::Drain, |config| {
             if let Some(server) = config.servers.get_mut("fixture") {
@@ -655,15 +668,30 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
             }
         })
         .await?;
+    let asked = "touch_id Give op://Dev/fixture/credential to the server “fixture”, new or \
+                 changed since it was last approved";
+    assert_eq!(execute(&harness.client, script).await?.is_error, Some(true));
+    assert_eq!(touch_prompts(), [asked]);
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
+
+    // a denial holds across a clean restart and a crash alike
+    let harness = harness.restart(Stop::Drain).await?;
+    assert_eq!(execute(&harness.client, script).await?.is_error, Some(true));
+    let harness = harness.restart(Stop::Crash).await?;
+    assert_eq!(execute(&harness.client, script).await?.is_error, Some(true));
+    assert_eq!(touch_prompts().len(), 3);
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
+
+    // approved once, the server keeps it through later restarts
+    mac.set_answer(Some(TouchId::Approved));
+    let harness = harness.restart(Stop::Crash).await?;
     assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(touch_prompts().len(), 4);
     assert_eq!(reads(&log, "op://Dev/fixture/credential"), 3);
-    assert_eq!(
-        touch_prompts(),
-        [
-            "touch_id Read op://Dev/fixture/credential for fixture, changed since it was last \
-             given this value"
-        ]
-    );
+    let harness = harness.restart(Stop::Crash).await?;
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(touch_prompts().len(), 4);
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 4);
 
     // forgetting, as `service restart --fresh` does, hands nothing over
     let (status, forgot) = harness
@@ -673,7 +701,7 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
     assert_eq!(forgot["forgotten"], 1, "{forgot}");
     let harness = harness.restart(Stop::Drain).await?;
     assert!(value(&harness.execute_json(script).await?));
-    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 4);
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 5);
 
     harness.stop().await
 }
