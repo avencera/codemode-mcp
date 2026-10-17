@@ -911,30 +911,35 @@ impl OnePassword {
         self
     }
 
-    /// Seals every value this process read for its config for the next
-    /// daemon on `state_dir` (see [`handoff`]); how many
+    /// Seals every value this process read for `config`, the one it runs,
+    /// for the next daemon on `state_dir` (see [`handoff`]); how many
     pub async fn hand_off(
         &self,
         state_dir: &Path,
         store: &handoff::KeyStore,
+        config: &Config,
     ) -> Result<usize, String> {
         let known = self.known.lock().await;
 
-        handoff::hand_off(state_dir, store, &known)
+        handoff::hand_off(state_dir, store, &known, handoff::Consumers::of(config))
     }
 
     /// Fills the cache from the last daemon's handoff, so its values are not
-    /// asked for again; how many it held
+    /// asked for again, except those `config` now sends to a server the last
+    /// daemon did not; what it took and dropped
     pub async fn take_over(
         &self,
         state_dir: &Path,
         store: &handoff::KeyStore,
-    ) -> Result<usize, String> {
-        let values = handoff::take_over(state_dir, store)?;
-        let count = values.len();
-        self.known.lock().await.extend(values);
+        config: &Config,
+    ) -> Result<handoff::TakenOver, String> {
+        let mut taken = handoff::take_over(state_dir, store, &handoff::Consumers::of(config))?;
+        self.known
+            .lock()
+            .await
+            .extend(std::mem::take(&mut taken.values));
 
-        Ok(count)
+        Ok(taken)
     }
 
     /// Forgets every value read, and every value kept for programs, so the

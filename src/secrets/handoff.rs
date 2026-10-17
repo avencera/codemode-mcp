@@ -10,6 +10,12 @@
 //! program asked for (`codemode-mcp op`) are never in the cache, so never
 //! here
 //!
+//! Each value goes with a digest of every server config it was filled
+//! into ([`Consumers`]). The next daemon drops a value when one of its own
+//! servers using that reference is not among them, so editing a server's
+//! command, url or environment to send a value somewhere new asks the owner
+//! again instead of handing it over silently
+//!
 //! The keychain is used only by the installed service binary with no
 //! `secrets.identity_file`: a keychain item is bound to the code that made
 //! it, so a test or checkout build writing it would leave the service a
@@ -18,15 +24,20 @@
 //! from this one
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use aws_lc_rs::{
+    aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey},
+    digest::{SHA256, digest},
+};
 use serde::{Deserialize, Serialize};
+
+use crate::config::{Config, ServerConfig};
 
 /// The sealed values, in the state directory
 pub const FILE: &str = "secrets.handoff";
@@ -50,19 +61,115 @@ const KEYCHAIN_ACCOUNT: &str = "daemon";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_NOT_FOUND: i32 = -25300;
 
-/// Bound into the ciphertext with the time it was written, so a handoff
-/// cannot be passed off as another format or a later one
-const AAD_PREFIX: &str = "codemode-mcp/handoff/1";
+/// Bound into the ciphertext with the format version and the time it was
+/// written, so a handoff cannot be passed off as another format or a later
+/// one
+const AAD_PREFIX: &str = "codemode-mcp/handoff";
+
+/// The format this daemon writes: [`Sealed`]
+const VERSION: u8 = 2;
 
 /// What [`FILE`] holds
 #[derive(Serialize, Deserialize)]
 struct Envelope {
+    /// The format, 1 when absent: the values alone, as 0.6 wrote them
+    #[serde(default = "first_version")]
+    version: u8,
     /// When it was written, in Unix milliseconds
     written_at_ms: u64,
     /// Hex
     nonce: String,
     /// Hex, with the tag
     ciphertext: String,
+}
+
+/// What the ciphertext of a [`VERSION`] handoff holds
+#[derive(Serialize, Deserialize)]
+struct Sealed {
+    values: HashMap<String, String>,
+    consumers: Consumers,
+}
+
+/// For each reference in the servers' config, a digest of each server that
+/// fills it in, covering everything that decides where its value goes: the
+/// server's name, command, arguments, working directory, environment, url,
+/// headers and OAuth client. A policy or tool setting is left out, so
+/// editing one asks for nothing
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Consumers(HashMap<String, BTreeSet<String>>);
+
+impl Consumers {
+    /// The consumers of every reference in `config`'s servers
+    pub fn of(config: &Config) -> Self {
+        let mut consumers = Self::default();
+        for (name, server) in &config.servers {
+            let digest = consumer_digest(name, server);
+            let texts = server
+                .env
+                .values()
+                .chain(server.headers.values())
+                .chain(&server.url)
+                .chain(&server.client_secret);
+            // a malformed value fails the server's own read, which reads
+            // nothing; it has no reference to bind here
+            let references = texts.flat_map(|text| super::references(text).unwrap_or_default());
+            for reference in references {
+                consumers
+                    .0
+                    .entry(reference.to_owned())
+                    .or_default()
+                    .insert(digest.clone());
+            }
+        }
+
+        consumers
+    }
+
+    /// Whether every server in `self` using `reference` is one that `handed`
+    /// gave its value to
+    fn all_known_to(&self, handed: &Self, reference: &str) -> bool {
+        let Some(now) = self.0.get(reference) else {
+            return true;
+        };
+
+        handed
+            .0
+            .get(reference)
+            .is_some_and(|before| now.is_subset(before))
+    }
+}
+
+/// Hex SHA-256 of what decides where `server`'s values go
+fn consumer_digest(name: &str, server: &ServerConfig) -> String {
+    /// Borrowed, so the digest covers exactly these fields
+    #[derive(Serialize)]
+    struct Placement<'a> {
+        name: &'a str,
+        command: &'a Option<String>,
+        args: &'a [String],
+        cwd: &'a Option<PathBuf>,
+        env: &'a std::collections::BTreeMap<String, String>,
+        url: &'a Option<String>,
+        headers: &'a std::collections::BTreeMap<String, String>,
+        client_id: &'a Option<String>,
+        client_secret: &'a Option<String>,
+    }
+
+    let placement = Placement {
+        name,
+        command: &server.command,
+        args: &server.args,
+        cwd: &server.cwd,
+        env: &server.env,
+        url: &server.url,
+        headers: &server.headers,
+        client_id: &server.client_id,
+        client_secret: &server.client_secret,
+    };
+    // serializing borrowed strings, maps and paths cannot fail
+    let bytes = serde_json::to_vec(&placement).unwrap_or_default();
+
+    hex::encode(digest(&SHA256, &bytes))
 }
 
 /// Where the key is kept
@@ -129,12 +236,13 @@ impl KeyStore {
     }
 }
 
-/// Seals `values` for the next daemon on `state_dir`; nothing is written when
-/// there are none
+/// Seals `values` for the next daemon on `state_dir`, each with the
+/// `consumers` it was filled into; nothing is written when there are none
 pub fn hand_off(
     state_dir: &Path,
     store: &KeyStore,
     values: &HashMap<String, String>,
+    consumers: Consumers,
 ) -> Result<usize, String> {
     if values.is_empty() {
         return Ok(0);
@@ -142,15 +250,20 @@ pub fn hand_off(
     let key: [u8; 32] = rand::random();
     let nonce: [u8; NONCE_LEN] = rand::random();
     let written_at_ms = now_ms();
-    let mut sealed = serde_json::to_vec(values).map_err(|error| error.to_string())?;
+    let sealed = Sealed {
+        values: values.clone(),
+        consumers,
+    };
+    let mut sealed = serde_json::to_vec(&sealed).map_err(|error| error.to_string())?;
     cipher(&key)?
         .seal_in_place_append_tag(
             Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad(written_at_ms)),
+            Aad::from(aad(VERSION, written_at_ms)),
             &mut sealed,
         )
         .map_err(|_| "sealing failed".to_owned())?;
     let envelope = Envelope {
+        version: VERSION,
         written_at_ms,
         nonce: hex::encode(nonce),
         ciphertext: hex::encode(sealed),
@@ -172,15 +285,32 @@ pub fn hand_off(
     Ok(values.len())
 }
 
-/// The values the last daemon on `state_dir` handed off, removing the
-/// handoff whether or not it could be used; empty when there is none or it
-/// is older than [`MAX_AGE`]
-pub fn take_over(state_dir: &Path, store: &KeyStore) -> Result<HashMap<String, String>, String> {
+/// What [`take_over`] found
+#[derive(Debug, Default)]
+pub struct TakenOver {
+    /// The values `consumers` may have
+    pub values: HashMap<String, String>,
+    /// References whose value was dropped, since a server now using it was
+    /// changed or added since the handoff
+    pub dropped: Vec<String>,
+}
+
+/// The values the last daemon on `state_dir` handed off for servers that
+/// `consumers` still names the same way, removing the handoff whether or
+/// not it could be used; empty when there is none or it is older than
+/// [`MAX_AGE`]
+pub fn take_over(
+    state_dir: &Path,
+    store: &KeyStore,
+    consumers: &Consumers,
+) -> Result<TakenOver, String> {
     let path = state_dir.join(FILE);
     let text = match std::fs::read(&path) {
         Ok(text) => text,
         // a key left without its file is replaced by the next handoff
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TakenOver::default());
+        }
         Err(error) => return Err(error.to_string()),
     };
     // used once, whatever happens next
@@ -209,12 +339,38 @@ pub fn take_over(state_dir: &Path, store: &KeyStore) -> Result<HashMap<String, S
     let opened = cipher(&key)?
         .open_in_place(
             Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad(envelope.written_at_ms)),
+            Aad::from(aad(envelope.version, envelope.written_at_ms)),
             &mut sealed,
         )
         .map_err(|_| "the handoff does not open with its key".to_owned())?;
+    let sealed = match envelope.version {
+        // the one restart from 0.6, which named no consumers: that daemon
+        // gave every value to the servers it had, so they are taken as
+        // today's, as upgrading should not ask again
+        1 => {
+            let values: HashMap<String, String> =
+                serde_json::from_slice(opened).map_err(|error| error.to_string())?;
 
-    serde_json::from_slice(opened).map_err(|error| error.to_string())
+            return Ok(TakenOver {
+                values,
+                dropped: Vec::new(),
+            });
+        }
+        VERSION => serde_json::from_slice::<Sealed>(opened).map_err(|error| error.to_string())?,
+        version => return Err(format!("the handoff is format {version}, not {VERSION}")),
+    };
+
+    let mut taken = TakenOver::default();
+    for (reference, value) in sealed.values {
+        if consumers.all_known_to(&sealed.consumers, &reference) {
+            taken.values.insert(reference, value);
+        } else {
+            taken.dropped.push(reference);
+        }
+    }
+    taken.dropped.sort();
+
+    Ok(taken)
 }
 
 fn cipher(key: &[u8; 32]) -> Result<LessSafeKey, String> {
@@ -223,8 +379,12 @@ fn cipher(key: &[u8; 32]) -> Result<LessSafeKey, String> {
         .map_err(|_| "bad key".to_owned())
 }
 
-fn aad(written_at_ms: u64) -> Vec<u8> {
-    format!("{AAD_PREFIX}\n{written_at_ms}").into_bytes()
+fn aad(version: u8, written_at_ms: u64) -> Vec<u8> {
+    format!("{AAD_PREFIX}/{version}\n{written_at_ms}").into_bytes()
+}
+
+const fn first_version() -> u8 {
+    1
 }
 
 fn now_ms() -> u64 {

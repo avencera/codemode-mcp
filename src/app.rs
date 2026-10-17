@@ -16,7 +16,10 @@ use crate::{
     notify::{Notifier, Ntfy},
     oauth::OAuth,
     passkeys::{PasskeyError, Passkeys},
-    secrets::{Secrets, handoff::KeyStore},
+    secrets::{
+        Secrets,
+        handoff::{KeyStore, TakenOver},
+    },
     snapshot::Sealer,
     store::{Store, StoreError},
     usage::UsageLog,
@@ -180,14 +183,26 @@ impl App {
             Role::Daemon => {
                 secrets
                     .onepassword
-                    .take_over(&state_dir, &handoff_keys)
+                    .take_over(&state_dir, &handoff_keys, &config)
                     .await
             }
-            Role::OneOff => Ok(0),
+            Role::OneOff => Ok(TakenOver::default()),
         };
         match taken {
-            Ok(0) => {}
-            Ok(count) => tracing::info!(count, "took over the last daemon's secrets"),
+            Ok(taken) => {
+                if !taken.values.is_empty() {
+                    tracing::info!(
+                        count = taken.values.len(),
+                        "took over the last daemon's secrets"
+                    );
+                }
+                if !taken.dropped.is_empty() {
+                    tracing::warn!(
+                        references = ?taken.dropped,
+                        "a server using these changed since the last daemon; asking for them again"
+                    );
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, "could not use the last daemon's secrets; reading them again");
             }
@@ -302,11 +317,11 @@ impl App {
             KeyStore::for_state(&self.state_dir, self.config.secrets.identity_file.is_none());
         // a read still waiting on a prompt holds the values; the stop does
         // not wait it out, and the next daemon asks instead
-        let handing = self
-            .gateway
-            .secrets()
-            .onepassword
-            .hand_off(&self.state_dir, &keys);
+        let handing =
+            self.gateway
+                .secrets()
+                .onepassword
+                .hand_off(&self.state_dir, &keys, &self.config);
         let handed = tokio::time::timeout(HAND_OFF_WAIT, handing)
             .await
             .unwrap_or_else(|_| Err("a read was still in flight".to_owned()));

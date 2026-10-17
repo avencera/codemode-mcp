@@ -14,8 +14,6 @@ struct RequestView: View {
     @State private var values: [Int: String] = [:]
     /// A program read's sealed items the owner enters instead
     @State private var replacing: Set<Int> = []
-    /// Whether a long destination shows in full
-    @State private var expanded = false
     /// Each button waits a moment after it appears: Approve and Done take
     /// each other's place, so a tap meant for one must not land on the
     /// next, and a result stays readable before it can be dismissed
@@ -37,7 +35,6 @@ struct RequestView: View {
             value = ""
             values = [:]
             replacing = []
-            expanded = false
             entering = false
             try? await Task.sleep(for: .seconds(1.5))
             armed = true
@@ -154,13 +151,13 @@ struct RequestView: View {
                         .font(.headline)
                         .multilineTextAlignment(.center)
                     if let destination = program.destination {
+                        // always whole: a cut path or command could hide
+                        // where the values really go
                         Text("Into \(destination)")
                             .font(.system(.callout, design: .monospaced))
-                            .lineLimit(expanded ? nil : 2)
-                            .truncationMode(.middle)
+                            .fixedSize(horizontal: false, vertical: true)
                             .multilineTextAlignment(.center)
                             .textSelection(.enabled)
-                            .onTapGesture { expanded.toggle() }
                     }
                     Text("Approving sends the values to a program running on \(read.gatewayName), not to codemode-mcp itself.")
                         .font(.footnote)

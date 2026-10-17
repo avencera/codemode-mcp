@@ -482,6 +482,18 @@ fn parse_mode(text: &str) -> Result<u32, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // the daemon and the `op` commands hold secret values in memory, which a
+    // crash must not write to disk; the hard limit stays, so a command `op
+    // run` starts can still turn its own dumps back on
+    let core = rustix::process::getrlimit(rustix::process::Resource::Core);
+    let _ = rustix::process::setrlimit(
+        rustix::process::Resource::Core,
+        rustix::process::Rlimit {
+            current: Some(0),
+            ..core
+        },
+    );
+
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -2067,18 +2079,20 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                 .map(|argument| shell_word(argument))
                 .collect::<Vec<_>>()
                 .join(" ");
-            let shown = shown_command(&line);
-            // a grant is keyed by what the prompt shows, which for a long
-            // command is not all of it, so another command could share it
-            if keep.is_some() && shown != line {
+            // refused rather than cut, since a part the prompt leaves out
+            // could change what the command does with the values, and a
+            // grant keyed by a cut line could answer another command
+            if line.chars().count() > MAX_COMMAND_CHARS
+                || codemode_mcp::prompt::one_line(&line, usize::MAX) != line
+            {
                 bail!(
-                    "--keep needs a command line short enough to show whole, at most \
-                     {COMMAND_SHOWN_CHARS} characters on one line; put a long script in a file"
+                    "a command line must fit one line of at most {MAX_COMMAND_CHARS} \
+                     characters so its prompt shows it whole; put a long script in a file"
                 );
             }
             let context = OpContext {
                 reason,
-                destination: Some(format!("the environment of {shown}")),
+                destination: Some(format!("the environment of {line}")),
                 keep_secs: keep,
             };
             let code = op_run(config, &env_file, no_masking, context, &command).await?;
@@ -2180,9 +2194,9 @@ async fn op_run(
 /// How long `op run` passes on output after its command exits
 const PIPE_DRAIN: Duration = Duration::from_secs(2);
 
-/// How much of `op run`'s command line its prompts show, leaving room for
-/// the words around it within the destination's limit
-const COMMAND_SHOWN_CHARS: usize = 200;
+/// The longest command line `op run` takes, leaving room for the words
+/// around it within the destination's limit
+const MAX_COMMAND_CHARS: usize = 200;
 
 /// `argument` as a shell would need it typed: as is when it holds only
 /// characters a shell leaves alone, otherwise in single quotes
@@ -2196,27 +2210,6 @@ fn shell_word(argument: &str) -> String {
     } else {
         format!("'{}'", argument.replace('\'', r"'\''"))
     }
-}
-
-/// `line` as one line that fits [`COMMAND_SHOWN_CHARS`]: a long one keeps
-/// its start, which names the program, and its end, where an argument that
-/// changes what it does could otherwise hide, and says how much is left out
-fn shown_command(line: &str) -> String {
-    let line = codemode_mcp::prompt::one_line(line, usize::MAX);
-    let characters: Vec<char> = line.chars().collect();
-    if characters.len() <= COMMAND_SHOWN_CHARS {
-        return line;
-    }
-    let (head, tail) = (120, 50);
-    let skipped = characters.len() - head - tail;
-
-    format!(
-        "{} …{skipped} characters… {}",
-        characters[..head].iter().collect::<String>(),
-        characters[characters.len() - tail..]
-            .iter()
-            .collect::<String>()
-    )
 }
 
 /// Passes the signals that stop a terminal command on to the child `pid`,

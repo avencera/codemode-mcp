@@ -175,22 +175,22 @@ struct Context {
     keep_secs: Option<u64>,
 }
 
-/// The destination, trimmed; `None` when blank. One that a prompt could not
-/// show whole and as is, being longer than [`MAX_DESTINATION_CHARS`] or
-/// holding a line break or control character, is refused rather than cut,
-/// since a cut path could hide the file the values really go to
+/// The destination; `None` when blank. One that a prompt could not show
+/// whole and as is, being longer than [`MAX_DESTINATION_CHARS`], holding a
+/// line break or control character, or starting or ending with whitespace,
+/// is refused rather than cut or trimmed, since the prompt would then name
+/// a different file from the one the values really go to
 pub fn clean_destination(destination: Option<&str>) -> Result<Option<String>, String> {
-    let Some(destination) = destination
-        .map(str::trim)
-        .filter(|destination| !destination.is_empty())
-    else {
+    let Some(destination) = destination.filter(|destination| !destination.trim().is_empty()) else {
         return Ok(None);
     };
     if destination.chars().count() > MAX_DESTINATION_CHARS
+        || destination.trim() != destination
         || prompt::one_line(destination, usize::MAX) != destination
     {
         return Err(format!(
-            "a destination is one line of at most {MAX_DESTINATION_CHARS} characters"
+            "a destination is one line of at most {MAX_DESTINATION_CHARS} characters, \
+             with no space at either end"
         ));
     }
 

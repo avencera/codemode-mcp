@@ -148,14 +148,14 @@ wherever you are.
 While you are at the gateway Mac it asks first, and the phone and companion Macs are asked 5 seconds later. While
 you are away they are all asked at once. The first approval sends every value, and the other prompts are taken
 down. A Deny on any device stops the request. Every prompt names the file the values go to, or the command whose
-environment gets them. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
+environment gets them, always in full: `op run` refuses a command line longer than 200 characters or spanning
+lines (put a long script in a file), and a file path that starts or ends with a space is refused. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
 A phone keeps a copy of each value sealed to its Face ID, as for config reads.
 
 When the next few commands need the same values, add `--keep 15m` to the first. Its prompt says the values will
 be handed out again without asking for that long, at most 60 minutes, and later requests for only those
 references going to the same file, or the same command's environment, are answered from memory until then.
-A request going anywhere else asks again. `op run --keep` needs a command line of at most 200 characters on
-one line, since a longer one is shortened in the prompt and could not be told apart from another. `codemode-mcp service restart --fresh` or
+A request going anywhere else asks again. `codemode-mcp service restart --fresh` or
 `POST /admin/secrets/forget` drops them early, and a restart never carries them over.
 
 Write a secrets file, the usual case:
@@ -677,7 +677,10 @@ What a restart does:
   them with AES-256-GCM under a new random key, writes the ciphertext to `<state_dir>/secrets.handoff` (mode
   0600) and keeps the key in the login keychain, where only the installed, signed binary reads it without a
   prompt. The next daemon opens both once and deletes both, and ignores a handoff more than 10 minutes old. A
-  crash leaves nothing, so that daemon asks once. `service restart --fresh` drops the values first, so the next
+  crash leaves nothing, so that daemon asks once. Each value is handed over only to the servers it went to:
+  after a change to a server's `command`, `args`, `cwd`, `env`, `url`, `headers`, `client_id` or
+  `client_secret`, or a new server using the same reference, the next daemon asks for that value once again
+  (changing a policy or tool setting asks nothing). `service restart --fresh` drops the values first, so the next
   daemon reads each again, as after rotating a key. A daemon run from anything but the installed binary, or
   with `secrets.identity_file` set, keeps the key in `<state_dir>/secrets.handoff.key` instead. Values a program
   asked for with `codemode-mcp op` are never kept or handed over.

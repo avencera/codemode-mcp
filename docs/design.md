@@ -235,8 +235,12 @@ approved wherever the owner is
   (destination, reference) until then. A later program read with the same destination whose targets are all
   references held for it is answered without asking anyone; any other destination asks. `forget()` clears
   them and bumps a counter, so a read approved after the forget began keeps nothing, and the restart handoff
-  never carries them. A destination longer than 256 characters or holding a control character is refused,
-  never cut, and `op inject` / `op read --out-file` name the file with its directory resolved
+  never carries them. A destination longer than 256 characters, holding a control character, or starting or
+  ending with whitespace is refused, never cut or trimmed, and `op inject` / `op read --out-file` name the file
+  with its directory resolved. `op run` refuses a quoted command line over 200 characters or spanning lines
+  rather than eliding its middle, and the phone shows the destination whole
+- Every codemode-mcp process sets its soft `RLIMIT_CORE` to 0 at start, since the daemon and the `op`
+  commands hold values in memory; the hard limit stays, so a command `op run` starts may raise its own
 - A batch holding a description goes to phones only, since a Mac prompt has no text field
 - Wire: a companion Mac gets `{"program_read": {references, reason, destination, keep_secs}}` and answers
   `{"values": [...]}` in order. A phone gets `{"program_read": {id, items, reason, destination, keep_secs,
@@ -566,7 +570,12 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   both whatever happens next, and seeds the cache only from a handoff under 10 minutes old. The keychain is used
   only by the installed service binary with no `secrets.identity_file`, since a test or checkout build writing
   the item would leave the service a keychain prompt; anything else keeps the key in
-  `secrets.handoff.key` beside the ciphertext. A crash or `kill -9` writes nothing. The owner-only
+  `secrets.handoff.key` beside the ciphertext. A crash or `kill -9` writes nothing. Each value is sealed with
+  the SHA-256 digests of the servers filling it in (name, command, args, cwd, env, url, headers, OAuth client),
+  and the next daemon drops it when one of its own servers using that reference has another digest, so
+  something able to edit the config file cannot redirect a value to a new command across a restart without a
+  prompt. Policy and tool settings stay out of the digest, so editing them asks nothing. Format 1 handoffs from
+  0.6 carry no digests and are taken whole, so the upgrade itself asks nothing. The owner-only
   `POST /admin/secrets/forget` (`service restart --fresh`) empties the cache first, for a rotated key. Program
   reads never enter the cache, so never the handoff. Trade-off: for the seconds of a restart the values are at
   rest on the gateway Mac, encrypted, with the key in the keychain; anything running as the signed binary could

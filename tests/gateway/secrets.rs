@@ -618,6 +618,31 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
     assert!(value(&harness.execute_json(script).await?));
     assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
 
+    // a setting that does not decide where the value goes hands it over
+    let harness = harness
+        .restart_with(Stop::Drain, |config| {
+            if let Some(server) = config.servers.get_mut("fixture") {
+                server.sensitive = Some(true);
+            }
+        })
+        .await?;
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 2);
+
+    // but a server whose environment changed, which could send the value
+    // anywhere, asks again instead of getting it from the last daemon
+    let harness = harness
+        .restart_with(Stop::Drain, |config| {
+            if let Some(server) = config.servers.get_mut("fixture") {
+                server
+                    .env
+                    .insert("FIXTURE_EXTRA".to_owned(), "1".to_owned());
+            }
+        })
+        .await?;
+    assert!(value(&harness.execute_json(script).await?));
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 3);
+
     // forgetting, as `service restart --fresh` does, hands nothing over
     let (status, forgot) = harness
         .admin_json("/admin/secrets/forget", &Value::Null)
@@ -626,7 +651,7 @@ async fn a_clean_restart_hands_its_secrets_over_sealed_and_a_crash_does_not() ->
     assert_eq!(forgot["forgotten"], 1, "{forgot}");
     let harness = harness.restart(Stop::Drain).await?;
     assert!(value(&harness.execute_json(script).await?));
-    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 3);
+    assert_eq!(reads(&log, "op://Dev/fixture/credential"), 4);
 
     harness.stop().await
 }
