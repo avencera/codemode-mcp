@@ -67,12 +67,24 @@ impl Drop for FreezeOnDrop {
     }
 }
 
+/// How long a stop waits for the secrets to be free to hand off
+const HAND_OFF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether an app is the daemon, which alone takes over and hands off the
+/// secrets of a restart
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Daemon,
+    OneOff,
+}
+
 /// A running codemode instance; cheap to clone
 #[derive(Clone)]
 pub struct App {
     _teardown: Arc<Teardown>,
     config: Arc<Config>,
     state_dir: PathBuf,
+    role: Role,
     gateway: Arc<Gateway>,
     executions: Arc<Executions>,
     passkeys: Arc<Passkeys>,
@@ -113,7 +125,7 @@ impl App {
         notifier: Option<Arc<dyn Notifier>>,
         mac: Option<Arc<dyn Mac>>,
     ) -> Result<Self, AppError> {
-        Self::build(config, notifier, mac, NO_NOTIFIER).await
+        Self::build(config, notifier, mac, NO_NOTIFIER, Role::Daemon).await
     }
 
     /// For one-off runs outside the daemon: nobody can reach an approval
@@ -127,7 +139,7 @@ impl App {
         config.secrets.listen = None;
         config.secrets.phones.clear();
 
-        Self::build(config, None, None, NO_APPROVAL_PAGE).await
+        Self::build(config, None, None, NO_APPROVAL_PAGE, Role::OneOff).await
     }
 
     async fn build(
@@ -135,6 +147,7 @@ impl App {
         notifier: Option<Arc<dyn Notifier>>,
         mac: Option<Arc<dyn Mac>>,
         unavailable: &'static str,
+        role: Role,
     ) -> Result<Self, AppError> {
         let config = Arc::new(config);
         let state_dir = config.state_dir()?;
@@ -160,12 +173,19 @@ impl App {
         );
         // before any upstream connects, so none asks for what the last
         // daemon already had
+        // only by the daemon, which has bound its listeners by now: a one-off
+        // run would use up what the next daemon is owed
         let handoff_keys = KeyStore::for_state(&state_dir, config.secrets.identity_file.is_none());
-        match secrets
-            .onepassword
-            .take_over(&state_dir, &handoff_keys)
-            .await
-        {
+        let taken = match role {
+            Role::Daemon => {
+                secrets
+                    .onepassword
+                    .take_over(&state_dir, &handoff_keys)
+                    .await
+            }
+            Role::OneOff => Ok(0),
+        };
+        match taken {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "took over the last daemon's secrets"),
             Err(error) => {
@@ -212,6 +232,7 @@ impl App {
             _teardown: teardown,
             config,
             state_dir,
+            role,
             gateway,
             executions,
             passkeys,
@@ -269,16 +290,27 @@ impl App {
     /// flushes the usage log
     pub async fn shutdown(&self) {
         self.halt();
-        // a clean stop only: a crash leaves nothing, and the next daemon asks
+        // a clean stop of the daemon only: a crash leaves nothing, and the
+        // next daemon asks
+        if self.role == Role::OneOff {
+            self.gateway.companions().close().await;
+            self.log.flush().await;
+
+            return;
+        }
         let keys =
             KeyStore::for_state(&self.state_dir, self.config.secrets.identity_file.is_none());
-        match self
+        // a read still waiting on a prompt holds the values; the stop does
+        // not wait it out, and the next daemon asks instead
+        let handing = self
             .gateway
             .secrets()
             .onepassword
-            .hand_off(&self.state_dir, &keys)
+            .hand_off(&self.state_dir, &keys);
+        let handed = tokio::time::timeout(HAND_OFF_WAIT, handing)
             .await
-        {
+            .unwrap_or_else(|_| Err("a read was still in flight".to_owned()));
+        match handed {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "handed this daemon's secrets to the next"),
             Err(error) => {

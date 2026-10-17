@@ -187,6 +187,19 @@ pub fn check_writable(path: &Path, force: bool) -> std::io::Result<()> {
 /// anything is written, then renamed over it, so the values are never in a
 /// file others could read, and a reader never sees half of it
 pub fn write_private(path: &Path, contents: &str, mode: u32, force: bool) -> std::io::Result<()> {
+    write_private_for(path, contents, mode, force, None)
+}
+
+/// [`write_private`], with the new file given `group` when there is one, so
+/// the group bits of `mode` reach the group they were meant for; when that
+/// group cannot be set they are dropped
+pub fn write_private_for(
+    path: &Path,
+    contents: &str,
+    mode: u32,
+    force: bool,
+    group: Option<u32>,
+) -> std::io::Result<()> {
     check_writable(path, force)?;
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -207,6 +220,14 @@ pub fn write_private(path: &Path, contents: &str, mode: u32, force: bool) -> std
             .create_new(true)
             .mode(mode)
             .open(&staging)?;
+        // the file starts in the directory's group, which may hold anyone,
+        // so it gets group bits only once it is in the group meant
+        let mode = match group {
+            Some(group) if std::os::unix::fs::fchown(&file, None, Some(group)).is_err() => {
+                mode & 0o700
+            }
+            _ => mode,
+        };
         // the umask may have taken bits off the mode asked for
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(contents.as_bytes())?;
@@ -273,30 +294,56 @@ impl Masker {
     }
 
     /// Masks what `buffer` holds, appending the result to `out`; returns how
-    /// many bytes were consumed. Unless `last`, a tail that is the start of a
-    /// value is left for the next call
+    /// many bytes were consumed. Unless `last`, nothing from where a value
+    /// could still be starting is passed on, so a shorter value that matches
+    /// first never lets the rest of a longer one through
+    ///
+    /// Every byte inside any value is covered, so overlapping values are
+    /// masked whole, and each run of covered bytes becomes one mask
     fn mask_into(&self, buffer: &[u8], last: bool, out: &mut Vec<u8>) -> usize {
-        let mut at = 0;
-        while at < buffer.len() {
+        let open = |at: usize| {
             let rest = &buffer[at..];
-            if let Some(needle) = self.needles.iter().find(|needle| rest.starts_with(needle)) {
-                out.extend_from_slice(MASK);
-                at += needle.len();
-                continue;
+            self.needles
+                .iter()
+                .any(|needle| needle.len() > rest.len() && needle.starts_with(rest))
+        };
+        let limit = if last {
+            buffer.len()
+        } else {
+            (0..buffer.len())
+                .find(|at| open(*at))
+                .unwrap_or(buffer.len())
+        };
+
+        let mut covered = vec![false; buffer.len()];
+        for start in 0..limit {
+            for needle in &self.needles {
+                if buffer[start..].starts_with(needle) {
+                    covered[start..start + needle.len()].fill(true);
+                }
             }
-            let may_grow = !last
-                && self
-                    .needles
-                    .iter()
-                    .any(|needle| needle.len() > rest.len() && needle.starts_with(rest));
-            if may_grow {
-                break;
-            }
-            out.push(buffer[at]);
-            at += 1;
+        }
+        // a value running past the limit is masked once the rest of it, and
+        // anything it might still be part of, has arrived
+        let mut end = limit;
+        while end > 0 && end < buffer.len() && covered[end - 1] && covered[end] {
+            end -= 1;
         }
 
-        at
+        let mut at = 0;
+        while at < end {
+            if covered[at] {
+                out.extend_from_slice(MASK);
+                while at < end && covered[at] {
+                    at += 1;
+                }
+            } else {
+                out.push(buffer[at]);
+                at += 1;
+            }
+        }
+
+        end
     }
 
     /// Copies `reader` to `writer` with every value masked
@@ -398,6 +445,36 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// What `values` mask `chunks` into, fed as `pipe` feeds reads
+    fn masked(values: &[&str], chunks: &[&str]) -> String {
+        let values: Vec<String> = values.iter().map(|value| (*value).to_owned()).collect();
+        let masker = super::Masker::new(&values);
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        for (index, chunk) in chunks.iter().chain([&""]).enumerate() {
+            pending.extend_from_slice(chunk.as_bytes());
+            let consumed = masker.mask_into(&pending, index == chunks.len(), &mut out);
+            pending.drain(..consumed);
+        }
+
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn a_shorter_value_never_lets_the_rest_of_a_longer_one_through() {
+        let values = ["abc", "abcdef0123456789"];
+        assert_eq!(
+            masked(&values, &["abc", "def0123456789 ok"]),
+            "[redacted] ok"
+        );
+        assert_eq!(masked(&values, &["abc", "x abc"]), "[redacted]x [redacted]");
+        // overlapping values are masked whole
+        assert_eq!(
+            masked(&["abcde", "cdefg"], &["abcd", "efg!"]),
+            "[redacted]!"
+        );
     }
 
     #[test]

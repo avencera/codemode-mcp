@@ -36,6 +36,10 @@ pub const KEY_FILE: &str = "secrets.handoff.key";
 /// a reboot within this window is still a planned stop
 pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
+/// How far ahead of this clock a handoff's time may be, for clocks that
+/// disagree by moments
+const CLOCK_SKEW_MS: u64 = 60_000;
+
 /// Keychain service of the key
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.praveen.codemode-mcp.handoff";
@@ -184,7 +188,13 @@ pub fn take_over(state_dir: &Path, store: &KeyStore) -> Result<HashMap<String, S
     let key = store.take()?;
 
     let envelope: Envelope = serde_json::from_slice(&text).map_err(|error| error.to_string())?;
-    let age = Duration::from_millis(now_ms().saturating_sub(envelope.written_at_ms));
+    // a clock set back since the handoff makes its age unknowable, so one
+    // from the future is refused like a stale one
+    let now = now_ms();
+    if envelope.written_at_ms > now.saturating_add(CLOCK_SKEW_MS) {
+        return Err("the handoff is dated in the future".to_owned());
+    }
+    let age = Duration::from_millis(now.saturating_sub(envelope.written_at_ms));
     if age > MAX_AGE {
         return Err(format!("the handoff is {}s old", age.as_secs()));
     }

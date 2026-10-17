@@ -219,9 +219,12 @@ in the file that the prompt never showed, so write it yourself or use `op inject
 named are replaced, including the rest of a multi-line quoted value, new ones are added at the end, and every
 other line is kept. Values that need it are single-quoted; a value with a line break or a single quote is
 refused, so use `op inject` with a template for those. A new file gets mode 0600, and so does one that others could
-read; one already closed to others keeps its group bits, so a service's group can still read it. The file is replaced by a new one, so a container that
+read; one already closed to others keeps its group and group bits, so a service's group can still read it; if the
+new file cannot be put in that group, it gets 0600. The file is replaced by a new one, so a container that
 bind-mounts the single file sees the change only after it restarts. The answer names the variables written and the device that approved,
-never a value, and the values are redacted from every later result. `keep_minutes` works like `--keep`.
+never a value, and values of 6 or more characters are redacted from every later result; a shorter one, such
+as a PIN, is not. A caller that cancels the call takes the prompts down, and nothing is written after a late
+approval. `keep_minutes` works like `--keep`.
 
 That prompt is the approval, so the gateway runs the call without asking first; a `policy = "ask"` on
 `write_env` is refused at startup. The server's instructions tell agents to name a file and use this tool rather
@@ -271,9 +274,8 @@ The 1Password Environments server is not covered; it only signs in through the g
      says so and exits with an error.
    - writes a `[companion]` section to this Mac's config.
    - installs and starts the companion's LaunchAgent, as `codemode-mcp companion install` does.
-   - asks the gateway to read one of those references through this Mac. Approve the one Touch ID prompt. While
-     1Password has authorized `op` on that Mac, the prompt is the companion's and names the reference;
-     otherwise it is 1Password's, and a notification names the reference. Both Macs print the value's
+   - asks the gateway to read one of those references through this Mac. Approve the companion's Touch ID prompt,
+     which names the reference; while `op` on that Mac is signed out, 1Password asks too. Both Macs print the value's
      length, never the value.
 
    On a Mac that already has codemode-mcp, the second command `invite` prints, `codemode-mcp companion pair

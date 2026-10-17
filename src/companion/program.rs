@@ -312,7 +312,11 @@ impl OnePassword {
         // set once this Mac has failed, so the others need not sit out the
         // rest of the grace
         let (local_failed, grace_over) = watch::channel(!local);
+        // held here too, since a sender dropped by a local read that
+        // succeeded would end the grace early
+        let local_failed = Arc::new(local_failed);
         if let (true, Some(references)) = (local, &references) {
+            let local_failed = Arc::clone(&local_failed);
             let onepassword = self.clone();
             let references = references.clone();
             let context = context.clone();
@@ -401,6 +405,10 @@ impl OnePassword {
                     ASK_TIMEOUT + grace
                 )))
             })?;
+
+        // the losers' prompts come down now, not after the sealing below
+        drop(sources);
+        drop(local_failed);
 
         if let Some(companions) = &companions {
             for (target, value) in targets.iter().zip(&outcome.values) {

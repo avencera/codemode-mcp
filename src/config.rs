@@ -216,8 +216,26 @@ impl Config {
         let Some(stripped) = without_companion_allow(&text) else {
             return Ok(false);
         };
-        // written in place, so the file keeps its mode
-        std::fs::write(path, stripped).map_err(|source| ConfigError::Write {
+        // a config kept in a dotfiles checkout is often a link; the file it
+        // points at is replaced, whole, keeping its mode
+        let write = || -> std::io::Result<()> {
+            let target = std::fs::canonicalize(path)?;
+            let permissions = std::fs::metadata(&target)?.permissions();
+            let staging = target.with_file_name(format!(
+                ".{}.{}.tmp",
+                target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                std::process::id()
+            ));
+            std::fs::write(&staging, &stripped)?;
+            std::fs::set_permissions(&staging, permissions)?;
+            std::fs::rename(&staging, &target).inspect_err(|_| {
+                let _ = std::fs::remove_file(&staging);
+            })
+        };
+        write().map_err(|source| ConfigError::Write {
             path: path.to_owned(),
             source,
         })?;
@@ -1657,74 +1675,18 @@ impl ServerConfig {
     }
 }
 
-/// `text` without the `allow = [...]` entry of its `[companion]` table,
-/// which may span lines; `None` when there is none
+/// `text` without the `allow` entry of its `[companion]` table, however it
+/// is written; `None` when there is none, or the text is not TOML. Edited as
+/// TOML, so text inside a string that only looks like that table is kept,
+/// and so are the comments and layout around it
 fn without_companion_allow(text: &str) -> Option<String> {
-    let mut kept = String::with_capacity(text.len());
-    let mut table = String::new();
-    // open brackets of the `allow` array being dropped
-    let mut skipping: Option<i32> = None;
-    let mut removed = false;
-    for line in text.split_inclusive('\n') {
-        if let Some(depth) = skipping {
-            let depth = depth + bracket_depth(line);
-            skipping = (depth > 0).then_some(depth);
-            continue;
-        }
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            table = trimmed
-                .trim_start_matches('[')
-                .split(']')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-        } else if table == "companion"
-            && let Some(value) = trimmed
-                .strip_prefix("allow")
-                .map(str::trim_start)
-                .and_then(|rest| rest.strip_prefix('='))
-        {
-            let depth = bracket_depth(value);
-            skipping = (depth > 0).then_some(depth);
-            removed = true;
-            continue;
-        }
-        kept.push_str(line);
-    }
+    let mut document: toml_edit::DocumentMut = text.parse().ok()?;
+    document
+        .get_mut("companion")?
+        .as_table_like_mut()?
+        .remove("allow")?;
 
-    removed.then_some(kept)
-}
-
-/// How many more `[` than `]` `line` opens, outside quoted strings and
-/// comments
-fn bracket_depth(line: &str) -> i32 {
-    let mut depth = 0;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for character in line.chars() {
-        match quote {
-            Some(open) => {
-                if escaped {
-                    escaped = false;
-                } else if character == '\\' && open == '"' {
-                    escaped = true;
-                } else if character == open {
-                    quote = None;
-                }
-            }
-            None => match character {
-                '"' | '\'' => quote = Some(character),
-                '#' => break,
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                _ => {}
-            },
-        }
-    }
-
-    depth
+    Some(document.to_string())
 }
 
 #[cfg(test)]
@@ -1981,6 +1943,21 @@ mod tests {
         let one_line = format!("[companion]\ngateway = \"{id}\"\nallow = [\"op://V/i/f\"]\n");
         let stripped = without_companion_allow(&one_line).unwrap_or_default();
         assert!(parse(&stripped).is_ok(), "{stripped}");
+
+        // a string that only looks like the table is kept, and a quoted key
+        // or dotted form is still found
+        let lookalike = "[servers.x]\ncommand = \"x\"\nenv = { NOTE = \"\"\"\n[companion]\nallow = [1]\n\"\"\" }\n";
+        assert_eq!(without_companion_allow(lookalike), None);
+        let quoted = format!("[companion]\ngateway = \"{id}\"\n\"allow\" = []\n");
+        assert_eq!(
+            without_companion_allow(&quoted).as_deref(),
+            Some(format!("[companion]\ngateway = \"{id}\"\n").as_str())
+        );
+        let dotted = format!("companion.gateway = \"{id}\"\ncompanion.allow = []\n");
+        assert_eq!(
+            without_companion_allow(&dotted).as_deref(),
+            Some(format!("companion.gateway = \"{id}\"\n").as_str())
+        );
     }
 
     #[test]

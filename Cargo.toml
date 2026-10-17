@@ -74,6 +74,7 @@ thiserror = "2.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "signal", "sync", "io-util", "io-std"] }
 tokio-util = "0.7.20"
 toml = "1.1.8"
+toml_edit = "0.25.17"
 # no mimalloc (it installs a global allocator) and no full-text search
 turso = { version = "0.8.3", default-features = false }
 tracing = "0.1.44"

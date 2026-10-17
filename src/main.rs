@@ -1232,8 +1232,8 @@ async fn pair_with_invite(
     }
 
     println!(
-        "Checking the pairing: approve the Touch ID prompt on this Mac, which is 1Password's \
-         own while it has not yet let `op` in."
+        "Checking the pairing: approve the Touch ID prompt on this Mac, which names the \
+         reference; 1Password asks too while it has not yet let `op` in."
     );
     let check = joined
         .check()
@@ -1959,10 +1959,13 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                     .map(|reference| ProgramTarget::Reference(reference.trim().to_owned()))
                     .collect(),
             };
+            // the file written is the one the prompt names, even if a link
+            // on the way changes while the owner decides
+            let out_file = out_file.map(|path| resolved_path(&path));
             let destination = match &out_file {
                 Some(path) => {
                     op::check_writable(path, force)?;
-                    Some(destination_of(path))
+                    Some(path.display().to_string())
                 }
                 None => None,
             };
@@ -2019,10 +2022,13 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                 }
             };
             let references = op::template_references(&template)?;
+            // the file written is the one the prompt names, even if a link
+            // on the way changes while the owner decides
+            let out_file = out_file.map(|path| resolved_path(&path));
             let destination = match &out_file {
                 Some(path) => {
                     op::check_writable(path, force)?;
-                    Some(destination_of(path))
+                    Some(path.display().to_string())
                 }
                 None => None,
             };
@@ -2054,9 +2060,16 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
             keep,
             command,
         } => {
+            // one line, cut to fit: a long or multi-line script must still
+            // be asked about, and the program it starts comes first
+            let line = command.join(" ");
+            let mut shown = codemode_mcp::prompt::one_line(&line, COMMAND_SHOWN_CHARS);
+            if line.chars().count() > COMMAND_SHOWN_CHARS {
+                shown.push('…');
+            }
             let context = OpContext {
                 reason,
-                destination: Some(format!("the environment of {}", command.join(" "))),
+                destination: Some(format!("the environment of {shown}")),
                 keep_secs: keep,
             };
             let code = op_run(config, &env_file, no_masking, context, &command).await?;
@@ -2138,13 +2151,29 @@ async fn op_run(
         }
     }
     let status = running.wait().await?;
-    for pipe in pipes {
-        let _ = pipe.await;
-    }
     forwarding.abort();
+    // a background process the command left behind may hold the pipes open;
+    // what is already in them is passed on, then this exits with the code
+    let drained = async {
+        for pipe in &mut pipes {
+            let _ = pipe.await;
+        }
+    };
+    if tokio::time::timeout(PIPE_DRAIN, drained).await.is_err() {
+        for pipe in &pipes {
+            pipe.abort();
+        }
+    }
 
     Ok(exit_code(status))
 }
+
+/// How long `op run` passes on output after its command exits
+const PIPE_DRAIN: Duration = Duration::from_secs(2);
+
+/// How much of `op run`'s command line its prompts show, leaving room for
+/// the words around it within the destination's limit
+const COMMAND_SHOWN_CHARS: usize = 200;
 
 /// Passes the signals that stop a terminal command on to the child `pid`,
 /// so it is never left running with the values after this process ends
@@ -2195,10 +2224,10 @@ struct OpContext {
     keep_secs: Option<u64>,
 }
 
-/// How prompts name `path`: absolute, with its directory resolved, so the
-/// owner sees the file written rather than a path whose `..` or links lead
-/// elsewhere
-fn destination_of(path: &std::path::Path) -> String {
+/// `path` absolute, with its directory resolved, so prompts name the file
+/// written rather than a path whose `..` or links lead elsewhere, and the
+/// write goes there
+fn resolved_path(path: &std::path::Path) -> PathBuf {
     let resolved = path.file_name().and_then(|name| {
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -2213,8 +2242,6 @@ fn destination_of(path: &std::path::Path) -> String {
     resolved
         .or_else(|| std::path::absolute(path).ok())
         .unwrap_or_else(|| path.to_path_buf())
-        .display()
-        .to_string()
 }
 
 /// Each reference mapped to its value, read in one approval; empty, asking

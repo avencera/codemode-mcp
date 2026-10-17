@@ -12,7 +12,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -20,10 +20,12 @@ use std::{
 
 use companion_wire::wire::{MAX_KEEP_SECS, MAX_PROGRAM_ITEMS};
 use rmcp::{
-    ServerHandler, ServiceExt,
+    RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
     model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig as McpServerConfig},
-    schemars, tool, tool_handler, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +41,9 @@ const INSTRUCTIONS: &str = "Writes 1Password values into an env file on this Mac
      Mac, and sees the file's path. Other lines of the file are kept. Use this whenever a \
      program needs a secret: never ask for the value itself.";
 
+/// The error of a call its caller cancelled; nothing was written
+const CANCELLED: &str = "the call was cancelled, so nothing was written";
+
 /// One write at a time, so two calls for the same file never merge into
 /// the same old text and drop each other's lines
 static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -49,9 +54,8 @@ pub struct WriteEnvParams {
     /// `<name>.env`, such as `/srv/stacks/lookout/superalert.secrets.env`;
     /// created mode 0600 when missing
     pub path: String,
-    /// Each variable to write, mapped to its `op://vault/item/field`
-    /// reference, or to text holding `{{ op://… }}` references such as
-    /// `https://{{ op://vault/db/user }}@db.example`
+    /// Each variable to write, mapped to one whole `op://vault/item/field`
+    /// reference; plain values and text around references are refused
     pub vars: BTreeMap<String, String>,
     /// Why the program needs these values; every prompt shows it
     pub reason: String,
@@ -125,6 +129,7 @@ impl SecretsServer {
     async fn write_env(
         &self,
         Parameters(params): Parameters<WriteEnvParams>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<EnvWritten>, CallToolResult> {
         let path = env_path(&params.path).map_err(failed)?;
         let vars = checked_vars(&params.vars).map_err(failed)?;
@@ -152,12 +157,12 @@ impl SecretsServer {
             destination: Some(path.display().to_string()),
             keep,
         };
-        let read = self
-            .0
-            .onepassword
-            .read_for_program(&ask)
-            .await
-            .map_err(failed)?;
+        // a caller that stops waiting takes the prompts down, and nothing is
+        // written for it after a late approval
+        let read = tokio::select! {
+            read = self.0.onepassword.read_for_program(&ask) => read.map_err(failed)?,
+            () = context.ct.cancelled() => return Err(failed(CANCELLED)),
+        };
         self.0.redactor.add(
             read.values
                 .iter()
@@ -173,7 +178,10 @@ impl SecretsServer {
             lines.push((key.clone(), env_line(key, value).map_err(failed)?));
         }
 
-        let _turn = TURN.lock().await;
+        let _turn = tokio::select! {
+            turn = TURN.lock() => turn,
+            () = context.ct.cancelled() => return Err(failed(CANCELLED)),
+        };
         // read again after the approval, which may have taken minutes, so an
         // edit made meanwhile is kept
         let existing = match std::fs::read_to_string(&path) {
@@ -183,17 +191,17 @@ impl SecretsServer {
         };
         let merged = merge(&existing, &lines);
         // a file already closed to others and shared with a service's group
-        // stays readable to it; one open to everyone was never deliberately
-        // shared, and on macOS the usual group, staff, holds every user
-        let mode = std::fs::metadata(&path).map_or(op::DEFAULT_FILE_MODE, |metadata| {
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o007 == 0 {
-                mode | op::DEFAULT_FILE_MODE
-            } else {
-                op::DEFAULT_FILE_MODE
-            }
-        });
-        op::write_private(&path, &merged.text, mode, true)
+        // stays readable to that group; one open to everyone was never
+        // deliberately shared, and on macOS the usual group, staff, holds
+        // every user
+        let (mode, group) = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.permissions().mode() & 0o007 == 0 => (
+                (metadata.permissions().mode() & 0o770) | op::DEFAULT_FILE_MODE,
+                Some(metadata.gid()),
+            ),
+            _ => (op::DEFAULT_FILE_MODE, None),
+        };
+        op::write_private_for(&path, &merged.text, mode, true, group)
             .map_err(|error| failed(format!("cannot write {}: {error}", path.display())))?;
 
         Ok(Json(EnvWritten {
