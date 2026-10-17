@@ -38,9 +38,9 @@ pub enum KeyStore {
 
 impl KeyStore {
     /// `item` in the keychain when `keychain` is allowed and this is the
-    /// installed service binary, otherwise `file` in `state_dir`
+    /// installed service binary on macOS, otherwise `file` in `state_dir`
     pub fn for_state(state_dir: &Path, keychain: bool, item: KeychainItem, file: &str) -> Self {
-        if keychain && is_installed_binary(state_dir) {
+        if cfg!(target_os = "macos") && keychain && is_installed_binary(state_dir) {
             Self::Keychain(item)
         } else {
             Self::File(state_dir.join(file))
@@ -86,15 +86,18 @@ impl KeyStore {
             .transpose()
     }
 
-    /// The key, removed from the store
+    /// The key, removed from the store; an error when it cannot be removed,
+    /// since a key taken must not be there to take again
     pub fn take(&self) -> Result<Option<[u8; 32]>, String> {
         // one that cannot be read stays, and the next `put` replaces it
         let key = self.read()?;
         match self {
-            Self::Keychain(item) => keychain_delete(*item),
-            Self::File(path) => {
-                let _ = std::fs::remove_file(path);
-            }
+            Self::Keychain(item) => keychain_delete(*item)?,
+            Self::File(path) => match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot remove the key: {error}")),
+            },
         }
 
         Ok(key)
@@ -130,10 +133,15 @@ fn keychain_read(item: KeychainItem) -> Result<Option<Vec<u8>>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_delete(item: KeychainItem) {
+fn keychain_delete(item: KeychainItem) -> Result<(), String> {
     use security_framework::passwords::delete_generic_password;
 
-    let _ = delete_generic_password(item.service, item.account);
+    match delete_generic_password(item.service, item.account) {
+        Err(error) if error.code() != KEYCHAIN_NOT_FOUND => {
+            Err(format!("cannot remove the key: {error}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -147,4 +155,6 @@ fn keychain_read(_item: KeychainItem) -> Result<Option<Vec<u8>>, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn keychain_delete(_item: KeychainItem) {}
+fn keychain_delete(_item: KeychainItem) -> Result<(), String> {
+    Ok(())
+}

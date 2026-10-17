@@ -192,10 +192,20 @@ impl DeviceTrust {
             Ok(None) if may_create => {
                 let key: [u8; 32] = rand::random();
                 let mut trust = with_key(&key);
-                if trust.load().committed {
+                // only no records, or records of a set-up that stopped before
+                // its key was kept, are a first start; committed records, or
+                // ones that cannot be read, mean the key was lost
+                let first_start = match std::fs::read(&records) {
+                    Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                    Ok(text) => serde_json::from_slice::<Records>(&text)
+                        .is_ok_and(|records| !records.committed),
+                };
+                if !first_start {
                     // a new key, trusting nothing: the config as it now
-                    // stands may not be what the owner trusted
-                    if let Err(error) = store.put(&key) {
+                    // stands may not be what the owner trusted. The records
+                    // stay marked, rewritten when unreadable, so losing this
+                    // key too is never taken for a first start
+                    if let Err(error) = store.put(&key).and_then(|()| trust.commit()) {
                         tracing::warn!(%error, "could not keep the device trust key");
 
                         return none();
@@ -663,9 +673,16 @@ mod tests {
         // a set-up that stopped before its key was kept is redone
         let _ = std::fs::remove_file(directory.join(KEY_FILE));
         std::fs::write(&records, r#"{"records":[]}"#).unwrap_or_else(|error| panic!("{error}"));
-        let redone = DeviceTrust::open_with(&store, records, &listed, true);
+        let redone = DeviceTrust::open_with(&store, records.clone(), &listed, true);
         assert!(redone.set_up());
         assert!(redone.is_trusted(&phone(3)));
+
+        // records that cannot be read are not a first start either
+        let _ = std::fs::remove_file(directory.join(KEY_FILE));
+        std::fs::write(&records, "not json").unwrap_or_else(|error| panic!("{error}"));
+        let unreadable = DeviceTrust::open_with(&store, records, &listed, true);
+        assert!(!unreadable.set_up());
+        assert!(!unreadable.is_trusted(&phone(3)));
 
         let _ = std::fs::remove_dir_all(&directory);
     }
