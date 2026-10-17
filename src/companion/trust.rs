@@ -147,6 +147,17 @@ struct Records {
     committed: bool,
 }
 
+/// Why the records file could not be used
+#[derive(Debug, thiserror::Error)]
+enum Unreadable {
+    /// It could not be read, perhaps for now
+    #[error("cannot read the device trust records: {0}")]
+    Io(String),
+    /// It holds something other than records
+    #[error("the device trust records are malformed: {0}")]
+    Malformed(String),
+}
+
 /// The trust key and the records it vouches for
 pub struct DeviceTrust {
     /// `None` when the key could not be read or made, so nothing is trusted
@@ -207,7 +218,7 @@ impl DeviceTrust {
                 // the records is complete but for the mark; marking only
                 // makes a later lost key trust nothing
                 if may_create
-                    && !trust.load().committed
+                    && trust.try_load().is_ok_and(|records| !records.committed)
                     && let Err(error) = trust.commit()
                 {
                     tracing::warn!(%error, "could not mark device trust as set up");
@@ -229,9 +240,18 @@ impl DeviceTrust {
                 if !first_start {
                     // a new key, trusting nothing: the config as it now
                     // stands may not be what the owner trusted. The records
-                    // stay marked, rewritten when unreadable, so losing this
-                    // key too is never taken for a first start
-                    if let Err(error) = store.put(&key).and_then(|()| trust.commit()) {
+                    // stay marked, so losing this key too is never taken for
+                    // a first start; malformed ones, which no key could use,
+                    // are replaced, while a file that cannot be read now is
+                    // left for a later start
+                    let marked = match trust.try_load() {
+                        Err(Unreadable::Malformed(_)) => trust.save(&Records {
+                            records: Vec::new(),
+                            committed: true,
+                        }),
+                        _ => trust.commit(),
+                    };
+                    if let Err(error) = marked.and_then(|()| store.put(&key)) {
                         tracing::warn!(%error, "could not keep the device trust key");
 
                         return none();
@@ -292,7 +312,7 @@ impl DeviceTrust {
     /// Marks the records as set up with a kept key
     fn commit(&self) -> Result<(), String> {
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut records = self.load();
+        let mut records = self.try_load().map_err(|error| error.to_string())?;
         records.committed = true;
 
         self.save(&records)
@@ -331,7 +351,7 @@ impl DeviceTrust {
         };
 
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut records = self.load();
+        let mut records = self.try_load().map_err(|error| error.to_string())?;
         if records.records.contains(&record) {
             return Ok(());
         }
@@ -343,7 +363,7 @@ impl DeviceTrust {
     /// Drops every record of the device `id`, under any key
     pub fn forget(&self, id: EndpointId) -> Result<(), String> {
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut records = self.load();
+        let mut records = self.try_load().map_err(|error| error.to_string())?;
         let before = records.records.len();
         records.records.retain(|record| record.id != id);
         if records.records.len() == before {
@@ -354,25 +374,28 @@ impl DeviceTrust {
     }
 
     /// The records; none when the file is missing or unreadable, which
-    /// leaves every device untrusted rather than failing the daemon
+    /// leaves every device untrusted rather than failing the daemon. Only
+    /// for reading: a write starts from [`Self::try_load`]
     fn load(&self) -> Records {
-        let text = match std::fs::read(&self.records) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Records::default();
-            }
-            Err(error) => {
-                tracing::warn!(%error, "cannot read the device trust records");
-
-                return Records::default();
-            }
-        };
-
-        serde_json::from_slice(&text).unwrap_or_else(|error| {
-            tracing::warn!(%error, "the device trust records are malformed");
+        self.try_load().unwrap_or_else(|unreadable| {
+            tracing::warn!(error = %unreadable, "cannot read the device trust records");
 
             Records::default()
         })
+    }
+
+    /// The records, none when the file is missing; an error when it cannot
+    /// be read or parsed, so a write never replaces records it did not see
+    fn try_load(&self) -> Result<Records, Unreadable> {
+        let text = match std::fs::read(&self.records) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Records::default());
+            }
+            Err(error) => return Err(Unreadable::Io(error.to_string())),
+        };
+
+        serde_json::from_slice(&text).map_err(|error| Unreadable::Malformed(error.to_string()))
     }
 
     /// Replaces the records file in one rename, so a crash leaves the old one
@@ -732,6 +755,16 @@ mod tests {
         let (unreadable, set_up) = open(&store, records, &listed);
         assert!(!set_up);
         assert!(!unreadable.is_trusted(&phone(3)));
+
+        // records that cannot be read for now are never written over: a
+        // directory in their place stands for a file that fails to open
+        let (kept, _) = open(&store, directory.join("unreadable"), &none);
+        let _ = std::fs::remove_file(directory.join("unreadable"));
+        std::fs::create_dir_all(directory.join("unreadable"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(kept.trust(&phone(4)).is_err());
+        assert!(kept.forget(phone(4).id()).is_err());
+        assert!(directory.join("unreadable").is_dir());
 
         let _ = std::fs::remove_dir_all(&directory);
     }
