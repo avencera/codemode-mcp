@@ -16,7 +16,7 @@ use crate::{
     notify::{Notifier, Ntfy},
     oauth::OAuth,
     passkeys::{PasskeyError, Passkeys},
-    secrets::Secrets,
+    secrets::{Secrets, handoff::KeyStore},
     snapshot::Sealer,
     store::{Store, StoreError},
     usage::UsageLog,
@@ -158,6 +158,20 @@ impl App {
             presence,
             Some(store.clone()),
         );
+        // before any upstream connects, so none asks for what the last
+        // daemon already had
+        let handoff_keys = KeyStore::for_state(&state_dir, config.secrets.identity_file.is_none());
+        match secrets
+            .onepassword
+            .take_over(&state_dir, &handoff_keys)
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "took over the last daemon's secrets"),
+            Err(error) => {
+                tracing::warn!(%error, "could not use the last daemon's secrets; reading them again");
+            }
+        }
         let oauth = OAuth::new(&config, store.clone(), secrets.onepassword.clone());
         let approvals = Approvals::new(
             &config.public_base(),
@@ -255,6 +269,22 @@ impl App {
     /// flushes the usage log
     pub async fn shutdown(&self) {
         self.halt();
+        // a clean stop only: a crash leaves nothing, and the next daemon asks
+        let keys =
+            KeyStore::for_state(&self.state_dir, self.config.secrets.identity_file.is_none());
+        match self
+            .gateway
+            .secrets()
+            .onepassword
+            .hand_off(&self.state_dir, &keys)
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "handed this daemon's secrets to the next"),
+            Err(error) => {
+                tracing::warn!(%error, "could not hand off the secrets; the next daemon asks")
+            }
+        }
         // tells connected phones and frees `secrets.listen` for the next
         // process
         self.gateway.companions().close().await;

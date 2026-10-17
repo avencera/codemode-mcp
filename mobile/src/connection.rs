@@ -1,6 +1,7 @@
 //! The connection actor: owns the phone's iroh endpoint, dials the gateway,
-//! hands each read the gateway sends to the app actor, and dials again when
-//! the link drops while the app is in the foreground
+//! hands each read the gateway sends (a single read or a program's batch) to
+//! the app actor, and dials again when the link drops while the app is in the
+//! foreground
 //!
 //! Dials, accepts and stream answers run in spawned tasks that report back
 //! as messages, so a handler never waits on the network
@@ -12,7 +13,7 @@ use std::{
 
 use companion_wire::{
     ASK_TIMEOUT, MAX_PHONE_READ_BYTES, MOBILE_ALPN,
-    mobile::{PhoneRead, PhoneRequest, PhoneResponse, RequestId},
+    mobile::{PhoneProgramRequest, PhoneRead, PhoneRequest, PhoneResponse, RequestId},
     wire::CompanionResponse,
 };
 use iroh::{
@@ -27,6 +28,7 @@ use crate::{
     ffi::ConnectionState,
     net,
     record::GatewayRecord,
+    request::Asked,
 };
 
 /// Longest wait between dials while the gateway cannot be reached
@@ -263,21 +265,19 @@ async fn accept_reads(connection: Connection, app: ActorRef<AppMsg>) {
             let Ok(Ok(body)) = body else {
                 return;
             };
-            let Ok(mut read) = serde_json::from_slice::<PhoneRead>(&body) else {
+            let Some(mut asked) = parse(&body) else {
                 tracing::warn!("the gateway sent a read this phone cannot parse");
 
                 return;
             };
             // the gateway never waits longer than this, so neither does the
             // phone's prompt
-            read.expires_in_ms = read
-                .expires_in_ms
-                .min(u64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
-            let id = read.id.clone();
+            asked.cap_expiry(u64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
+            let id = asked.id().clone();
             let seq = STREAMS.fetch_add(1, Ordering::Relaxed);
             let (responder, answered) = oneshot::channel();
             let incoming = Incoming {
-                read,
+                asked,
                 seq,
                 responder,
             };
@@ -288,6 +288,18 @@ async fn accept_reads(connection: Connection, app: ActorRef<AppMsg>) {
             answer(send, answered, id, seq, app).await;
         });
     }
+}
+
+/// Reads what the gateway sent on a stream it opened: a program's batch,
+/// keyed `program_read`, or a single read, which has no such key
+fn parse(body: &[u8]) -> Option<Asked> {
+    if let Ok(request) = serde_json::from_slice::<PhoneProgramRequest>(body) {
+        return Some(Asked::Program(request.program_read));
+    }
+
+    serde_json::from_slice::<PhoneRead>(body)
+        .ok()
+        .map(Asked::Read)
 }
 
 /// Writes the read's answer, or tells the app the gateway stopped wanting

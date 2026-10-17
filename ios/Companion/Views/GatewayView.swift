@@ -1,8 +1,7 @@
 import CompanionCore
 import SwiftUI
 
-/// The paired gateway: its name, the link, what this iPhone may read, and
-/// unpairing
+/// The paired gateway: its name, the link, and unpairing
 struct GatewayView: View {
     @Environment(AppManager.self) private var manager
     @State private var confirmingUnpair = false
@@ -17,19 +16,6 @@ struct GatewayView: View {
                 }
                 if let pairing = pairingMessage {
                     Section("Pairing") { Text(pairing) }
-                }
-                Section {
-                    ForEach(gateway.allow, id: \.self) { reference in
-                        Text(reference)
-                            .font(.system(.footnote, design: .monospaced))
-                            .swipeActions {
-                                Button("Remove", role: .destructive) {
-                                    manager.dispatch(.disallow(reference: reference))
-                                }
-                            }
-                    }
-                } header: {
-                    Text("Allowed references")
                 }
                 Section {
                     Button("Unpair", role: .destructive) { confirmingUnpair = true }

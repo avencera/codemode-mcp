@@ -171,8 +171,7 @@ pub fn seal_info(gateway: &EndpointId, reference: &str) -> Vec<u8> {
 pub struct PhoneRead {
     /// The id the push named
     pub id: RequestId,
-    /// The `op://` reference, shown in the prompt and matched exactly
-    /// against the phone's allow list
+    /// The `op://` reference, shown in the prompt
     pub reference: String,
     /// The value, sealed to this phone; `None` when the gateway has no copy
     /// yet, so the owner pastes or fills it in
@@ -180,6 +179,68 @@ pub struct PhoneRead {
     pub sealed: Option<Sealed>,
     /// Milliseconds until the gateway gives up on this read
     pub expires_in_ms: u64,
+}
+
+/// Values a program on the gateway Mac asked for (`codemode-mcp op read`,
+/// `op inject`, `op run`), sent as `{"program_read": {...}}` on a stream the
+/// gateway opens, like a [`PhoneRead`]; the phone answers
+/// [`CompanionResponse::Values`](crate::wire::CompanionResponse::Values) in
+/// the order of `items`, or an error
+///
+/// One approval covers the batch. The prompt names every item and says the
+/// values go to a program on the gateway Mac, with the program's reason.
+/// A phone from before this cannot parse the request, which has
+/// no `reference`, and the gateway reports that the app needs updating
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneProgramRequest {
+    /// The batch
+    pub program_read: PhoneProgramRead,
+}
+
+/// One program read the gateway asks a phone to approve
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneProgramRead {
+    /// The id the push named
+    pub id: RequestId,
+    /// What the program asks for, at most
+    /// [`MAX_PROGRAM_ITEMS`](crate::wire::MAX_PROGRAM_ITEMS)
+    pub items: Vec<ProgramItem>,
+    /// Why the program wants them, in its own words
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where the values go, as in
+    /// [`ProgramBatch::destination`](crate::wire::ProgramBatch::destination)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// How long the gateway may hand them out again without asking, as in
+    /// [`ProgramBatch::keep_secs`](crate::wire::ProgramBatch::keep_secs)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_secs: Option<u64>,
+    /// Milliseconds until the gateway gives up on this read
+    pub expires_in_ms: u64,
+}
+
+/// One value of a [`PhoneProgramRead`]: an `op://` reference, or only a
+/// description when the program does not know the item
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramItem {
+    /// An `op://` reference; with a sealed copy the phone opens it with
+    /// Face ID, without one the owner enters the value
+    Reference {
+        /// The reference, shown in the prompt; the seal's `info` binds it
+        reference: String,
+        /// The value sealed to this phone, as in [`PhoneRead::sealed`]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealed: Option<Sealed>,
+    },
+    /// Only a description, such as `Pushover app token`; the owner picks the
+    /// item with AutoFill or pastes the value. Nothing is sealed for it
+    Describe {
+        /// The program's description, at most
+        /// [`MAX_DESCRIPTION_CHARS`](crate::wire::MAX_DESCRIPTION_CHARS)
+        description: String,
+    },
 }
 
 /// Which APNs environment a push token belongs to: a build installed from
@@ -259,6 +320,15 @@ pub mod push_keys {
     /// When the gateway stops waiting for the answer, in Unix milliseconds;
     /// a push tapped later names a read that is already gone
     pub const EXPIRES: &str = "expires";
+    /// Set to [`PROGRAM`] on the push for a
+    /// [`PhoneProgramRead`](super::PhoneProgramRead), which carries
+    /// [`SUMMARY`] instead of [`REFERENCE`]
+    pub const KIND: &str = "kind";
+    /// The [`KIND`] of a program read
+    pub const PROGRAM: &str = "program";
+    /// One line naming a program read's items, such as `2 items: op://…,
+    /// Pushover app token`
+    pub const SUMMARY: &str = "summary";
 }
 
 mod base64_bytes {

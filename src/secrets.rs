@@ -5,6 +5,7 @@
 //! The braces follow `op inject`'s template syntax, so a value can mix text
 //! and references, e.g. `Bearer {{ op://Dev/Context7/credential }}`
 
+pub mod handoff;
 mod logs;
 mod spawn;
 
@@ -12,7 +13,7 @@ pub use logs::{RedactingMakeWriter, redacting_logs};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock, PoisonError, RwLock},
     time::Duration,
 };
@@ -32,10 +33,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the phones wait while the owner is at this Mac, whose own
 /// prompt usually answers first; a read answered within it never pushes
 pub const PHONE_GRACE: Duration = Duration::from_secs(5);
-/// How long `op whoami` may take; it answers without a prompt
-const WHOAMI_TIMEOUT: Duration = Duration::from_secs(10);
-/// What `op whoami` prints when the app has not authorized the CLI
-const SIGNED_OUT: &str = "account is not signed in";
 /// Longest upstream error text handed to a script
 const MAX_ERROR_TEXT: usize = 2000;
 /// Replacement for secrets found in upstream text
@@ -551,6 +548,29 @@ pub fn references(value: &str) -> Result<Vec<&str>, SecretError> {
         .collect())
 }
 
+/// `value` with each `{{ op://… }}` replaced by what `lookup` gives for the
+/// reference; `None` from `lookup` is a [`SecretError::Read`]
+pub fn fill<'a>(
+    value: &str,
+    lookup: impl Fn(&str) -> Option<&'a str>,
+) -> Result<String, SecretError> {
+    let mut text = String::with_capacity(value.len());
+    for piece in pieces(value)? {
+        match piece {
+            Piece::Text(literal) => text.push_str(literal),
+            Piece::Reference(reference) => {
+                let found = lookup(reference).ok_or_else(|| SecretError::Read {
+                    reference: reference.to_owned(),
+                    reason: "no value was read for it".to_owned(),
+                })?;
+                text.push_str(found);
+            }
+        }
+    }
+
+    Ok(text)
+}
+
 /// A server `url` with its references replaced
 pub struct ResolvedUrl {
     /// The URL to connect to; never to be logged or stored
@@ -826,8 +846,33 @@ pub struct Resolved {
 pub struct OnePassword {
     program: String,
     known: Arc<Mutex<HashMap<String, String>>>,
+    /// Values a program read with a keep window, by destination and
+    /// reference, until it ends; never handed to the next daemon
+    kept: Arc<Mutex<KeptValues>>,
     companions: Option<Arc<Companions>>,
     on_mac: Option<OnMac>,
+}
+
+/// The keep grants, and how many times they were forgotten, so a read
+/// approved before a forget cannot keep its values after it
+#[derive(Default)]
+struct KeptValues {
+    grants: HashMap<(Option<String>, String), Kept>,
+    forgotten: u64,
+}
+
+/// A value a program may get again without asking until both clocks pass
+/// its end: `Instant` stops while the Mac sleeps, the wall clock can be set
+struct Kept {
+    value: String,
+    until: std::time::Instant,
+    until_wall: std::time::SystemTime,
+}
+
+impl Kept {
+    fn live(&self) -> bool {
+        std::time::Instant::now() < self.until && std::time::SystemTime::now() < self.until_wall
+    }
 }
 
 impl std::fmt::Debug for OnePassword {
@@ -845,6 +890,7 @@ impl OnePassword {
         Self {
             program: program.into(),
             known: Arc::default(),
+            kept: Arc::default(),
             companions: None,
             on_mac: None,
         }
@@ -863,6 +909,115 @@ impl OnePassword {
         self.on_mac = on_mac;
 
         self
+    }
+
+    /// Seals every value this process read for its config for the next
+    /// daemon on `state_dir` (see [`handoff`]); how many
+    pub async fn hand_off(
+        &self,
+        state_dir: &Path,
+        store: &handoff::KeyStore,
+    ) -> Result<usize, String> {
+        let known = self.known.lock().await;
+
+        handoff::hand_off(state_dir, store, &known)
+    }
+
+    /// Fills the cache from the last daemon's handoff, so its values are not
+    /// asked for again; how many it held
+    pub async fn take_over(
+        &self,
+        state_dir: &Path,
+        store: &handoff::KeyStore,
+    ) -> Result<usize, String> {
+        let values = handoff::take_over(state_dir, store)?;
+        let count = values.len();
+        self.known.lock().await.extend(values);
+
+        Ok(count)
+    }
+
+    /// Forgets every value read, and every value kept for programs, so the
+    /// next read of each asks again, as after a rotated key; how many config
+    /// values were held
+    pub async fn forget(&self) -> usize {
+        {
+            let mut kept = self.kept.lock().await;
+            kept.grants.clear();
+            kept.forgotten += 1;
+        }
+        let mut known = self.known.lock().await;
+        let count = known.len();
+        known.clear();
+
+        count
+    }
+
+    /// The companions and phones this reader asks, when it has any
+    pub fn companions(&self) -> Option<&Arc<Companions>> {
+        self.companions.as_ref()
+    }
+
+    /// The values kept for `references` going to `destination`, when every
+    /// one of them is still within a window approved for that destination
+    pub(crate) async fn kept_values(
+        &self,
+        destination: Option<&str>,
+        references: &[String],
+    ) -> Option<Vec<String>> {
+        let mut kept = self.kept.lock().await;
+        kept.grants.retain(|_, entry| entry.live());
+        let destination = destination.map(str::to_owned);
+
+        references
+            .iter()
+            .map(|reference| {
+                kept.grants
+                    .get(&(destination.clone(), reference.clone()))
+                    .map(|entry| entry.value.clone())
+            })
+            .collect()
+    }
+
+    /// How many times the grants were forgotten; pass it to [`Self::keep`]
+    pub(crate) async fn forgotten(&self) -> u64 {
+        self.kept.lock().await.forgotten
+    }
+
+    /// Keeps `values`, one per reference, for programs sending them to the
+    /// same `destination` to get again without asking until `keep` has
+    /// passed; nothing is kept when the grants were forgotten since
+    /// `forgotten` was read, as the owner asked while this read waited
+    pub(crate) async fn keep(
+        &self,
+        destination: Option<&str>,
+        references: &[String],
+        values: &[String],
+        keep: Duration,
+        forgotten: u64,
+    ) {
+        let until = std::time::Instant::now() + keep;
+        let until_wall = std::time::SystemTime::now() + keep;
+        let mut kept = self.kept.lock().await;
+        if kept.forgotten != forgotten {
+            return;
+        }
+        for (reference, value) in references.iter().zip(values) {
+            kept.grants.insert(
+                (destination.map(str::to_owned), reference.clone()),
+                Kept {
+                    value: value.clone(),
+                    until,
+                    until_wall,
+                },
+            );
+        }
+    }
+
+    /// Where the owner's presence is read and Touch ID asked, when this
+    /// reader was set up with one
+    pub fn on_mac(&self) -> Option<&OnMac> {
+        self.on_mac.as_ref()
     }
 
     /// `values` with every reference replaced by what 1Password holds; a
@@ -1062,26 +1217,6 @@ impl OnePassword {
                 timeout: READ_TIMEOUT,
             }),
         }
-    }
-
-    /// Whether `op` is surely signed out, so the next read puts 1Password's
-    /// own prompt up
-    ///
-    /// `op whoami` answers from the current authorization and never puts a
-    /// prompt up itself. Only its explicit signed-out answer counts: a
-    /// timeout, a failed start or any other error may still read silently,
-    /// so those answer `false` and the caller keeps asking for itself
-    pub async fn signed_out(&self) -> bool {
-        let whoami = tokio::time::timeout(
-            WHOAMI_TIMEOUT,
-            spawn::output(&self.program, &["whoami"], None),
-        );
-
-        matches!(
-            whoami.await,
-            Ok(Ok(output)) if !output.status.success()
-                && String::from_utf8_lossy(&output.stderr).contains(SIGNED_OUT)
-        )
     }
 
     /// Runs `op read` on this Mac, with no cache and no companions

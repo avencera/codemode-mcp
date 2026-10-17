@@ -38,6 +38,7 @@ use tokio::{
 
 use crate::{
     config::{Builtin, LoginConfig, ServerConfig, Transport},
+    env_files::SecretsServer,
     logins::LoginsServer,
     mac::Mac,
     oauth::OAuth,
@@ -57,6 +58,11 @@ pub struct Builtins {
     /// The Mac whose screen the `logins` server types on; `None` off macOS
     pub mac: Option<Arc<dyn Mac>>,
 }
+
+/// Least time a `secrets` server call is given: the companions' approval
+/// timeout, and time to write after it
+const SECRETS_CALL_TIMEOUT: Duration =
+    crate::companion::ASK_TIMEOUT.saturating_add(Duration::from_secs(30));
 
 /// Time allowed for the initialize handshake plus the first tool listing
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1132,17 +1138,31 @@ impl Upstream {
 
     /// Serves `builtin` on `io` until the connection drops its end
     fn spawn_builtin(&self, builtin: Builtin, io: DuplexStream) {
-        let server = match builtin {
-            Builtin::Logins => LoginsServer::new(
-                Arc::clone(&self.builtins.logins),
-                self.onepassword.clone(),
-                Arc::clone(&self.redactor),
-                self.builtins.mac.clone(),
+        type Served = std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
+                    > + Send,
+            >,
+        >;
+        let server: Served = match builtin {
+            Builtin::Logins => Box::pin(
+                LoginsServer::new(
+                    Arc::clone(&self.builtins.logins),
+                    self.onepassword.clone(),
+                    Arc::clone(&self.redactor),
+                    self.builtins.mac.clone(),
+                )
+                .serve_on(io),
+            ),
+            Builtin::Secrets => Box::pin(
+                SecretsServer::new(self.onepassword.clone(), Arc::clone(&self.redactor))
+                    .serve_on(io),
             ),
         };
         let name = self.name.clone();
         tokio::spawn(async move {
-            if let Err(error) = server.serve_on(io).await {
+            if let Err(error) = server.await {
                 tracing::debug!(server = %name, %error, "builtin server stopped");
             }
         });
@@ -1342,7 +1362,13 @@ impl Upstreams {
             let upstream = Arc::new(Upstream {
                 name: name.clone(),
                 config: config.clone(),
-                call_timeout,
+                // a write waits on the owner for up to the approval's own
+                // timeout, then writes; the gateway's limit must outlast both
+                call_timeout: if config.builtin == Some(Builtin::Secrets) {
+                    call_timeout.max(SECRETS_CALL_TIMEOUT)
+                } else {
+                    call_timeout
+                },
                 cache_unshown: AtomicBool::new(!tools.is_empty()),
                 inner: RwLock::new(Inner {
                     peer: None,

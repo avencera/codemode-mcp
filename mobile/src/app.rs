@@ -7,7 +7,7 @@
 //! comes back as a message
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, PoisonError, RwLock, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,9 +15,13 @@ use std::{
 use companion_wire::{
     ASK_TIMEOUT,
     mobile::{
-        PhoneRead, PhoneRequest, PushEnvironment as WirePushEnvironment, PushToken, RequestId,
+        PhoneProgramRead, PhoneRequest, ProgramItem as WireProgramItem,
+        PushEnvironment as WirePushEnvironment, PushToken, RequestId,
     },
-    wire::{CompanionErrorCode, CompanionFault, CompanionResponse, PairCheck},
+    wire::{
+        CompanionErrorCode, CompanionFault, CompanionResponse, MAX_DESCRIPTION_CHARS,
+        MAX_DESTINATION_CHARS, MAX_PROGRAM_ITEMS, MAX_REASON_CHARS, PairCheck,
+    },
 };
 use iroh::SecretKey;
 use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, SupervisionEvent};
@@ -26,12 +30,12 @@ use tokio::sync::oneshot;
 use crate::{
     connection::{ConnArgs, ConnMsg, ConnectionActor},
     ffi::{
-        AppAction, AppState, ConnectionState, PairingState, PendingRead, Platform, PushEnvironment,
-        ReadStatus, Reconciler, Update,
+        AppAction, AppState, ConnectionState, PairingState, PendingRead, Platform, ProgramItem,
+        ProgramRead, PushEnvironment, ReadStatus, Reconciler, Update,
     },
     pairing,
     record::{GatewayRecord, load_key},
-    request::{RequestActor, RequestArgs, RequestMsg, Secret},
+    request::{Asked, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
 };
 
 /// How long a read opened from a push may take to arrive once the link is
@@ -44,6 +48,10 @@ const UNPAIR_TIMEOUT: Duration = Duration::from_secs(5);
 /// Seconds before the connection actor is started again after it would not
 /// start or failed
 const RESTART_SECS: u32 = 1;
+/// Longest reference a program read's prompt shows in full
+const MAX_REFERENCE_CHARS: usize = 256;
+/// Longest summary of a program read's items a push placeholder shows
+const MAX_SUMMARY_CHARS: usize = 200;
 
 /// How a read's stream ended without an answer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,11 +68,25 @@ pub enum StreamEnd {
 /// A read as it arrives, with where its answer goes
 pub struct Incoming {
     /// The read
-    pub read: PhoneRead,
+    pub asked: Asked,
     /// Its stream's number
     pub seq: u64,
     /// Where the answer goes
     pub responder: oneshot::Sender<CompanionResponse>,
+}
+
+/// An approval that may ask Face ID, run at once or, while another read's
+/// prompt is up, once that one ends
+enum Approval {
+    /// The owner tapped Approve
+    Approve(String),
+    /// The owner sent a program read, with the values entered by item index
+    Program {
+        /// The read
+        id: String,
+        /// The values
+        entered: HashMap<u32, Secret>,
+    },
 }
 
 /// What the app actor is told
@@ -77,6 +99,14 @@ pub enum AppMsg {
         id: String,
         /// The value
         value: Secret,
+    },
+    /// The owner approved a program read, with the values entered by item
+    /// index
+    AnswerProgram {
+        /// The read
+        id: String,
+        /// The values
+        entered: HashMap<u32, Secret>,
     },
     /// The pairing registered, or failed to
     Registered(Result<GatewayRecord, String>),
@@ -227,6 +257,98 @@ impl Shared {
     }
 }
 
+/// The first `limit` characters with line breaks shown as `⏎` and other
+/// control, invisible and direction-changing characters as `?`, cut with `…`,
+/// so text a program chose stays on one line and reads in the order it is
+/// stored; the gateway's prompts clean text the same way
+fn one_line(text: &str, limit: usize) -> String {
+    let mut shown: String = text
+        .chars()
+        .take(limit)
+        .map(|character| match character {
+            '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => '⏎',
+            '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}' => '?',
+            other if other.is_control() => '?',
+            other => other,
+        })
+        .collect();
+    if text.chars().nth(limit).is_some() {
+        shown.push('…');
+    }
+
+    shown
+}
+
+/// A program read as its prompt shows it, with a one-line summary for the
+/// row's `reference`
+fn program_prompt(program: &PhoneProgramRead) -> (String, ProgramRead) {
+    let items: Vec<ProgramItem> = program
+        .items
+        .iter()
+        .map(|item| match item {
+            WireProgramItem::Reference { reference, sealed } => ProgramItem::Reference {
+                reference: one_line(reference, MAX_REFERENCE_CHARS),
+                sealed: sealed.is_some(),
+            },
+            WireProgramItem::Describe { description } => ProgramItem::Describe {
+                description: one_line(description, MAX_DESCRIPTION_CHARS),
+            },
+        })
+        .collect();
+    let named: Vec<&str> = items
+        .iter()
+        .map(|item| match item {
+            ProgramItem::Reference { reference, .. } => reference.as_str(),
+            ProgramItem::Describe { description } => description.as_str(),
+        })
+        .collect();
+    let summary = match named.as_slice() {
+        [one] => (*one).to_owned(),
+        many => format!("{} values: {}", many.len(), many.join(", ")),
+    };
+    let reason = program
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| one_line(reason, MAX_REASON_CHARS));
+    let destination = program
+        .destination
+        .as_deref()
+        .map(str::trim)
+        .filter(|destination| !destination.is_empty())
+        .map(|destination| one_line(destination, MAX_DESTINATION_CHARS));
+    let prompt = ProgramRead {
+        reason,
+        destination,
+        keep_secs: keep_secs(program),
+        items,
+    };
+
+    (summary, prompt)
+}
+
+/// Why the phone cannot answer a program read as sent, if it cannot
+fn malformed(program: &PhoneProgramRead) -> Option<String> {
+    if program.items.is_empty() {
+        return Some("the program read names no items".to_owned());
+    }
+    if program.items.len() > MAX_PROGRAM_ITEMS {
+        return Some(format!(
+            "the program read names {} items, more than {MAX_PROGRAM_ITEMS}",
+            program.items.len()
+        ));
+    }
+
+    None
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -256,6 +378,8 @@ pub struct AppActorState {
     requests: HashMap<String, ActorRef<RequestMsg>>,
     /// The read whose Face ID prompt is up; one at a time
     approving: Option<String>,
+    /// Approvals made while a prompt was up, run in order once it ends
+    queued: VecDeque<Approval>,
     foreground: bool,
     /// Where the gateway pushes: `None` until iOS has said, `Some(None)`
     /// once notifications are off, so that is sent too
@@ -368,33 +492,7 @@ impl App {
                     Err(message) => state.shared.set_pairing(PairingState::Failed { message }),
                 }
             }
-            AppAction::Allow { id } => {
-                let reference = state
-                    .shared
-                    .state()
-                    .reads
-                    .into_iter()
-                    .find(|read| read.id == id && !read.status.is_finished())
-                    .map(|read| read.reference);
-                if let Some(reference) = reference {
-                    Self::list(state, &reference, true).await;
-                }
-            }
-            AppAction::Disallow { reference } => Self::list(state, &reference, false).await,
-            AppAction::Approve { id } => {
-                // one Face ID prompt at a time: the request answers before
-                // the next action is taken, so two quick taps cannot both
-                // start one
-                if state.approving.is_some() {
-                    return;
-                }
-                if let Some(request) = state.requests.get(&id) {
-                    let started = ractor::call_t!(request, RequestMsg::Approve, 2_000);
-                    if matches!(started, Ok(true)) {
-                        state.approving = Some(id);
-                    }
-                }
-            }
+            AppAction::Approve { id } => Self::approve(state, Approval::Approve(id)).await,
             AppAction::Deny { id } => match state.requests.get(&id) {
                 Some(request) => {
                     let _ = request.cast(RequestMsg::Deny);
@@ -467,51 +565,38 @@ impl App {
                 gateway,
                 expires_at_ms,
             } => {
-                let listed = state
-                    .record
-                    .as_ref()
-                    .is_some_and(|record| record.allows(&reference));
-                let now = now_ms();
-                let longest = now + i64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
-                let expires_at_ms = expires_at_ms.map_or(longest, |at| at.min(longest));
-                // tapped after the gateway stopped waiting: say so at once;
-                // the phone still dials, and a read that comes anyway (the
-                // clocks disagree) takes this row's place
-                let status = if expires_at_ms <= now {
-                    ReadStatus::Expired
-                } else {
-                    ReadStatus::Connecting
+                let pushed = PendingRead {
+                    id,
+                    reference,
+                    gateway_name: gateway,
+                    expires_at_ms: 0,
+                    status: ReadStatus::Connecting,
+                    sealed: false,
+                    program: None,
                 };
-                state.shared.change_reads(|reads| {
-                    if reads.iter().any(|read| read.id == id) {
-                        return false;
-                    }
-                    reads.push(PendingRead {
-                        id: id.clone(),
-                        reference,
-                        gateway_name: gateway,
-                        expires_at_ms,
-                        status,
-                        sealed: false,
-                        listed,
-                    });
-
-                    true
-                });
-                let left = Duration::from_millis(u64::try_from(expires_at_ms - now).unwrap_or(0));
-                let waiting = id.clone();
-                myself.send_after(left, move || AppMsg::PushWaitOver {
-                    id: waiting,
-                    link: None,
-                });
-                if state.shared.state().connection == ConnectionState::Connected {
-                    let link = Some(state.link);
-                    myself.send_after(PUSH_WAIT, move || AppMsg::PushWaitOver { id, link });
-                }
-                state.foreground = true;
-                if let Some(connection) = &state.connection {
-                    let _ = connection.cast(ConnMsg::Connect);
-                }
+                Self::opened_from_push(myself, state, pushed, expires_at_ms);
+            }
+            AppAction::OpenedFromProgramPush {
+                id,
+                summary,
+                gateway,
+                expires_at_ms,
+            } => {
+                let pushed = PendingRead {
+                    id,
+                    reference: one_line(&summary, MAX_SUMMARY_CHARS),
+                    gateway_name: gateway,
+                    expires_at_ms: 0,
+                    status: ReadStatus::Connecting,
+                    sealed: false,
+                    program: Some(ProgramRead {
+                        reason: None,
+                        destination: None,
+                        keep_secs: None,
+                        items: Vec::new(),
+                    }),
+                };
+                Self::opened_from_push(myself, state, pushed, expires_at_ms);
             }
             AppAction::PushToken { token, environment } => {
                 let environment = match environment {
@@ -530,59 +615,121 @@ impl App {
         }
     }
 
-    /// Starts a request actor for a new read, or hands a read offered again
-    /// after a reconnect to the one it already has
-    /// Puts `reference` on the allow list or takes it off, keeps the list
-    /// in the Keychain, and tells the reads of it still open
-    async fn list(state: &mut AppActorState, reference: &str, listed: bool) {
-        let reference = reference.trim();
-        let Some(record) = state.record.as_mut() else {
-            return;
-        };
+    /// Runs `approval`, or queues it while another read's Face ID prompt is
+    /// up: one prompt at a time, and a tap made meanwhile is not lost
+    async fn approve(state: &mut AppActorState, approval: Approval) {
+        if state.approving.is_some() {
+            state.queued.push_back(approval);
 
-        if record.allows(reference) != listed {
-            if listed {
-                record.allow.push(reference.to_owned());
-            } else {
-                record.allow.retain(|allowed| allowed.trim() != reference);
-            }
-            let platform = Arc::clone(&state.platform);
-            let saved = record.clone();
-            let kept = tokio::task::spawn_blocking(move || saved.save(platform.as_ref())).await;
-            // the change holds until the app quits either way; only keeping
-            // it failed
-            if let Ok(Err(error)) = kept {
-                tracing::warn!(%error, "could not keep the allow list");
-            }
-            state.shared.set_gateway(Some(record));
+            return;
         }
 
-        let mut changed = Vec::new();
-        state.shared.change_reads(|reads| {
-            let open = reads
-                .iter_mut()
-                .filter(|read| read.reference.trim() == reference && !read.status.is_finished());
-            for read in open {
-                read.listed = listed;
-                changed.push(read.id.clone());
-            }
+        Self::start_approval(state, approval).await;
+    }
 
-            !changed.is_empty()
-        });
-        for id in changed {
-            if let Some(request) = state.requests.get(&id) {
-                let _ = request.cast(RequestMsg::Listed(listed));
-            }
+    /// Runs what was queued while a prompt was up, until one asks Face ID
+    async fn run_queued(state: &mut AppActorState) {
+        while state.approving.is_none() {
+            let Some(approval) = state.queued.pop_front() else {
+                return;
+            };
+            Self::start_approval(state, approval).await;
         }
     }
 
+    /// Hands `approval` to its request, which answers whether Face ID is up
+    /// before the next action is taken, so two quick taps cannot both start
+    /// a prompt
+    async fn start_approval(state: &mut AppActorState, approval: Approval) {
+        let (id, started) = match approval {
+            Approval::Approve(id) => {
+                let Some(request) = state.requests.get(&id) else {
+                    return;
+                };
+                let started = ractor::call_t!(request, RequestMsg::Approve, 2_000);
+
+                (id, started)
+            }
+            Approval::Program { id, entered } => {
+                let Some(request) = state.requests.get(&id) else {
+                    return;
+                };
+                let started = ractor::call_t!(
+                    request,
+                    |reply| RequestMsg::AnswerProgram { entered, reply },
+                    2_000
+                );
+
+                (id, started)
+            }
+        };
+
+        if matches!(started, Ok(true)) {
+            state.approving = Some(id);
+        }
+    }
+
+    /// Shows the read a tapped push names until the gateway sends it, and
+    /// dials; `pushed` comes without its deadline, which the push may give
+    fn opened_from_push(
+        myself: &ActorRef<AppMsg>,
+        state: &mut AppActorState,
+        pushed: PendingRead,
+        expires_at_ms: Option<i64>,
+    ) {
+        let now = now_ms();
+        let longest = now + i64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
+        let expires_at_ms = expires_at_ms.map_or(longest, |at| at.min(longest));
+        // tapped after the gateway stopped waiting: say so at once; the phone
+        // still dials, and a read that comes anyway (the clocks disagree)
+        // takes this row's place
+        let status = if expires_at_ms <= now {
+            ReadStatus::Expired
+        } else {
+            ReadStatus::Connecting
+        };
+
+        let id = pushed.id.clone();
+        state.shared.change_reads(|reads| {
+            if reads.iter().any(|read| read.id == id) {
+                return false;
+            }
+            reads.push(PendingRead {
+                expires_at_ms,
+                status,
+                ..pushed
+            });
+
+            true
+        });
+
+        let left = Duration::from_millis(u64::try_from(expires_at_ms - now).unwrap_or(0));
+        let waiting = id.clone();
+        myself.send_after(left, move || AppMsg::PushWaitOver {
+            id: waiting,
+            link: None,
+        });
+
+        if state.shared.state().connection == ConnectionState::Connected {
+            let link = Some(state.link);
+            myself.send_after(PUSH_WAIT, move || AppMsg::PushWaitOver { id, link });
+        }
+
+        state.foreground = true;
+        if let Some(connection) = &state.connection {
+            let _ = connection.cast(ConnMsg::Connect);
+        }
+    }
+
+    /// Starts a request actor for a new read, or hands a read offered again
+    /// after a reconnect to the one it already has
     async fn incoming(myself: &ActorRef<AppMsg>, state: &mut AppActorState, incoming: Incoming) {
         let Incoming {
-            read,
+            asked,
             seq,
             responder,
         } = incoming;
-        let id = read.id.to_string();
+        let id = asked.id().to_string();
         if let Some(request) = state.requests.get(&id) {
             let _ = request.cast(RequestMsg::Replace { seq, responder });
 
@@ -607,15 +754,33 @@ impl App {
             return;
         };
 
-        let expires_at_ms = now_ms() + i64::try_from(read.expires_in_ms).unwrap_or(i64::MAX);
+        let expires_at_ms = now_ms() + i64::try_from(asked.expires_in_ms()).unwrap_or(i64::MAX);
+        let (reference, sealed, program) = match &asked {
+            Asked::Read(read) => (read.reference.clone(), read.sealed.is_some(), None),
+            Asked::Program(program) => {
+                if let Some(message) = malformed(program) {
+                    tracing::warn!(%message, "the gateway sent a program read this phone refuses");
+                    let _ = responder.send(CompanionResponse::Error(CompanionFault {
+                        code: CompanionErrorCode::NotAllowed,
+                        message,
+                    }));
+
+                    return;
+                }
+                let (summary, prompt) = program_prompt(program);
+                let sealed = prompt.items.iter().all(ProgramItem::is_sealed);
+
+                (summary, sealed, Some(prompt))
+            }
+        };
         let pending = PendingRead {
             id: id.clone(),
-            reference: read.reference.clone(),
+            reference,
             gateway_name: record.name.clone(),
             expires_at_ms,
             status: ReadStatus::Waiting,
-            sealed: read.sealed.is_some(),
-            listed: record.allows(&read.reference),
+            sealed,
+            program,
         };
         state.shared.change_reads(|reads| {
             match reads.iter_mut().find(|read| read.id == id) {
@@ -627,7 +792,7 @@ impl App {
         });
 
         let args = RequestArgs {
-            read,
+            asked,
             seq,
             responder,
             record,
@@ -670,6 +835,7 @@ impl Actor for App {
             connection: None,
             requests: HashMap::new(),
             approving: None,
+            queued: VecDeque::new(),
             foreground: false,
             push: None,
             denied: HashMap::new(),
@@ -725,6 +891,7 @@ impl Actor for App {
                 for (_, request) in state.requests.drain() {
                     request.stop(None);
                 }
+                state.queued.clear();
                 state.shared.set_gateway(None);
                 state.shared.set_connection(ConnectionState::Offline);
                 state.shared.change_reads(|reads| {
@@ -763,6 +930,9 @@ impl Actor for App {
                     let _ = request.cast(RequestMsg::Answer(value));
                 }
             }
+            AppMsg::AnswerProgram { id, entered } => {
+                Self::approve(state, Approval::Program { id, entered }).await;
+            }
             AppMsg::StreamEnded { id, seq, end } => {
                 if let Some(request) = state.requests.get(id.as_str()) {
                     let _ = request.cast(RequestMsg::StreamEnded { seq, end });
@@ -781,6 +951,7 @@ impl Actor for App {
                         .map(|read| read.status = status)
                         .is_some()
                 });
+                Self::run_queued(state).await;
             }
             AppMsg::PushWaitOver { id, link } => {
                 // the link dropped and the gateway waits for the next one
@@ -850,6 +1021,7 @@ impl Actor for App {
                     .map(|read| read.status = ReadStatus::Failed { message })
                     .is_some()
             });
+            Self::run_queued(state).await;
         }
 
         Ok(())

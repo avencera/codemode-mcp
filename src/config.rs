@@ -68,6 +68,14 @@ pub enum ConfigError {
     /// The file parsed but a value is unusable
     #[error("invalid config: {0}")]
     Invalid(String),
+    /// The config file could not be rewritten
+    #[error("failed to write config {path}: {source}")]
+    Write {
+        /// The file
+        path: PathBuf,
+        /// Why
+        source: std::io::Error,
+    },
     /// No home directory is known, so the default path cannot be derived
     #[error("cannot locate the default config path because $HOME is not set")]
     NoHome,
@@ -185,6 +193,36 @@ impl Config {
         config.path = Some(path.to_owned());
 
         Ok(config)
+    }
+
+    /// Removes the `allow` list a companion's `[companion]` section held
+    /// before every read asked by name, so the file loads again; `true` when
+    /// the file changed
+    ///
+    /// Run where a companion starts, since `codemode-mcp update` on that Mac
+    /// is the old binary, which cannot know to do it. Nothing else in the
+    /// file is touched, comments and order included
+    pub fn strip_companion_allow(path: &Path) -> Result<bool, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        };
+        let Some(stripped) = without_companion_allow(&text) else {
+            return Ok(false);
+        };
+        // written in place, so the file keeps its mode
+        std::fs::write(path, stripped).map_err(|source| ConfigError::Write {
+            path: path.to_owned(),
+            source,
+        })?;
+
+        Ok(true)
     }
 
     /// The file this was loaded from, which a companion registering with an
@@ -373,6 +411,8 @@ impl Config {
 
 /// The tools of the `logins` builtin, which per-tool settings may name
 const LOGINS_TOOLS: [&str; 2] = ["fill", "list"];
+/// The tools of the `secrets` builtin, which per-tool settings may name
+const SECRETS_TOOLS: [&str; 1] = ["write_env"];
 
 /// Longest login name; the approval page and prompts show it
 const MAX_LOGIN_NAME_CHARS: usize = 63;
@@ -671,11 +711,6 @@ pub struct CompanionConfig {
     /// Name of the gateway Mac, shown in the Touch ID prompt
     #[serde(default = "default_gateway_name")]
     pub gateway_name: String,
-    /// References matched exactly that may be approved through 1Password's
-    /// own prompt alone; any other reference is still readable, after a
-    /// Touch ID prompt on this Mac that names it
-    #[serde(default)]
-    pub allow: Vec<String>,
     /// The vaults this companion creates items in for the gateway; empty, it
     /// creates none. Items are only ever created, never edited or deleted
     #[serde(default)]
@@ -704,13 +739,6 @@ impl CompanionConfig {
                 "companion.gateway_name must be 1 to {MAX_MAC_NAME_CHARS} characters on one line"
             )));
         }
-        for reference in &self.allow {
-            if !crate::secrets::is_reference(reference.trim()) {
-                return Err(ConfigError::Invalid(
-                    "companion.allow entries must be op://vault/item/field references".into(),
-                ));
-            }
-        }
         for vault in &self.create_vaults {
             if !crate::secrets::is_item_name(vault) {
                 return Err(ConfigError::Invalid(
@@ -727,13 +755,6 @@ impl CompanionConfig {
     /// Whether items may be created in `vault`, matched exactly
     pub fn allows_create(&self, vault: &str) -> bool {
         self.create_vaults.iter().any(|allowed| allowed == vault)
-    }
-
-    /// Whether `reference` is on the allow list; both sides are trimmed
-    pub fn allows(&self, reference: &str) -> bool {
-        let reference = reference.trim();
-
-        self.allow.iter().any(|allowed| allowed.trim() == reference)
     }
 }
 
@@ -1288,6 +1309,12 @@ pub struct ServerConfig {
     /// A server the daemon serves itself instead of `command` or `url`
     #[serde(default)]
     pub builtin: Option<Builtin>,
+    /// Whether the server only works with the owner at this Mac, such as
+    /// 1Password's Environments server, which waits on the 1Password app's
+    /// prompt here; while the owner is away its calls are refused at once,
+    /// before anyone is asked to approve them
+    #[serde(default)]
+    pub needs_owner_here: bool,
 }
 
 /// A server served inside the daemon, which holds what it needs: the
@@ -1298,6 +1325,9 @@ pub enum Builtin {
     /// Types a `[logins]` username or password into the focused field of a
     /// page on the login's sites
     Logins,
+    /// Writes 1Password values into an env file, approved once on whichever
+    /// device the owner is at
+    Secrets,
 }
 
 /// Per-tool settings that override the server defaults
@@ -1575,6 +1605,7 @@ impl ServerConfig {
 
         match self.builtin {
             Some(Builtin::Logins) => self.validate_logins(name),
+            Some(Builtin::Secrets) => self.validate_secrets(name),
             None => Ok(()),
         }
     }
@@ -1601,6 +1632,99 @@ impl ServerConfig {
 
         Ok(())
     }
+
+    /// The device prompt of `write_env` names the file and is the approval,
+    /// so the gateway asking first would only ask twice
+    fn validate_secrets(&self, name: &str) -> Result<(), ConfigError> {
+        if let Some(tool) = self
+            .tools
+            .keys()
+            .find(|tool| !SECRETS_TOOLS.contains(&tool.as_str()))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}.tools.{tool}: the secrets server has only {}",
+                SECRETS_TOOLS.join(" and ")
+            )));
+        }
+        if self.policy_for("write_env") == Policy::Ask {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}: the secrets server's `write_env` asks the owner on its own, \
+                 naming the file, so it cannot also be `ask`; leave the policy unset"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// `text` without the `allow = [...]` entry of its `[companion]` table,
+/// which may span lines; `None` when there is none
+fn without_companion_allow(text: &str) -> Option<String> {
+    let mut kept = String::with_capacity(text.len());
+    let mut table = String::new();
+    // open brackets of the `allow` array being dropped
+    let mut skipping: Option<i32> = None;
+    let mut removed = false;
+    for line in text.split_inclusive('\n') {
+        if let Some(depth) = skipping {
+            let depth = depth + bracket_depth(line);
+            skipping = (depth > 0).then_some(depth);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            table = trimmed
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+        } else if table == "companion"
+            && let Some(value) = trimmed
+                .strip_prefix("allow")
+                .map(str::trim_start)
+                .and_then(|rest| rest.strip_prefix('='))
+        {
+            let depth = bracket_depth(value);
+            skipping = (depth > 0).then_some(depth);
+            removed = true;
+            continue;
+        }
+        kept.push_str(line);
+    }
+
+    removed.then_some(kept)
+}
+
+/// How many more `[` than `]` `line` opens, outside quoted strings and
+/// comments
+fn bracket_depth(line: &str) -> i32 {
+    let mut depth = 0;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        match quote {
+            Some(open) => {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' && open == '"' {
+                    escaped = true;
+                } else if character == open {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '"' | '\'' => quote = Some(character),
+                '#' => break,
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            },
+        }
+    }
+
+    depth
 }
 
 #[cfg(test)]
@@ -1821,15 +1945,6 @@ mod tests {
         assert!(secrets(&[peer("mba")], "discovery = false").is_err());
         assert!(parse("[secrets]\ncompanions = [{ name = \"mba\", id = \"not-an-id\" }]").is_err());
 
-        let companion = |allow: &str| {
-            parse(&format!(
-                "[companion]\ngateway = \"{id}\"\nallow = [{allow}]"
-            ))
-        };
-        assert!(companion("\"op://Dev/Context7/credential\"").is_ok());
-        assert!(companion("\"op://Dev/Context7\"").is_err());
-        assert!(companion("\"sk-live-123\"").is_err());
-
         // names and references from a ticket reach the companion's Touch ID
         // prompt, so none may pass for the prompt's own wording
         let named = |name: &str| {
@@ -1843,8 +1958,29 @@ mod tests {
         assert!(named("").is_err());
         assert!(named(&"m".repeat(64)).is_err());
         assert!(secrets(&[peer("mba\\nok")], "").is_err());
-        assert!(companion("\"op://Dev/Context7\\u202e/credential\"").is_err());
-        assert!(companion(&format!("\"op://Dev/{}/credential\"", "x".repeat(300))).is_err());
+    }
+
+    #[test]
+    fn a_companion_allow_list_is_stripped_and_the_rest_kept() {
+        let id = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let old = format!(
+            "# paired by codemode-mcp\n[companion]\ngateway = \"{id}\"\n\
+             allow = [\n  \"op://Dev/a [x]/credential\", # first\n  \"op://Dev/b/credential\",\n]\n\
+             create_vaults = [\"Personal\"]\n\n[servers.allow]\nallow = 1\n"
+        );
+        let stripped = without_companion_allow(&old).unwrap_or_default();
+
+        assert_eq!(
+            stripped,
+            format!(
+                "# paired by codemode-mcp\n[companion]\ngateway = \"{id}\"\n\
+                 create_vaults = [\"Personal\"]\n\n[servers.allow]\nallow = 1\n"
+            )
+        );
+        assert_eq!(without_companion_allow(&stripped), None);
+        let one_line = format!("[companion]\ngateway = \"{id}\"\nallow = [\"op://V/i/f\"]\n");
+        let stripped = without_companion_allow(&one_line).unwrap_or_default();
+        assert!(parse(&stripped).is_ok(), "{stripped}");
     }
 
     #[test]

@@ -268,17 +268,12 @@ impl Notifier for RecordingNotifier {
 #[derive(Default)]
 pub struct FakeMac {
     present: std::sync::atomic::AtomicBool,
-    /// Whether notifications fail, as without terminal-notifier
-    notify_fails: std::sync::atomic::AtomicBool,
     /// `None` leaves the prompt up until it is taken down
     answer: Mutex<Option<TouchId>>,
     /// How long a prompt stays up before it answers
     answer_after: Mutex<Duration>,
     /// A file that must exist before a prompt answers
     answer_once: Mutex<Option<PathBuf>>,
-    /// A file each notification creates, so a test can change the world
-    /// while one is up
-    on_notify: Mutex<Option<PathBuf>>,
     /// Whether a prompt asked while another still shows fails at once, as
     /// Touch ID does on a Mac whose last prompt was never taken down
     one_prompt: std::sync::atomic::AtomicBool,
@@ -299,12 +294,6 @@ impl FakeMac {
     pub fn set_present(&self, present: bool) {
         self.present
             .store(present, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Whether later notifications fail to show
-    pub fn set_notify_fails(&self, fails: bool) {
-        self.notify_fails
-            .store(fails, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether a prompt asked over one that is still showing fails at once
@@ -337,13 +326,6 @@ impl FakeMac {
     /// test can order an answer after something else has started
     pub fn set_answer_once(&self, path: PathBuf) {
         if let Ok(mut slot) = self.answer_once.lock() {
-            *slot = Some(path);
-        }
-    }
-
-    /// Create `path` whenever a notification shows
-    pub fn set_on_notify(&self, path: PathBuf) {
-        if let Ok(mut slot) = self.on_notify.lock() {
             *slot = Some(path);
         }
     }
@@ -493,15 +475,7 @@ impl Mac for FakeMac {
         &'a self,
         notification: &'a MacNotification,
     ) -> BoxFuture<'a, Result<(), MacError>> {
-        if self.notify_fails.load(std::sync::atomic::Ordering::SeqCst) {
-            return Box::pin(std::future::ready(Err(MacError(
-                "terminal-notifier is not installed".to_owned(),
-            ))));
-        }
         self.record(format!("notify {}", notification.title));
-        if let Some(path) = self.on_notify.lock().ok().and_then(|path| path.clone()) {
-            let _ = std::fs::write(path, b"");
-        }
 
         Box::pin(std::future::ready(Ok(())))
     }
@@ -806,6 +780,11 @@ impl Harness {
         Ok((status, body))
     }
 
+    /// The daemon's state directory, which holds the owner token
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     /// Posts JSON to the admin listener
     pub async fn admin_json(
         &self,
@@ -816,8 +795,13 @@ impl Harness {
             .http
             .post(format!("{}{path}", self.admin_base()))
             .json(body);
-        // the invite routes need the owner's proof, as the CLI makes it
-        if path.starts_with("/admin/companion/invite") || path == "/admin/companion/create" {
+        // the routes that hand out or write secrets need the owner's proof,
+        // as the CLI makes it
+        if path.starts_with("/admin/companion/invite")
+            || path == "/admin/companion/create"
+            || path == "/admin/op/read"
+            || path == "/admin/secrets/forget"
+        {
             request = request.header(
                 codemode_mcp::admin::OWNER_PROOF_HEADER,
                 self.owner_proof(path).await?,

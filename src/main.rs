@@ -21,10 +21,12 @@ use codemode_mcp::{
     app::App,
     catalog::function_prefix,
     companion::{
-        self, AnyTicket, InviteStatus, InviteTicket, Joining, PairCheck, Paired, Pairing, Ticket,
+        self, AnyTicket, InviteStatus, InviteTicket, Joining, PairCheck, Paired, Pairing,
+        ProgramTarget, Ticket,
     },
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
+    op,
     server::{Listeners, outcome_text},
     service::{self, Action, ServicePaths},
     store::{self, Store},
@@ -185,11 +187,16 @@ enum ServiceCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Restart the running service
+    /// Restart the running service; the secrets it read for its servers
+    /// carry over, sealed, so nothing is asked again
     Restart {
         /// Print what would be done
         #[arg(long)]
         dry_run: bool,
+        /// Read every secret again after the restart, as after rotating a
+        /// key in 1Password
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -323,6 +330,154 @@ enum OpCommand {
         #[arg(long)]
         server: Option<String>,
     },
+    /// Print 1Password values, like `op read`, approved wherever the owner
+    /// is: Touch ID here, then (or while away, at once) on a companion Mac or
+    /// the phone
+    ///
+    /// One reference prints its value; several print a JSON object of each
+    /// reference to its value, all with one approval. What is printed lands
+    /// in whatever reads this command's output, such as an agent's context;
+    /// prefer `--out-file`, `op inject` or `op run`
+    #[command(after_long_help = OP_AFTER_HELP)]
+    Read {
+        /// The `op://vault/item/field` references
+        #[arg(required_unless_present = "describe", conflicts_with = "describe")]
+        references: Vec<String>,
+        /// Describe the item instead of naming it, such as "Pushover app
+        /// token"; only the phone can answer, where the owner picks the item
+        /// with AutoFill
+        #[arg(long)]
+        describe: Option<String>,
+        /// Why the value is needed; every prompt shows it
+        #[arg(long)]
+        reason: Option<String>,
+        /// Hand the same values out again without asking for this long, such
+        /// as `15m`; at most 60 minutes, and every prompt says so
+        #[arg(long, value_parser = parse_keep)]
+        keep: Option<u64>,
+        /// Write what would be printed to this file, created with
+        /// `--file-mode`; every prompt names it
+        #[arg(short = 'o', long)]
+        out_file: Option<PathBuf>,
+        /// Replace `--out-file` if it exists
+        #[arg(short, long)]
+        force: bool,
+        /// Mode of `--out-file`, in octal
+        #[arg(long, default_value = "0600", value_parser = parse_mode)]
+        file_mode: u32,
+        /// Print the value without a trailing newline
+        #[arg(short, long)]
+        no_newline: bool,
+    },
+    /// Fill each `{{ op://… }}` in a template, like `op inject`, with one
+    /// approval for the whole template
+    ///
+    /// The usual way to keep a secrets file, such as a stack's
+    /// `*.secrets.env`: the values go into the file and never into this
+    /// command's output
+    #[command(after_long_help = OP_AFTER_HELP)]
+    Inject {
+        /// The template; standard input when not given
+        #[arg(short, long)]
+        in_file: Option<PathBuf>,
+        /// Where to write the filled template, created with `--file-mode`;
+        /// standard output when not given
+        #[arg(short, long)]
+        out_file: Option<PathBuf>,
+        /// Replace `--out-file` if it exists; it may be the template itself
+        #[arg(short, long)]
+        force: bool,
+        /// Mode of `--out-file`, in octal
+        #[arg(long, default_value = "0600", value_parser = parse_mode)]
+        file_mode: u32,
+        /// Why the values are needed; every prompt shows it
+        #[arg(long)]
+        reason: Option<String>,
+        /// Hand the same values out again without asking for this long, such
+        /// as `15m`; at most 60 minutes, and every prompt says so
+        #[arg(long, value_parser = parse_keep)]
+        keep: Option<u64>,
+    },
+    /// Run a command with 1Password values in its environment only, like
+    /// `op run`, with one approval for all of them
+    ///
+    /// Opt-in for high-severity secrets: no file holds the values, they live
+    /// only in the command's environment, and any value of 3 or more
+    /// characters the command prints, or any line of one, is replaced with
+    /// [redacted]. Values come from `--env-file` lines such
+    /// as `TOKEN=op://vault/item/field` or `URL=https://{{ op://… }}@host`,
+    /// and from variables already set to an `op://` reference
+    #[command(after_long_help = OP_AFTER_HELP)]
+    Run {
+        /// An env file of `KEY=value` lines; may be given more than once
+        #[arg(long)]
+        env_file: Vec<PathBuf>,
+        /// Pass the command's output through unmasked
+        #[arg(long)]
+        no_masking: bool,
+        /// Why the values are needed; every prompt shows it
+        #[arg(long)]
+        reason: Option<String>,
+        /// Hand the same values out again without asking for this long, such
+        /// as `15m`; at most 60 minutes, and every prompt says so
+        #[arg(long, value_parser = parse_keep)]
+        keep: Option<u64>,
+        /// The command and its arguments, after `--`
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+}
+
+/// Who `op read`, `op inject` and `op run` ask, shown under their `--help`
+const OP_AFTER_HELP: &str = "\
+Who approves: while the owner is at this Mac, its own Touch ID prompt names every value and the \
+program's reason, and this Mac's `op` reads them. The phone and companion Macs are asked 5 seconds \
+later, or at once while the owner is away, and the first approval sends every value. A Deny on any \
+device stops the read. Every prompt names the file the values go to. Nothing is reused from \
+earlier approvals unless one was given `--keep`, and the daemon keeps no value past that; a phone \
+keeps a copy sealed to its Face ID.
+
+Which command: `op inject -o FILE` writes values into a file such as a stack's *.secrets.env, which \
+is the default for most secrets. For high-severity secrets that should never be in a file, keep \
+only op:// references and use `op run`.";
+
+/// Reads a keep window such as `15m`, `1h` or `90s`, in seconds; a bare
+/// number is minutes
+fn parse_keep(text: &str) -> Result<u64, String> {
+    let (number, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((at, _)) => text.split_at(at),
+        None => (text, "m"),
+    };
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        _ => return Err(format!("{text} is not a duration such as 15m")),
+    };
+    let secs = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|number| number.checked_mul(scale))
+        .filter(|secs| *secs > 0)
+        .ok_or_else(|| format!("{text} is not a duration such as 15m"))?;
+    if secs > companion::wire::MAX_KEEP_SECS {
+        return Err(format!(
+            "{text} is longer than the 60 minutes a grant may last"
+        ));
+    }
+
+    Ok(secs)
+}
+
+/// Reads an octal file mode such as `0600`
+fn parse_mode(text: &str) -> Result<u32, String> {
+    let mode = u32::from_str_radix(text.trim_start_matches("0o"), 8)
+        .map_err(|_| format!("{text} is not an octal mode such as 0600"))?;
+    if mode > 0o777 {
+        return Err(format!("{text} is not a file mode"));
+    }
+
+    Ok(mode)
 }
 
 #[tokio::main]
@@ -349,9 +504,10 @@ async fn main() -> Result<()> {
         Command::Stats { since } => stats_command(&Config::load(&path)?, &since),
         Command::Review { since, out } => review_command(&Config::load(&path)?, &since, out),
         Command::Passkey { command } => passkey_command(&Config::load(&path)?, command).await,
-        Command::Op {
-            command: OpCommand::Warm { server },
-        } => warm_command(&Config::load(&path)?, server).await,
+        Command::Op { command } => match command {
+            OpCommand::Warm { server } => warm_command(&Config::load(&path)?, server).await,
+            command => op_command(&load_or_default(&path)?, command).await,
+        },
         Command::OAuth { command } => oauth_command(&Config::load(&path)?, command).await,
         Command::Service { command } => {
             service_command(&load_or_default(&path)?, explicit.as_deref(), command).await
@@ -520,7 +676,18 @@ async fn service_command(
             (plan, dry_run)
         }
         ServiceCommand::Uninstall { dry_run } => (service::uninstall_plan(&paths, uid), dry_run),
-        ServiceCommand::Restart { dry_run } => {
+        ServiceCommand::Restart { dry_run, fresh } => {
+            if fresh && !dry_run {
+                let forgot: admin::ForgetSecretsResponse =
+                    admin_post_as_owner(config, "/admin/secrets/forget", &serde_json::json!({}))
+                        .await
+                        .wrap_err("could not ask the daemon to forget its secrets")?;
+                println!(
+                    "The daemon forgot {} secrets; they are read again after the restart.",
+                    forgot.forgotten
+                );
+            }
+
             (service::restart_plan(uid, service::Agent::Daemon), dry_run)
         }
         ServiceCommand::Status { dry_run } => {
@@ -607,8 +774,14 @@ async fn companion_command(
                 pair_by_hand(path, explicit_config, &ticket, identity_file.as_deref())?;
             }
         },
-        CompanionCommand::Serve => companion_serve_command(Config::load(path)?).await?,
+        CompanionCommand::Serve => {
+            strip_companion_allow(path)?;
+            companion_serve_command(Config::load(path)?).await?;
+        }
         CompanionCommand::Install { dry_run } => {
+            if !dry_run {
+                strip_companion_allow(path)?;
+            }
             install_companion(path, explicit_config, dry_run)?;
         }
         CompanionCommand::Uninstall { dry_run } => {
@@ -1147,6 +1320,19 @@ fn pair_by_hand(
     install_companion(path, explicit_config, false)
 }
 
+/// Drops a `[companion]` allow list left from before every read was asked
+/// for by name, so the config still loads after an update
+fn strip_companion_allow(path: &std::path::Path) -> Result<()> {
+    if Config::strip_companion_allow(path)? {
+        tracing::warn!(
+            config = %path.display(),
+            "removed the [companion] allow list: every read now asks Touch ID naming the reference"
+        );
+    }
+
+    Ok(())
+}
+
 /// Copies and signs the binary and loads the companion's LaunchAgent, as
 /// `companion install` does
 fn install_companion(
@@ -1428,7 +1614,15 @@ async fn update_command(
         )?;
     }
     if daemon_loaded {
-        service_command(config, None, ServiceCommand::Restart { dry_run: false }).await?;
+        service_command(
+            config,
+            None,
+            ServiceCommand::Restart {
+                dry_run: false,
+                fresh: false,
+            },
+        )
+        .await?;
     }
 
     Ok(())
@@ -1739,6 +1933,339 @@ async fn passkey_command(config: &Config, command: PasskeyCommand) -> Result<()>
     }
 
     Ok(())
+}
+
+/// `op read`, `op inject` and `op run`
+async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
+    match command {
+        // needs the full config, so it is run before this
+        OpCommand::Warm { server } => warm_command(config, server).await?,
+        OpCommand::Read {
+            references,
+            describe,
+            reason,
+            keep,
+            out_file,
+            force,
+            file_mode,
+            no_newline,
+        } => {
+            let several = references.len() > 1;
+            let targets = match describe {
+                Some(description) => vec![ProgramTarget::Describe(description)],
+                None if references.is_empty() => bail!("give a reference or --describe"),
+                None => references
+                    .iter()
+                    .map(|reference| ProgramTarget::Reference(reference.trim().to_owned()))
+                    .collect(),
+            };
+            let destination = match &out_file {
+                Some(path) => {
+                    op::check_writable(path, force)?;
+                    Some(destination_of(path))
+                }
+                None => None,
+            };
+            let values = program_values(
+                config,
+                admin::OpReadRequest {
+                    targets,
+                    reason,
+                    destination,
+                    keep_secs: keep,
+                },
+            )
+            .await?;
+            let mut text = if several {
+                // keyed as the daemon read them, trimmed; a repeat is one key
+                let map: std::collections::BTreeMap<_, _> = references
+                    .iter()
+                    .map(|reference| reference.trim())
+                    .zip(&values)
+                    .collect();
+                serde_json::to_string_pretty(&map)?
+            } else {
+                values.into_iter().next().unwrap_or_default()
+            };
+            if !no_newline {
+                text.push('\n');
+            }
+
+            match out_file {
+                Some(path) => {
+                    op::write_private(&path, &text, file_mode, force)
+                        .wrap_err_with(|| format!("cannot write {}", path.display()))?;
+                    eprintln!("Wrote {}", path.display());
+                }
+                None => print!("{text}"),
+            }
+        }
+        OpCommand::Inject {
+            in_file,
+            out_file,
+            force,
+            file_mode,
+            reason,
+            keep,
+        } => {
+            let template = match &in_file {
+                Some(path) => std::fs::read_to_string(path)
+                    .wrap_err_with(|| format!("cannot read {}", path.display()))?,
+                None => {
+                    let mut text = String::new();
+                    std::io::stdin().read_to_string(&mut text)?;
+
+                    text
+                }
+            };
+            let references = op::template_references(&template)?;
+            let destination = match &out_file {
+                Some(path) => {
+                    op::check_writable(path, force)?;
+                    Some(destination_of(path))
+                }
+                None => None,
+            };
+            let values = program_map(
+                config,
+                references,
+                OpContext {
+                    reason,
+                    destination,
+                    keep_secs: keep,
+                },
+            )
+            .await?;
+            let filled = op::fill_template(&template, &values)?;
+
+            match out_file {
+                Some(path) => {
+                    op::write_private(&path, &filled, file_mode, force)
+                        .wrap_err_with(|| format!("cannot write {}", path.display()))?;
+                    eprintln!("Wrote {} with {} values", path.display(), values.len());
+                }
+                None => print!("{filled}"),
+            }
+        }
+        OpCommand::Run {
+            env_file,
+            no_masking,
+            reason,
+            keep,
+            command,
+        } => {
+            let context = OpContext {
+                reason,
+                destination: Some(format!("the environment of {}", command.join(" "))),
+                keep_secs: keep,
+            };
+            let code = op_run(config, &env_file, no_masking, context, &command).await?;
+            std::process::exit(code);
+        }
+    }
+
+    Ok(())
+}
+
+/// Runs `command` with the values of `env_files` and of variables set to
+/// references in its environment, masking them in its output unless
+/// `no_masking`; the command's exit code, or 128 plus the signal that
+/// stopped it
+async fn op_run(
+    config: &Config,
+    env_files: &[PathBuf],
+    no_masking: bool,
+    context: OpContext,
+    command: &[String],
+) -> Result<i32> {
+    let mut entries = Vec::new();
+    for path in env_files {
+        let text = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("cannot read {}", path.display()))?;
+        entries
+            .extend(op::parse_env(&text).map_err(|reason| eyre!("{}: {reason}", path.display()))?);
+    }
+    // as `op run` does, a variable already set to a reference is read too;
+    // one that is not text cannot be a reference
+    for (key, value) in std::env::vars_os() {
+        if let (Some(key), Some(value)) = (key.to_str(), value.to_str())
+            && value.starts_with("op://")
+        {
+            entries.push(op::EnvEntry {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            });
+        }
+    }
+
+    let mut references = Vec::new();
+    for entry in &entries {
+        references.extend(entry.references()?);
+    }
+    let values = program_map(config, op::unique(references), context).await?;
+    let (program, arguments) = command
+        .split_first()
+        .ok_or_else(|| eyre!("give the command to run after --"))?;
+    let mut child = tokio::process::Command::new(program);
+    child.args(arguments);
+    for entry in &entries {
+        child.env(&entry.key, entry.filled(&values)?);
+    }
+    let masking = !no_masking && !values.is_empty();
+    if masking {
+        child
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+    }
+    let mut running = child
+        .spawn()
+        .wrap_err_with(|| format!("cannot run {program}"))?;
+    let forwarding = forward_signals(running.id());
+
+    let mut pipes = Vec::new();
+    if masking {
+        let masker = Arc::new(op::Masker::new(values.values()));
+        if let Some(stdout) = running.stdout.take() {
+            let masker = Arc::clone(&masker);
+            pipes.push(tokio::spawn(async move {
+                let _ = masker.pipe(stdout, tokio::io::stdout()).await;
+            }));
+        }
+        if let Some(stderr) = running.stderr.take() {
+            pipes.push(tokio::spawn(async move {
+                let _ = masker.pipe(stderr, tokio::io::stderr()).await;
+            }));
+        }
+    }
+    let status = running.wait().await?;
+    for pipe in pipes {
+        let _ = pipe.await;
+    }
+    forwarding.abort();
+
+    Ok(exit_code(status))
+}
+
+/// Passes the signals that stop a terminal command on to the child `pid`,
+/// so it is never left running with the values after this process ends
+fn forward_signals(pid: Option<u32>) -> tokio::task::JoinHandle<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::spawn(async move {
+        let Some(pid) = pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            return;
+        };
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return;
+        };
+        loop {
+            let forwarded = tokio::select! {
+                Some(()) = interrupt.recv() => rustix::process::Signal::INT,
+                Some(()) = terminate.recv() => rustix::process::Signal::TERM,
+                Some(()) = hangup.recv() => rustix::process::Signal::HUP,
+                else => return,
+            };
+            let _ = rustix::process::kill_process(pid, forwarded);
+        }
+    })
+}
+
+/// The shell's exit code for `status`: its own code, or 128 plus the signal
+/// that stopped it
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+/// What every prompt of one `op` command shows besides the items
+struct OpContext {
+    reason: Option<String>,
+    destination: Option<String>,
+    keep_secs: Option<u64>,
+}
+
+/// How prompts name `path`: absolute, with its directory resolved, so the
+/// owner sees the file written rather than a path whose `..` or links lead
+/// elsewhere
+fn destination_of(path: &std::path::Path) -> String {
+    let resolved = path.file_name().and_then(|name| {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => std::path::Path::new("."),
+        };
+
+        std::fs::canonicalize(parent)
+            .ok()
+            .map(|parent| parent.join(name))
+    });
+
+    resolved
+        .or_else(|| std::path::absolute(path).ok())
+        .unwrap_or_else(|| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Each reference mapped to its value, read in one approval; empty, asking
+/// nobody, when there are none
+async fn program_map(
+    config: &Config,
+    references: Vec<String>,
+    context: OpContext,
+) -> Result<std::collections::HashMap<String, String>> {
+    if references.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let targets = references
+        .iter()
+        .cloned()
+        .map(ProgramTarget::Reference)
+        .collect();
+    let request = admin::OpReadRequest {
+        targets,
+        reason: context.reason,
+        destination: context.destination,
+        keep_secs: context.keep_secs,
+    };
+    let values = program_values(config, request).await?;
+
+    Ok(references.into_iter().zip(values).collect())
+}
+
+/// Asks the daemon for the request's targets, which asks the owner, and
+/// returns one value per target
+async fn program_values(config: &Config, request: admin::OpReadRequest) -> Result<Vec<String>> {
+    let count = request.targets.len();
+    let noun = if count == 1 { "value" } else { "values" };
+    eprintln!(
+        "Asking the owner to approve {count} 1Password {noun}: Touch ID on this Mac, or the \
+         phone or a companion Mac..."
+    );
+    let response: admin::OpReadResponse =
+        admin_post_as_owner(config, "/admin/op/read", &request).await?;
+
+    match response {
+        admin::OpReadResponse::Values { source, values } if values.len() == count => {
+            eprintln!("Approved on {source}");
+
+            Ok(values)
+        }
+        admin::OpReadResponse::Values { .. } => bail!("the daemon sent the wrong number of values"),
+        admin::OpReadResponse::Invalid { message } => bail!("refused: {message}"),
+        admin::OpReadResponse::Denied { message } => bail!("denied: {message}"),
+        admin::OpReadResponse::Failed { message } => bail!("no values: {message}"),
+    }
 }
 
 async fn warm_command(config: &Config, server: Option<String>) -> Result<()> {

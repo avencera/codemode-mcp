@@ -53,7 +53,32 @@ macro_rules! session_rule {
     };
 }
 
+macro_rules! onepassword_rule {
+    () => {
+        "When a program needs a 1Password value, never fetch the value into your context: decide \
+         which env file the program reads, such as a stack's `*.secrets.env`, asking the user when it \
+         is not clear, and have the values written there. From a script, call the `write_env` tool of \
+         the `secrets` server (search_tools \"env file\") with the file's absolute path and each \
+         variable's op:// reference; it answers with the variable names only. In a shell on this Mac, \
+         `codemode-mcp op inject -i TEMPLATE -o FILE --reason WHY` fills each `{{ op://vault/item/field \
+         }}` of a template the same way. For a high-severity secret that should never be in a file, \
+         write only its op:// reference into the env file and start the program with `codemode-mcp op \
+         run --env-file FILE --reason WHY -- COMMAND`, which puts the value in that command's \
+         environment only and masks it in its output. `codemode-mcp op read` prints values, so use it \
+         only when nothing else will do; pass `--describe \"Pushover app token\"` instead of a \
+         reference when you do not know the item. The user approves each batch once, with Touch ID on \
+         this Mac or on their phone or other Mac, and sees the file it goes to; add `--keep 15m` (or \
+         `keep_minutes`) only when the next few commands send the same values to the same file or \
+         command. Prefer all of these to \
+         `op`, which only works while the user is at this Mac. The `onepassword` tools here cover \
+         1Password Environments only, not vault items."
+    };
+}
+
 pub(crate) use {script_rules, session_rule, tool_call_rule};
+
+/// Shown with `search_tools` results for a query about 1Password or secrets
+pub const ONEPASSWORD_RULE: &str = onepassword_rule!();
 
 /// Rule about calling tools, repeated at the top of `describe_tools` output
 pub const TOOL_CALL_RULE: &str = tool_call_rule!();
@@ -74,5 +99,26 @@ pub const INSTRUCTIONS: &str = concat!(
      of awaiting each in a loop, so the user approves the whole set at once. ",
     session_rule!(),
     "\n\n",
+    onepassword_rule!(),
+    "\n\n",
     script_rules!()
 );
+
+/// Whether a `search_tools` query is about reading a secret, so the results
+/// carry [`ONEPASSWORD_RULE`]
+pub fn asks_for_secrets(query: &str) -> bool {
+    let query = query.to_ascii_lowercase();
+
+    [
+        "1password",
+        "onepassword",
+        "op://",
+        "secret",
+        "password",
+        "api key",
+        "credential",
+        "token",
+    ]
+    .iter()
+    .any(|word| query.contains(word))
+}

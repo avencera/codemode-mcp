@@ -303,3 +303,48 @@ async fn one_fingerprint_approves_per_call_calls_started_together() -> TestResul
 
     harness.stop().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_needs_the_owner_here_is_refused_at_once_while_they_are_away() -> TestResult {
+    let mac = Arc::new(FakeMac::default());
+    let Some(harness) = Harness::with(Setup {
+        server: "policy = \"ask\"\nneeds_owner_here = true",
+        notify: true,
+        mac: Some(Arc::clone(&mac)),
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    harness.enroll_passkey().await?;
+
+    // away: refused without a prompt, a push or an approval to wait on
+    let away = text_of(
+        &call(
+            &harness.client,
+            "execute",
+            json!({ "code": ADD, "reason": "add two numbers" }),
+        )
+        .await?,
+    );
+    assert!(away.contains("codemode-mcp op inject"), "{away}");
+    assert!(!away.contains("approval_url"), "{away}");
+    assert!(mac.shown().is_empty());
+    assert!(harness.notifier.tool_requests().is_empty());
+
+    // at the Mac the call is asked for as usual
+    mac.set_present(true);
+    mac.set_answer(Some(TouchId::Approved));
+    let here = text_of(
+        &call(
+            &harness.client,
+            "execute",
+            json!({ "code": ADD, "reason": "add two numbers" }),
+        )
+        .await?,
+    );
+    assert!(here.contains("\"result\":3"), "{here}");
+
+    harness.stop().await
+}

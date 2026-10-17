@@ -50,12 +50,21 @@ pub enum PushFailure {
 pub struct Alert {
     /// The read it asks about
     pub request: RequestId,
-    /// The reference to read
-    pub reference: String,
+    /// What the read asks for
+    pub subject: Subject,
     /// The gateway Mac's short name
     pub gateway: String,
     /// When the gateway stops waiting for the answer
     pub expires: SystemTime,
+}
+
+/// What a push asks the owner to approve
+#[derive(Debug, Clone)]
+pub enum Subject {
+    /// One reference the gateway's own config uses
+    Reference(String),
+    /// A program read, by its one-line summary
+    Program(String),
 }
 
 /// Sends pushes to the phones; cheap to clone
@@ -91,12 +100,18 @@ impl Apns {
             return Err(PushFailure::Gone);
         }
         let expires = alert.expires.duration_since(UNIX_EPOCH).unwrap_or_default();
-        let body = json!({
+        let (subtitle, text) = match &alert.subject {
+            Subject::Reference(reference) => {
+                (format!("codemode-mcp on {}", alert.gateway), reference)
+            }
+            Subject::Program(summary) => (format!("A program on {}", alert.gateway), summary),
+        };
+        let mut body = json!({
             "aps": {
                 "alert": {
                     "title": "Approve a 1Password read",
-                    "subtitle": format!("codemode-mcp on {}", alert.gateway),
-                    "body": alert.reference,
+                    "subtitle": subtitle,
+                    "body": text,
                 },
                 "sound": "default",
                 "interruption-level": "time-sensitive",
@@ -104,10 +119,18 @@ impl Apns {
                 "thread-id": "reads",
             },
             push_keys::REQUEST: alert.request.as_str(),
-            push_keys::REFERENCE: alert.reference,
             push_keys::GATEWAY: alert.gateway,
             push_keys::EXPIRES: u64::try_from(expires.as_millis()).unwrap_or(u64::MAX),
         });
+        match &alert.subject {
+            Subject::Reference(reference) => {
+                body[push_keys::REFERENCE] = json!(reference);
+            }
+            Subject::Program(summary) => {
+                body[push_keys::KIND] = json!(push_keys::PROGRAM);
+                body[push_keys::SUMMARY] = json!(summary);
+            }
+        }
 
         let response = self
             .0

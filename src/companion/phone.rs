@@ -24,7 +24,7 @@ use tokio::{sync::watch, time::Instant};
 use super::{
     ASK_TIMEOUT, CompanionFailure, CompanionResponse, Companions, MAX_BODY_BYTES,
     MAX_PHONE_READ_BYTES, answer,
-    apns::{Alert, PushFailure},
+    apns::{Alert, PushFailure, Subject},
     read_request, short_hostname,
 };
 use crate::config::PhonePeer;
@@ -223,13 +223,50 @@ impl Companions {
             .store
             .as_ref()
             .and_then(|store| store.seal(&key, reference).ok().flatten());
+        let id = RequestId::generate();
+        let encode = |expires_in_ms| {
+            encode_read(&PhoneRead {
+                id: id.clone(),
+                reference: reference.to_owned(),
+                sealed: sealed.clone(),
+                expires_in_ms,
+            })
+        };
+        let subject = Subject::Reference(reference.to_owned());
+
+        match self
+            .ask_until(phone, &id, subject, deadline, encode)
+            .await?
+        {
+            CompanionResponse::Value(value) => Ok(value),
+            CompanionResponse::Values(_) => Err(CompanionFailure::Exchange {
+                name: phone.name.clone(),
+                detail: "answered one read with several values".to_owned(),
+            }),
+            CompanionResponse::Error(fault) => Err(CompanionFailure::Refused {
+                code: fault.code,
+                message: fault.message,
+            }),
+        }
+    }
+
+    /// Wakes `phone` for request `id` and offers it the request `encode`
+    /// makes, given the milliseconds left, on each connection it dials in
+    /// with until one answers or `deadline` passes
+    pub(super) async fn ask_until(
+        self: &Arc<Self>,
+        phone: &PhonePeer,
+        id: &RequestId,
+        subject: Subject,
+        deadline: Instant,
+        encode: impl Fn(u64) -> Result<Vec<u8>, String>,
+    ) -> Result<CompanionResponse, CompanionFailure> {
         let endpoint = self.endpoint().await?;
         self.start_accepting(endpoint);
         self.refresh_alpns();
 
-        let id = RequestId::generate();
         let expires = SystemTime::now() + deadline.saturating_duration_since(Instant::now());
-        self.wake(phone, &id, reference, expires);
+        self.wake(phone, id, subject, expires);
 
         let mut link = self.links.link(phone.id).subscribe();
         let mut lost: Option<usize> = None;
@@ -250,28 +287,21 @@ impl Companions {
                 continue;
             };
 
-            let read = PhoneRead {
-                id: id.clone(),
-                reference: reference.to_owned(),
-                sealed: sealed.clone(),
-                expires_in_ms: u64::try_from(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis(),
-                )
-                .unwrap_or(u64::MAX),
-            };
-            match offer(&connection, &read).await {
-                Ok(CompanionResponse::Value(value)) => {
+            let expires_in_ms = u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            let request = encode(expires_in_ms).map_err(|detail| CompanionFailure::Exchange {
+                name: phone.name.clone(),
+                detail,
+            })?;
+            match offer(&connection, &request).await {
+                Ok(response) => {
                     tracing::info!(phone = %phone.name, %id, "phone answered a read");
 
-                    return Ok(value);
-                }
-                Ok(CompanionResponse::Error(fault)) => {
-                    return Err(CompanionFailure::Refused {
-                        code: fault.code,
-                        message: fault.message,
-                    });
+                    return Ok(response);
                 }
                 Err(Offer::Lost) => {
                     tracing::debug!(phone = %phone.name, %id, "phone connection lost mid-read");
@@ -290,7 +320,7 @@ impl Companions {
     /// Sends the push that brings the phone's app up; a phone without a
     /// token, or a gateway without an APNs key, is only asked while the app
     /// is open
-    fn wake(&self, phone: &PhonePeer, id: &RequestId, reference: &str, expires: SystemTime) {
+    fn wake(&self, phone: &PhonePeer, id: &RequestId, subject: Subject, expires: SystemTime) {
         let (Some(apns), Some(store)) = (self.apns.clone(), self.store.clone()) else {
             return;
         };
@@ -306,7 +336,7 @@ impl Companions {
         };
         let alert = Alert {
             request: id.clone(),
-            reference: reference.to_owned(),
+            subject,
             gateway: short_hostname(),
             expires,
         };
@@ -432,9 +462,25 @@ impl Companions {
     }
 }
 
-/// Opens a stream on `connection`, sends `read` and waits for the answer;
-/// dropping the future stops the stream, which takes the phone's prompt down
-async fn offer(connection: &Connection, read: &PhoneRead) -> Result<CompanionResponse, Offer> {
+/// A single read as the phone receives it; a sealed copy too large for the
+/// phone to take is left out, and the owner enters the value instead
+fn encode_read(read: &PhoneRead) -> Result<Vec<u8>, String> {
+    let request = serde_json::to_vec(read).map_err(|error| error.to_string())?;
+    if request.len() <= MAX_PHONE_READ_BYTES || read.sealed.is_none() {
+        return Ok(request);
+    }
+    let unsealed = PhoneRead {
+        sealed: None,
+        ..read.clone()
+    };
+
+    serde_json::to_vec(&unsealed).map_err(|error| error.to_string())
+}
+
+/// Opens a stream on `connection`, sends `request` and waits for the
+/// answer; dropping the future stops the stream, which takes the phone's
+/// prompt down
+async fn offer(connection: &Connection, request: &[u8]) -> Result<CompanionResponse, Offer> {
     let lost = |connection: &Connection, detail: String| {
         if connection.close_reason().is_some() {
             Offer::Lost
@@ -443,22 +489,11 @@ async fn offer(connection: &Connection, read: &PhoneRead) -> Result<CompanionRes
         }
     };
 
-    let mut request =
-        serde_json::to_vec(read).map_err(|error| Offer::Exchange(error.to_string()))?;
-    // a copy too large for the phone to take: the owner enters the value
-    if request.len() > MAX_PHONE_READ_BYTES && read.sealed.is_some() {
-        let unsealed = PhoneRead {
-            sealed: None,
-            ..read.clone()
-        };
-        request =
-            serde_json::to_vec(&unsealed).map_err(|error| Offer::Exchange(error.to_string()))?;
-    }
     let (mut send, mut receive) = connection
         .open_bi()
         .await
         .map_err(|error| lost(connection, error.to_string()))?;
-    send.write_all(&request)
+    send.write_all(request)
         .await
         .map_err(|error| lost(connection, error.to_string()))?;
     send.finish()
@@ -467,6 +502,12 @@ async fn offer(connection: &Connection, read: &PhoneRead) -> Result<CompanionRes
         .read_to_end(MAX_BODY_BYTES)
         .await
         .map_err(|error| lost(connection, error.to_string()))?;
+    // an app that cannot parse a request closes the stream without a word
+    if body.is_empty() {
+        return Err(Offer::Exchange(
+            "the phone did not take the request; its Companion app may need updating".to_owned(),
+        ));
+    }
 
     serde_json::from_slice(&body)
         .map_err(|error| Offer::Exchange(format!("malformed answer: {error}")))

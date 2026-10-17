@@ -7,12 +7,14 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use super::{
     ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
-    CompanionFault, CompanionRequest, CompanionResponse, HANDSHAKE_TIMEOUT, Hangup, IdentityError,
-    MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem, Role, bind_endpoint, load_or_create,
+    CompanionFault, CompanionProgramRequest, CompanionRequest, CompanionResponse,
+    HANDSHAKE_TIMEOUT, Hangup, IdentityError, MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem,
+    ProgramBatch, Role, bind_endpoint, load_or_create, program,
 };
 use crate::{
     config::CompanionConfig,
-    mac::{Mac, MacNotification, TouchId},
+    mac::{Mac, TouchId},
+    prompt,
     secrets::{CreateError, OnePassword, check_new_item, is_reference},
 };
 
@@ -63,16 +65,12 @@ impl CompanionHandle {
 
 /// Starts answering the configured gateway
 ///
-/// Every read takes a fingerprint the gateway cannot fake, given to a prompt
-/// that names the reference. While `op` is authorized it would answer
-/// silently, so this Mac asks Touch ID itself, naming the reference.
-/// Otherwise 1Password asks for a fingerprint, but its prompt does not name
-/// the item, and one approval lets `op` read anything for about ten minutes.
-/// For a reference on the allow list that prompt is enough, with a
-/// notification naming the reference, so the owner touches once; any other
-/// reference is asked for here by name first, so a compromised gateway cannot
-/// slip an unlisted item behind 1Password's unnamed prompt. `mac` is `None`
-/// where there is no Touch ID, and every request is then denied
+/// Every read takes a fingerprint the gateway cannot fake, given to this
+/// Mac's own Touch ID prompt naming the reference, before `op` runs. While
+/// `op` is signed out, 1Password then asks too: its prompt names no item and
+/// one approval lets `op` read anything for about ten minutes, so it never
+/// stands in for this one. `mac` is `None` where there is no Touch ID, and
+/// every request is then denied
 pub async fn serve(
     config: CompanionConfig,
     mac: Option<Arc<dyn Mac>>,
@@ -173,6 +171,8 @@ impl Companion {
     async fn dispatch(self: &Arc<Self>, body: &[u8]) -> Vec<u8> {
         let bytes = if let Ok(create) = serde_json::from_slice::<CompanionCreateRequest>(body) {
             serde_json::to_vec(&self.create(create.create).await)
+        } else if let Ok(read) = serde_json::from_slice::<CompanionProgramRequest>(body) {
+            serde_json::to_vec(&self.program_read(read.program_read).await)
         } else {
             serde_json::to_vec(&self.answer(body).await)
         };
@@ -282,6 +282,105 @@ impl Companion {
         })
     }
 
+    /// Answers a program read: one Touch ID prompt naming every reference
+    /// and the program's reason, then `op read` for each, in order
+    ///
+    /// 1Password's own prompt never stands in for this one: it names no
+    /// item, and these values leave the gateway's daemon
+    async fn program_read(&self, batch: ProgramBatch) -> CompanionResponse {
+        let fault = |code, message: &str| {
+            CompanionResponse::Error(CompanionFault {
+                code,
+                message: message.to_owned(),
+            })
+        };
+
+        let references = match program::checked_references(&batch.references) {
+            Ok(references) => references,
+            Err(reason) => {
+                tracing::warn!(%reason, "refused a malformed program read");
+
+                return fault(CompanionErrorCode::NotAllowed, &reason);
+            }
+        };
+        let reason = program::clean_reason(batch.reason.as_deref());
+        let destination = match program::clean_destination(batch.destination.as_deref()) {
+            Ok(destination) => destination,
+            Err(reason) => {
+                tracing::warn!(%reason, "refused a malformed program read");
+
+                return fault(CompanionErrorCode::NotAllowed, &reason);
+            }
+        };
+        let keep_secs = program::clean_keep(batch.keep_secs);
+
+        // a second request waits for the first prompt's answer
+        let _turn = self.one_at_a_time.lock().await;
+
+        // only the owner's own refusal is `denied`, which ends the read on
+        // every device; a Mac that cannot ask leaves the others asking
+        let Some(mac) = &self.mac else {
+            return fault(
+                CompanionErrorCode::ReadFailed,
+                "Touch ID is unavailable on this machine",
+            );
+        };
+        let text = prompt::program_prompt_text(&prompt::ProgramPrompt {
+            items: &references,
+            place: &self.config.gateway_name,
+            reason: reason.as_deref(),
+            destination: destination.as_deref(),
+            keep_secs,
+        });
+        match mac.touch_id(&text, CANCEL_TITLE).await {
+            TouchId::Approved => {}
+            TouchId::Review => {
+                tracing::info!(items = references.len(), "program read denied on this Mac");
+
+                return fault(CompanionErrorCode::Denied, "denied on this Mac");
+            }
+            TouchId::Away => {
+                return fault(
+                    CompanionErrorCode::ReadFailed,
+                    "the prompt was taken down; the owner seems away from this Mac",
+                );
+            }
+            TouchId::Unavailable => {
+                return fault(
+                    CompanionErrorCode::ReadFailed,
+                    "Touch ID is unavailable on this Mac",
+                );
+            }
+        }
+
+        let mut values = Vec::with_capacity(references.len());
+        for reference in &references {
+            match self.onepassword.read_local(reference).await {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    tracing::warn!(reference, %error, "program read failed on this Mac");
+
+                    return fault(CompanionErrorCode::ReadFailed, &error.to_string());
+                }
+            }
+        }
+        let response = CompanionResponse::Values(values);
+        // the gateway reads at most MAX_BODY_BYTES, so a longer answer would
+        // reach it only as an opaque exchange error
+        if serde_json::to_vec(&response).map_or(true, |bytes| bytes.len() > MAX_BODY_BYTES) {
+            return fault(
+                CompanionErrorCode::ReadFailed,
+                "the values are too large to send together",
+            );
+        }
+        tracing::info!(
+            items = references.len(),
+            "program read approved and answered"
+        );
+
+        response
+    }
+
     /// Answers one read request: refuses anything that is not a reference,
     /// then reads it only after a fingerprint given to a prompt that names it
     async fn answer(&self, body: &[u8]) -> CompanionResponse {
@@ -304,11 +403,6 @@ impl Companion {
                 "the request is not an op://vault/item/field reference",
             );
         }
-        // 1Password's own prompt does not name the item, so only a listed
-        // reference may be approved through it; any other is asked for by
-        // name here, and the owner chooses each one as it comes
-        let listed = self.config.allows(reference);
-
         // a second request waits for the first prompt's answer
         let _turn = self.one_at_a_time.lock().await;
 
@@ -318,43 +412,14 @@ impl Companion {
                 "Touch ID is unavailable on this machine",
             );
         };
-        let mut reason = format!(
+        // asked here even when 1Password is about to ask too: its prompt
+        // names no item, and one approval lets `op` read anything for about
+        // ten minutes, so it never stands in for this one
+        let reason = format!(
             "codemode-mcp on {} wants to read {reference}",
             self.config.gateway_name
         );
-        // so a request slipped in among routine reads stands out
-        if !listed {
-            reason.push_str(", which is not on this Mac's allow list");
-        }
-        // still held turn: no other request can read between this check and
-        // the read below and spend the approval 1Password is about to ask for
-        let named_for_1password = if listed && self.onepassword.signed_out().await {
-            // 1Password is about to ask for a fingerprint itself, which
-            // approves this read as well as ours would, so asking first only
-            // makes the owner touch twice. Its prompt names neither the
-            // gateway nor the reference, so a notification does
-            let notification = MacNotification {
-                title: reason.clone(),
-                message: "Approve in 1Password to send it.".to_owned(),
-                click: None,
-            };
-            match mac.notify(&notification).await {
-                Ok(()) => true,
-                Err(error) => {
-                    // nothing else would name the reference, so ask as well
-                    tracing::info!(%error, "could not name the read in a notification");
-
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        // the turn lock covers only this process: another `op` on this Mac
-        // may have been approved while the notification went up, and then
-        // 1Password reads silently, so this read is asked for after all
-        let named_for_1password = named_for_1password && self.onepassword.signed_out().await;
-        if !named_for_1password && mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
+        if mac.touch_id(&reason, CANCEL_TITLE).await != TouchId::Approved {
             tracing::info!(reference, "read not approved on this Mac");
 
             return fault(CompanionErrorCode::Denied, "not approved on this Mac");

@@ -32,7 +32,8 @@ use codemode_mcp::{
         self, CompanionErrorCode, CompanionFault, CompanionResponse, InviteTicket, MOBILE_ALPN,
         PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registration, Role,
         mobile::{
-            PhoneRead, PhoneRegistration, PhoneRequest, PhoneResponse, PushEnvironment, PushToken,
+            PhoneProgramRead, PhoneProgramRequest, PhoneRead, PhoneRegistration, PhoneRequest,
+            PhoneResponse, ProgramItem, PushEnvironment, PushToken,
         },
     },
     config::Config,
@@ -80,6 +81,12 @@ struct Seen {
     sealed: bool,
     /// The gateway stopped the stream before the phone answered
     withdrawn: bool,
+    /// A program read's items: each reference, or the description in
+    /// quotes, with ` (sealed)` when a copy came with it; empty for a read
+    /// of one reference
+    items: Vec<String>,
+    /// A program read's reason
+    reason: Option<String>,
 }
 
 /// One push as the fake APNs server received it
@@ -302,7 +309,17 @@ impl FakePhone {
                 return;
             };
             let Ok(read) = serde_json::from_slice::<PhoneRead>(&body) else {
-                return;
+                let Ok(program) = serde_json::from_slice::<PhoneProgramRequest>(&body) else {
+                    return;
+                };
+                let response = self.answer_program(&program.program_read);
+                let Ok(bytes) = serde_json::to_vec(&response) else {
+                    return;
+                };
+                if send.write_all(&bytes).await.is_err() || send.finish().is_err() {
+                    return;
+                }
+                continue;
             };
             let index = self.seen.lock().map_or(0, |mut seen| {
                 seen.push(Seen {
@@ -311,6 +328,8 @@ impl FakePhone {
                     expires_in_ms: read.expires_in_ms,
                     sealed: read.sealed.is_some(),
                     withdrawn: false,
+                    items: Vec::new(),
+                    reason: None,
                 });
 
                 seen.len() - 1
@@ -367,6 +386,77 @@ impl FakePhone {
                 return;
             }
         }
+    }
+
+    /// Answers a program read as the app does: sealed copies are opened
+    /// with one Face ID, and each item without one gets the value of
+    /// [`Answer::Enter`]
+    fn answer_program(&self, read: &PhoneProgramRead) -> CompanionResponse {
+        let items = read
+            .items
+            .iter()
+            .map(|item| match item {
+                ProgramItem::Reference { reference, sealed } => {
+                    format!(
+                        "{reference}{}",
+                        if sealed.is_some() { " (sealed)" } else { "" }
+                    )
+                }
+                ProgramItem::Describe { description } => format!("\"{description}\""),
+            })
+            .collect();
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(Seen {
+                id: read.id.to_string(),
+                reference: String::new(),
+                expires_in_ms: read.expires_in_ms,
+                sealed: false,
+                withdrawn: false,
+                items,
+                reason: read.reason.clone(),
+            });
+        }
+        let answer = self.answer.lock().map_or(Answer::Deny, |answer| *answer);
+        let entered = match answer {
+            Answer::Enter(value) => Some(value),
+            Answer::Open => None,
+            Answer::Deny | Answer::Hang => {
+                return CompanionResponse::Error(CompanionFault {
+                    code: CompanionErrorCode::Denied,
+                    message: "not approved on this phone".to_owned(),
+                });
+            }
+        };
+
+        let mut values = Vec::new();
+        for item in &read.items {
+            let value = match (item, entered) {
+                (
+                    ProgramItem::Reference {
+                        reference,
+                        sealed: Some(sealed),
+                    },
+                    _,
+                ) => self
+                    .key
+                    .open(&self.gateway, reference, sealed)
+                    .map(|value| String::from_utf8_lossy(&value).into_owned())
+                    .map_err(|error| error.to_string()),
+                (_, Some(entered)) => Ok(entered.to_owned()),
+                (_, None) => Err("no sealed copy and nothing entered".to_owned()),
+            };
+            match value {
+                Ok(value) => values.push(value),
+                Err(message) => {
+                    return CompanionResponse::Error(CompanionFault {
+                        code: CompanionErrorCode::ReadFailed,
+                        message,
+                    });
+                }
+            }
+        }
+
+        CompanionResponse::Values(values)
     }
 
     /// Sends one request of the phone's own and reads the answer
@@ -444,6 +534,8 @@ struct Rig {
     local_log: PathBuf,
     /// The Mac companion's prompts, when the rig has one
     companion_mac: Option<Arc<FakeMac>>,
+    /// The gateway's own Mac, where the owner is while the rig starts
+    gateway_mac: Arc<FakeMac>,
     companion: Option<companion::CompanionHandle>,
 }
 
@@ -473,7 +565,6 @@ impl Rig {
                 "[companion]\n\
                  gateway = \"{gateway}\"\n\
                  gateway_name = \"main\"\n\
-                 allow = [\"{REFERENCE}\"]\n\
                  listen = \"127.0.0.1:0\"\n\
                  discovery = false\n\
                  identity_file = \"{key}\"\n\
@@ -529,7 +620,7 @@ impl Rig {
         );
         let Some(harness) = Harness::with(Setup {
             extra: &extra,
-            mac: Some(gateway_mac),
+            mac: Some(Arc::clone(&gateway_mac)),
             ..Setup::default()
         })
         .await?
@@ -563,6 +654,7 @@ impl Rig {
             apns,
             local_log,
             companion_mac,
+            gateway_mac,
             companion,
         }))
     }
@@ -747,15 +839,14 @@ async fn a_phone_that_answers_first_takes_the_other_prompts_down() -> TestResult
     // companion's prompt came up before it won depends on timing
     let before = dismissals();
 
-    // after a restart the cache is empty: the owner is at the gateway, but
+    // after a fresh restart the cache is empty: the owner is at the gateway, but
     // its 1Password prompt goes unanswered, and so does the companion's
     let (hanging, pid) = hanging_op()?;
     phone.answer_once(pid.clone());
-    let harness = harness
-        .restart_with(Stop::Drain, |config| {
-            config.secrets.op = hanging.display().to_string();
-        })
-        .await?;
+    let harness = restart_fresh(harness, |config| {
+        config.secrets.op = hanging.display().to_string();
+    })
+    .await?;
 
     let body = harness
         .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
@@ -816,11 +907,10 @@ async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
     // after a restart the owner at the gateway answers 1Password within
     // the phones' grace, so the phone is never pushed or asked
     let quick = slow_op(1)?;
-    let harness = harness
-        .restart_with(Stop::Drain, |config| {
-            config.secrets.op = quick.display().to_string();
-        })
-        .await?;
+    let harness = restart_fresh(harness, |config| {
+        config.secrets.op = quick.display().to_string();
+    })
+    .await?;
     let body = harness
         .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
         .await?;
@@ -831,11 +921,10 @@ async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
 
     // and again, slowly enough that the phone has its prompt up first
     let slow = slow_op(PHONE_GRACE.as_secs() + 2)?;
-    let harness = harness
-        .restart_with(Stop::Drain, |config| {
-            config.secrets.op = slow.display().to_string();
-        })
-        .await?;
+    let harness = restart_fresh(harness, |config| {
+        config.secrets.op = slow.display().to_string();
+    })
+    .await?;
     let body = harness
         .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
         .await?;
@@ -973,9 +1062,7 @@ async fn a_value_entered_on_the_phone_is_sealed_for_the_next_read() -> TestResul
     // unanswered: the phone is asked without a copy and the owner enters it
     phone.set_answer(Answer::Enter(entered));
     let (hanging, _) = hanging_op()?;
-    let harness = harness
-        .restart_with(Stop::Drain, |config| use_other(config, &hanging))
-        .await?;
+    let harness = restart_fresh(harness, |config| use_other(config, &hanging)).await?;
     let body = harness
         .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
         .await?;
@@ -988,9 +1075,7 @@ async fn a_value_entered_on_the_phone_is_sealed_for_the_next_read() -> TestResul
     // after a restart the phone opens the copy of what it entered
     phone.set_answer(Answer::Open);
     let (hanging, _) = hanging_op()?;
-    let harness = harness
-        .restart_with(Stop::Drain, |config| use_other(config, &hanging))
-        .await?;
+    let harness = restart_fresh(harness, |config| use_other(config, &hanging)).await?;
     let body = harness
         .execute_json(r#"await twin_env(name="FIXTURE_SECRET")"#)
         .await?;
@@ -1129,4 +1214,81 @@ async fn an_invite_pairs_a_phone_and_seals_what_was_read_before_it() -> TestResu
     assert_eq!(status["in_use"], true, "{status}");
 
     harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_read_is_answered_on_the_phone_with_one_approval() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: false,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    rig.gateway_mac.set_present(false);
+    rig.phone
+        .set_answer(Answer::Enter("pushover-token-entered"));
+
+    let (status, body) = rig
+        .harness
+        .admin_json(
+            "/admin/op/read",
+            &json!({
+                "targets": [{ "reference": REFERENCE }, { "describe": "Pushover app token" }],
+                "reason": "freezerwatch alerts",
+            }),
+        )
+        .await?;
+
+    // the sealed copy opens and the described item is filled in, in order
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "values": { "source": "iphone", "values": [VALUE, "pushover-token-entered"] } })
+    );
+    let program = rig
+        .phone
+        .seen()
+        .into_iter()
+        .find(|seen| !seen.items.is_empty())
+        .ok_or("the phone saw no program read")?;
+    assert_eq!(
+        program.items,
+        [
+            format!("{REFERENCE} (sealed)"),
+            "\"Pushover app token\"".to_owned()
+        ]
+    );
+    assert_eq!(program.reason.as_deref(), Some("freezerwatch alerts"));
+    // the push names the batch, not one reference
+    let push = rig
+        .apns
+        .pushes()
+        .into_iter()
+        .rev()
+        .find(|push| push.body["kind"] == "program")
+        .ok_or("no push for the program read")?;
+    let summary = push.body["summary"].as_str().unwrap_or_default();
+    assert!(summary.contains("Pushover app token"), "{summary}");
+    assert!(summary.contains("freezerwatch alerts"), "{summary}");
+    assert!(push.body.get("reference").is_none(), "{}", push.body);
+    // the owner was away, so the gateway's own `op` never ran for it
+    assert_eq!(reads(&rig.local_log, REFERENCE), 1);
+
+    rig.stop().await
+}
+
+/// Restarts cleanly after forgetting the secrets, as `service restart
+/// --fresh` does, so the next daemon reads each again instead of taking them
+/// over
+async fn restart_fresh(
+    harness: Harness,
+    change: impl FnOnce(&mut Config),
+) -> Result<Harness, Box<dyn Error>> {
+    let (status, body) = harness
+        .admin_json("/admin/secrets/forget", &Value::Null)
+        .await?;
+    assert_eq!(status, 200, "{body}");
+
+    harness.restart_with(Stop::Drain, change).await
 }

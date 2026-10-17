@@ -144,11 +144,12 @@ async fn register(
         other => return Err(format!("unexpected answer: {other:?}")),
     };
 
+    // the gateway still names the references it reads; every read is asked
+    // about anyway, so the phone keeps no list of them
     let record = GatewayRecord {
         id: ticket.gateway,
         name: registered.gateway_name,
         phone_name: registered.name,
-        allow: registered.references,
         addrs: ticket.addrs.clone(),
     };
     let saved = {

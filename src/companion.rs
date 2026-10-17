@@ -14,6 +14,7 @@ mod invite;
 mod join;
 mod pair;
 mod phone;
+mod program;
 mod server;
 
 /// The wire types, shared with the phone's core
@@ -27,14 +28,15 @@ pub use identity::{IdentityError, Role, load_or_create};
 pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
 pub use pair::{PairError, Paired, Pairing, companion_id, pair};
+pub use program::{ProgramAsk, ProgramReadError, ProgramTarget, ProgramValues};
 pub use server::{CompanionHandle, ServeError, serve};
 pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
 };
 pub use wire::{
     CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode, CompanionFault,
-    CompanionRequest, CompanionResponse, CreatedItem, MALFORMED_REQUEST, NewItem, PairCheck,
-    PairRequest, PairResponse, Registered, Registration,
+    CompanionProgramRequest, CompanionRequest, CompanionResponse, CreatedItem, MALFORMED_REQUEST,
+    NewItem, PairCheck, PairRequest, PairResponse, ProgramBatch, Registered, Registration,
 };
 
 use std::time::Duration;

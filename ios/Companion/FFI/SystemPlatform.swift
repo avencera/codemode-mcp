@@ -109,6 +109,35 @@ final class SystemPlatform: Platform, @unchecked Sendable {
     // MARK: Face ID
 
     func openSealed(request: OpenRequest) throws -> String {
+        let reason = "Read \(request.reference) for codemode-mcp on \(request.gatewayName)"
+
+        return try withFaceID(id: request.id, reason: reason) { key in
+            try Self.open(key: key, info: request.info, enc: request.enc, ciphertext: request.ciphertext)
+        }
+    }
+
+    func openSealedBatch(batch: OpenBatch) throws -> [String] {
+        let values = batch.total == 1 ? "1 value" : "\(batch.total) values"
+        var reason = "Send \(values) to a program on \(batch.gatewayName)"
+        if let keep = batch.keepSecs {
+            reason += " (again for \(keepMinutes(keep)) min)"
+        }
+
+        return try withFaceID(id: batch.id, reason: reason) { key in
+            try batch.items.map { item in
+                try Self.open(key: key, info: item.info, enc: item.enc, ciphertext: item.ciphertext)
+            }
+        }
+    }
+
+    /// Asks Face ID once for read `id`, then hands `body` the Secure Enclave
+    /// key unlocked by that one approval, so a batch opens every value
+    /// without asking again
+    private func withFaceID<T>(
+        id: String,
+        reason: String,
+        _ body: (SecureEnclave.P256.KeyAgreement.PrivateKey) throws -> T
+    ) throws -> T {
         guard let handle = loadSecret(key: Self.sealKeyItem) else {
             throw OpenError.Failed(message: "this iPhone has no seal key; pair it again")
         }
@@ -116,18 +145,18 @@ final class SystemPlatform: Platform, @unchecked Sendable {
         let context = LAContext()
         context.localizedCancelTitle = "Deny"
         let alreadyCancelled = lock.withLock {
-            contexts[request.id] = context
-            return cancelled.remove(request.id) != nil
+            contexts[id] = context
+            return cancelled.remove(id) != nil
         }
         if alreadyCancelled {
-            _ = lock.withLock { contexts.removeValue(forKey: request.id) }
-            throw OpenError.Denied
+            _ = lock.withLock { contexts.removeValue(forKey: id) }
+            // the core took the read down and has answered it already
+            throw OpenError.Failed(message: "the prompt was taken down")
         }
-        defer { _ = lock.withLock { contexts.removeValue(forKey: request.id) } }
+        defer { _ = lock.withLock { contexts.removeValue(forKey: id) } }
 
         // asked once here; the key use below takes this context instead of
         // prompting again
-        let reason = "Read \(request.reference) for codemode-mcp on \(request.gatewayName)"
         let answered = DispatchSemaphore(value: 0)
         var refusal: Error?
         context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { approved, error in
@@ -136,13 +165,21 @@ final class SystemPlatform: Platform, @unchecked Sendable {
         }
         answered.wait()
         if let refusal {
+            // only the owner's Deny refuses: a denial ends the read on every
+            // device, so an interrupted or unmatched Face ID is a failure the
+            // gateway's other sources can still answer
             switch (refusal as? LAError)?.code {
-            case .userCancel, .appCancel, .systemCancel, .userFallback, .notInteractive:
+            case .userCancel:
                 throw OpenError.Denied
+            case .appCancel:
+                // the core took the prompt down and has answered already
+                throw OpenError.Failed(message: "the prompt was taken down")
+            case .systemCancel:
+                throw OpenError.Failed(message: "Face ID was interrupted")
             case .biometryLockout, .biometryNotEnrolled, .biometryNotAvailable:
                 throw OpenError.Failed(message: "Face ID is unavailable: \(refusal.localizedDescription)")
             default:
-                throw OpenError.Denied
+                throw OpenError.Failed(message: "Face ID did not approve: \(refusal.localizedDescription)")
             }
         }
 
@@ -151,24 +188,35 @@ final class SystemPlatform: Platform, @unchecked Sendable {
                 dataRepresentation: handle,
                 authenticationContext: context
             )
-            var recipient = try HPKE.Recipient(
-                privateKey: key,
-                ciphersuite: .P256_SHA256_AES_GCM_256,
-                info: request.info,
-                encapsulatedKey: request.enc
-            )
-            let plaintext = try recipient.open(request.ciphertext)
-            guard let value = String(data: plaintext, encoding: .utf8) else {
-                throw OpenError.Failed(message: "the value is not text")
-            }
 
-            return value
+            return try body(key)
         } catch let error as OpenError {
             throw error
         } catch {
             // a changed Face ID enrollment voids the key; a new pairing makes another
             throw OpenError.Failed(message: "the value did not open: \(error.localizedDescription)")
         }
+    }
+
+    /// Opens one value sealed to `key`
+    private static func open(
+        key: SecureEnclave.P256.KeyAgreement.PrivateKey,
+        info: Data,
+        enc: Data,
+        ciphertext: Data
+    ) throws -> String {
+        var recipient = try HPKE.Recipient(
+            privateKey: key,
+            ciphersuite: .P256_SHA256_AES_GCM_256,
+            info: info,
+            encapsulatedKey: enc
+        )
+        let plaintext = try recipient.open(ciphertext)
+        guard let value = String(data: plaintext, encoding: .utf8) else {
+            throw OpenError.Failed(message: "the value is not text")
+        }
+
+        return value
     }
 
     func cancelOpen(id: String) {

@@ -1,0 +1,260 @@
+//! Carries the values the daemon read for its own config across a restart,
+//! so a planned restart or update does not ask the owner again
+//!
+//! A daemon that stops cleanly seals its cache with AES-256-GCM under a
+//! fresh random key, writes the ciphertext to [`FILE`] in the state
+//! directory and puts the key in the login keychain, where only the signed
+//! binary reads it without a prompt. The next daemon takes both, deletes
+//! both, and uses the values only when they are younger than [`MAX_AGE`].
+//! A crash leaves nothing, and that daemon asks again as before. Values a
+//! program asked for (`codemode-mcp op`) are never in the cache, so never
+//! here
+//!
+//! The keychain is used only by the installed service binary with no
+//! `secrets.identity_file`: a keychain item is bound to the code that made
+//! it, so a test or checkout build writing it would leave the service a
+//! keychain prompt. Any other daemon puts the key in [`KEY_FILE`] beside the
+//! ciphertext, mode 0600, which keeps the values from other users but not
+//! from this one
+
+use std::{
+    collections::HashMap,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+use serde::{Deserialize, Serialize};
+
+/// The sealed values, in the state directory
+pub const FILE: &str = "secrets.handoff";
+/// The key, when there is no keychain
+pub const KEY_FILE: &str = "secrets.handoff.key";
+/// How old a handoff may be and still be used; a restart takes seconds, and
+/// a reboot within this window is still a planned stop
+pub const MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Keychain service of the key
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "dev.praveen.codemode-mcp.handoff";
+/// Keychain account of the key
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "daemon";
+/// `errSecItemNotFound`
+#[cfg(target_os = "macos")]
+const KEYCHAIN_NOT_FOUND: i32 = -25300;
+
+/// Bound into the ciphertext with the time it was written, so a handoff
+/// cannot be passed off as another format or a later one
+const AAD_PREFIX: &str = "codemode-mcp/handoff/1";
+
+/// What [`FILE`] holds
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    /// When it was written, in Unix milliseconds
+    written_at_ms: u64,
+    /// Hex
+    nonce: String,
+    /// Hex, with the tag
+    ciphertext: String,
+}
+
+/// Where the key is kept
+#[derive(Debug, Clone)]
+pub enum KeyStore {
+    /// The login keychain
+    Keychain,
+    /// A file, for systems without a keychain
+    File(PathBuf),
+}
+
+impl KeyStore {
+    /// The keychain for the installed service binary using it for its
+    /// identity too, otherwise a file in `state_dir`
+    pub fn for_state(state_dir: &Path, identity_in_keychain: bool) -> Self {
+        let installed = crate::service::ServicePaths::from_env(state_dir).is_ok_and(|paths| {
+            let running = std::env::current_exe().and_then(std::fs::canonicalize);
+            let installed = std::fs::canonicalize(&paths.binary);
+
+            matches!((running, installed), (Ok(running), Ok(installed)) if running == installed)
+        });
+        if identity_in_keychain && installed {
+            Self::Keychain
+        } else {
+            Self::File(state_dir.join(KEY_FILE))
+        }
+    }
+
+    fn put(&self, key: &[u8; 32]) -> Result<(), String> {
+        match self {
+            Self::Keychain => keychain_put(key),
+            Self::File(path) => {
+                let _ = std::fs::remove_file(path);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map_err(|error| error.to_string())?;
+
+                file.write_all(key).map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    /// The key, removed from the store
+    fn take(&self) -> Result<Option<[u8; 32]>, String> {
+        match self {
+            Self::Keychain => keychain_take(),
+            Self::File(path) => {
+                let bytes = match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.to_string()),
+                };
+                let _ = std::fs::remove_file(path);
+
+                bytes
+                    .try_into()
+                    .map(Some)
+                    .map_err(|_| "the key is not 32 bytes".to_owned())
+            }
+        }
+    }
+}
+
+/// Seals `values` for the next daemon on `state_dir`; nothing is written when
+/// there are none
+pub fn hand_off(
+    state_dir: &Path,
+    store: &KeyStore,
+    values: &HashMap<String, String>,
+) -> Result<usize, String> {
+    if values.is_empty() {
+        return Ok(0);
+    }
+    let key: [u8; 32] = rand::random();
+    let nonce: [u8; NONCE_LEN] = rand::random();
+    let written_at_ms = now_ms();
+    let mut sealed = serde_json::to_vec(values).map_err(|error| error.to_string())?;
+    cipher(&key)?
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad(written_at_ms)),
+            &mut sealed,
+        )
+        .map_err(|_| "sealing failed".to_owned())?;
+    let envelope = Envelope {
+        written_at_ms,
+        nonce: hex::encode(nonce),
+        ciphertext: hex::encode(sealed),
+    };
+
+    store.put(&key)?;
+    let path = state_dir.join(FILE);
+    let _ = std::fs::remove_file(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&serde_json::to_vec(&envelope).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+
+    Ok(values.len())
+}
+
+/// The values the last daemon on `state_dir` handed off, removing the
+/// handoff whether or not it could be used; empty when there is none or it
+/// is older than [`MAX_AGE`]
+pub fn take_over(state_dir: &Path, store: &KeyStore) -> Result<HashMap<String, String>, String> {
+    let path = state_dir.join(FILE);
+    let text = match std::fs::read(&path) {
+        Ok(text) => text,
+        // a key left without its file is replaced by the next handoff
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    // used once, whatever happens next
+    let _ = std::fs::remove_file(&path);
+    let key = store.take()?;
+
+    let envelope: Envelope = serde_json::from_slice(&text).map_err(|error| error.to_string())?;
+    let age = Duration::from_millis(now_ms().saturating_sub(envelope.written_at_ms));
+    if age > MAX_AGE {
+        return Err(format!("the handoff is {}s old", age.as_secs()));
+    }
+    let Some(key) = key else {
+        return Err("the handoff's key is gone".to_owned());
+    };
+    let nonce: [u8; NONCE_LEN] = hex::decode(&envelope.nonce)
+        .ok()
+        .and_then(|nonce| nonce.try_into().ok())
+        .ok_or("the nonce is malformed")?;
+    let mut sealed = hex::decode(&envelope.ciphertext).map_err(|error| error.to_string())?;
+    let opened = cipher(&key)?
+        .open_in_place(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad(envelope.written_at_ms)),
+            &mut sealed,
+        )
+        .map_err(|_| "the handoff does not open with its key".to_owned())?;
+
+    serde_json::from_slice(opened).map_err(|error| error.to_string())
+}
+
+fn cipher(key: &[u8; 32]) -> Result<LessSafeKey, String> {
+    UnboundKey::new(&AES_256_GCM, key)
+        .map(LessSafeKey::new)
+        .map_err(|_| "bad key".to_owned())
+}
+
+fn aad(written_at_ms: u64) -> Vec<u8> {
+    format!("{AAD_PREFIX}\n{written_at_ms}").into_bytes()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_put(key: &[u8; 32]) -> Result<(), String> {
+    use security_framework::passwords::set_generic_password;
+
+    set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_take() -> Result<Option<[u8; 32]>, String> {
+    use security_framework::passwords::{delete_generic_password, get_generic_password};
+
+    let stored = match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(stored) => stored,
+        Err(error) if error.code() == KEYCHAIN_NOT_FOUND => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let _ = delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
+
+    stored
+        .try_into()
+        .map(Some)
+        .map_err(|_| "the key is not 32 bytes".to_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_put(_key: &[u8; 32]) -> Result<(), String> {
+    Err("this system has no login keychain".to_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_take() -> Result<Option<[u8; 32]>, String> {
+    Ok(None)
+}
