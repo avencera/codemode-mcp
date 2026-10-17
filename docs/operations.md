@@ -219,8 +219,9 @@ in the file that the prompt never showed, so write it yourself or use `op inject
 named are replaced, including the rest of a multi-line quoted value, new ones are added at the end, and every
 other line is kept. Values that need it are single-quoted; a value with a line break or a single quote is
 refused, so use `op inject` with a template for those. A new file gets mode 0600, and so does one that others could
-read; one already closed to others keeps its group and group bits, so a service's group can still read it; if the
-new file cannot be put in that group, it gets 0600. The file is replaced by a new one, so a container that
+read; one already closed to others, owned by the daemon's user and in a group other than `staff`, `everyone` or
+`users` keeps its group and group bits, so a service's group can still read it; if the new file cannot be put
+in that group, it gets 0600. The file is replaced by a new one, so a container that
 bind-mounts the single file sees the change only after it restarts. The answer names the variables written and the device that approved,
 never a value, and values of 6 or more characters are redacted from every later result; a shorter one, such
 as a PIN, is not. A caller that cancels the call takes the prompts down, and nothing is written after a late

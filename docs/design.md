@@ -268,7 +268,8 @@ approved wherever the owner is
   lines (keeping what precedes the name, such as a BOM or `export`, dropping later duplicates and the rest of a
   multi-line quoted value, never reading a line inside a quoted value as a variable), appends the rest with the
   file's own line ending and writes through `op::write_private`, with mode 0600, or, when the existing file gave others
-  none, its group bits with its group set on the new file by `fchown` (dropped if that fails; on macOS a new
+  none, is owned by the daemon's user and is not in a catch-all group (`staff`, `everyone`, `users`), its
+  group bits with its group set on the new file by `fchown` (dropped if that fails; on macOS a new
   file's group, staff, holds every user). Cancelling the MCP request drops the read, taking its prompts down,
   and is checked again before the write Values outside `[A-Za-z0-9_-.:/+=@,%]`, or starting with `=`, are single-quoted, since a
   shell expands `~` in an assignment and zsh a leading `=`; a line break or a single quote is refused. The answer holds the path, the replaced and added names and the approving

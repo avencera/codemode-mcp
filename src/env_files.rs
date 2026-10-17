@@ -41,6 +41,10 @@ const INSTRUCTIONS: &str = "Writes 1Password values into an env file on this Mac
      Mac, and sees the file's path. Other lines of the file are kept. Use this whenever a \
      program needs a secret: never ask for the value itself.";
 
+/// Groups that hold every user, whose read bit is never kept: `staff` and
+/// `everyone` on macOS, `users` on Linux
+const CATCH_ALL_GROUPS: [u32; 3] = [20, 12, 100];
+
 /// The error of a call its caller cancelled; nothing was written
 const CANCELLED: &str = "the call was cancelled, so nothing was written";
 
@@ -195,10 +199,16 @@ impl SecretsServer {
         // deliberately shared, and on macOS the usual group, staff, holds
         // every user
         let (mode, group) = match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.permissions().mode() & 0o007 == 0 => (
-                (metadata.permissions().mode() & 0o770) | op::DEFAULT_FILE_MODE,
-                Some(metadata.gid()),
-            ),
+            Ok(metadata)
+                if metadata.permissions().mode() & 0o007 == 0
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && !CATCH_ALL_GROUPS.contains(&metadata.gid()) =>
+            {
+                (
+                    (metadata.permissions().mode() & 0o770) | op::DEFAULT_FILE_MODE,
+                    Some(metadata.gid()),
+                )
+            }
             _ => (op::DEFAULT_FILE_MODE, None),
         };
         op::write_private_for(&path, &merged.text, mode, true, group)

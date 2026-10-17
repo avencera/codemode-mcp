@@ -2060,13 +2060,7 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
             keep,
             command,
         } => {
-            // one line, cut to fit: a long or multi-line script must still
-            // be asked about, and the program it starts comes first
-            let line = command.join(" ");
-            let mut shown = codemode_mcp::prompt::one_line(&line, COMMAND_SHOWN_CHARS);
-            if line.chars().count() > COMMAND_SHOWN_CHARS {
-                shown.push('…');
-            }
+            let shown = shown_command(&command.join(" "));
             let context = OpContext {
                 reason,
                 destination: Some(format!("the environment of {shown}")),
@@ -2174,6 +2168,27 @@ const PIPE_DRAIN: Duration = Duration::from_secs(2);
 /// How much of `op run`'s command line its prompts show, leaving room for
 /// the words around it within the destination's limit
 const COMMAND_SHOWN_CHARS: usize = 200;
+
+/// `line` as one line that fits [`COMMAND_SHOWN_CHARS`]: a long one keeps
+/// its start, which names the program, and its end, where an argument that
+/// changes what it does could otherwise hide, and says how much is left out
+fn shown_command(line: &str) -> String {
+    let line = codemode_mcp::prompt::one_line(line, usize::MAX);
+    let characters: Vec<char> = line.chars().collect();
+    if characters.len() <= COMMAND_SHOWN_CHARS {
+        return line;
+    }
+    let (head, tail) = (120, 50);
+    let skipped = characters.len() - head - tail;
+
+    format!(
+        "{} …{skipped} characters… {}",
+        characters[..head].iter().collect::<String>(),
+        characters[characters.len() - tail..]
+            .iter()
+            .collect::<String>()
+    )
+}
 
 /// Passes the signals that stop a terminal command on to the child `pid`,
 /// so it is never left running with the values after this process ends
