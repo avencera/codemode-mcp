@@ -2060,7 +2060,16 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
             keep,
             command,
         } => {
-            let shown = shown_command(&command.join(" "));
+            let line = command.join(" ");
+            let shown = shown_command(&line);
+            // a grant is keyed by what the prompt shows, which for a long
+            // command is not all of it, so another command could share it
+            if keep.is_some() && shown != line {
+                bail!(
+                    "--keep needs a command line short enough to show whole, at most \
+                     {COMMAND_SHOWN_CHARS} characters on one line; put a long script in a file"
+                );
+            }
             let context = OpContext {
                 reason,
                 destination: Some(format!("the environment of {shown}")),

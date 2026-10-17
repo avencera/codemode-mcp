@@ -263,6 +263,17 @@ pub const MIN_MASKED_CHARS: usize = 3;
 /// What replaces a value in a command's output
 const MASK: &[u8] = b"[redacted]";
 
+/// What masking one stream carries from one read to the next
+#[derive(Debug, Default)]
+struct Masking {
+    /// Bytes at the start of the next read still inside a value already
+    /// being masked
+    carry: usize,
+    /// Whether the last byte passed on was masked, so a value carrying on
+    /// from it adds no second mask
+    in_mask: bool,
+}
+
 /// Replaces values in a command's output, as `op run` conceals them
 ///
 /// Each value is matched as written, and each line of a multi-line value on
@@ -296,18 +307,26 @@ impl Masker {
     /// Masks what `buffer` holds, appending the result to `out`; returns how
     /// many bytes were consumed. Unless `last`, nothing from where a value
     /// could still be starting is passed on, so a shorter value that matches
-    /// first never lets the rest of a longer one through
+    /// first never lets the rest of a longer one through, and only that tail
+    /// is kept for the next call
     ///
     /// Every byte inside any value is covered, so overlapping values are
-    /// masked whole, and each run of covered bytes becomes one mask
-    fn mask_into(&self, buffer: &[u8], last: bool, out: &mut Vec<u8>) -> usize {
+    /// masked whole, and each run of covered bytes becomes one mask. A value
+    /// running past what is passed on carries over in `masking`
+    fn mask_into(
+        &self,
+        buffer: &[u8],
+        last: bool,
+        masking: &mut Masking,
+        out: &mut Vec<u8>,
+    ) -> usize {
         let open = |at: usize| {
             let rest = &buffer[at..];
             self.needles
                 .iter()
                 .any(|needle| needle.len() > rest.len() && needle.starts_with(rest))
         };
-        let limit = if last {
+        let end = if last {
             buffer.len()
         } else {
             (0..buffer.len())
@@ -316,32 +335,26 @@ impl Masker {
         };
 
         let mut covered = vec![false; buffer.len()];
-        for start in 0..limit {
+        covered[..masking.carry.min(buffer.len())].fill(true);
+        let mut reach = masking.carry;
+        for start in 0..end {
             for needle in &self.needles {
                 if buffer[start..].starts_with(needle) {
                     covered[start..start + needle.len()].fill(true);
+                    reach = reach.max(start + needle.len());
                 }
             }
-        }
-        // a value running past the limit is masked once the rest of it, and
-        // anything it might still be part of, has arrived
-        let mut end = limit;
-        while end > 0 && end < buffer.len() && covered[end - 1] && covered[end] {
-            end -= 1;
         }
 
-        let mut at = 0;
-        while at < end {
-            if covered[at] {
+        for (&byte, &hidden) in buffer[..end].iter().zip(&covered) {
+            if !hidden {
+                out.push(byte);
+            } else if !masking.in_mask {
                 out.extend_from_slice(MASK);
-                while at < end && covered[at] {
-                    at += 1;
-                }
-            } else {
-                out.push(buffer[at]);
-                at += 1;
             }
+            masking.in_mask = hidden;
         }
+        masking.carry = reach.saturating_sub(end);
 
         end
     }
@@ -355,12 +368,13 @@ impl Masker {
         let mut pending: Vec<u8> = Vec::new();
         let mut chunk = vec![0_u8; 8192];
         let mut out = Vec::new();
+        let mut masking = Masking::default();
         loop {
             let read = reader.read(&mut chunk).await?;
             let last = read == 0;
             pending.extend_from_slice(&chunk[..read]);
             out.clear();
-            let consumed = self.mask_into(&pending, last, &mut out);
+            let consumed = self.mask_into(&pending, last, &mut masking, &mut out);
             pending.drain(..consumed);
             writer.write_all(&out).await?;
             writer.flush().await?;
@@ -453,9 +467,11 @@ mod tests {
         let masker = super::Masker::new(&values);
         let mut pending = Vec::new();
         let mut out = Vec::new();
+        let mut masking = super::Masking::default();
         for (index, chunk) in chunks.iter().chain([&""]).enumerate() {
             pending.extend_from_slice(chunk.as_bytes());
-            let consumed = masker.mask_into(&pending, index == chunks.len(), &mut out);
+            let consumed =
+                masker.mask_into(&pending, index == chunks.len(), &mut masking, &mut out);
             pending.drain(..consumed);
         }
 
@@ -474,6 +490,24 @@ mod tests {
         assert_eq!(
             masked(&["abcde", "cdefg"], &["abcd", "efg!"]),
             "[redacted]!"
+        );
+    }
+
+    #[test]
+    fn repeated_output_is_masked_as_it_arrives() {
+        let values = ["aaa".to_owned()];
+        let masker = super::Masker::new(&values);
+        let mut masking = super::Masking::default();
+        let mut out = Vec::new();
+        let stream = vec![b'a'; 10_000];
+
+        // all but the tail that could still start a value is passed on
+        let consumed = masker.mask_into(&stream, false, &mut masking, &mut out);
+        assert!(consumed >= stream.len() - 2, "{consumed}");
+        assert_eq!(out, b"[redacted]");
+        assert_eq!(
+            masked(&["aaa", "secret-b"], &["aaaa", "aa", "aa x secret-", "b!"]),
+            "[redacted] x [redacted]!"
         );
     }
 

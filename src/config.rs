@@ -229,8 +229,21 @@ impl Config {
                     .unwrap_or_default(),
                 std::process::id()
             ));
-            std::fs::write(&staging, &stripped)?;
-            std::fs::set_permissions(&staging, permissions)?;
+            // private from the first byte, since a config can hold secrets
+            // and the directory may be readable by others
+            let mut file = std::os::unix::fs::OpenOptionsExt::mode(
+                std::fs::OpenOptions::new().write(true).create_new(true),
+                0o600,
+            )
+            .open(&staging)?;
+            let written = std::io::Write::write_all(&mut file, stripped.as_bytes())
+                .and_then(|()| file.sync_all())
+                .and_then(|()| std::fs::set_permissions(&staging, permissions));
+            if let Err(error) = written {
+                let _ = std::fs::remove_file(&staging);
+
+                return Err(error);
+            }
             std::fs::rename(&staging, &target).inspect_err(|_| {
                 let _ = std::fs::remove_file(&staging);
             })

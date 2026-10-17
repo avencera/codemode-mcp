@@ -154,7 +154,8 @@ A phone keeps a copy of each value sealed to its Face ID, as for config reads.
 When the next few commands need the same values, add `--keep 15m` to the first. Its prompt says the values will
 be handed out again without asking for that long, at most 60 minutes, and later requests for only those
 references going to the same file, or the same command's environment, are answered from memory until then.
-A request going anywhere else asks again. `codemode-mcp service restart --fresh` or
+A request going anywhere else asks again. `op run --keep` needs a command line of at most 200 characters on
+one line, since a longer one is shortened in the prompt and could not be told apart from another. `codemode-mcp service restart --fresh` or
 `POST /admin/secrets/forget` drops them early, and a restart never carries them over.
 
 Write a secrets file, the usual case:
