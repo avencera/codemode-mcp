@@ -1140,7 +1140,12 @@ impl OnePassword {
         }
         let value = self.read(reference, ask).await?;
         known.insert(reference.to_owned(), value.clone());
-        if let Some(consumer) = ask {
+        // every source asked the owner, naming the server here, unless
+        // there is no Mac to ask on, where `op` answered as it would
+        // anyone: that read is not taken as an approval
+        if let Some(consumer) = ask
+            && self.on_mac.is_some()
+        {
             self.approved.approve(consumer, reference);
         }
 
