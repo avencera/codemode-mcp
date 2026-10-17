@@ -584,7 +584,7 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   reference, not the server). A successful read approves the pair. Pairs live in `secrets.approved`, each
   with an HMAC under a key derived from the device trust key, so they survive restarts and crashes and nothing
   without that key adds one. The start that sets device trust up approves every server the config lists then,
-  so upgrading asks nothing; a config edited just before that start is taken as approved. One-off runs gate
+  before it keeps the trust key, so upgrading asks nothing and a stop part way redoes the whole set-up; a config edited just before that start is taken as approved. One-off runs gate
   nothing, reading as `op` itself would. Logins and program reads have their own prompts and pass no consumer
 - Reads go through the 1Password app integration, so the Mac prompts. A service account token
   (`OP_SERVICE_ACCOUNT_TOKEN`) would read without prompting, but it is a reusable credential on the Mac that
@@ -724,7 +724,8 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   before an unpair and put back restores that phone's trust; it is still useless without that phone's Secure
   Enclave key. Unpairing drops the record before anything else and fails when it cannot. `companion trust`
   takes the device from the config file as it is now and checks it is still listed the same once approved, and
-  `companion list` shows devices appended to the file since the start as untrusted, with their fingerprints
+  `companion list` shows devices appended to the file since the start as untrusted, with their fingerprints,
+  and an untrusted device under the name the file gives it now
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
   one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
   stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt

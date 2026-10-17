@@ -12,8 +12,8 @@
 //! a key derived from the device trust key, so nothing without that key can
 //! add one. They outlive restarts and crashes, so a changed server keeps
 //! needing approval until it gets one. On the start that sets device trust
-//! up, every server the config lists then is approved, so upgrading asks
-//! nothing
+//! up, every server the config lists then is approved, before the key is
+//! kept, so upgrading asks nothing and a stop part way does it all again
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -147,10 +147,8 @@ impl Approved {
         Self { gate: None }
     }
 
-    /// The approvals on `state_dir` under `key`; with `set_up`, the start
-    /// that made the device trust key, every server `config` lists is
-    /// approved for the references it uses
-    pub fn open(state_dir: &Path, key: Option<[u8; 32]>, config: &Config, set_up: bool) -> Self {
+    /// The approvals on `state_dir` under `key`
+    pub fn open(state_dir: &Path, key: Option<[u8; 32]>) -> Self {
         let key = key.and_then(|key| Hmac::<Sha256>::new_from_slice(&key).ok());
         let path = state_dir.join(FILE);
         let pairs = match &key {
@@ -165,24 +163,42 @@ impl Approved {
                 HashSet::new()
             }
         };
-        let approved = Self {
+
+        Self {
             gate: Some(Gate {
                 key,
                 path,
                 pairs: Mutex::new(pairs),
             }),
-        };
+        }
+    }
 
-        if set_up {
-            for (name, server) in &config.servers {
-                let consumer = Consumer::of(name, server);
-                for reference in server_references(server) {
-                    approved.approve(&consumer, reference);
-                }
+    /// Approves every server `config` lists for the references it uses,
+    /// under `key`, as the start that sets device trust up does; an error
+    /// when they cannot be kept, which has that set-up done again
+    pub fn approve_config(
+        state_dir: &Path,
+        key: Option<[u8; 32]>,
+        config: &Config,
+    ) -> Result<(), String> {
+        let key = key
+            .and_then(|key| Hmac::<Sha256>::new_from_slice(&key).ok())
+            .ok_or("no key to approve the config's servers under")?;
+        let path = state_dir.join(FILE);
+        // under a new key nothing older verifies, so it starts afresh
+        let mut entries = Entries::default();
+        for (name, server) in &config.servers {
+            let consumer = Consumer::of(name, server);
+            for reference in server_references(server) {
+                entries.entries.push(Entry {
+                    reference: reference.to_owned(),
+                    consumer: consumer.digest.clone(),
+                    tag: hex::encode(tag(&key, reference, &consumer.digest)),
+                });
             }
         }
 
-        approved
+        save(&path, &entries)
     }
 
     /// Whether `consumer` may be given the value of `reference` without

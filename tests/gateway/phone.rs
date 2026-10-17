@@ -1374,6 +1374,28 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
     };
     assert_eq!(trusted("iphone"), Some(json!(true)), "{listed}");
     assert_eq!(trusted("stranger"), Some(json!(false)), "{listed}");
+
+    // renamed in the file, an untrusted phone is listed under the name
+    // `companion trust` would take
+    let listed_text = std::fs::read_to_string(&path)?;
+    std::fs::write(
+        &path,
+        listed_text.replacen("name = \"stranger\"", "name = \"renamed\"", 1),
+    )?;
+    let (_, renamed) = harness
+        .admin_json("/admin/companion/list", &Value::Null)
+        .await?;
+    let names: Vec<&str> = renamed["devices"]
+        .as_array()
+        .map(|devices| {
+            devices
+                .iter()
+                .filter_map(|device| device["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(names, ["iphone", "renamed"], "{renamed}");
+    std::fs::write(&path, listed_text)?;
     let refused = match stranger.dial(MOBILE_ALPN).await {
         Ok(connection) => stranger
             .request(

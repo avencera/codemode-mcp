@@ -154,18 +154,32 @@ pub struct DeviceTrust {
     records: PathBuf,
     /// One read-modify-write of the records at a time
     writing: std::sync::Mutex<()>,
-    /// Whether this start set trust up, trusting what the config listed
-    set_up: bool,
 }
 
 impl DeviceTrust {
     /// The trust on `state_dir`; with `may_create`, a missing key is made and
     /// every device `listed` names is trusted. Only the daemon may create:
     /// a one-off run without a key trusts nothing
-    pub fn open(state_dir: &Path, listed: &SecretsConfig, may_create: bool) -> Self {
+    ///
+    /// `set_up_also` runs on a first start before the key is kept, for what
+    /// else the config as it stands is taken to approve; when it fails, or
+    /// the daemon stops before the key is kept, the next start does the
+    /// whole set-up again under a new key
+    pub fn open(
+        state_dir: &Path,
+        listed: &SecretsConfig,
+        may_create: bool,
+        set_up_also: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> Self {
         let store = KeyStore::for_state(state_dir, true, KEYCHAIN_ITEM, KEY_FILE);
 
-        Self::open_with(&store, state_dir.join(RECORDS_FILE), listed, may_create)
+        Self::open_with(
+            &store,
+            state_dir.join(RECORDS_FILE),
+            listed,
+            may_create,
+            set_up_also,
+        )
     }
 
     fn open_with(
@@ -173,25 +187,37 @@ impl DeviceTrust {
         records: PathBuf,
         listed: &SecretsConfig,
         may_create: bool,
+        set_up_also: impl FnOnce(&Self) -> Result<(), String>,
     ) -> Self {
         let with_key = |key: &[u8; 32]| Self {
             key: Hmac::<Sha256>::new_from_slice(key).ok(),
             records: records.clone(),
             writing: std::sync::Mutex::new(()),
-            set_up: false,
         };
         let none = || Self {
             key: None,
             records: records.clone(),
             writing: std::sync::Mutex::new(()),
-            set_up: false,
         };
 
         match store.read() {
-            Ok(Some(key)) => with_key(&key),
+            Ok(Some(key)) => {
+                let trust = with_key(&key);
+                // a set-up that stopped between keeping its key and marking
+                // the records is complete but for the mark; marking only
+                // makes a later lost key trust nothing
+                if may_create
+                    && !trust.load().committed
+                    && let Err(error) = trust.commit()
+                {
+                    tracing::warn!(%error, "could not mark device trust as set up");
+                }
+
+                trust
+            }
             Ok(None) if may_create => {
                 let key: [u8; 32] = rand::random();
-                let mut trust = with_key(&key);
+                let trust = with_key(&key);
                 // only no records, or records of a set-up that stopped before
                 // its key was kept, are a first start; committed records, or
                 // ones that cannot be read, mean the key was lost
@@ -218,12 +244,14 @@ impl DeviceTrust {
                     return trust;
                 }
 
-                // records first, then the key, then the mark that both are
-                // kept: a stop anywhere before the mark is redone next start
+                // records and the rest first, then the key, then the mark:
+                // a stop before the key is kept is redone next start, and
+                // one after it only lacks the mark, which that start adds
                 let devices = Device::listed(listed);
                 let set_up = devices
                     .iter()
                     .try_for_each(|device| trust.trust(device))
+                    .and_then(|()| set_up_also(&trust))
                     .and_then(|()| store.put(&key))
                     .and_then(|()| trust.commit());
                 if let Err(error) = set_up {
@@ -236,8 +264,6 @@ impl DeviceTrust {
                     devices = %names.join(", "),
                     "set up device trust, trusting the companions and phones the config lists"
                 );
-                trust.set_up = true;
-
                 trust
             }
             Ok(None) => none(),
@@ -252,12 +278,6 @@ impl DeviceTrust {
     /// Whether the key could be read, so records can be checked at all
     pub fn has_key(&self) -> bool {
         self.key.is_some()
-    }
-
-    /// Whether this start set trust up, trusting what the config listed;
-    /// what else the config named then is taken as approved too
-    pub fn set_up(&self) -> bool {
-        self.set_up
     }
 
     /// A key for `domain`, derived from the trust key so it is as hard to
@@ -439,14 +459,18 @@ impl Companions {
             .map(|config| Device::listed(&config.secrets))
             .unwrap_or_default();
         for device in in_file {
-            if !devices
-                .iter()
-                .any(|listed| listed.device.identity() == device.identity())
+            match devices
+                .iter_mut()
+                .find(|listed| listed.device.identity() == device.identity())
             {
-                devices.push(ListedDevice {
+                // an untrusted one shows as the file names it now, the name
+                // `companion trust` takes
+                Some(listed) if !listed.trusted => listed.device = device,
+                Some(_) => {}
+                None => devices.push(ListedDevice {
                     device,
                     trusted: false,
-                });
+                }),
             }
         }
 
@@ -632,8 +656,20 @@ mod tests {
         let records = directory.join(RECORDS_FILE);
         let store = KeyStore::File(directory.join(KEY_FILE));
         let none = SecretsConfig::default();
+        // a device trust and whether its first-start set-up ran
+        let open = |store: &KeyStore, records: PathBuf, listed: &SecretsConfig| {
+            let ran = std::cell::Cell::new(false);
+            let trust = DeviceTrust::open_with(store, records, listed, true, |_| {
+                ran.set(true);
 
-        let trust = DeviceTrust::open_with(&store, records.clone(), &none, true);
+                Ok(())
+            });
+
+            (trust, ran.get())
+        };
+
+        let (trust, set_up) = open(&store, records.clone(), &none);
+        assert!(set_up);
         assert!(trust.has_key());
         assert!(!trust.is_trusted(&phone(1)));
         trust
@@ -645,14 +681,15 @@ mod tests {
 
         // a record written by hand under another key does not verify
         let other = KeyStore::File(directory.join("other.key"));
-        let forger = DeviceTrust::open_with(&other, directory.join("forged"), &none, true);
+        let (forger, _) = open(&other, directory.join("forged"), &none);
         forger
             .trust(&phone(2))
             .unwrap_or_else(|error| panic!("{error}"));
         let forged = std::fs::read_to_string(directory.join("forged"))
             .unwrap_or_else(|error| panic!("{error}"));
         std::fs::write(&records, forged).unwrap_or_else(|error| panic!("{error}"));
-        let reopened = DeviceTrust::open_with(&store, records.clone(), &none, true);
+        let (reopened, set_up) = open(&store, records.clone(), &none);
+        assert!(!set_up);
         assert!(!reopened.is_trusted(&phone(2)));
         assert!(!reopened.is_trusted(&phone(1)));
 
@@ -665,23 +702,35 @@ mod tests {
             }],
             ..SecretsConfig::default()
         };
-        let rekeyed = DeviceTrust::open_with(&store, records.clone(), &listed, true);
+        let (rekeyed, set_up) = open(&store, records.clone(), &listed);
         assert!(rekeyed.has_key());
         assert!(!rekeyed.is_trusted(&phone(3)));
-        assert!(!rekeyed.set_up());
+        assert!(!set_up);
 
         // a set-up that stopped before its key was kept is redone
         let _ = std::fs::remove_file(directory.join(KEY_FILE));
         std::fs::write(&records, r#"{"records":[]}"#).unwrap_or_else(|error| panic!("{error}"));
-        let redone = DeviceTrust::open_with(&store, records.clone(), &listed, true);
-        assert!(redone.set_up());
+        let (redone, set_up) = open(&store, records.clone(), &listed);
+        assert!(set_up);
         assert!(redone.is_trusted(&phone(3)));
+
+        // so is one whose other set-up failed, as approving the config's
+        // servers would, leaving the records unmarked
+        let _ = std::fs::remove_file(directory.join(KEY_FILE));
+        std::fs::write(&records, r#"{"records":[]}"#).unwrap_or_else(|error| panic!("{error}"));
+        let failed = DeviceTrust::open_with(&store, records.clone(), &listed, true, |_| {
+            Err("no room".to_owned())
+        });
+        assert!(!failed.has_key());
+        let (again, set_up) = open(&store, records.clone(), &listed);
+        assert!(set_up);
+        assert!(again.is_trusted(&phone(3)));
 
         // records that cannot be read are not a first start either
         let _ = std::fs::remove_file(directory.join(KEY_FILE));
         std::fs::write(&records, "not json").unwrap_or_else(|error| panic!("{error}"));
-        let unreadable = DeviceTrust::open_with(&store, records, &listed, true);
-        assert!(!unreadable.set_up());
+        let (unreadable, set_up) = open(&store, records, &listed);
+        assert!(!set_up);
         assert!(!unreadable.is_trusted(&phone(3)));
 
         let _ = std::fs::remove_dir_all(&directory);

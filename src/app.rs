@@ -172,15 +172,14 @@ impl App {
         let on_mac = presence.clone().filter(|_| config.notify.mac.enabled);
         // only the daemon sets trust up: a one-off run without the key trusts
         // nothing rather than whatever the config lists
-        let trust = DeviceTrust::open(&state_dir, &config.secrets, role == Role::Daemon);
+        // with the servers the config lists approved for their values as
+        // part of the same set-up, so upgrading asks nothing
+        let trust = DeviceTrust::open(&state_dir, &config.secrets, role == Role::Daemon, |trust| {
+            Approved::approve_config(&state_dir, trust.derived_key(approved::KEY_DOMAIN), &config)
+        });
         // a one-off run reads as `op` itself would, so it gates nothing
         let approved = match role {
-            Role::Daemon => Approved::open(
-                &state_dir,
-                trust.derived_key(approved::KEY_DOMAIN),
-                &config,
-                trust.set_up(),
-            ),
+            Role::Daemon => Approved::open(&state_dir, trust.derived_key(approved::KEY_DOMAIN)),
             Role::OneOff => Approved::ungated(),
         };
         let secrets = Secrets::new(
