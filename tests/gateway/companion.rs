@@ -1995,5 +1995,34 @@ async fn op_read_of_several_references_prints_them_as_json_after_one_approval() 
     assert!(!ok && stderr.contains("60 minutes"), "{stderr}");
     assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
 
+    // `op run` names its command with each argument quoted, so a grant for
+    // `sh -c 'echo a b'` is never one for `sh -c echo a b`, and refuses to
+    // keep values for a command the prompt cannot show exactly
+    let directory = std::fs::canonicalize(rig.harness.state_dir())?;
+    let env_file = directory.join("run.env");
+    std::fs::write(&env_file, format!("APP_TOKEN={SECOND_REFERENCE}\n"))?;
+    let env_arg = env_file.display().to_string();
+    let run = async |script: &str, keep: bool| {
+        let mut args = vec!["op", "run", "--env-file", env_arg.as_str()];
+        if keep {
+            args.extend(["--keep", "5m"]);
+        }
+        args.extend(["--", "sh", "-c", script]);
+
+        cli(&rig, &args).await
+    };
+    for refused in ["echo one\necho two", "\u{202e}echo hidden"] {
+        let (ok, _, stderr) = run(refused, true).await?;
+        assert!(!ok && stderr.contains("--keep needs"), "{stderr}");
+    }
+    assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
+    let (ok, stdout, stderr) = run("echo a b", true).await?;
+    assert!(ok && stdout == "a b\n", "{stderr}");
+    let prompts = program_prompts(&rig.companion_mac);
+    assert!(
+        prompts[1].contains("for \"the environment of sh -c 'echo a b'\""),
+        "{prompts:?}"
+    );
+
     rig.stop().await
 }
