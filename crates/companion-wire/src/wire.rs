@@ -6,8 +6,9 @@
 
 use std::net::SocketAddr;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use iroh_base::EndpointId;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::mobile::PhoneRegistration;
 
@@ -204,15 +205,98 @@ pub struct CompanionFault {
     pub message: String,
 }
 
+/// One value of a program read: the bytes 1Password holds
+///
+/// UTF-8 text goes on the wire as a JSON string, as it always has, so
+/// gateways, companions and phones from before binary values still read
+/// each other's text. Other bytes, such as a `.p12` file attached to an
+/// item, go as `{"base64": "..."}`, which those older peers refuse as a
+/// malformed answer rather than misread
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ProgramValue(Vec<u8>);
+
+impl ProgramValue {
+    /// The bytes as 1Password holds them
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The value as text, when it is UTF-8
+    pub fn as_text(&self) -> Option<&str> {
+        std::str::from_utf8(&self.0).ok()
+    }
+
+    /// Whether the value holds no bytes
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The bytes as 1Password holds them
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<String> for ProgramValue {
+    fn from(text: String) -> Self {
+        Self(text.into_bytes())
+    }
+}
+
+impl From<Vec<u8>> for ProgramValue {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for ProgramValue {
+    // the value stays out of logs
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ProgramValue({} bytes)", self.0.len())
+    }
+}
+
+/// [`ProgramValue`] as it is written on the wire
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WireValue<'a> {
+    Text(std::borrow::Cow<'a, str>),
+    Binary { base64: String },
+}
+
+impl Serialize for ProgramValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match std::str::from_utf8(&self.0) {
+            Ok(text) => WireValue::Text(text.into()),
+            Err(_) => WireValue::Binary {
+                base64: STANDARD.encode(&self.0),
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProgramValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match WireValue::deserialize(deserializer)? {
+            WireValue::Text(text) => Ok(Self::from(text.into_owned())),
+            WireValue::Binary { base64 } => STANDARD
+                .decode(base64)
+                .map(Self)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 /// A companion's answer: `{"value": "..."}`, `{"values": [...]}` or
 /// `{"error": {...}}`
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionResponse {
-    /// The value 1Password holds
+    /// The value 1Password holds, for a config read, which is always text
     Value(String),
     /// The values of a program read, one per item in the order asked
-    Values(Vec<String>),
+    Values(Vec<ProgramValue>),
     /// Nothing was read
     Error(CompanionFault),
 }
@@ -348,6 +432,26 @@ mod tests {
     #[test]
     fn debug_output_never_holds_the_value() {
         assert!(!format!("{:?}", request()).contains("hunter2"));
+    }
+
+    #[test]
+    fn text_stays_a_string_on_the_wire_and_other_bytes_go_as_base64() {
+        let values = [
+            ProgramValue::from("hunter2".to_owned()),
+            ProgramValue::from(vec![0x30, 0x82, 0x00, 0xff]),
+        ];
+        let body =
+            serde_json::to_value(CompanionResponse::Values(values.to_vec())).unwrap_or_default();
+
+        // peers from before binary values read the text as they always did
+        assert_eq!(
+            body,
+            serde_json::json!({ "values": ["hunter2", { "base64": "MIIA/w==" }] })
+        );
+        assert_eq!(
+            serde_json::from_value::<CompanionResponse>(body).ok(),
+            Some(CompanionResponse::Values(values.to_vec()))
+        );
     }
 
     #[test]

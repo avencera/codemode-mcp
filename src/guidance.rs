@@ -66,7 +66,9 @@ macro_rules! onepassword_rule {
          run --env-file FILE --reason WHY -- COMMAND`, which puts the value in that command's \
          environment only and masks it in its output. `codemode-mcp op read` prints values, so use it \
          only when nothing else will do; pass `--describe \"Pushover app token\"` instead of a \
-         reference when you do not know the item. The user approves each batch once, with Touch ID on \
+         reference when you do not know the item. A file attached to an item, such as a `.p12`, is \
+         not text: write it with `codemode-mcp op read REFERENCE --out-file PATH`, which keeps its \
+         exact bytes, since env files, templates and `op run` take text only. The user approves each batch once, with Touch ID on \
          this Mac or on their phone or other Mac, and sees the file it goes to; add `--keep 15m` (or \
          `keep_minutes`) only when the next few commands send the same values to the same file or \
          command. Prefer all of these to \

@@ -183,10 +183,10 @@ pub fn check_writable(path: &Path, force: bool) -> std::io::Result<()> {
 /// Writes `contents` to `path` with `mode`, replacing an existing file only
 /// with `force`
 ///
-/// The text goes to a new file beside `path`, created with `mode` before
+/// The contents go to a new file beside `path`, created with `mode` before
 /// anything is written, then renamed over it, so the values are never in a
 /// file others could read, and a reader never sees half of it
-pub fn write_private(path: &Path, contents: &str, mode: u32, force: bool) -> std::io::Result<()> {
+pub fn write_private(path: &Path, contents: &[u8], mode: u32, force: bool) -> std::io::Result<()> {
     write_private_for(path, contents, mode, force, None)
 }
 
@@ -195,7 +195,7 @@ pub fn write_private(path: &Path, contents: &str, mode: u32, force: bool) -> std
 /// group cannot be set they are dropped
 pub fn write_private_for(
     path: &Path,
-    contents: &str,
+    contents: &[u8],
     mode: u32,
     force: bool,
     group: Option<u32>,
@@ -230,7 +230,7 @@ pub fn write_private_for(
         };
         // the umask may have taken bits off the mode asked for
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        file.write_all(contents.as_bytes())?;
+        file.write_all(contents)?;
         file.sync_all()?;
 
         if force {

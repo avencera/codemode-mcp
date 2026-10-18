@@ -15,7 +15,7 @@ use std::{collections::HashMap, time::Duration};
 use companion_wire::{
     MAX_BODY_BYTES,
     mobile::{PhoneProgramRead, PhoneRead, ProgramItem, RequestId, seal_info},
-    wire::{CompanionErrorCode, CompanionFault, CompanionResponse, MAX_KEEP_SECS},
+    wire::{CompanionErrorCode, CompanionFault, CompanionResponse, MAX_KEEP_SECS, ProgramValue},
 };
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tokio::sync::oneshot;
@@ -277,7 +277,9 @@ impl RequestState {
         if sealed.is_empty() {
             let values = (0..count).filter_map(|index| entered.remove(&index));
             self.send(CompanionResponse::Values(
-                values.map(|Secret(value)| value).collect(),
+                values
+                    .map(|Secret(value)| ProgramValue::from(value))
+                    .collect(),
             ));
 
             return false;
@@ -331,7 +333,7 @@ impl RequestState {
         let mut opened = opened.into_iter();
         let values = (0..program.items.len())
             .filter_map(|index| entered.remove(&index).or_else(|| opened.next()))
-            .map(|Secret(value)| value)
+            .map(|Secret(value)| ProgramValue::from(value))
             .collect();
         self.send(CompanionResponse::Values(values));
     }

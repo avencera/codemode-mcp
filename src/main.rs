@@ -2,7 +2,7 @@
 //! one script against the configured upstreams
 
 use std::{
-    io::{IsTerminal, Read},
+    io::{IsTerminal, Read, Write},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -22,11 +22,12 @@ use codemode_mcp::{
     catalog::function_prefix,
     companion::{
         self, AnyTicket, InviteStatus, InviteTicket, Joining, PairCheck, Paired, Pairing,
-        ProgramTarget, Ticket,
+        ProgramTarget, ProgramValue, Ticket,
     },
     config::{Config, ConfigError, expand_home},
     executions::WaitResult,
     op,
+    secrets::NOT_TEXT,
     server::{Listeners, outcome_text},
     service::{self, Action, ServicePaths},
     store::{self, Store},
@@ -2049,28 +2050,48 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                 },
             )
             .await?;
-            let mut text = if several {
+            let mut contents = if several {
                 // keyed as the daemon read them, trimmed; a repeat is one key
-                let map: std::collections::BTreeMap<_, _> = references
+                let mut map = std::collections::BTreeMap::new();
+                for (reference, value) in references
                     .iter()
                     .map(|reference| reference.trim())
                     .zip(&values)
-                    .collect();
-                serde_json::to_string_pretty(&map)?
+                {
+                    let text = value.as_text().ok_or_else(|| {
+                        eyre!("{reference} cannot go in a JSON object: {NOT_TEXT}")
+                    })?;
+                    map.insert(reference, text);
+                }
+
+                serde_json::to_string_pretty(&map)?.into_bytes()
             } else {
-                values.into_iter().next().unwrap_or_default()
+                values.into_iter().next().unwrap_or_default().into_bytes()
             };
-            if !no_newline {
-                text.push('\n');
+            // a file such as a `.p12` is written exactly as 1Password holds
+            // it, since a newline after it would change it
+            let binary = std::str::from_utf8(&contents).is_err();
+            if !no_newline && !binary {
+                contents.push(b'\n');
             }
 
             match out_file {
                 Some(path) => {
-                    op::write_private(&path, &text, file_mode, force)
+                    op::write_private(&path, &contents, file_mode, force)
                         .wrap_err_with(|| format!("cannot write {}", path.display()))?;
                     eprintln!("Wrote {}", path.display());
                 }
-                None => print!("{text}"),
+                // raw bytes could set off a terminal's control sequences
+                None if binary && std::io::stdout().is_terminal() => {
+                    bail!(
+                        "the value holds binary data such as a file; write it with --out-file <path>"
+                    )
+                }
+                None => {
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(&contents)?;
+                    stdout.flush()?;
+                }
             }
         }
         OpCommand::Inject {
@@ -2116,7 +2137,7 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
 
             match out_file {
                 Some(path) => {
-                    op::write_private(&path, &filled, file_mode, force)
+                    op::write_private(&path, filled.as_bytes(), file_mode, force)
                         .wrap_err_with(|| format!("cannot write {}", path.display()))?;
                     eprintln!("Wrote {} with {} values", path.display(), values.len());
                 }
@@ -2362,12 +2383,26 @@ async fn program_map(
     };
     let values = program_values(config, request).await?;
 
-    Ok(references.into_iter().zip(values).collect())
+    references
+        .into_iter()
+        .zip(values)
+        .map(
+            |(reference, value)| match String::from_utf8(value.into_bytes()) {
+                Ok(text) => Ok((reference, text)),
+                Err(_) => Err(eyre!(
+                    "{reference} cannot go in a template or an environment: {NOT_TEXT}"
+                )),
+            },
+        )
+        .collect()
 }
 
 /// Asks the daemon for the request's targets, which asks the owner, and
 /// returns one value per target
-async fn program_values(config: &Config, request: admin::OpReadRequest) -> Result<Vec<String>> {
+async fn program_values(
+    config: &Config,
+    request: admin::OpReadRequest,
+) -> Result<Vec<ProgramValue>> {
     let count = request.targets.len();
     let noun = if count == 1 { "value" } else { "values" };
     eprintln!(

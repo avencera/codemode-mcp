@@ -24,7 +24,7 @@ use tokio::{sync::Mutex, task::JoinSet};
 
 use self::approved::{Approved, Consumer};
 use crate::{
-    companion::{Companions, CreatedItem, DeviceTrust, NewItem},
+    companion::{Companions, CreatedItem, DeviceTrust, NewItem, ProgramValue},
     config::{Config, SecretsConfig},
     mac::{OnMac, TouchId},
     store::Store,
@@ -53,6 +53,10 @@ const MAX_ITEM_NAME_CHARS: usize = 80;
 pub const MAX_ITEM_VALUE_JSON_BYTES: usize = 32 * 1024;
 /// Longest `op://` reference accepted
 const MAX_REFERENCE_CHARS: usize = 256;
+/// Why a value that is not UTF-8, such as a `.p12` file attached to an item,
+/// cannot go where only text fits
+pub const NOT_TEXT: &str = "it holds binary data such as a file, not text; write it to its own \
+                            file with `codemode-mcp op read <reference> --out-file <path>`";
 
 /// The daemon's one 1Password reader and the companions it may ask, shared
 /// by upstream connections and OAuth logins so they keep one cache and one
@@ -880,7 +884,7 @@ struct KeptValues {
 /// A value a program may get again without asking until both clocks pass
 /// its end: `Instant` stops while the Mac sleeps, the wall clock can be set
 struct Kept {
-    value: String,
+    value: ProgramValue,
     until: std::time::Instant,
     until_wall: std::time::SystemTime,
 }
@@ -991,7 +995,7 @@ impl OnePassword {
         &self,
         destination: Option<&str>,
         references: &[String],
-    ) -> Option<Vec<String>> {
+    ) -> Option<Vec<ProgramValue>> {
         let mut kept = self.kept.lock().await;
         kept.grants.retain(|_, entry| entry.live());
         let destination = destination.map(str::to_owned);
@@ -1019,7 +1023,7 @@ impl OnePassword {
         &self,
         destination: Option<&str>,
         references: &[String],
-        values: &[String],
+        values: &[ProgramValue],
         keep: Duration,
         forgotten: u64,
     ) {
@@ -1311,13 +1315,25 @@ impl OnePassword {
             }
         }
 
-        self.read_local(reference).await
+        self.read_local_text(reference).await
     }
 
-    /// Runs `op read` on this Mac, with no cache and no companions
+    /// [`Self::read_local`] for a value that must be text, such as one going
+    /// into a server's config
+    pub async fn read_local_text(&self, reference: &str) -> Result<String, SecretError> {
+        let bytes = self.read_local(reference).await?;
+
+        String::from_utf8(bytes).map_err(|_| SecretError::Read {
+            reference: reference.to_owned(),
+            reason: NOT_TEXT.to_owned(),
+        })
+    }
+
+    /// Runs `op read` on this Mac, with no cache and no companions; the bytes
+    /// as 1Password holds them, which may be a file such as a `.p12`
     ///
     /// The companion side answers with this: every request asks anew
-    pub async fn read_local(&self, reference: &str) -> Result<String, SecretError> {
+    pub async fn read_local(&self, reference: &str) -> Result<Vec<u8>, SecretError> {
         let args = ["read", "--no-newline", reference];
         let output = tokio::time::timeout(READ_TIMEOUT, spawn::output(&self.program, &args, None))
             .await
@@ -1345,10 +1361,7 @@ impl OnePassword {
             });
         }
 
-        String::from_utf8(output.stdout).map_err(|_| SecretError::Read {
-            reference: reference.to_owned(),
-            reason: "the value is not UTF-8".to_owned(),
-        })
+        Ok(output.stdout)
     }
 
     /// Creates one item on this Mac, with no cache and no companions, unless

@@ -260,6 +260,12 @@ approved wherever the owner is
   grow into a value). It forwards SIGINT, SIGTERM and SIGHUP to the command and exits with its code, or 128
   plus the signal. Without `--force` the file is linked into place, which fails on a file that appeared while
   the owner was approving. References are deduplicated, so a template asks once per item
+- A program read's values are bytes (`ProgramValue`). On the wire and in the admin answer, text stays a JSON
+  string, so peers from before keep working, and anything else goes as `{"base64": "..."}`, which those peers
+  reject as a malformed answer instead of misreading it. Only `op read` takes a binary value, written as is with no
+  newline added. Templates, env files, environments and the JSON object of several references take text only, and
+  gateway config reads go through `read_local_text`. A binary value is never sealed to phones, because the app
+  answers with text
 - `op read` with several references prints a JSON object of each reference and its value. `--keep` takes `90s`,
   `15m`, `1h` or bare minutes, at most 60 minutes, and is checked before anyone is asked
 - The `secrets` builtin (`src/env_files.rs`) serves `write_env(path, vars, reason, keep_minutes)` in process,

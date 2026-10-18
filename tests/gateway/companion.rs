@@ -23,6 +23,10 @@ const REFERENCE: &str = "op://Dev/fixture/credential";
 /// A second item only the companion's `op` knows
 const SECOND_REFERENCE: &str = "op://Dev/second/credential";
 const SECOND_VALUE: &str = "second-value-from-companion";
+/// An item's attached `.p12`, which is not UTF-8
+const CERT_REFERENCE: &str = "op://Dev/signing/cert.p12";
+/// What the fake `op` prints for it, ending in a newline that is part of it
+const CERT_BYTES: &[u8] = &[0x30, 0x82, 0x00, 0xff, b'\n'];
 
 /// A gateway and one companion wired together over loopback
 struct Rig {
@@ -253,6 +257,7 @@ fn creating_op(signed_in: bool, slow_create: bool) -> Result<(PathBuf, PathBuf),
                  [ \"$3\" = {REFERENCE} ] && printf '{VALUE}' && exit 0\n\
                  [ \"$3\" = {SECOND_REFERENCE} ] && printf '{SECOND_VALUE}' && exit 0\n\
                  [ \"$3\" = op://Dev/big/credential ] && head -c 70000 /dev/zero | tr '\\0' a && exit 0\n\
+                 [ \"$3\" = {CERT_REFERENCE} ] && printf '\\060\\202\\000\\377\\n' && exit 0\n\
                  echo \"[ERROR] no item matched\" >&2; exit 1 ;;\n\
                'item list') case \"$*\" in\n\
                    *--include-archive*) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}},{{\"id\":\"old2\",\"title\":\"Archived\"}}]' ;;\n\
@@ -1754,6 +1759,44 @@ async fn op_inject_writes_a_private_file_and_op_run_masks_its_values() -> TestRe
     .await?;
     assert!(ok, "{stderr}");
     assert_eq!(stdout, "token is [redacted]\n");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binary_value_reaches_a_file_exactly_and_is_refused_where_only_text_fits() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    let directory = std::fs::canonicalize({
+        let directory = temp_state_dir();
+        std::fs::create_dir_all(&directory)?;
+        directory
+    })?;
+    let out = directory.join("signing.p12");
+    let out_arg = out.display().to_string();
+
+    let (ok, stdout, stderr) = cli(
+        &rig,
+        &["op", "read", CERT_REFERENCE, "-o", out_arg.as_str()],
+    )
+    .await?;
+    assert!(ok, "{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    // no newline is added after a file's bytes
+    assert_eq!(std::fs::read(&out)?, CERT_BYTES);
+    assert_eq!(std::fs::metadata(&out)?.permissions().mode() & 0o777, 0o600);
+
+    // a template is text, so the read is refused by name after the approval
+    let template = directory.join("signing.env.tpl");
+    std::fs::write(&template, format!("CERT={{{{ {CERT_REFERENCE} }}}}\n"))?;
+    let template_arg = template.display().to_string();
+    let (ok, stdout, stderr) = cli(&rig, &["op", "inject", "-i", template_arg.as_str()]).await?;
+    assert!(!ok && stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains(CERT_REFERENCE) && stderr.contains("--out-file"),
+        "{stderr}"
+    );
 
     rig.stop().await
 }

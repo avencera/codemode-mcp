@@ -26,7 +26,8 @@ use companion_wire::{
     seal::{SoftwareKey, seal},
     ticket::{InviteSecret, InviteTicket},
     wire::{
-        CompanionErrorCode, CompanionResponse, PairCheck, PairRequest, PairResponse, Registered,
+        CompanionErrorCode, CompanionResponse, PairCheck, PairRequest, PairResponse, ProgramValue,
+        Registered,
     },
 };
 use iroh::{
@@ -36,6 +37,16 @@ use iroh::{
 use tokio::sync::watch;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+/// A program read's answer of text values
+fn texts(values: &[&str]) -> CompanionResponse {
+    CompanionResponse::Values(
+        values
+            .iter()
+            .map(|value| ProgramValue::from((*value).to_owned()))
+            .collect(),
+    )
+}
 
 const REFERENCE: &str = "op://Dev/fixture/credential";
 const VALUE: &str = "value-from-1password";
@@ -1252,10 +1263,7 @@ async fn a_program_read_opens_its_sealed_items_with_one_face_id() -> TestResult 
 
     // one Approve opens all three
     app.dispatch(AppAction::Approve { id: id.to_string() });
-    assert_eq!(
-        reading.await??,
-        CompanionResponse::Values(values.map(str::to_owned).to_vec())
-    );
+    assert_eq!(reading.await??, texts(&values));
     let all = [REFERENCE, others[0], others[1]]
         .map(str::to_owned)
         .to_vec();
@@ -1320,14 +1328,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
         id.to_string(),
         HashMap::from([(1, "entered-1".to_owned()), (2, "entered-2".to_owned())]),
     );
-    assert_eq!(
-        reading.await??,
-        CompanionResponse::Values(vec![
-            VALUE.to_owned(),
-            "entered-1".to_owned(),
-            "entered-2".to_owned()
-        ])
-    );
+    assert_eq!(reading.await??, texts(&[VALUE, "entered-1", "entered-2"]));
     assert_eq!(platform.batch_prompts().len(), 1);
     assert_eq!(platform.batch_prompts()[0].1, 3);
 
@@ -1352,10 +1353,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
         id.to_string(),
         HashMap::from([(0, "fresher".to_owned()), (1, "user-key".to_owned())]),
     );
-    assert_eq!(
-        reading.await??,
-        CompanionResponse::Values(vec!["fresher".to_owned(), "user-key".to_owned()])
-    );
+    assert_eq!(reading.await??, texts(&["fresher", "user-key"]));
     assert_eq!(platform.batch_prompts().len(), 1);
 
     // values that do not fit in one answer are refused, not cut
@@ -1566,10 +1564,7 @@ async fn an_approval_made_while_another_prompt_is_up_runs_when_it_ends() -> Test
         id: first.to_string(),
     });
     assert!(matches!(first_reading.await??, CompanionResponse::Error(_)));
-    assert_eq!(
-        second_reading.await??,
-        CompanionResponse::Values(vec![VALUE.to_owned(), "app-token".to_owned()])
-    );
+    assert_eq!(second_reading.await??, texts(&[VALUE, "app-token"]));
     assert_eq!(platform.batch_prompts().len(), 2);
 
     Ok(())

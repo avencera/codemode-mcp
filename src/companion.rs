@@ -38,7 +38,8 @@ pub use trust::{Device, DeviceTrust, ListedDevice};
 pub use wire::{
     CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode, CompanionFault,
     CompanionProgramRequest, CompanionRequest, CompanionResponse, CreatedItem, MALFORMED_REQUEST,
-    NewItem, PairCheck, PairRequest, PairResponse, ProgramBatch, Registered, Registration,
+    NewItem, PairCheck, PairRequest, PairResponse, ProgramBatch, ProgramValue, Registered,
+    Registration,
 };
 
 use std::time::Duration;

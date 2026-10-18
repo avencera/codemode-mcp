@@ -27,7 +27,7 @@ use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use super::{
     ASK_TIMEOUT, CompanionErrorCode, CompanionFailure, CompanionProgramRequest, CompanionResponse,
-    Companions, MALFORMED_REQUEST, MAX_PHONE_READ_BYTES, ProgramBatch, apns::Subject,
+    Companions, MALFORMED_REQUEST, MAX_PHONE_READ_BYTES, ProgramBatch, ProgramValue, apns::Subject,
 };
 use crate::{
     config::{CompanionPeer, PhonePeer},
@@ -56,8 +56,8 @@ pub enum ProgramTarget {
 pub struct ProgramValues {
     /// `this Mac`, or the name of the companion or phone that answered
     pub source: String,
-    /// One value per target
-    pub values: Vec<String>,
+    /// One value per target, as 1Password holds it, which may not be text
+    pub values: Vec<ProgramValue>,
 }
 
 impl std::fmt::Debug for ProgramValues {
@@ -308,7 +308,7 @@ impl OnePassword {
             return Err(ProgramReadError::Failed(message.to_owned()));
         }
 
-        let mut sources: JoinSet<(String, Result<Vec<String>, Miss>)> = JoinSet::new();
+        let mut sources: JoinSet<(String, Result<Vec<ProgramValue>, Miss>)> = JoinSet::new();
         // set once this Mac has failed, so the others need not sit out the
         // rest of the grace
         let (local_failed, grace_over) = watch::channel(!local);
@@ -412,8 +412,11 @@ impl OnePassword {
 
         if let Some(companions) = &companions {
             for (target, value) in targets.iter().zip(&outcome.values) {
-                if let ProgramTarget::Reference(reference) = target {
-                    companions.seal_for_phones(reference, value).await;
+                // a phone hands back what it opens as text, so a file such as
+                // a `.p12` is never sealed to it
+                if let (ProgramTarget::Reference(reference), Some(text)) = (target, value.as_text())
+                {
+                    companions.seal_for_phones(reference, text).await;
                 }
             }
         }
@@ -437,7 +440,7 @@ impl OnePassword {
         &self,
         references: &[String],
         context: &Context,
-    ) -> Result<Vec<String>, Miss> {
+    ) -> Result<Vec<ProgramValue>, Miss> {
         let Some(on_mac) = self.on_mac() else {
             return Err(Miss::Failed("this Mac: no Touch ID".to_owned()));
         };
@@ -468,7 +471,7 @@ impl OnePassword {
                 .read_local(reference)
                 .await
                 .map_err(|error| Miss::Failed(format!("this Mac: {error}")))?;
-            values.push(value);
+            values.push(ProgramValue::from(value));
         }
 
         Ok(values)
@@ -481,7 +484,7 @@ impl Companions {
         &self,
         peer: &CompanionPeer,
         batch: ProgramBatch,
-    ) -> Result<Vec<String>, CompanionFailure> {
+    ) -> Result<Vec<ProgramValue>, CompanionFailure> {
         let expected = batch.references.len();
         let request = serde_json::to_vec(&CompanionProgramRequest {
             program_read: batch,
@@ -536,7 +539,7 @@ impl Companions {
         targets: &[ProgramTarget],
         context: &Context,
         deadline: Instant,
-    ) -> Result<Vec<String>, CompanionFailure> {
+    ) -> Result<Vec<ProgramValue>, CompanionFailure> {
         let key = phone.id.to_string();
         let items: Vec<ProgramItem> = targets
             .iter()

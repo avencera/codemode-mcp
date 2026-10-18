@@ -30,7 +30,7 @@ use codemode_mcp::{
     app::App,
     companion::{
         self, CompanionErrorCode, CompanionFault, CompanionResponse, InviteTicket, MOBILE_ALPN,
-        PAIR_ALPN, PairCheck, PairRequest, PairResponse, Registration, Role,
+        PAIR_ALPN, PairCheck, PairRequest, PairResponse, ProgramValue, Registration, Role,
         mobile::{
             PhoneProgramRead, PhoneProgramRequest, PhoneRead, PhoneRegistration, PhoneRequest,
             PhoneResponse, ProgramItem, PushEnvironment, PushToken,
@@ -447,7 +447,7 @@ impl FakePhone {
                 (_, None) => Err("no sealed copy and nothing entered".to_owned()),
             };
             match value {
-                Ok(value) => values.push(value),
+                Ok(value) => values.push(ProgramValue::from(value)),
                 Err(message) => {
                     return CompanionResponse::Error(CompanionFault {
                         code: CompanionErrorCode::ReadFailed,

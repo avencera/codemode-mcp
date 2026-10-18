@@ -546,8 +546,9 @@ pub enum OpReadResponse {
     Values {
         /// `this Mac`, or the companion or phone that answered
         source: String,
-        /// The values
-        values: Vec<String>,
+        /// The values, each a string when it is text and otherwise
+        /// `{"base64": "..."}`
+        values: Vec<companion::ProgramValue>,
     },
     /// The request was refused before anyone was asked
     Invalid {

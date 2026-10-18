@@ -9,7 +9,7 @@ use super::{
     ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
     CompanionFault, CompanionProgramRequest, CompanionRequest, CompanionResponse,
     HANDSHAKE_TIMEOUT, Hangup, IdentityError, MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem,
-    ProgramBatch, Role, bind_endpoint, load_or_create, program,
+    ProgramBatch, ProgramValue, Role, bind_endpoint, load_or_create, program,
 };
 use crate::{
     config::CompanionConfig,
@@ -356,7 +356,7 @@ impl Companion {
         let mut values = Vec::with_capacity(references.len());
         for reference in &references {
             match self.onepassword.read_local(reference).await {
-                Ok(value) => values.push(value),
+                Ok(value) => values.push(ProgramValue::from(value)),
                 Err(error) => {
                     tracing::warn!(reference, %error, "program read failed on this Mac");
 
@@ -425,7 +425,8 @@ impl Companion {
             return fault(CompanionErrorCode::Denied, "not approved on this Mac");
         }
 
-        match self.onepassword.read_local(reference).await {
+        // a gateway's config read always wants text
+        match self.onepassword.read_local_text(reference).await {
             Ok(value) => {
                 let response = CompanionResponse::Value(value);
                 // the gateway reads at most MAX_BODY_BYTES, so a longer

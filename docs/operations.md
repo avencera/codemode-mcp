@@ -192,6 +192,12 @@ references print a JSON object of each reference and its value, after one approv
 does not know the item can describe it, as in `codemode-mcp op read --describe "Pushover app token"`. Only the
 phone can answer a description: you pick the item there with AutoFill.
 
+A file attached to an item, such as a signing certificate's `.p12`, is binary. Write it with
+`codemode-mcp op read "op://Personal/Signing/cert.p12" --out-file cert.p12`, which keeps its exact bytes and adds no
+newline; it is not printed to a terminal. Templates, env files, `write_env`, `op run` and a JSON object of several
+references take text only, so they name such a reference and refuse it after the approval. Phones are never sent a
+sealed copy of a binary value, so only this Mac or a companion Mac can answer one.
+
 Every request carries `--reason`, shown quoted as the program's claim. A request holds 1 to 20 values. Only the
 user that runs the daemon can make one: the CLI proves it holds the owner token in the daemon's state directory.
 

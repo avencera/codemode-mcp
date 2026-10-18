@@ -30,9 +30,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    companion::{ProgramAsk, ProgramTarget},
+    companion::{ProgramAsk, ProgramTarget, ProgramValue},
     op,
-    secrets::{OnePassword, Redactor, is_reference},
+    secrets::{NOT_TEXT, OnePassword, Redactor, is_reference},
 };
 
 const INSTRUCTIONS: &str = "Writes 1Password values into an env file on this Mac, such as a \
@@ -167,18 +167,25 @@ impl SecretsServer {
             read = self.0.onepassword.read_for_program(&ask) => read.map_err(failed)?,
             () = context.ct.cancelled() => return Err(failed(CANCELLED)),
         };
+        // a value that is not text cannot show up in a later text result
         self.0.redactor.add(
             read.values
                 .iter()
+                .filter_map(ProgramValue::as_text)
                 .filter(|value| !value.is_empty())
-                .cloned(),
+                .map(str::to_owned),
         );
-        let values: HashMap<String, String> = references.into_iter().zip(read.values).collect();
+        let values: HashMap<String, ProgramValue> =
+            references.into_iter().zip(read.values).collect();
         let mut lines = Vec::with_capacity(vars.len());
         for (key, reference) in &vars {
             let value = values
                 .get(reference)
-                .ok_or_else(|| failed(format!("no value was read for {reference}")))?;
+                .ok_or_else(|| failed(format!("no value was read for {reference}")))?
+                .as_text()
+                .ok_or_else(|| {
+                    failed(format!("{reference} cannot go in an env file: {NOT_TEXT}"))
+                })?;
             lines.push((key.clone(), env_line(key, value).map_err(failed)?));
         }
 
@@ -211,7 +218,7 @@ impl SecretsServer {
             }
             _ => (op::DEFAULT_FILE_MODE, None),
         };
-        op::write_private_for(&path, &merged.text, mode, true, group)
+        op::write_private_for(&path, merged.text.as_bytes(), mode, true, group)
             .map_err(|error| failed(format!("cannot write {}: {error}", path.display())))?;
 
         Ok(Json(EnvWritten {
