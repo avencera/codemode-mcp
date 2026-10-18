@@ -24,8 +24,11 @@ targets:
     platform: iOS
     sources:
       - Companion
+      - Shared
     dependencies:
       - package: CompanionCore
+      # embedded, so 1Password's share sheet lists the app
+      - target: CompanionShare
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.avencera.codemode-mcp.companion
@@ -55,3 +58,38 @@ targets:
         # an App Store export switches this to production
         aps-environment: development
         com.apple.developer.usernotifications.time-sensitive: true
+        # the share extension leaves shared files here for the app
+        com.apple.security.application-groups:
+          - group.com.avencera.codemode-mcp.companion
+  CompanionShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - CompanionShare
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.avencera.codemode-mcp.companion.share
+        PRODUCT_NAME: CompanionShare
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: CompanionShare/Info.plist
+      properties:
+        CFBundleDisplayName: CMCP Companion
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            # one shared file of any kind, such as a .p12 from 1Password
+            NSExtensionActivationRule: >-
+              SUBQUERY (extensionItems, $extensionItem, SUBQUERY
+              ($extensionItem.attachments, $attachment, ANY
+              $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO
+              "public.data").@count == 1).@count == 1
+    entitlements:
+      path: CompanionShare/CompanionShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.avencera.codemode-mcp.companion

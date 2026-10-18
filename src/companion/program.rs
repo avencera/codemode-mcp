@@ -27,7 +27,8 @@ use tokio::{sync::watch, task::JoinSet, time::Instant};
 
 use super::{
     ASK_TIMEOUT, CompanionErrorCode, CompanionFailure, CompanionProgramRequest, CompanionResponse,
-    Companions, MALFORMED_REQUEST, MAX_PHONE_READ_BYTES, ProgramBatch, ProgramValue, apns::Subject,
+    Companions, FindQuery, Found, MALFORMED_REQUEST, MAX_PHONE_READ_BYTES, ProgramBatch,
+    ProgramFound, ProgramValue, apns::Subject,
 };
 use crate::{
     config::{CompanionPeer, PhonePeer},
@@ -69,6 +70,35 @@ impl std::fmt::Debug for ProgramValues {
             .field("values", &self.values.len())
             .finish()
     }
+}
+
+/// A Mac's find for `description` as an answer; one that matched nothing
+/// leaves the phones to answer, rather than ending the read with nothing
+fn matched(source: &str, description: &str, found: Found) -> Result<Answer, Miss> {
+    if found.items.is_empty() {
+        return Err(Miss::Failed(format!(
+            "{source}: no 1Password item matches \"{description}\""
+        )));
+    }
+
+    Ok(Answer::Found(found))
+}
+
+/// What a program read answered
+#[derive(Debug)]
+pub enum ProgramRead {
+    /// The values, read or entered
+    Values(ProgramValues),
+    /// A Mac searched for the one description instead, since a Mac cannot
+    /// enter a value; nothing was read, and the program picks a reference
+    /// from these items and asks again
+    Found(ProgramFound),
+}
+
+/// What one device answered
+enum Answer {
+    Values(Vec<ProgramValue>),
+    Found(Found),
 }
 
 /// Why a program read gave no values; none of the text holds a value
@@ -268,15 +298,18 @@ impl OnePassword {
     /// destination and any keep window shown in every prompt; see the
     /// module docs for who is asked when
     ///
-    /// A batch holding a description goes to the phones only, since the
-    /// Macs have no way to enter a value. Values read for references are
-    /// sealed to the phones afterwards, so the next request opens with Face
-    /// ID there. With `ask.keep`, they are also kept in memory for that long
-    /// and handed out again without asking
+    /// A batch holding one description goes to the phones, where the owner
+    /// picks the item, and to the Macs as a find for it, answered as
+    /// [`ProgramRead::Found`] with nothing read, so the program asks again
+    /// with the reference it picks; whichever the owner approves first wins. A batch holding several goes
+    /// to the phones only. Values read for references are sealed to the
+    /// phones afterwards, so the next request opens with Face ID there. With
+    /// `ask.keep`, they are also kept in memory for that long and handed out
+    /// again without asking
     pub async fn read_for_program(
         &self,
         ask: &ProgramAsk,
-    ) -> Result<ProgramValues, ProgramReadError> {
+    ) -> Result<ProgramRead, ProgramReadError> {
         let targets = checked_targets(&ask.targets).map_err(ProgramReadError::Invalid)?;
         let context = Context {
             reason: clean_reason(ask.reason.as_deref()),
@@ -285,27 +318,39 @@ impl OnePassword {
             keep_secs: clean_keep(ask.keep.map(|keep| keep.as_secs())),
         };
         let references = all_references(&targets);
+        // a Mac cannot enter a value, but it can find the item one
+        // description means, and the program asks again with every
+        // reference; several would each need their own prompt
+        let mut descriptions = targets.iter().filter_map(|target| match target {
+            ProgramTarget::Describe(description) => Some(description),
+            ProgramTarget::Reference(_) => None,
+        });
+        let description = match (descriptions.next(), descriptions.next()) {
+            (Some(description), None) => Some(description.clone()),
+            _ => None,
+        };
+        let macs = references.is_some() || description.is_some();
         let forgotten = self.forgotten().await;
         if let Some(references) = &references
             && let Some(values) = self
                 .kept_values(context.destination.as_deref(), references)
                 .await
         {
-            return Ok(ProgramValues {
+            return Ok(ProgramRead::Values(ProgramValues {
                 source: "kept from an earlier approval".to_owned(),
                 values,
-            });
+            }));
         }
         let companions = self.companions().cloned();
 
-        let local = match (self.on_mac(), &references) {
-            (Some(on_mac), Some(_)) => {
+        let local = match self.on_mac() {
+            Some(on_mac) if macs => {
                 on_mac.config.touch_id && on_mac.mac.present(on_mac.config.idle()).await
             }
             _ => false,
         };
-        let peers = match (&companions, &references) {
-            (Some(companions), Some(_)) => companions.peers(),
+        let peers = match &companions {
+            Some(companions) if macs => companions.peers(),
             _ => Vec::new(),
         };
         let phones = companions
@@ -313,36 +358,47 @@ impl OnePassword {
             .map(|companions| companions.phones())
             .unwrap_or_default();
         if !local && peers.is_empty() && phones.is_empty() {
-            let message = if references.is_some() {
+            let message = if macs {
                 "nobody can approve this: the owner is away from this Mac and no companion Mac or \
                  phone is paired (`codemode-mcp companion invite`)"
             } else {
-                "only a phone can answer a description, and none is paired; pass op:// \
-                 references instead"
+                "only a phone can answer several descriptions, and none is paired; describe one \
+                 item at a time, or pass op:// references"
             };
 
             return Err(ProgramReadError::Failed(message.to_owned()));
         }
 
-        let mut sources: JoinSet<(String, Result<Vec<ProgramValue>, Miss>)> = JoinSet::new();
+        let mut sources: JoinSet<(String, Result<Answer, Miss>)> = JoinSet::new();
         // set once this Mac has failed, so the others need not sit out the
         // rest of the grace
         let (local_failed, grace_over) = watch::channel(!local);
         // held here too, since a sender dropped by a local read that
         // succeeded would end the grace early
         let local_failed = Arc::new(local_failed);
-        if let (true, Some(references)) = (local, &references) {
+        if local {
             let local_failed = Arc::clone(&local_failed);
             let onepassword = self.clone();
             let references = references.clone();
+            let description = description.clone();
             let context = context.clone();
             sources.spawn(async move {
-                let values = onepassword.read_here(&references, &context).await;
-                if values.is_err() {
+                let answer = match (&references, &description) {
+                    (Some(references), _) => onepassword
+                        .read_here(references, &context)
+                        .await
+                        .map(Answer::Values),
+                    (None, Some(description)) => onepassword
+                        .find_here(description, context.reason.as_deref())
+                        .await
+                        .and_then(|found| matched("this Mac", description, found)),
+                    (None, None) => Err(Miss::Failed("this Mac: nothing to read".to_owned())),
+                };
+                if answer.is_err() {
                     local_failed.send_replace(true);
                 }
 
-                ("this Mac".to_owned(), values)
+                ("this Mac".to_owned(), answer)
             });
         }
         // the owner at this Mac answers its prompt first, and a read answered
@@ -356,24 +412,43 @@ impl OnePassword {
             }
         };
         let deadline = Instant::now() + ASK_TIMEOUT;
-        if let (Some(references), Some(companions)) = (&references, &companions) {
+        if let Some(companions) = &companions {
             for peer in peers {
                 let companions = Arc::clone(companions);
-                let batch = ProgramBatch {
-                    references: references.clone(),
-                    reason: context.reason.clone(),
-                    destination: context.destination.clone(),
-                    keep_secs: context.keep_secs,
-                };
+                let references = references.clone();
+                let description = description.clone();
+                let context = context.clone();
                 let waited = wait_grace();
                 sources.spawn(async move {
                     waited.await;
-                    let values = companions
-                        .program_read_mac(&peer, batch)
-                        .await
-                        .map_err(|failure| Miss::from_failure(&peer.name, failure));
+                    let answer = match (references, description) {
+                        (Some(references), _) => {
+                            let batch = ProgramBatch {
+                                references,
+                                reason: context.reason,
+                                destination: context.destination,
+                                keep_secs: context.keep_secs,
+                            };
+                            companions
+                                .program_read_mac(&peer, batch)
+                                .await
+                                .map(Answer::Values)
+                                .map_err(|failure| Miss::from_failure(&peer.name, failure))
+                        }
+                        (None, description) => {
+                            let query = description.unwrap_or_default();
+                            let find = FindQuery {
+                                query: query.clone(),
+                                reason: context.reason,
+                            };
+                            match companions.find_mac(&peer, find).await {
+                                Ok(found) => matched(&peer.name, &query, found),
+                                Err(failure) => Err(Miss::from_failure(&peer.name, failure)),
+                            }
+                        }
+                    };
 
-                    (peer.name, values)
+                    (peer.name, answer)
                 });
             }
         }
@@ -389,6 +464,7 @@ impl OnePassword {
                 let values = companions
                     .program_read_phone(&phone, &targets, &context, deadline)
                     .await
+                    .map(Answer::Values)
                     .map_err(|failure| Miss::from_failure(&phone.name, failure));
 
                 (phone.name, values)
@@ -402,7 +478,7 @@ impl OnePassword {
             let mut failures = Vec::new();
             while let Some(finished) = sources.join_next().await {
                 match finished {
-                    Ok((source, Ok(values))) => return Ok(ProgramValues { source, values }),
+                    Ok((source, Ok(answer))) => return Ok((source, answer)),
                     Ok((_, Err(Miss::Denied(message)))) => {
                         return Err(ProgramReadError::Denied(message));
                     }
@@ -413,7 +489,7 @@ impl OnePassword {
 
             Err(ProgramReadError::Failed(failures.join("; ")))
         };
-        let outcome = tokio::time::timeout(ASK_TIMEOUT + grace, first)
+        let (source, answer) = tokio::time::timeout(ASK_TIMEOUT + grace, first)
             .await
             .unwrap_or_else(|_| {
                 Err(ProgramReadError::Failed(format!(
@@ -425,6 +501,12 @@ impl OnePassword {
         // the losers' prompts come down now, not after the sealing below
         drop(sources);
         drop(local_failed);
+
+        let values = match answer {
+            Answer::Values(values) => values,
+            Answer::Found(found) => return Ok(ProgramRead::Found(ProgramFound { source, found })),
+        };
+        let outcome = ProgramValues { source, values };
 
         if let Some(companions) = &companions {
             for (target, value) in targets.iter().zip(&outcome.values) {
@@ -447,7 +529,7 @@ impl OnePassword {
             .await;
         }
 
-        Ok(outcome)
+        Ok(ProgramRead::Values(outcome))
     }
 
     /// Asks on this Mac: its own Touch ID prompt naming every reference,

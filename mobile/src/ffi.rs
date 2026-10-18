@@ -10,12 +10,13 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use companion_wire::wire::ProgramValue;
 use ractor::{Actor, ActorRef};
 
 use crate::{
     app::{App, AppArgs, AppMsg, Shared},
     record::GatewayRecord,
-    request::Secret,
+    request::{Entered, Secret},
 };
 
 /// What the app shows
@@ -60,6 +61,32 @@ pub enum ConnectionState {
         /// Why the last one failed
         error: String,
     },
+}
+
+/// A value the owner entered for one item of a program read; no `Debug`, so
+/// it never reaches a log
+#[derive(uniffi::Enum)]
+pub enum EnteredValue {
+    /// Text pasted or filled in with AutoFill
+    Text {
+        /// The value
+        value: String,
+    },
+    /// A file shared from 1Password, such as a `.p12`
+    File {
+        /// Its bytes, at most [`max_file_bytes`]
+        bytes: Vec<u8>,
+    },
+}
+
+/// Most bytes a shared file may hold: it goes to the gateway base64 encoded,
+/// a third larger, in an answer of at most [`companion_wire::MAX_BODY_BYTES`]
+pub const MAX_FILE_BYTES: u32 = 44 * 1024;
+
+/// [`MAX_FILE_BYTES`], for the app to refuse a larger file before sending
+#[uniffi::export]
+pub fn max_file_bytes() -> u32 {
+    MAX_FILE_BYTES
 }
 
 /// One read the gateway asked this phone to approve
@@ -505,14 +532,21 @@ impl FfiApp {
     }
 
     /// Approves the program read `id`: sends `entered`, the values the owner
-    /// pasted or filled in keyed by item index, and opens every other item
-    /// with one Face ID. Nothing is sent unless each item has an entered
-    /// value or a sealed copy. Its own call for the same reason as
-    /// [`FfiApp::answer`]
-    pub fn answer_program(&self, id: String, entered: HashMap<u32, String>) {
+    /// pasted, filled in or shared from 1Password keyed by item index, and
+    /// opens every other item with one Face ID. Nothing is sent unless each
+    /// item has an entered value or a sealed copy. Its own call for the same
+    /// reason as [`FfiApp::answer`]
+    pub fn answer_program(&self, id: String, entered: HashMap<u32, EnteredValue>) {
         let entered = entered
             .into_iter()
-            .map(|(index, value)| (index, Secret(value)))
+            .map(|(index, value)| {
+                let value = match value {
+                    EnteredValue::Text { value } => ProgramValue::from(value),
+                    EnteredValue::File { bytes } => ProgramValue::from(bytes),
+                };
+
+                (index, Entered(value))
+            })
             .collect();
         if let Err(error) = self.actor.cast(AppMsg::AnswerProgram { id, entered }) {
             tracing::error!(%error, "the app actor is gone");

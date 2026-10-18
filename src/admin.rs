@@ -550,6 +550,16 @@ pub enum OpReadResponse {
         /// `{"base64": "..."}`
         values: Vec<companion::ProgramValue>,
     },
+    /// A Mac searched for the one description instead and nothing was
+    /// read; the program asks again with the reference it picks
+    Found {
+        /// The Mac that searched
+        source: String,
+        /// The items, best first
+        items: Vec<companion::FoundItem>,
+        /// How many more matched but were left out
+        more: usize,
+    },
     /// The request was refused before anyone was asked
     Invalid {
         /// Why
@@ -575,6 +585,16 @@ impl std::fmt::Debug for OpReadResponse {
                 .debug_struct("Values")
                 .field("source", source)
                 .field("values", &values.len())
+                .finish(),
+            Self::Found {
+                source,
+                items,
+                more,
+            } => formatter
+                .debug_struct("Found")
+                .field("source", source)
+                .field("items", items)
+                .field("more", more)
                 .finish(),
             Self::Invalid { message } => formatter.debug_tuple("Invalid").field(message).finish(),
             Self::Denied { message } => formatter.debug_tuple("Denied").field(message).finish(),
@@ -1299,7 +1319,7 @@ async fn op_read(
         })
         .await;
     let response = match answer {
-        Ok(read) => {
+        Ok(companion::ProgramRead::Values(read)) => {
             tracing::info!(
                 source = %read.source,
                 values = read.values.len(),
@@ -1309,6 +1329,19 @@ async fn op_read(
             OpReadResponse::Values {
                 source: read.source,
                 values: read.values,
+            }
+        }
+        Ok(companion::ProgramRead::Found(found)) => {
+            tracing::info!(
+                source = %found.source,
+                items = found.found.items.len(),
+                "program read answered with a find"
+            );
+
+            OpReadResponse::Found {
+                source: found.source,
+                items: found.found.items,
+                more: found.found.more,
             }
         }
         Err(failure) => {

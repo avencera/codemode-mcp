@@ -36,6 +36,16 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// A value the owner entered for one item of a program read: text, or a
+/// file shared from 1Password; kept out of `Debug` like [`Secret`]
+pub struct Entered(pub(crate) ProgramValue);
+
+impl std::fmt::Debug for Entered {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Entered(..)")
+    }
+}
+
 /// What the gateway asked: one value for its own config, or the values a
 /// program on the gateway Mac wants
 pub enum Asked {
@@ -92,7 +102,7 @@ pub enum RequestMsg {
     /// by item index; replies whether Face ID was asked
     AnswerProgram {
         /// The values entered
-        entered: HashMap<u32, Secret>,
+        entered: HashMap<u32, Entered>,
         /// Whether it was
         reply: RpcReplyPort<bool>,
     },
@@ -152,7 +162,7 @@ pub struct RequestState {
     status: ReadStatus,
     /// The values the owner entered for a program read, by item index, held
     /// while Face ID opens the rest
-    entered: HashMap<usize, Secret>,
+    entered: HashMap<usize, Entered>,
 }
 
 impl RequestState {
@@ -238,7 +248,7 @@ impl RequestState {
     fn answer_program(
         &mut self,
         myself: &ActorRef<RequestMsg>,
-        entered: HashMap<u32, Secret>,
+        entered: HashMap<u32, Entered>,
     ) -> bool {
         let Asked::Program(program) = &self.asked else {
             return false;
@@ -249,10 +259,10 @@ impl RequestState {
 
         let count = program.items.len();
         // an empty field or an index past the items enters nothing
-        let mut entered: HashMap<usize, Secret> = entered
+        let mut entered: HashMap<usize, Entered> = entered
             .into_iter()
             .filter_map(|(index, value)| Some((usize::try_from(index).ok()?, value)))
-            .filter(|(index, Secret(value))| *index < count && !value.is_empty())
+            .filter(|(index, Entered(value))| *index < count && !value.is_empty())
             .collect();
         let mut sealed = Vec::new();
         for (index, item) in program.items.iter().enumerate() {
@@ -277,9 +287,7 @@ impl RequestState {
         if sealed.is_empty() {
             let values = (0..count).filter_map(|index| entered.remove(&index));
             self.send(CompanionResponse::Values(
-                values
-                    .map(|Secret(value)| ProgramValue::from(value))
-                    .collect(),
+                values.map(|Entered(value)| value).collect(),
             ));
 
             return false;
@@ -332,8 +340,12 @@ impl RequestState {
 
         let mut opened = opened.into_iter();
         let values = (0..program.items.len())
-            .filter_map(|index| entered.remove(&index).or_else(|| opened.next()))
-            .map(|Secret(value)| ProgramValue::from(value))
+            .filter_map(|index| {
+                entered
+                    .remove(&index)
+                    .map(|Entered(value)| value)
+                    .or_else(|| opened.next().map(|Secret(value)| ProgramValue::from(value)))
+            })
             .collect();
         self.send(CompanionResponse::Values(values));
     }

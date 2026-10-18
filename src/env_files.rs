@@ -30,7 +30,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    companion::{FindAsk, ProgramAsk, ProgramTarget, ProgramValue},
+    companion::{FindAsk, ProgramAsk, ProgramFound, ProgramRead, ProgramTarget, ProgramValue},
     op,
     secrets::{NOT_TEXT, OnePassword, Redactor, is_reference},
 };
@@ -59,8 +59,18 @@ pub struct WriteEnvParams {
     /// created mode 0600 when missing
     pub path: String,
     /// Each variable to write, mapped to one whole `op://vault/item/field`
-    /// reference; plain values and text around references are refused
+    /// reference; plain values and text around references are refused. May
+    /// be empty when `describe` names the one variable
+    #[serde(default)]
     pub vars: BTreeMap<String, String>,
+    /// At most one variable whose item you do not know, mapped to a
+    /// description such as `Pushover app token`. When the owner approves on
+    /// a Mac, it searches 1Password instead and the answer is `found`,
+    /// writing nothing: call again with the reference you pick in `vars`.
+    /// When the owner approves on their phone, they pick the item there and
+    /// the value is written
+    #[serde(default)]
+    pub describe: BTreeMap<String, String>,
     /// Why the program needs these values; every prompt shows it
     pub reason: String,
     /// Minutes for which the same references are handed out again without
@@ -128,6 +138,10 @@ pub struct EnvWritten {
     pub added: Vec<String>,
     /// Where the owner approved
     pub approved_on: String,
+    /// Set when a Mac searched for the described variable instead, in which
+    /// case nothing was written; pass the reference you pick in `vars`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found: Option<ReferencesFound>,
 }
 
 struct Inner {
@@ -176,7 +190,10 @@ impl SecretsServer {
                        of reading a value whenever a program can take it from a file. For a \
                        high-severity secret that should never be in a file, write its op:// \
                        reference into the file yourself and start the program with \
-                       `codemode-mcp op run --env-file <file> -- <command>`."
+                       `codemode-mcp op run --env-file <file> -- <command>`. When you do not \
+                       know a reference, put one variable in `describe` with a description of \
+                       the item: a Mac answers `found` with the matches and writes nothing, so \
+                       call again with the reference you pick; a phone lets the owner pick it."
     )]
     async fn write_env(
         &self,
@@ -184,7 +201,12 @@ impl SecretsServer {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<EnvWritten>, CallToolResult> {
         let path = env_path(&params.path).map_err(failed)?;
-        let vars = checked_vars(&params.vars).map_err(failed)?;
+        let vars = checked_vars(&params.vars, &params.describe).map_err(failed)?;
+        let described = params
+            .describe
+            .iter()
+            .next()
+            .map(|(key, description)| (key.clone(), description.clone()));
         let keep = match params.keep_minutes {
             None => None,
             Some(minutes) => Some(
@@ -199,12 +221,16 @@ impl SecretsServer {
         };
 
         let references = op::unique(vars.iter().map(|(_, reference)| reference.clone()));
+        let mut targets: Vec<ProgramTarget> = references
+            .iter()
+            .cloned()
+            .map(ProgramTarget::Reference)
+            .collect();
+        if let Some((_, description)) = &described {
+            targets.push(ProgramTarget::Describe(description.clone()));
+        }
         let ask = ProgramAsk {
-            targets: references
-                .iter()
-                .cloned()
-                .map(ProgramTarget::Reference)
-                .collect(),
+            targets,
             reason: Some(params.reason),
             destination: Some(path.display().to_string()),
             keep,
@@ -215,6 +241,18 @@ impl SecretsServer {
             read = self.0.onepassword.read_for_program(&ask) => read.map_err(failed)?,
             () = context.ct.cancelled() => return Err(failed(CANCELLED)),
         };
+        let mut read = match read {
+            ProgramRead::Values(read) => read,
+            ProgramRead::Found(found) => {
+                return Ok(Json(EnvWritten {
+                    path: path.display().to_string(),
+                    replaced: Vec::new(),
+                    added: Vec::new(),
+                    approved_on: found.source.clone(),
+                    found: Some(references_found(found)),
+                }));
+            }
+        };
         // a value that is not text cannot show up in a later text result
         self.0.redactor.add(
             read.values
@@ -223,9 +261,22 @@ impl SecretsServer {
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
         );
+        // the described value comes after the references, as asked
+        let described_value = match &described {
+            Some(_) => read.values.pop(),
+            None => None,
+        };
         let values: HashMap<String, ProgramValue> =
             references.into_iter().zip(read.values).collect();
-        let mut lines = Vec::with_capacity(vars.len());
+        let mut lines = Vec::with_capacity(vars.len() + 1);
+        if let (Some((key, description)), Some(value)) = (&described, &described_value) {
+            let value = value.as_text().ok_or_else(|| {
+                failed(format!(
+                    "the item picked for \"{description}\" cannot go in an env file: {NOT_TEXT}"
+                ))
+            })?;
+            lines.push((key.clone(), env_line(key, value).map_err(failed)?));
+        }
         for (key, reference) in &vars {
             let value = values
                 .get(reference)
@@ -274,6 +325,7 @@ impl SecretsServer {
             replaced: merged.replaced,
             added: merged.added,
             approved_on: read.source,
+            found: None,
         }))
     }
 
@@ -298,30 +350,7 @@ impl SecretsServer {
             () = context.ct.cancelled() => return Err(failed("the call was cancelled")),
         };
 
-        Ok(Json(ReferencesFound {
-            items: found
-                .found
-                .items
-                .into_iter()
-                .map(|item| FoundEntry {
-                    vault: item.vault,
-                    title: item.title,
-                    category: item.category,
-                    fields: item
-                        .fields
-                        .into_iter()
-                        .map(|field| FoundReference {
-                            reference: field.reference,
-                            label: field.label,
-                            kind: field.kind,
-                            section: field.section,
-                        })
-                        .collect(),
-                })
-                .collect(),
-            more: found.found.more,
-            approved_on: found.source,
-        }))
+        Ok(Json(references_found(found)))
     }
 }
 
@@ -330,6 +359,34 @@ impl ServerHandler for SecretsServer {
     fn get_info(&self) -> McpServerConfig {
         McpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(INSTRUCTIONS)
+    }
+}
+
+/// A find's answer as the tools give it
+fn references_found(found: ProgramFound) -> ReferencesFound {
+    ReferencesFound {
+        items: found
+            .found
+            .items
+            .into_iter()
+            .map(|item| FoundEntry {
+                vault: item.vault,
+                title: item.title,
+                category: item.category,
+                fields: item
+                    .fields
+                    .into_iter()
+                    .map(|field| FoundReference {
+                        reference: field.reference,
+                        label: field.label,
+                        kind: field.kind,
+                        section: field.section,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        more: found.found.more,
+        approved_on: found.source,
     }
 }
 
@@ -405,11 +462,28 @@ fn is_env_name(name: &str) -> bool {
 /// Text around a reference, or a plain value, would put into the file what
 /// the owner's prompt never showed, such as a URL that sends the value
 /// elsewhere
-fn checked_vars(vars: &BTreeMap<String, String>) -> Result<Vec<(String, String)>, String> {
-    if vars.is_empty() || vars.len() > MAX_PROGRAM_ITEMS {
+/// The variables mapped to references, checked; `describe` must name at
+/// most one variable, not also in `vars`
+fn checked_vars(
+    vars: &BTreeMap<String, String>,
+    describe: &BTreeMap<String, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let count = vars.len() + describe.len();
+    if count == 0 || count > MAX_PROGRAM_ITEMS {
         return Err(format!(
             "write 1 to {MAX_PROGRAM_ITEMS} variables at a time"
         ));
+    }
+    if describe.len() > 1 {
+        return Err("describe one variable at a time".to_owned());
+    }
+    for key in describe.keys() {
+        if !op::is_env_key(key) {
+            return Err(format!("{key:?} is not a variable name"));
+        }
+        if vars.contains_key(key) {
+            return Err(format!("{key} is in both vars and describe"));
+        }
     }
 
     vars.iter()

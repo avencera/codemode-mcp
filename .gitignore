@@ -10,3 +10,5 @@ target/
 /ios/CompanionCore/companion_core_ffi.xcframework/
 /ios/Companion/Info.plist
 /ios/Companion/Companion.entitlements
+/ios/CompanionShare/Info.plist
+/ios/CompanionShare/CompanionShare.entitlements

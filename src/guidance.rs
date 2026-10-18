@@ -68,8 +68,11 @@ macro_rules! onepassword_rule {
          only when nothing else will do. When you do not know the exact reference, find it first: \
          `codemode-mcp op find WORDS --reason WHY` (or the `secrets` server's `find_references` \
          tool) lists matching items' op:// references and types, never values, after the user \
-         approves on a Mac; then use the reference you picked. `--describe \"Pushover app token\"` \
-         instead of a reference asks the user to pick the item on their phone. A file attached to an item, such as a `.p12`, is \
+         approves on a Mac; then use the reference you picked. Or pass a description in one step: \
+         `codemode-mcp op read --describe \"Apple signing cert\" --out-file PATH` or `write_env`'s \
+         `describe`. If the user approves on a Mac it searches instead, writes nothing and answers the \
+         matches (`op read` exits 3), so run again with the exact reference; if they approve on their \
+         phone they pick the item, file attachments included, and it is written. A file attached to an item, such as a `.p12`, is \
          not text: write it with `codemode-mcp op read REFERENCE --out-file PATH`, which keeps its \
          exact bytes, since env files, templates and `op run` take text only. The user approves each batch once, with Touch ID on \
          this Mac or on their phone or other Mac, and sees the file it goes to; add `--keep 15m` (or \

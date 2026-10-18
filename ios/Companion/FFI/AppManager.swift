@@ -26,9 +26,10 @@ final class AppManager: Reconciler, @unchecked Sendable {
         rust.answer(id: id, value: value)
     }
 
-    /// Approves a program read: sends the values the owner pasted or filled
-    /// in, by item index, and opens the sealed rest with one Face ID
-    func answerProgram(id: String, entered: [UInt32: String]) {
+    /// Approves a program read: sends the values the owner pasted, filled in
+    /// or shared from 1Password, by item index, and opens the sealed rest
+    /// with one Face ID
+    func answerProgram(id: String, entered: [UInt32: EnteredValue]) {
         rust.answerProgram(id: id, entered: entered)
     }
 

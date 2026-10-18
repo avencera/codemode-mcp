@@ -621,12 +621,12 @@ public protocol FfiAppProtocol: AnyObject, Sendable {
     
     /**
      * Approves the program read `id`: sends `entered`, the values the owner
-     * pasted or filled in keyed by item index, and opens every other item
-     * with one Face ID. Nothing is sent unless each item has an entered
-     * value or a sealed copy. Its own call for the same reason as
-     * [`FfiApp::answer`]
+     * pasted, filled in or shared from 1Password keyed by item index, and
+     * opens every other item with one Face ID. Nothing is sent unless each
+     * item has an entered value or a sealed copy. Its own call for the same
+     * reason as [`FfiApp::answer`]
      */
-    func answerProgram(id: String, entered: [UInt32: String]) 
+    func answerProgram(id: String, entered: [UInt32: EnteredValue]) 
     
     /**
      * Asks for `action`; its effects arrive through the reconciler
@@ -730,17 +730,17 @@ open func answer(id: String, value: String)  {try! rustCall() {
     
     /**
      * Approves the program read `id`: sends `entered`, the values the owner
-     * pasted or filled in keyed by item index, and opens every other item
-     * with one Face ID. Nothing is sent unless each item has an entered
-     * value or a sealed copy. Its own call for the same reason as
-     * [`FfiApp::answer`]
+     * pasted, filled in or shared from 1Password keyed by item index, and
+     * opens every other item with one Face ID. Nothing is sent unless each
+     * item has an entered value or a sealed copy. Its own call for the same
+     * reason as [`FfiApp::answer`]
      */
-open func answerProgram(id: String, entered: [UInt32: String])  {try! rustCall() {
+open func answerProgram(id: String, entered: [UInt32: EnteredValue])  {try! rustCall() {
         uniffiCallStatus in
     uniffi_companion_core_fn_method_ffiapp_answer_program(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(id),
-        FfiConverterDictionaryUInt32String.lower(entered),uniffiCallStatus
+        FfiConverterDictionaryUInt32TypeEnteredValue.lower(entered),uniffiCallStatus
     )
 }
 }
@@ -1859,6 +1859,94 @@ public func FfiConverterTypeConnectionState_lift(_ buf: RustBuffer) throws -> Co
 #endif
 public func FfiConverterTypeConnectionState_lower(_ value: ConnectionState) -> RustBuffer {
     return FfiConverterTypeConnectionState.lower(value)
+}
+
+
+
+/**
+ * A value the owner entered for one item of a program read; no `Debug`, so
+ * it never reaches a log
+ */
+
+public enum EnteredValue: Equatable, Hashable {
+    
+    /**
+     * Text pasted or filled in with AutoFill
+     */
+    case text(
+        /**
+         * The value
+         */value: String
+    )
+    /**
+     * A file shared from 1Password, such as a `.p12`
+     */
+    case file(
+        /**
+         * Its bytes, at most [`max_file_bytes`]
+         */bytes: Data
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EnteredValue: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnteredValue: FfiConverterRustBuffer {
+    typealias SwiftType = EnteredValue
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnteredValue {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text(value: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .file(bytes: try FfiConverterData.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EnteredValue, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .text(value):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(value, into: &buf)
+            
+        
+        case let .file(bytes):
+            writeInt(&buf, Int32(2))
+            FfiConverterData.write(bytes, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnteredValue_lift(_ buf: RustBuffer) throws -> EnteredValue {
+    return try FfiConverterTypeEnteredValue.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnteredValue_lower(_ value: EnteredValue) -> RustBuffer {
+    return FfiConverterTypeEnteredValue.lower(value)
 }
 
 
@@ -3336,27 +3424,37 @@ fileprivate struct FfiConverterSequenceTypeProgramItem: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterDictionaryUInt32String: FfiConverterRustBuffer {
-    public static func write(_ value: [UInt32: String], into buf: inout [UInt8]) {
+fileprivate struct FfiConverterDictionaryUInt32TypeEnteredValue: FfiConverterRustBuffer {
+    public static func write(_ value: [UInt32: EnteredValue], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for (key, value) in value {
             FfiConverterUInt32.write(key, into: &buf)
-            FfiConverterString.write(value, into: &buf)
+            FfiConverterTypeEnteredValue.write(value, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32: String] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32: EnteredValue] {
         let len: Int32 = try readInt(&buf)
-        var dict = [UInt32: String]()
+        var dict = [UInt32: EnteredValue]()
         dict.reserveCapacity(Int(len))
         for _ in 0..<len {
             let key = try FfiConverterUInt32.read(from: &buf)
-            let value = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterTypeEnteredValue.read(from: &buf)
             dict[key] = value
         }
         return dict
     }
+}
+/**
+ * [`MAX_FILE_BYTES`], for the app to refuse a larger file before sending
+ */
+public func maxFileBytes() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_companion_core_fn_func_max_file_bytes(uniffiCallStatus
+    )
+})
 }
 
 private enum InitializationResult {
@@ -3374,10 +3472,13 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_companion_core_checksum_func_max_file_bytes() != 30447) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_companion_core_checksum_method_ffiapp_answer() != 9068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_companion_core_checksum_method_ffiapp_answer_program() != 65112) {
+    if (uniffi_companion_core_checksum_method_ffiapp_answer_program() != 62734) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_companion_core_checksum_method_ffiapp_dispatch() != 44585) {

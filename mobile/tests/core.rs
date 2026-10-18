@@ -13,9 +13,9 @@ use std::{
 };
 
 use companion_core::ffi::{
-    AppAction, AppState, ConnectionState, FfiApp, OpenBatch, OpenError, OpenRequest, PairingState,
-    PendingRead, Platform, PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus,
-    Reconciler, Update,
+    AppAction, AppState, ConnectionState, EnteredValue, FfiApp, OpenBatch, OpenError, OpenRequest,
+    PairingState, PendingRead, Platform, PlatformError, ProgramItem as ShownItem, PushEnvironment,
+    ReadStatus, Reconciler, Update,
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
@@ -37,6 +37,21 @@ use iroh::{
 use tokio::sync::watch;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+/// Text the owner entered for a program read, by item index
+fn typed(values: &[(u32, &str)]) -> HashMap<u32, EnteredValue> {
+    values
+        .iter()
+        .map(|(index, value)| {
+            (
+                *index,
+                EnteredValue::Text {
+                    value: (*value).to_owned(),
+                },
+            )
+        })
+        .collect()
+}
 
 /// A program read's answer of text values
 fn texts(values: &[&str]) -> CompanionResponse {
@@ -1319,16 +1334,25 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
 
     // with an item still blank nothing goes and Face ID is not asked
     app.dispatch(AppAction::Approve { id: id.to_string() });
-    app.answer_program(id.to_string(), HashMap::from([(1, "entered-1".to_owned())]));
+    app.answer_program(id.to_string(), typed(&[(1, "entered-1")]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!reading.is_finished());
     assert!(platform.batch_prompts().is_empty());
 
-    app.answer_program(
-        id.to_string(),
-        HashMap::from([(1, "entered-1".to_owned()), (2, "entered-2".to_owned())]),
+    // a described item may be answered with a file shared from 1Password,
+    // which goes as its bytes
+    let p12 = vec![0x30, 0x82, 0x00, 0xff];
+    let mut entered = typed(&[(1, "entered-1")]);
+    entered.insert(2, EnteredValue::File { bytes: p12.clone() });
+    app.answer_program(id.to_string(), entered);
+    assert_eq!(
+        reading.await??,
+        CompanionResponse::Values(vec![
+            ProgramValue::from(VALUE.to_owned()),
+            ProgramValue::from("entered-1".to_owned()),
+            ProgramValue::from(p12),
+        ])
     );
-    assert_eq!(reading.await??, texts(&[VALUE, "entered-1", "entered-2"]));
     assert_eq!(platform.batch_prompts().len(), 1);
     assert_eq!(platform.batch_prompts()[0].1, 3);
 
@@ -1349,10 +1373,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
         shown(&app, &id).is_some_and(|read| read.status == ReadStatus::Waiting)
     })
     .await?;
-    app.answer_program(
-        id.to_string(),
-        HashMap::from([(0, "fresher".to_owned()), (1, "user-key".to_owned())]),
-    );
+    app.answer_program(id.to_string(), typed(&[(0, "fresher"), (1, "user-key")]));
     assert_eq!(reading.await??, texts(&["fresher", "user-key"]));
     assert_eq!(platform.batch_prompts().len(), 1);
 
@@ -1375,7 +1396,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
     let large = "x".repeat(MAX_BODY_BYTES / 2);
     app.answer_program(
         id.to_string(),
-        HashMap::from([(0, large.clone()), (1, large)]),
+        typed(&[(0, large.as_str()), (1, large.as_str())]),
     );
     let CompanionResponse::Error(fault) = reading.await?? else {
         return Err("values over the limit were sent".into());
@@ -1550,10 +1571,7 @@ async fn an_approval_made_while_another_prompt_is_up_runs_when_it_ends() -> Test
         shown(&app, &second).is_some_and(|read| read.status == ReadStatus::Waiting)
     })
     .await?;
-    app.answer_program(
-        second.to_string(),
-        HashMap::from([(1, "app-token".to_owned())]),
-    );
+    app.answer_program(second.to_string(), typed(&[(1, "app-token")]));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(platform.batch_prompts().len(), 1);
     assert!(!second_reading.is_finished());

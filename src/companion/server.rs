@@ -23,8 +23,8 @@ use crate::{
 const CANCEL_TITLE: &str = "Deny";
 
 /// Longest a create runs once Touch ID approved it; `op` itself gives up on
-/// each of its two steps sooner, and the gateway has stopped waiting long
-/// before
+/// each of its two steps sooner, and the gateway, whose wait began before
+/// the prompt, has stopped waiting by then
 const CREATE_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Why the companion could not start

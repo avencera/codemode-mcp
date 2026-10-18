@@ -142,7 +142,7 @@ impl OnePassword {
 
     /// Asks on this Mac: its own Touch ID prompt naming the query, then the
     /// local `op`
-    async fn find_here(&self, query: &str, reason: Option<&str>) -> Result<Found, Miss> {
+    pub(super) async fn find_here(&self, query: &str, reason: Option<&str>) -> Result<Found, Miss> {
         let Some(on_mac) = self.on_mac() else {
             return Err(Miss::Failed("this Mac: no Touch ID".to_owned()));
         };
@@ -168,7 +168,7 @@ impl OnePassword {
 
 impl Companions {
     /// Asks the companion Mac `peer` to search
-    async fn find_mac(
+    pub(super) async fn find_mac(
         &self,
         peer: &CompanionPeer,
         find: FindQuery,

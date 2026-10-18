@@ -142,7 +142,8 @@ wherever you are.
 - At the gateway Mac, its own Touch ID prompt names every value and the reason the program gave, and then this
   Mac's `op` reads them. A 1Password prompt may follow while `op` is signed out.
 - On the phone, Companion shows the same list. Values it holds a sealed copy of open with one Face ID, and you
-  fill in the others with AutoFill or Paste.
+  fill in the others with AutoFill or Paste. A described item can also take a file: tap Attach a file from
+  1Password, then in 1Password open the item, tap the file, tap Share and choose CMCP Companion, and come back.
 - On a companion Mac, its own Touch ID prompt names every value, and its `op` reads them.
 
 While you are at the gateway Mac it asks first, and the phone and companion Macs are asked 5 seconds later. While
@@ -189,8 +190,19 @@ Interrupt, terminate and hang-up signals are passed to the command, and its exit
 Read one value with `codemode-mcp op read "op://Personal/Pushover/app token"`. It prints the value, so whatever
 reads the output sees it, such as an agent's context; `--out-file` writes it to a file instead. Several
 references print a JSON object of each reference and its value, after one approval. A program that
-does not know the item can describe it, as in `codemode-mcp op read --describe "Pushover app token"`. Only the
-phone can answer a description: you pick the item there with AutoFill.
+does not know the item can describe it, as in `codemode-mcp op read --describe "Pushover app token" -o token.txt`.
+The description goes to every device at once, the phone after the usual 5 seconds while you are at this Mac, and
+the first you approve answers:
+
+- On a Mac (this one while you are there, or a companion), it is searched for as `op find` would, and nothing is
+  read: the matches are printed on standard error and the command exits with code 3, so the program picks the
+  exact reference and runs again with it, which asks again naming that item. A search that matches nothing
+  leaves the phone to answer.
+- On the phone, you pick the item yourself, with AutoFill or by sharing a file from 1Password, and the value is
+  written where the command said. A file of up to 44 KiB can be sent this way.
+
+`write_env` takes the same as `describe = {"VAR": "Pushover app token"}`, for one variable at a time; when a Mac
+searched it answers `found` with the matches and writes nothing.
 
 A program that does not know the exact reference can look it up first:
 `codemode-mcp op find apple signing --reason "sign the iOS build"` prints a JSON list of the matching items, each
@@ -205,7 +217,8 @@ A file attached to an item, such as a signing certificate's `.p12`, is binary. W
 `codemode-mcp op read "op://Personal/Signing/cert.p12" --out-file cert.p12`, which keeps its exact bytes and adds no
 newline; it is not printed to a terminal. Templates, env files, `write_env`, `op run` and a JSON object of several
 references take text only, so they name such a reference and refuse it after the approval. Phones are never sent a
-sealed copy of a binary value, so only this Mac or a companion Mac can answer one.
+sealed copy of a binary value, so a read by reference needs this Mac or a companion Mac; with `--describe`, you can
+share the file from 1Password on the phone instead.
 
 Every request carries `--reason`, shown quoted as the program's claim. A request holds 1 to 20 values. Only the
 user that runs the daemon can make one: the CLI proves it holds the owner token in the daemon's state directory.
@@ -308,7 +321,7 @@ The 1Password Environments server is not covered; it only signs in through the g
    ```
 
    It asks every companion and phone at once, waits for each, and prints each one's answer and the value's length,
-   never the value. A device you do not touch keeps its prompt up until the 120-second limit, so to test one,
+   never the value. A device you do not touch keeps its prompt up until the 300-second limit, so to test one,
    name it, and nothing else is asked:
 
    ```sh
@@ -351,7 +364,7 @@ Options: `--category` (default `API_CREDENTIAL`), `--field` (the label of the fi
 `credential`) and `--companion <name>`, which is needed only when several companions are listed. The secret is read
 from stdin, minus one trailing newline. Empty input is refused, and so is a value over 32 KiB once escaped for JSON
 (quotes, backslashes and control characters count double or more); the command stops reading stdin past that. The command waits for the Touch ID answer on the
-companion Mac (up to two minutes) and prints the new item's id and its `op://vault/title/field` reference, never the
+companion Mac (up to five minutes) and prints the new item's id and its `op://vault/title/field` reference, never the
 value. Every create asks Touch ID on the companion, naming the vault first, as in `create in Personal: "Zoho MCP infraops"`,
 and no approval is reused. Details:
 
@@ -444,7 +457,8 @@ How reads work with a phone paired:
   within 5 seconds never pushes to the phone. When another source answers first, the phone's prompt is taken
   down; when the phone answers first, the other prompts are.
 - The phone dials the gateway, since iOS does not let a suspended app accept connections. The gateway sends
-  each read over that connection and waits up to 120 seconds; the phone shows a countdown and marks the read
+  each read over that connection and waits up to 300 seconds, long enough to fetch a file from 1Password; the
+  phone shows a countdown and marks the read
   expired when the gateway stops waiting.
 - The phone shows one read at a time, naming the reference, and one Face ID or one entered value answers it. The
   values it opens or is given never leave its memory except in the answer, which is at most 64 KiB.

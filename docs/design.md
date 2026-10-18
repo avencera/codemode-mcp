@@ -241,7 +241,11 @@ approved wherever the owner is
   rather than eliding its middle, and the phone shows the destination whole
 - Every codemode-mcp process sets its soft `RLIMIT_CORE` to 0 at start, since the daemon and the `op`
   commands hold values in memory; the hard limit stays, so a command `op run` starts may raise its own
-- A batch holding a description goes to phones only, since a Mac prompt has no text field
+- A batch holding one description goes to the phones as before and to the Macs as a find for it (see the
+  find below), since a Mac prompt has no text field. A Mac that wins answers `ProgramRead::Found`, nothing is
+  read, and the CLI prints the matches on stderr and exits 3 (`write_env` answers `found`), so the program runs again
+  with the reference it picks and that read names the item. A batch holding several descriptions goes to phones
+  only, since each would need its own search prompt
 - Wire: a companion Mac gets `{"program_read": {references, reason, destination, keep_secs}}` and answers
   `{"values": [...]}` in order. A phone gets `{"program_read": {id, items, reason, destination, keep_secs,
   expires_in_ms}}` on the
@@ -251,7 +255,14 @@ approved wherever the owner is
   app closes the stream without an answer, and the gateway reports that it needs updating. There is no fallback
   to per-value reads
 - Sealed items open together with one Face ID on the phone; items without a copy, and descriptions, take an
-  entered value
+  entered value. A description may take a file instead: the app's share extension (`ios/CompanionShare`)
+  keeps what 1Password's share sheet hands it in the app group's `Inbox` with complete file protection, and the
+  app attaches the newest file shared since the owner tapped Attach, or the only empty described item's, to
+  that item. It goes to the core as `EnteredValue::File`, at most `MAX_FILE_BYTES` (44 KiB, so the base64
+  answer fits `MAX_BODY_BYTES`), and to the gateway as a `ProgramValue`, as base64 unless it is UTF-8. Inbox
+  files are deleted once sent or when their read ends; a file no read took is deleted once older than 300 s,
+  the next time the app opens or the extension runs. A Mac's find that matches nothing fails that Mac's
+  answer rather than winning, so the phones can still answer
 - CLI: values come back to the CLI, which fills the template or environment. `op inject` and `op read
   --out-file` write through a new file created with the mode (0600 by default) and renamed into place, and
   refuse an existing file without `--force` before asking anyone. `op run` passes values in the child's
@@ -742,7 +753,7 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   `companion list` shows devices appended to the file since the start as untrusted, with their fingerprints,
   and an untrusted device under the name the file gives it now
 - The companion trusts the gateway for nothing beyond asking. It answers only the endpoint id it was paired with,
-  one request at a time, each request no longer than the gateway's 120 s deadline (a gateway that stops the
+  one request at a time, each request no longer than the gateway's 300 s deadline (a gateway that stops the
   stream or never gives up loses the prompt), and only after a fingerprint given to its own Touch ID prompt
   naming the reference and the gateway (its other button says Deny). 1Password's prompt, which follows while
   `op` is signed out, never stands in for it: it names no item and one approval lets `op` read anything for

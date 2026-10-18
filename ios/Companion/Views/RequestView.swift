@@ -4,9 +4,11 @@ import SwiftUI
 /// One read: what it is for, how long the gateway waits, and the answers:
 /// Face ID opens the copy the gateway sealed to this phone, or the owner
 /// pastes or fills in the value when there is no copy or it is stale. A
-/// program read lists every item it asks for and sends them together
+/// program read lists every item it asks for and sends them together; a
+/// described item may instead take a file shared from 1Password
 struct RequestView: View {
     @Environment(AppManager.self) private var manager
+    @Environment(\.scenePhase) private var scenePhase
     let read: PendingRead
     @State private var entering = false
     @State private var value = ""
@@ -14,6 +16,12 @@ struct RequestView: View {
     @State private var values: [Int: String] = [:]
     /// A program read's sealed items the owner enters instead
     @State private var replacing: Set<Int> = []
+    /// Files shared from 1Password for described items, by item index
+    @State private var attached: [Int: SharedInbox.File] = [:]
+    /// The described item the owner went to 1Password for, and when
+    @State private var fetching: (index: Int, since: Date)?
+    /// Why the last shared file was not attached
+    @State private var attachError: String?
     /// Each button waits a moment after it appears: Approve and Done take
     /// each other's place, so a tap meant for one must not land on the
     /// next, and a result stays readable before it can be dismissed
@@ -36,8 +44,18 @@ struct RequestView: View {
             values = [:]
             replacing = []
             entering = false
+            // a finished read takes no file, so what it was shared is gone
+            if read.status.isFinished {
+                for file in attached.values { SharedInbox.remove(file) }
+                attached = [:]
+                fetching = nil
+            }
             try? await Task.sleep(for: .seconds(1.5))
             armed = true
+        }
+        // back from 1Password's share sheet: attach what it shared
+        .onChange(of: scenePhase, initial: true) { _, phase in
+            if phase == .active { attachShared() }
         }
         .navigationTitle(read.program == nil ? "Approve a read" : "Approve a program's read")
         .navigationBarTitleDisplayMode(.inline)
@@ -243,11 +261,16 @@ struct RequestView: View {
             case let .describe(description):
                 Text("“\(description)”")
                     .italic()
-                Label("Pick in 1Password", systemImage: "hand.point.up.left")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                if !read.status.isFinished {
-                    field(index: index)
+                if let file = attached[index] {
+                    attachedRow(index: index, file: file)
+                } else {
+                    Label("Pick in 1Password", systemImage: "hand.point.up.left")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    if !read.status.isFinished {
+                        field(index: index)
+                        fileButton(index: index)
+                    }
                 }
             }
         }
@@ -276,6 +299,87 @@ struct RequestView: View {
         }
     }
 
+    /// For a file: send the owner to 1Password's share sheet, and take what
+    /// it shares when the app comes back
+    @ViewBuilder
+    private func fileButton(index: Int) -> some View {
+        if fetching?.index == index {
+            Text("In 1Password, open the item, tap the file, tap Share and choose CMCP Companion. Then come back here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            Button {
+                fetching = (index, Date())
+                attachError = nil
+            } label: {
+                Label("Attach a file from 1Password", systemImage: "paperclip")
+            }
+            .font(.caption)
+            .disabled(read.status != .waiting)
+        }
+        if let attachError, fetching?.index == index {
+            Text(attachError)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    private func attachedRow(index: Int, file: SharedInbox.File) -> some View {
+        HStack {
+            Label(file.name, systemImage: "doc.fill")
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if !read.status.isFinished {
+                Button {
+                    SharedInbox.remove(file)
+                    attached[index] = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .accessibilityLabel("Remove the file")
+            }
+        }
+        .font(.caption)
+    }
+
+    /// Attaches the newest shared file to the described item the owner went
+    /// to fetch it for, or to the only described item still empty; a file
+    /// shared before the read showed belongs to some other read
+    private func attachShared() {
+        guard let program = read.program, read.status == .waiting,
+              let file = SharedInbox.latest(),
+              !attached.values.contains(file)
+        else { return }
+        let open = program.items.indices.filter { index in
+            if case .describe = program.items[index] {
+                return attached[index] == nil && (values[index] ?? "").isEmpty
+            }
+            return false
+        }
+        let since = fetching?.since ?? Date(timeIntervalSince1970: Double(read.expiresAtMs) / 1000 - SharedInbox.lifetime)
+        guard file.received >= since,
+              let index = fetching.map(\.index).flatMap({ open.contains($0) ? $0 : nil })
+              ?? (open.count == 1 ? open.first : nil)
+        else { return }
+
+        if file.size == 0 {
+            SharedInbox.remove(file)
+            attachError = "\(file.name) is empty; share the file again."
+            return
+        }
+        if file.size > Int(maxFileBytes()) {
+            SharedInbox.remove(file)
+            attachError = "\(file.name) is \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)); at most \(ByteCountFormatter.string(fromByteCount: Int64(maxFileBytes()), countStyle: .file)) can be sent."
+            return
+        }
+        attached[index] = file
+        fetching = nil
+        attachError = nil
+    }
+
     /// Whether the owner enters item `index` rather than Face ID opening it
     private func entersValue(index: Int, item: ProgramItem) -> Bool {
         switch item {
@@ -290,7 +394,7 @@ struct RequestView: View {
             done
         } else {
             let entered = program.items.indices.filter { entersValue(index: $0, item: program.items[$0]) }
-            let complete = entered.allSatisfy { !(values[$0] ?? "").isEmpty }
+            let complete = entered.allSatisfy { !(values[$0] ?? "").isEmpty || attached[$0] != nil }
             let faceID = entered.count < program.items.count
             VStack(spacing: 12) {
                 if !program.items.isEmpty {
@@ -314,11 +418,24 @@ struct RequestView: View {
 
     private func sendProgram(entered: [Int]) {
         guard armed, read.status == .waiting else { return }
-        var answer: [UInt32: String] = [:]
+        var answer: [UInt32: EnteredValue] = [:]
         for index in entered {
-            answer[UInt32(index)] = values[index] ?? ""
+            if let file = attached[index] {
+                guard let bytes = SharedInbox.bytes(of: file) else {
+                    attached[index] = nil
+                    attachError = "\(file.name) is gone; share it again."
+                    fetching = (index, Date())
+                    return
+                }
+                answer[UInt32(index)] = .file(bytes: bytes)
+            } else {
+                answer[UInt32(index)] = .text(value: values[index] ?? "")
+            }
         }
         manager.answerProgram(id: read.id, entered: answer)
+        // the core holds the bytes now; the shared copies are not kept
+        for file in attached.values { SharedInbox.remove(file) }
+        attached = [:]
     }
 
     // MARK: Shared

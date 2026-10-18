@@ -734,14 +734,16 @@ async fn a_push_wakes_the_phone_and_it_opens_the_copy_sealed_to_it() -> TestResu
     assert_eq!(push.body["reference"], REFERENCE);
     assert_eq!(seen[0].reference, REFERENCE);
     assert!(
-        seen[0].expires_in_ms > 0 && seen[0].expires_in_ms <= 120_000,
+        seen[0].expires_in_ms > 0
+            && u128::from(seen[0].expires_in_ms) <= companion::ASK_TIMEOUT.as_millis(),
         "{seen:?}"
     );
     assert!(push.body["gateway"].is_string());
     // the deadline, so a push tapped after it shows the read as gone
     let expires = push.body["expires"].as_u64().ok_or("no deadline")?;
     let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    assert!(expires > now && expires <= now + 120_000, "{expires} {now}");
+    let longest = u64::try_from(companion::ASK_TIMEOUT.as_millis())?;
+    assert!(expires > now && expires <= now + longest, "{expires} {now}");
     assert_eq!(push.body["aps"]["interruption-level"], "time-sensitive");
 
     // addressed and signed as APNs requires

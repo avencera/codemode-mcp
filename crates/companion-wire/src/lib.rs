@@ -35,5 +35,6 @@ pub const MAX_PHONE_READ_BYTES: usize = 2 * MAX_BODY_BYTES;
 
 /// How long one companion or phone request may take, including the owner's
 /// answer on the other device; the gateway gives up after it and the other
-/// device takes its prompt down
-pub const ASK_TIMEOUT: Duration = Duration::from_secs(120);
+/// device takes its prompt down. Long enough to switch to 1Password on the
+/// phone, find an item and share its file back
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(300);

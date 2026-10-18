@@ -358,8 +358,10 @@ enum OpCommand {
         #[arg(required_unless_present = "describe", conflicts_with = "describe")]
         references: Vec<String>,
         /// Describe the item instead of naming it, such as "Pushover app
-        /// token"; only the phone can answer, where the owner picks the item
-        /// with AutoFill
+        /// token". On the phone the owner picks the item, with AutoFill or by
+        /// sharing a file from 1Password, and it is read. A Mac searches
+        /// instead and nothing is read: the matches are printed as with `op
+        /// find` and this exits with code 3, to run again with a reference
         #[arg(long)]
         describe: Option<String>,
         /// Why the value is needed; every prompt shows it
@@ -2317,6 +2319,9 @@ async fn op_run(
     Ok(exit_code(status))
 }
 
+/// Exit code of `op read --describe` when a Mac searched instead of reading
+const FOUND_EXIT: i32 = 3;
+
 /// How long `op run` passes on output after its command exits
 const PIPE_DRAIN: Duration = Duration::from_secs(2);
 
@@ -2466,6 +2471,24 @@ async fn program_values(
             Ok(values)
         }
         admin::OpReadResponse::Values { .. } => bail!("the daemon sent the wrong number of values"),
+        // only a description gets this; nothing was read or written, so the
+        // program picks a reference from the list and runs again with it
+        admin::OpReadResponse::Found {
+            source,
+            items,
+            more,
+        } => {
+            // on stderr, so output captured as the value never holds the list
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "items": items, "more": more }))?
+            );
+            eprintln!(
+                "Approved a search on {source} instead; nothing was read. Run again with the \
+                 op:// reference you pick from the list above"
+            );
+            std::process::exit(FOUND_EXIT);
+        }
         admin::OpReadResponse::Invalid { message } => bail!("refused: {message}"),
         admin::OpReadResponse::Denied { message } => bail!("denied: {message}"),
         admin::OpReadResponse::Failed { message } => bail!("no values: {message}"),

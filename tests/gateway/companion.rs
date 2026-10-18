@@ -1645,21 +1645,15 @@ async fn a_deny_on_the_companion_ends_a_program_read() -> TestResult {
     assert!(body["denied"]["message"].is_string(), "{body}");
     assert_eq!(program_prompts(&rig.companion_mac).len(), 1);
 
-    // a description is for a phone, and none is paired
+    // a description is searched for on the companion, where the deny ends it
     let (_, body) = program_read(&rig, json!([{ "describe": "Pushover app token" }])).await?;
-    assert!(
-        body["failed"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("only a phone")),
-        "{body}"
-    );
+    assert!(body["denied"]["message"].is_string(), "{body}");
 
     rig.stop().await
 }
 
-/// Runs the CLI against the rig's daemon, as a program on the gateway Mac
-/// does; its success, stdout and stderr
-async fn cli(rig: &Rig, args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
+/// A CLI config that talks to the rig's daemon
+fn cli_config(rig: &Rig) -> Result<PathBuf, Box<dyn Error>> {
     let directory = rig.harness.state_dir();
     let config = directory.join("cli.toml");
     std::fs::write(
@@ -1670,9 +1664,16 @@ async fn cli(rig: &Rig, args: &[&str]) -> Result<(bool, String, String), Box<dyn
             state = directory.display(),
         ),
     )?;
+
+    Ok(config)
+}
+
+/// Runs the CLI against the rig's daemon, as a program on the gateway Mac
+/// does; its success, stdout and stderr
+async fn cli(rig: &Rig, args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp"))
         .arg("--config")
-        .arg(&config)
+        .arg(cli_config(rig)?)
         .args(args)
         .output()
         .await?;
@@ -1803,12 +1804,9 @@ async fn a_binary_value_reaches_a_file_exactly_and_is_refused_where_only_text_fi
     rig.stop().await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_find_on_the_companion_answers_references_and_never_values() -> TestResult {
-    let Some(rig) = Rig::start(Options::default()).await? else {
-        return Ok(());
-    };
-    let secret = "hunter2-signing-secret";
+/// What the companion's `op` holds for finds: an `Apple Signing` item whose
+/// password is `secret`, and two items no signing search matches
+fn signing_items(rig: &Rig, secret: &str) -> Result<(), Box<dyn Error>> {
     std::fs::write(
         rig.companion_log.with_file_name("items.json"),
         r#"[{"id":"old1","title":"Existing","category":"LOGIN","vault":{"id":"v1","name":"Personal"}},
@@ -1825,6 +1823,17 @@ async fn a_find_on_the_companion_answers_references_and_never_values() -> TestRe
                 "files":[{{"id":"f1","name":"cert.p12","size":4}}]}}"#
         ),
     )?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_find_on_the_companion_answers_references_and_never_values() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    let secret = "hunter2-signing-secret";
+    signing_items(&rig, secret)?;
 
     let (ok, stdout, stderr) = cli(
         &rig,
@@ -1877,6 +1886,93 @@ async fn a_find_on_the_companion_answers_references_and_never_values() -> TestRe
     rig.companion_mac.set_answer(Some(TouchId::Review));
     let (ok, _, stderr) = cli(&rig, &["op", "find", "signing"]).await?;
     assert!(!ok && stderr.contains("denied"), "{stderr}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_description_approved_on_a_mac_answers_its_matches_and_writes_nothing() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        extra: "[servers.secrets]\nbuiltin = \"secrets\"\n",
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let secret = "hunter2-signing-secret";
+    signing_items(&rig, secret)?;
+    let directory = std::fs::canonicalize({
+        let directory = temp_state_dir();
+        std::fs::create_dir_all(&directory)?;
+        directory
+    })?;
+    let out = directory.join("signing.p12");
+    let out_arg = out.display().to_string();
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp"))
+        .arg("--config")
+        .arg(cli_config(&rig)?)
+        .args([
+            "op",
+            "read",
+            "--describe",
+            "apple signing cert",
+            "-o",
+            out_arg.as_str(),
+            "--reason",
+            "sign the iOS build",
+        ])
+        .output()
+        .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // exit 3 says a Mac searched instead, so a script cannot take it as a read
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    // the matches go to stderr, so output captured as the value stays empty
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(!stderr.contains(secret), "{stderr}");
+    // after the line saying who is asked
+    let start = stderr.find('{').ok_or("no matches printed")?;
+    let found: Value = serde_json::Deserializer::from_str(&stderr[start..])
+        .into_iter()
+        .next()
+        .ok_or("no matches printed")??;
+    assert_eq!(found["items"][0]["title"], "Apple Signing");
+    assert_eq!(
+        found["items"][0]["fields"][1]["reference"],
+        "op://Personal/Apple Signing/cert.p12"
+    );
+    assert!(!out.exists());
+    // the companion was asked to search for the description, never to read
+    let prompts = rig.companion_mac.shown();
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("1Password items match \"apple signing cert\"")),
+        "{prompts:?}"
+    );
+    assert!(
+        program_prompts(&rig.companion_mac).is_empty(),
+        "{prompts:?}"
+    );
+
+    // `write_env` answers the matches the same way and leaves the file alone
+    let file = directory.join("signing.secrets.env");
+    std::fs::write(&file, "KEPT=1\n")?;
+    let code = format!(
+        "await secrets_write_env(path=\"{path}\", describe={{\"CERT_PASSWORD\": \"apple signing \
+         password\"}}, reason=\"sign the iOS build\")",
+        path = file.display()
+    );
+    let body = script(&rig, &code).await?;
+    assert_eq!(body["added"], json!([]), "{body}");
+    assert_eq!(
+        body["found"]["items"][0]["fields"][0]["reference"],
+        "op://Personal/Apple Signing/password"
+    );
+    assert_eq!(std::fs::read_to_string(&file)?, "KEPT=1\n");
+    assert!(!body.to_string().contains(secret), "{body}");
 
     rig.stop().await
 }

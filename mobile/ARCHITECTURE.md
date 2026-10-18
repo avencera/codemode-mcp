@@ -64,7 +64,9 @@ App (supervisor)
 - **Program reads** ride the same request actor. A `PhoneProgramRequest` lists several items for a program on the
   gateway Mac: each a reference, with or without a sealed copy, or only a description. Approve opens every sealed
   item with one Face ID through `Platform::open_sealed_batch`, and `FfiApp::answer_program` carries the values
-  entered for the other items, by index. The answer is `CompanionResponse::Values` in item order. The prompt
+  entered for the other items, by index: `EnteredValue::Text`, or `EnteredValue::File` for a file the owner
+  shared from 1Password through the app's share extension, at most `max_file_bytes()`. The answer is
+  `CompanionResponse::Values` in item order, a file's bytes going as `{"base64": ...}` unless they are UTF-8. The prompt
   shows the program's destination, cleaned to one line, and its keep (at most an hour), which Face ID's reason
   names too.
 

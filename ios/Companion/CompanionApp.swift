@@ -16,6 +16,8 @@ struct CompanionApp: App {
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
             case .active:
+                // a file shared for a read that has since ended is not kept
+                SharedInbox.purgeExpired()
                 AppManager.shared.dispatch(.foreground)
             case .background:
                 // iOS suspends the app within seconds; hanging up first tells

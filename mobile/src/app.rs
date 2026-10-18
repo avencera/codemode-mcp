@@ -35,7 +35,7 @@ use crate::{
     },
     pairing,
     record::{GatewayRecord, load_key},
-    request::{Asked, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
+    request::{Asked, Entered, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
 };
 
 /// How long a read opened from a push may take to arrive once the link is
@@ -85,7 +85,7 @@ enum Approval {
         /// The read
         id: String,
         /// The values
-        entered: HashMap<u32, Secret>,
+        entered: HashMap<u32, Entered>,
     },
 }
 
@@ -106,7 +106,7 @@ pub enum AppMsg {
         /// The read
         id: String,
         /// The values
-        entered: HashMap<u32, Secret>,
+        entered: HashMap<u32, Entered>,
     },
     /// The pairing registered, or failed to
     Registered(Result<GatewayRecord, String>),
