@@ -801,6 +801,7 @@ impl Harness {
             || path == "/admin/companion/create"
             || path == "/admin/companion/trust"
             || path == "/admin/op/read"
+            || path == "/admin/op/find"
             || path == "/admin/secrets/forget"
         {
             request = request.header(

@@ -69,6 +69,85 @@ pub struct ProgramBatch {
     pub keep_secs: Option<u64>,
 }
 
+/// Longest query a find may give, in characters; prompts show it quoted
+pub const MAX_FIND_QUERY_CHARS: usize = 80;
+
+/// Most items one find answers with; the rest are only counted
+pub const MAX_FOUND_ITEMS: usize = 10;
+
+/// Asks a Mac which 1Password items match a query, for a program that does
+/// not know the exact reference, sent as `{"find": {...}}`; answered with
+/// [`CompanionFindResponse`]
+///
+/// The answer names items and their fields' references, never a value, so
+/// the program then reads the one it wants with its own approval. A
+/// companion from before this answers [`MALFORMED_REQUEST`]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompanionFindRequest {
+    /// The search
+    pub find: FindQuery,
+}
+
+/// One search of item titles
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindQuery {
+    /// Words to look for in item titles, vault names, tags and categories,
+    /// at most [`MAX_FIND_QUERY_CHARS`]
+    pub query: String,
+    /// Why the program is looking, in its own words, at most
+    /// [`MAX_REASON_CHARS`]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A Mac's answer to a [`CompanionFindRequest`]: `{"found": {...}}` or
+/// `{"error": {...}}`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanionFindResponse {
+    /// The items that matched
+    Found(Found),
+    /// Nothing was searched
+    Error(CompanionFault),
+}
+
+/// The items a find matched, best first; never a value
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Found {
+    /// At most [`MAX_FOUND_ITEMS`] items
+    pub items: Vec<FoundItem>,
+    /// How many more items matched but were left out
+    pub more: usize,
+}
+
+/// One item a find matched
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundItem {
+    /// Name of the vault it is in
+    pub vault: String,
+    /// The item's title
+    pub title: String,
+    /// 1Password category, such as `LOGIN` or `DOCUMENT`
+    pub category: String,
+    /// Its fields and attached files
+    pub fields: Vec<FoundField>,
+}
+
+/// One field or attached file of a found item, named by its reference
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundField {
+    /// The `op://` reference that reads it
+    pub reference: String,
+    /// Its label, or the file's name
+    pub label: String,
+    /// 1Password's field type in lowercase, such as `concealed` or `otp`, or
+    /// `file` for an attachment
+    pub kind: String,
+    /// The section it is in, when it is in one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+}
+
 /// Why a companion did not send a value
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

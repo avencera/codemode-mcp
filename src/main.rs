@@ -383,6 +383,22 @@ enum OpCommand {
         #[arg(short, long)]
         no_newline: bool,
     },
+    /// List the 1Password items matching a query, with each field's and
+    /// file's `op://` reference but no values, approved with Touch ID on this
+    /// Mac or a companion Mac
+    ///
+    /// For a program that does not know the exact reference: pick one from
+    /// the JSON printed, then read it with `op read`, `op inject` or `op run`,
+    /// which ask again and name that item. Words are matched in item titles,
+    /// vaults, tags and categories, ignoring case; at most 10 items are listed
+    Find {
+        /// Words to look for, such as `apple signing`
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+        /// Why the program is looking; every prompt shows it
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Fill each `{{ op://… }}` in a template, like `op inject`, with one
     /// approval for the whole template
     ///
@@ -2092,6 +2108,37 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                     stdout.write_all(&contents)?;
                     stdout.flush()?;
                 }
+            }
+        }
+        OpCommand::Find { query, reason } => {
+            let request = admin::OpFindRequest {
+                query: query.join(" "),
+                reason,
+            };
+            eprintln!(
+                "Asking the owner to approve a 1Password search: Touch ID on this Mac or a \
+                 companion Mac..."
+            );
+            let response: admin::OpFindResponse =
+                admin_post_as_owner(config, "/admin/op/find", &request).await?;
+            match response {
+                admin::OpFindResponse::Found {
+                    source,
+                    items,
+                    more,
+                } => {
+                    eprintln!("Approved on {source}");
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "items": items,
+                            "more": more,
+                        }))?
+                    );
+                }
+                admin::OpFindResponse::Invalid { message } => bail!("refused: {message}"),
+                admin::OpFindResponse::Denied { message } => bail!("denied: {message}"),
+                admin::OpFindResponse::Failed { message } => bail!("no items: {message}"),
             }
         }
         OpCommand::Inject {

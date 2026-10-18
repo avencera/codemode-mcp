@@ -65,8 +65,11 @@ macro_rules! onepassword_rule {
          write only its op:// reference into the env file and start the program with `codemode-mcp op \
          run --env-file FILE --reason WHY -- COMMAND`, which puts the value in that command's \
          environment only and masks it in its output. `codemode-mcp op read` prints values, so use it \
-         only when nothing else will do; pass `--describe \"Pushover app token\"` instead of a \
-         reference when you do not know the item. A file attached to an item, such as a `.p12`, is \
+         only when nothing else will do. When you do not know the exact reference, find it first: \
+         `codemode-mcp op find WORDS --reason WHY` (or the `secrets` server's `find_references` \
+         tool) lists matching items' op:// references and types, never values, after the user \
+         approves on a Mac; then use the reference you picked. `--describe \"Pushover app token\"` \
+         instead of a reference asks the user to pick the item on their phone. A file attached to an item, such as a `.p12`, is \
          not text: write it with `codemode-mcp op read REFERENCE --out-file PATH`, which keeps its \
          exact bytes, since env files, templates and `op run` take text only. The user approves each batch once, with Touch ID on \
          this Mac or on their phone or other Mac, and sees the file it goes to; add `--keep 15m` (or \

@@ -30,7 +30,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    companion::{ProgramAsk, ProgramTarget, ProgramValue},
+    companion::{FindAsk, ProgramAsk, ProgramTarget, ProgramValue},
     op,
     secrets::{NOT_TEXT, OnePassword, Redactor, is_reference},
 };
@@ -67,6 +67,54 @@ pub struct WriteEnvParams {
     /// asking, up to 60; leave unset unless several calls in a row need them
     #[serde(default)]
     pub keep_minutes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindReferencesParams {
+    /// Words to look for in item titles, vault names, tags and categories,
+    /// such as `apple signing`
+    pub query: String,
+    /// Why the program needs to know; every prompt shows it
+    pub reason: String,
+}
+
+/// The answer to `find_references`; never holds a value
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReferencesFound {
+    /// The matching items, best first, at most 10
+    pub items: Vec<FoundEntry>,
+    /// How many more items matched but were left out
+    pub more: usize,
+    /// Where the owner approved
+    pub approved_on: String,
+}
+
+/// One item `find_references` matched
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FoundEntry {
+    /// Name of the vault it is in
+    pub vault: String,
+    /// The item's title
+    pub title: String,
+    /// 1Password category, such as `LOGIN` or `DOCUMENT`
+    pub category: String,
+    /// Its fields and attached files
+    pub fields: Vec<FoundReference>,
+}
+
+/// One field or attached file, named by the reference that reads it
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FoundReference {
+    /// The `op://` reference to give `write_env`
+    pub reference: String,
+    /// Its label, or the file's name
+    pub label: String,
+    /// 1Password's field type in lowercase, such as `concealed`, or `file`
+    /// for an attachment, which only `codemode-mcp op read --out-file` can
+    /// write
+    pub kind: String,
+    /// The section it is in, when it is in one
+    pub section: Option<String>,
 }
 
 /// The answer to `write_env`; never holds a value
@@ -226,6 +274,53 @@ impl SecretsServer {
             replaced: merged.replaced,
             added: merged.added,
             approved_on: read.source,
+        }))
+    }
+
+    #[tool(
+        description = "Lists the 1Password items whose title, vault, tags or category match the \
+                       query, with each field's and attached file's op:// reference and type but \
+                       no values. Use it when you do not know the exact reference, then pass the \
+                       one you want to `write_env`, which asks the owner again naming that item. \
+                       The owner approves the search with Touch ID on this Mac or a companion Mac."
+    )]
+    async fn find_references(
+        &self,
+        Parameters(params): Parameters<FindReferencesParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<ReferencesFound>, CallToolResult> {
+        let ask = FindAsk {
+            query: params.query,
+            reason: Some(params.reason),
+        };
+        let found = tokio::select! {
+            found = self.0.onepassword.find_for_program(&ask) => found.map_err(failed)?,
+            () = context.ct.cancelled() => return Err(failed("the call was cancelled")),
+        };
+
+        Ok(Json(ReferencesFound {
+            items: found
+                .found
+                .items
+                .into_iter()
+                .map(|item| FoundEntry {
+                    vault: item.vault,
+                    title: item.title,
+                    category: item.category,
+                    fields: item
+                        .fields
+                        .into_iter()
+                        .map(|field| FoundReference {
+                            reference: field.reference,
+                            label: field.label,
+                            kind: field.kind,
+                            section: field.section,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            more: found.found.more,
+            approved_on: found.source,
         }))
     }
 }

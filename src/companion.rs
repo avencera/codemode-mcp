@@ -9,6 +9,7 @@
 
 mod apns;
 mod client;
+mod find;
 mod identity;
 mod invite;
 mod join;
@@ -25,6 +26,7 @@ pub use client::{CheckOutcome, CompanionFailure, Companions};
 pub use companion_wire::{
     ALPN, ASK_TIMEOUT, MAX_BODY_BYTES, MAX_PHONE_READ_BYTES, MOBILE_ALPN, PAIR_ALPN,
 };
+pub use find::{FindAsk, ProgramFound};
 pub use identity::{IdentityError, Role, load_or_create};
 pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
@@ -37,7 +39,8 @@ pub use ticket::{
 pub use trust::{Device, DeviceTrust, ListedDevice};
 pub use wire::{
     CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode, CompanionFault,
-    CompanionProgramRequest, CompanionRequest, CompanionResponse, CreatedItem, MALFORMED_REQUEST,
+    CompanionFindRequest, CompanionFindResponse, CompanionProgramRequest, CompanionRequest,
+    CompanionResponse, CreatedItem, FindQuery, Found, FoundField, FoundItem, MALFORMED_REQUEST,
     NewItem, PairCheck, PairRequest, PairResponse, ProgramBatch, ProgramValue, Registered,
     Registration,
 };

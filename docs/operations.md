@@ -192,6 +192,15 @@ references print a JSON object of each reference and its value, after one approv
 does not know the item can describe it, as in `codemode-mcp op read --describe "Pushover app token"`. Only the
 phone can answer a description: you pick the item there with AutoFill.
 
+A program that does not know the exact reference can look it up first:
+`codemode-mcp op find apple signing --reason "sign the iOS build"` prints a JSON list of the matching items, each
+with its fields' and attached files' references, labels and types, and never a value. Words are matched, ignoring
+case, in item titles, vault names, tags and categories, and at most 10 items are listed, best first, with `more`
+counting the rest. You approve the search with Touch ID on this Mac while you are there, or on a companion Mac;
+the prompt quotes the words and the reason. The phone cannot search 1Password, so it is not asked. Reading the
+reference picked afterwards asks again and names that item. Scripts can do the same with the `secrets` server's
+`find_references(query, reason)`.
+
 A file attached to an item, such as a signing certificate's `.p12`, is binary. Write it with
 `codemode-mcp op read "op://Personal/Signing/cert.p12" --out-file cert.p12`, which keeps its exact bytes and adds no
 newline; it is not printed to a terminal. Templates, env files, `write_env`, `op run` and a JSON object of several

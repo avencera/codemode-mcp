@@ -116,6 +116,25 @@ pub fn program_prompt_text(prompt: &ProgramPrompt<'_>) -> String {
     text
 }
 
+/// Text of the Touch ID prompt for a program's find at `place`: the query
+/// and the reason quoted, as the program's claims
+pub fn find_prompt_text(query: &str, place: &str, reason: Option<&str>) -> String {
+    let mut text = format!(
+        "show a program on {place} which 1Password items match {}, with their references but \
+         no values",
+        quoted(query.trim(), REASON_CHARS)
+    );
+    match reason.filter(|reason| !reason.trim().is_empty()) {
+        Some(reason) => {
+            text.push_str(", for ");
+            text.push_str(&quoted(reason.trim(), REASON_CHARS));
+        }
+        None => text.push_str(", no reason given"),
+    }
+
+    text
+}
+
 /// The tools of a batch, such as `calendar.delete_event ×3,
 /// reminders.delete_reminder`; a count shows only when it is above one
 pub fn calls_text(calls: &[(String, usize)]) -> String {

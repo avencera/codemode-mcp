@@ -7,9 +7,10 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use super::{
     ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
-    CompanionFault, CompanionProgramRequest, CompanionRequest, CompanionResponse,
-    HANDSHAKE_TIMEOUT, Hangup, IdentityError, MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem,
-    ProgramBatch, ProgramValue, Role, bind_endpoint, load_or_create, program,
+    CompanionFault, CompanionFindRequest, CompanionFindResponse, CompanionProgramRequest,
+    CompanionRequest, CompanionResponse, FindQuery, HANDSHAKE_TIMEOUT, Hangup, IdentityError,
+    MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem, ProgramBatch, ProgramValue, Role, bind_endpoint,
+    load_or_create, program,
 };
 use crate::{
     config::CompanionConfig,
@@ -167,12 +168,14 @@ impl Companion {
         }
     }
 
-    /// The serialized answer to one request body: a read, or a create
+    /// The serialized answer to one request body: a read, a find or a create
     async fn dispatch(self: &Arc<Self>, body: &[u8]) -> Vec<u8> {
         let bytes = if let Ok(create) = serde_json::from_slice::<CompanionCreateRequest>(body) {
             serde_json::to_vec(&self.create(create.create).await)
         } else if let Ok(read) = serde_json::from_slice::<CompanionProgramRequest>(body) {
             serde_json::to_vec(&self.program_read(read.program_read).await)
+        } else if let Ok(find) = serde_json::from_slice::<CompanionFindRequest>(body) {
+            serde_json::to_vec(&self.find(find.find).await)
         } else {
             serde_json::to_vec(&self.answer(body).await)
         };
@@ -379,6 +382,79 @@ impl Companion {
         );
 
         response
+    }
+
+    /// Answers a find: one Touch ID prompt naming the query and the
+    /// program's reason, then `op` lists and opens the matching items, and
+    /// only their references and labels are sent
+    async fn find(&self, query: FindQuery) -> CompanionFindResponse {
+        let fault = |code, message: &str| {
+            CompanionFindResponse::Error(CompanionFault {
+                code,
+                message: message.to_owned(),
+            })
+        };
+
+        let text = match program::checked_query(&query.query) {
+            Ok(text) => text,
+            Err(reason) => {
+                tracing::warn!(%reason, "refused a malformed find");
+
+                return fault(CompanionErrorCode::NotAllowed, &reason);
+            }
+        };
+        let reason = program::clean_reason(query.reason.as_deref());
+
+        // a second request waits for the first prompt's answer
+        let _turn = self.one_at_a_time.lock().await;
+
+        let Some(mac) = &self.mac else {
+            return fault(
+                CompanionErrorCode::ReadFailed,
+                "Touch ID is unavailable on this machine",
+            );
+        };
+        let prompt = prompt::find_prompt_text(&text, &self.config.gateway_name, reason.as_deref());
+        match mac.touch_id(&prompt, CANCEL_TITLE).await {
+            TouchId::Approved => {}
+            TouchId::Review => {
+                tracing::info!("find denied on this Mac");
+
+                return fault(CompanionErrorCode::Denied, "denied on this Mac");
+            }
+            TouchId::Away => {
+                return fault(
+                    CompanionErrorCode::ReadFailed,
+                    "the prompt was taken down; the owner seems away from this Mac",
+                );
+            }
+            TouchId::Unavailable => {
+                return fault(
+                    CompanionErrorCode::ReadFailed,
+                    "Touch ID is unavailable on this Mac",
+                );
+            }
+        }
+
+        let mut found = match self.onepassword.find_local(&text).await {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(%error, "find failed on this Mac");
+
+                return fault(CompanionErrorCode::ReadFailed, &error.to_string());
+            }
+        };
+        // the gateway reads at most MAX_BODY_BYTES, so the last items are
+        // only counted when all of them would not fit
+        while serde_json::to_vec(&CompanionFindResponse::Found(found.clone()))
+            .map_or(true, |bytes| bytes.len() > MAX_BODY_BYTES)
+            && found.items.pop().is_some()
+        {
+            found.more += 1;
+        }
+        tracing::info!(items = found.items.len(), "find approved and answered");
+
+        CompanionFindResponse::Found(found)
     }
 
     /// Answers one read request: refuses anything that is not a reference,

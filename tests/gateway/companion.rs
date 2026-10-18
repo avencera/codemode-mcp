@@ -261,8 +261,10 @@ fn creating_op(signed_in: bool, slow_create: bool) -> Result<(PathBuf, PathBuf),
                  echo \"[ERROR] no item matched\" >&2; exit 1 ;;\n\
                'item list') case \"$*\" in\n\
                    *--include-archive*) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}},{{\"id\":\"old2\",\"title\":\"Archived\"}}]' ;;\n\
-                   *) printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}}]' ;;\n\
+                   *) [ -e \"$d/items.json\" ] && cat \"$d/items.json\" && exit 0\n\
+                     printf '[{{\"id\":\"old1\",\"title\":\"Existing\"}}]' ;;\n\
                  esac ;;\n\
+               'item get') cat \"$d/item-$3.json\" ;;\n\
                'item create') cat > \"$d/stdin.log\"\n\
                  grep -q '\"title\":\"No Id\"' \"$d/stdin.log\" && printf '{{}}' && exit 0\n\
                  grep -q '\"title\":\"Killed\"' \"$d/stdin.log\" && kill -KILL $$\n\
@@ -1797,6 +1799,84 @@ async fn a_binary_value_reaches_a_file_exactly_and_is_refused_where_only_text_fi
         stderr.contains(CERT_REFERENCE) && stderr.contains("--out-file"),
         "{stderr}"
     );
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_find_on_the_companion_answers_references_and_never_values() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    let secret = "hunter2-signing-secret";
+    std::fs::write(
+        rig.companion_log.with_file_name("items.json"),
+        r#"[{"id":"old1","title":"Existing","category":"LOGIN","vault":{"id":"v1","name":"Personal"}},
+            {"id":"sig1","title":"Apple Signing","category":"DOCUMENT","vault":{"id":"v1","name":"Personal"}},
+            {"id":"tok1","title":"Pushover","category":"API_CREDENTIAL","vault":{"id":"v1","name":"Personal"}}]"#,
+    )?;
+    std::fs::write(
+        rig.companion_log.with_file_name("item-sig1.json"),
+        format!(
+            r#"{{"id":"sig1","title":"Apple Signing","category":"DOCUMENT",
+                "vault":{{"id":"v1","name":"Personal"}},
+                "fields":[{{"id":"password","type":"CONCEALED","label":"password","value":"{secret}",
+                            "reference":"op://Personal/Apple Signing/password"}}],
+                "files":[{{"id":"f1","name":"cert.p12","size":4}}]}}"#
+        ),
+    )?;
+
+    let (ok, stdout, stderr) = cli(
+        &rig,
+        &[
+            "op",
+            "find",
+            "apple",
+            "signing",
+            "--reason",
+            "sign the iOS build",
+        ],
+    )
+    .await?;
+    assert!(ok, "{stderr}");
+    assert!(
+        !stdout.contains(secret) && !stderr.contains(secret),
+        "{stdout}"
+    );
+    let found: Value = serde_json::from_str(&stdout)?;
+    // only the item matching a word is opened; the others are not counted
+    assert_eq!(
+        found,
+        json!({
+            "items": [{
+                "vault": "Personal",
+                "title": "Apple Signing",
+                "category": "DOCUMENT",
+                "fields": [
+                    { "reference": "op://Personal/Apple Signing/password", "label": "password", "kind": "concealed" },
+                    { "reference": "op://Personal/Apple Signing/cert.p12", "label": "cert.p12", "kind": "file" },
+                ],
+            }],
+            "more": 0,
+        })
+    );
+    assert_eq!(
+        rig.companion_mac
+            .shown()
+            .into_iter()
+            .filter(|prompt| prompt.contains("1Password items match"))
+            .collect::<Vec<_>>(),
+        [
+            "touch_id show a program on main which 1Password items match \"apple signing\", with \
+          their references but no values, for \"sign the iOS build\""
+        ]
+    );
+    assert!(!op_file(&rig.companion_log, "argv.log").contains("item get tok1"));
+
+    // a deny on the companion ends the find
+    rig.companion_mac.set_answer(Some(TouchId::Review));
+    let (ok, _, stderr) = cli(&rig, &["op", "find", "signing"]).await?;
+    assert!(!ok && stderr.contains("denied"), "{stderr}");
 
     rig.stop().await
 }

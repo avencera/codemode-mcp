@@ -260,6 +260,15 @@ approved wherever the owner is
   grow into a value). It forwards SIGINT, SIGTERM and SIGHUP to the command and exits with its code, or 128
   plus the signal. Without `--force` the file is linked into place, which fails on a file that appeared while
   the owner was approving. References are deduplicated, so a template asks once per item
+- A find (`op find`, `/admin/op/find`, `find_references`; `src/companion/find.rs`) is raced like a program read
+  between this Mac, after its own Touch ID prompt, and the companion Macs, sent as `{"find": {"query",
+  "reason"}}`. A companion from before finds answers `malformed request`. Phones are not asked. The Mac that
+  answers runs `op item list --format json`, which holds no values, and scores items by how many query words
+  appear in their title, vault, tags or category. It opens only the 10 best with `op item get --format json`
+  and copies nothing out of that JSON beyond each field's `reference`, label, type and section, and each
+  file's name, building a file's reference as `op://vault/item/[section/]file`, with an ID in place of any name
+  that has characters a reference cannot hold (`src/secrets/find.rs`). Items that do not fit `MAX_BODY_BYTES`
+  are dropped from the end and counted in `more`
 - A program read's values are bytes (`ProgramValue`). On the wire and in the admin answer, text stays a JSON
   string, so peers from before keep working, and anything else goes as `{"base64": "..."}`, which those peers
   reject as a malformed answer instead of misreading it. Only `op read` takes a binary value, written as is with no

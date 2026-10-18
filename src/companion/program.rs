@@ -18,8 +18,8 @@ use std::{sync::Arc, time::Duration};
 use companion_wire::{
     mobile::{PhoneProgramRead, PhoneProgramRequest, ProgramItem, RequestId},
     wire::{
-        MAX_DESCRIPTION_CHARS, MAX_DESTINATION_CHARS, MAX_KEEP_SECS, MAX_PROGRAM_ITEMS,
-        MAX_REASON_CHARS,
+        MAX_DESCRIPTION_CHARS, MAX_DESTINATION_CHARS, MAX_FIND_QUERY_CHARS, MAX_KEEP_SECS,
+        MAX_PROGRAM_ITEMS, MAX_REASON_CHARS,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,22 @@ pub fn checked_targets(targets: &[ProgramTarget]) -> Result<Vec<ProgramTarget>, 
         .collect()
 }
 
+/// The query of a find, trimmed, when it is one line of 1 to
+/// [`MAX_FIND_QUERY_CHARS`]
+pub fn checked_query(query: &str) -> Result<String, String> {
+    let query = query.trim();
+    let readable = !query.is_empty()
+        && query.chars().count() <= MAX_FIND_QUERY_CHARS
+        && prompt::one_line(query, usize::MAX) == query;
+    if readable {
+        Ok(query.to_owned())
+    } else {
+        Err(format!(
+            "a find query is one line of 1 to {MAX_FIND_QUERY_CHARS} characters"
+        ))
+    }
+}
+
 /// The reason as prompts may show it: one line, at most
 /// [`MAX_REASON_CHARS`]; `None` when blank
 pub fn clean_reason(reason: Option<&str>) -> Option<String> {
@@ -228,7 +244,7 @@ fn all_references(targets: &[ProgramTarget]) -> Option<Vec<String>> {
 }
 
 /// Why one device gave no values
-enum Miss {
+pub(super) enum Miss {
     /// The owner said no there, which ends the whole read
     Denied(String),
     /// Anything else; the other devices are still waited for
@@ -236,7 +252,7 @@ enum Miss {
 }
 
 impl Miss {
-    fn from_failure(source: &str, failure: CompanionFailure) -> Self {
+    pub(super) fn from_failure(source: &str, failure: CompanionFailure) -> Self {
         match failure {
             CompanionFailure::Refused {
                 code: CompanionErrorCode::Denied,

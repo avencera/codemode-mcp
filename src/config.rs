@@ -443,7 +443,7 @@ impl Config {
 /// The tools of the `logins` builtin, which per-tool settings may name
 const LOGINS_TOOLS: [&str; 2] = ["fill", "list"];
 /// The tools of the `secrets` builtin, which per-tool settings may name
-const SECRETS_TOOLS: [&str; 1] = ["write_env"];
+const SECRETS_TOOLS: [&str; 2] = ["write_env", "find_references"];
 
 /// Longest login name; the approval page and prompts show it
 const MAX_LOGIN_NAME_CHARS: usize = 63;
@@ -1664,8 +1664,9 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// The device prompt of `write_env` names the file and is the approval,
-    /// so the gateway asking first would only ask twice
+    /// The device prompts of `write_env`, naming the file, and of
+    /// `find_references`, naming the query, are the approval, so the gateway
+    /// asking first would only ask twice
     fn validate_secrets(&self, name: &str) -> Result<(), ConfigError> {
         if let Some(tool) = self
             .tools
@@ -1677,10 +1678,13 @@ impl ServerConfig {
                 SECRETS_TOOLS.join(" and ")
             )));
         }
-        if self.policy_for("write_env") == Policy::Ask {
+        if let Some(tool) = SECRETS_TOOLS
+            .into_iter()
+            .find(|tool| self.policy_for(tool) == Policy::Ask)
+        {
             return Err(ConfigError::Invalid(format!(
-                "servers.{name}: the secrets server's `write_env` asks the owner on its own, \
-                 naming the file, so it cannot also be `ask`; leave the policy unset"
+                "servers.{name}: the secrets server's `{tool}` asks the owner on its own, so it \
+                 cannot also be `ask`; leave the policy unset"
             )));
         }
 

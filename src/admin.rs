@@ -583,6 +583,47 @@ impl std::fmt::Debug for OpReadResponse {
     }
 }
 
+/// Body of `POST /admin/op/find`: items a program on this Mac looks for,
+/// approved on this Mac or a companion Mac
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpFindRequest {
+    /// Words to look for in item titles, vaults, tags and categories
+    pub query: String,
+    /// Why, shown quoted in every prompt
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Answer of `POST /admin/op/find`; never holds a value
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpFindResponse {
+    /// The items that matched, best first
+    Found {
+        /// `this Mac`, or the companion that answered
+        source: String,
+        /// The items
+        items: Vec<companion::FoundItem>,
+        /// How many more matched but were left out
+        more: usize,
+    },
+    /// The request was refused before anyone was asked
+    Invalid {
+        /// Why
+        message: String,
+    },
+    /// The owner said no
+    Denied {
+        /// Where
+        message: String,
+    },
+    /// No Mac searched
+    Failed {
+        /// Each Mac's reason
+        message: String,
+    },
+}
+
 /// Answer of `POST /admin/secrets/forget`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ForgetSecretsResponse {
@@ -674,6 +715,7 @@ pub fn router(app: &App) -> Router {
         .route("/admin/companion/check/one", post(companion_check_one))
         .route("/admin/companion/create", post(companion_create))
         .route("/admin/op/read", post(op_read))
+        .route("/admin/op/find", post(op_find))
         .route("/admin/secrets/forget", post(forget_secrets))
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
@@ -1276,6 +1318,56 @@ async fn op_read(
                 companion::ProgramReadError::Invalid(_) => OpReadResponse::Invalid { message },
                 companion::ProgramReadError::Denied(_) => OpReadResponse::Denied { message },
                 companion::ProgramReadError::Failed(_) => OpReadResponse::Failed { message },
+            }
+        }
+    };
+
+    Json(response).into_response()
+}
+
+/// Finds items for a program on this Mac, such as `codemode-mcp op find`
+///
+/// The answer names items, which the owner may not want any local user to
+/// list, so the route needs the owner proof like `/admin/op/read`
+async fn op_find(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<OpFindRequest>,
+) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/op/find") {
+        return refused;
+    }
+
+    let answer = state
+        .gateway
+        .secrets()
+        .onepassword
+        .find_for_program(&companion::FindAsk {
+            query: request.query,
+            reason: request.reason,
+        })
+        .await;
+    let response = match answer {
+        Ok(found) => {
+            tracing::info!(
+                source = %found.source,
+                items = found.found.items.len(),
+                "program find answered"
+            );
+
+            OpFindResponse::Found {
+                source: found.source,
+                items: found.found.items,
+                more: found.found.more,
+            }
+        }
+        Err(failure) => {
+            tracing::info!(%failure, "program find gave no items");
+            let message = failure.to_string();
+            match failure {
+                companion::ProgramReadError::Invalid(_) => OpFindResponse::Invalid { message },
+                companion::ProgramReadError::Denied(_) => OpFindResponse::Denied { message },
+                companion::ProgramReadError::Failed(_) => OpFindResponse::Failed { message },
             }
         }
     };

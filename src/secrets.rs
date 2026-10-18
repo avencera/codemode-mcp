@@ -6,11 +6,13 @@
 //! and references, e.g. `Bearer {{ op://Dev/Context7/credential }}`
 
 pub mod approved;
+mod find;
 pub mod handoff;
 pub mod key_store;
 mod logs;
 mod spawn;
 
+pub use find::FindError;
 pub use logs::{RedactingMakeWriter, redacting_logs};
 
 use std::{
