@@ -211,6 +211,9 @@ pub struct ProgramAsk {
     /// How long to hand the same values out again without asking, at most
     /// [`MAX_KEEP_SECS`]; said in every prompt
     pub keep: Option<Duration>,
+    /// Ask only the phones, where the owner enters the values, as for a
+    /// login picked for a page; no Mac searches or reads
+    pub phones_only: bool,
 }
 
 /// What every prompt of one program read shows besides the items, cleaned
@@ -329,7 +332,7 @@ impl OnePassword {
             (Some(description), None) => Some(description.clone()),
             _ => None,
         };
-        let macs = references.is_some() || description.is_some();
+        let macs = !ask.phones_only && (references.is_some() || description.is_some());
         let forgotten = self.forgotten().await;
         if let Some(references) = &references
             && let Some(values) = self
@@ -361,6 +364,8 @@ impl OnePassword {
             let message = if macs {
                 "nobody can approve this: the owner is away from this Mac and no companion Mac or \
                  phone is paired (`codemode-mcp companion invite`)"
+            } else if ask.phones_only {
+                "only a phone can answer this, and none is paired (`codemode-mcp companion invite`)"
             } else {
                 "only a phone can answer several descriptions, and none is paired; describe one \
                  item at a time, or pass op:// references"

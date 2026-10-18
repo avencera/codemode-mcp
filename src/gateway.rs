@@ -265,9 +265,8 @@ impl Gateway {
             secrets,
             mac,
         } = access;
-        let logins = Arc::new(config.logins.clone());
-        let fill_check = FillCheck::new(Arc::clone(&logins), mac.clone());
-        let builtins = Builtins { logins, mac };
+        let fill_check = FillCheck::new(secrets.onepassword.clone(), mac.clone());
+        let builtins = Builtins { mac };
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
@@ -412,9 +411,9 @@ impl Gateway {
     /// execution already holds data from a sensitive server, which keeps the
     /// approval request off the disk
     ///
-    /// A `logins` `fill` call also has its focused field checked here, so a
-    /// field the login may not go into is refused without asking anyone,
-    /// and the owner is shown the host it would go to
+    /// A `logins` `fill` call also has its focused field checked and its
+    /// login found here, so a field no login may go into is refused without
+    /// asking anyone, and the owner is shown the login and the host
     pub async fn prepare(
         &self,
         context: &CallContext,

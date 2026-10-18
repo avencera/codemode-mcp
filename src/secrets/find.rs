@@ -1,11 +1,11 @@
 //! Finding which 1Password items match a query, for a program that does not
-//! know the exact reference
+//! know the exact reference, and which logins are saved for a website
 //!
-//! `op item list` gives titles, vaults, tags and categories without values,
-//! so items are matched on those alone. Only the best matches are opened
-//! with `op item get`, whose JSON does hold values: only each field's
-//! reference, label, type and section, and each file's name, are copied out
-//! of it
+//! `op item list` gives titles, vaults, tags, categories and websites
+//! without values, so items are matched on those alone. Only the best
+//! matches are opened with `op item get`, whose JSON does hold values: only
+//! each field's reference, label, type, purpose and section, and each file's
+//! name, are copied out of it
 
 use companion_wire::wire::{Found, FoundField, FoundItem, MAX_FOUND_ITEMS};
 use serde::Deserialize;
@@ -54,6 +54,15 @@ struct Listed {
     tags: Vec<String>,
     #[serde(default)]
     vault: Named,
+    #[serde(default)]
+    urls: Vec<ListedUrl>,
+}
+
+/// One website an item is saved for
+#[derive(Deserialize)]
+struct ListedUrl {
+    #[serde(default)]
+    href: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -84,6 +93,10 @@ struct Opened {
 #[derive(Deserialize)]
 struct OpenedField {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
     label: String,
     #[serde(default, rename = "type")]
     kind: String,
@@ -102,7 +115,100 @@ struct OpenedFile {
     section: Option<Named>,
 }
 
+/// A Login item and the hosts of the websites it is saved for, as `op item
+/// list` names them; never a value
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedLogin {
+    /// The item's ID
+    pub id: String,
+    /// Its title
+    pub title: String,
+    /// ID of the vault it is in
+    pub vault_id: String,
+    /// Name of that vault
+    pub vault: String,
+    /// Lowercase hosts of its saved websites, such as `github.com`
+    pub hosts: Vec<String>,
+}
+
+/// Which field of a Login item to read
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginPart {
+    /// The field 1Password fills as the username
+    Username,
+    /// The field 1Password fills as the password
+    Password,
+    /// The first one-time password field
+    OneTimePassword,
+}
+
 impl OnePassword {
+    /// Every Login item on this Mac, with the websites it is saved for, with
+    /// no cache and no companions; the caller decides whether the owner must
+    /// be asked first
+    pub async fn saved_logins(&self) -> Result<Vec<SavedLogin>, FindError> {
+        let list = self
+            .op(
+                "item list",
+                &["item", "list", "--categories", "Login", "--format", "json"],
+            )
+            .await?;
+        let listed: Vec<Listed> = serde_json::from_slice(&list).map_err(|_| FindError::Failed {
+            command: "item list",
+            reason: "the answer was not a JSON list of items".to_owned(),
+        })?;
+
+        Ok(listed
+            .into_iter()
+            .map(|item| SavedLogin {
+                hosts: item
+                    .urls
+                    .iter()
+                    .filter_map(|url| website_host(&url.href))
+                    .collect(),
+                id: item.id,
+                title: item.title,
+                vault_id: item.vault.id,
+                vault: item.vault.name,
+            })
+            .collect())
+    }
+
+    /// The reference of `login`'s `part`, by IDs so a title shared by two
+    /// items or holding a `/` cannot change which is read; `None` when the
+    /// item has no such field
+    pub async fn login_reference(
+        &self,
+        login: &SavedLogin,
+        part: LoginPart,
+    ) -> Result<Option<String>, FindError> {
+        let vault = first_set(&login.vault_id, &login.vault);
+        let json = self
+            .op(
+                "item get",
+                &[
+                    "item", "get", &login.id, "--vault", vault, "--format", "json",
+                ],
+            )
+            .await?;
+        let opened: Opened = serde_json::from_slice(&json).map_err(|_| FindError::Failed {
+            command: "item get",
+            reason: "the answer was not a JSON item".to_owned(),
+        })?;
+
+        Ok(login_field(&opened, part).map(|(section, field)| {
+            let mut reference = format!("op://{vault}/{}", login.id);
+            if let Some(section) = section {
+                reference.push('/');
+                reference.push_str(section);
+            }
+            reference.push('/');
+            reference.push_str(field);
+
+            reference
+        }))
+    }
+
     /// The items on this Mac matching `query`, best first, with no cache and
     /// no companions; the caller asks the owner first
     ///
@@ -255,6 +361,47 @@ fn found_item(opened: Opened, listed: &Listed) -> FoundItem {
     }
 }
 
+/// The section ID, when the field is in one, and the field ID of `opened`'s
+/// `part`; 1Password marks a Login's own username and password fields by
+/// purpose, whatever their labels
+fn login_field(opened: &Opened, part: LoginPart) -> Option<(Option<&str>, &str)> {
+    let field = opened.fields.iter().find(|field| match part {
+        LoginPart::Username => field.purpose.eq_ignore_ascii_case("USERNAME"),
+        LoginPart::Password => field.purpose.eq_ignore_ascii_case("PASSWORD"),
+        LoginPart::OneTimePassword => field.kind.eq_ignore_ascii_case("OTP"),
+    })?;
+    if field.id.is_empty() {
+        return None;
+    }
+    let section = field
+        .section
+        .as_ref()
+        .map(|section| section.id.as_str())
+        .filter(|id| !id.is_empty());
+
+    Some((section, field.id.as_str()))
+}
+
+/// The lowercase host of a saved website; 1Password keeps what the owner
+/// typed, so `github.com` without a scheme counts as `https://github.com`.
+/// Addresses other than web ones, such as an app's, have none
+fn website_host(href: &str) -> Option<String> {
+    let href = href.trim();
+    // `github.com:8443` parses with `github.com` as its scheme, which a real
+    // scheme such as `mailto` never holds; read either as a bare host
+    let url = match reqwest::Url::parse(href) {
+        Ok(url) if !url.scheme().contains('.') => url,
+        _ => reqwest::Url::parse(&format!("https://{href}")).ok()?,
+    };
+    if !matches!(url.scheme(), "https" | "http") {
+        return None;
+    }
+
+    url.host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+}
+
 fn first_set<'a>(first: &'a str, second: &'a str) -> &'a str {
     if first.is_empty() { second } else { first }
 }
@@ -278,7 +425,7 @@ fn segment<'a>(name: &'a str, id: &'a str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Listed, Opened, found_item};
+    use super::{Listed, LoginPart, Opened, found_item, login_field, website_host};
 
     #[test]
     fn an_opened_item_answers_references_and_never_its_values() -> Result<(), serde_json::Error> {
@@ -315,6 +462,43 @@ mod tests {
                 ("op://Personal/Apple Signing/cert.p12", "file"),
                 ("op://Personal/Apple Signing/Archive/f2", "file"),
             ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_login_is_known_by_its_websites_and_its_fields_by_purpose() -> Result<(), serde_json::Error>
+    {
+        let listed: Listed = serde_json::from_str(
+            r#"{"id":"gh1","title":"GitHub","category":"LOGIN",
+                "vault":{"id":"v1","name":"Personal"},
+                "urls":[{"label":"website","primary":true,"href":"https://GitHub.com/login"},
+                        {"href":"gist.github.com"},{"href":"gist.github.com:8443"},
+                        {"href":"androidapp://com.github.android"},
+                        {"href":"mailto:me@github.com"}]}"#,
+        )?;
+        let hosts: Vec<String> = listed
+            .urls
+            .iter()
+            .filter_map(|url| website_host(&url.href))
+            .collect();
+        assert_eq!(hosts, ["github.com", "gist.github.com", "gist.github.com"]);
+
+        let opened: Opened = serde_json::from_str(
+            r#"{"id":"gh1","fields":[
+                  {"id":"login","type":"STRING","purpose":"USERNAME","label":"email"},
+                  {"id":"password","type":"CONCEALED","purpose":"PASSWORD","label":"password"},
+                  {"id":"TOTP_x1","type":"OTP","label":"one-time password",
+                   "section":{"id":"add more"}}]}"#,
+        )?;
+        assert_eq!(
+            login_field(&opened, LoginPart::Username),
+            Some((None, "login"))
+        );
+        assert_eq!(
+            login_field(&opened, LoginPart::OneTimePassword),
+            Some((Some("add more"), "TOTP_x1"))
         );
 
         Ok(())

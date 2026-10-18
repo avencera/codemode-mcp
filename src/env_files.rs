@@ -234,6 +234,7 @@ impl SecretsServer {
             reason: Some(params.reason),
             destination: Some(path.display().to_string()),
             keep,
+            phones_only: false,
         };
         // a caller that stops waiting takes the prompts down, and nothing is
         // written for it after a late approval

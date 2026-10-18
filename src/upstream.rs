@@ -37,7 +37,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{Builtin, LoginConfig, ServerConfig, Transport},
+    config::{Builtin, ServerConfig, Transport},
     env_files::SecretsServer,
     logins::LoginsServer,
     mac::Mac,
@@ -53,15 +53,13 @@ const BUILTIN_PIPE_BYTES: usize = 64 * 1024;
 /// What the servers the daemon serves itself need beyond their config
 #[derive(Clone, Default)]
 pub struct Builtins {
-    /// Logins the `logins` server may fill
-    pub logins: Arc<BTreeMap<String, LoginConfig>>,
     /// The Mac whose screen the `logins` server types on; `None` off macOS
     pub mac: Option<Arc<dyn Mac>>,
 }
 
-/// Least time a `secrets` server call is given: the companions' approval
-/// timeout, and time to write after it
-const SECRETS_CALL_TIMEOUT: Duration =
+/// Least time a `secrets` or `logins` server call is given: the companions'
+/// approval timeout, and time to write or type after it
+const BUILTIN_CALL_TIMEOUT: Duration =
     crate::companion::ASK_TIMEOUT.saturating_add(Duration::from_secs(30));
 
 /// Time allowed for the initialize handshake plus the first tool listing
@@ -1150,7 +1148,6 @@ impl Upstream {
         let server: Served = match builtin {
             Builtin::Logins => Box::pin(
                 LoginsServer::new(
-                    Arc::clone(&self.builtins.logins),
                     self.onepassword.clone(),
                     Arc::clone(&self.redactor),
                     self.builtins.mac.clone(),
@@ -1364,10 +1361,12 @@ impl Upstreams {
             let upstream = Arc::new(Upstream {
                 name: name.clone(),
                 config: config.clone(),
-                // a write waits on the owner for up to the approval's own
-                // timeout, then writes; the gateway's limit must outlast both
-                call_timeout: if config.builtin == Some(Builtin::Secrets) {
-                    call_timeout.max(SECRETS_CALL_TIMEOUT)
+                // a write, or a login picked on the phone, waits on the owner
+                // for up to the approval's own timeout, then writes or types;
+                // the gateway's limit must outlast both
+                call_timeout: if matches!(config.builtin, Some(Builtin::Secrets | Builtin::Logins))
+                {
+                    call_timeout.max(BUILTIN_CALL_TIMEOUT)
                 } else {
                     call_timeout
                 },

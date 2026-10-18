@@ -50,9 +50,9 @@ before the script sees them.
 - **Durable executions.** A script waiting on an approval is snapshotted and survives agent timeouts and daemon
   restarts
 - **Built-in adapters.** Calendar and Reminders through EventKit, served as MCP tools
-- **Website sign-in.** An agent driving the Mac's screen can have a 1Password username, password or
-  one-time code typed into a login page on that login's sites, in a code-signed browser, without the value
-  reaching the agent
+- **Website sign-in.** An agent driving the Mac's screen can sign in to any website with the 1Password login
+  saved for it, or one you pick on your phone, typed into the page in a code-signed browser without the
+  value reaching the agent
 - **Usage review.** Per-client stats and a Markdown review of how agents use the gateway
 - **launchd service** with signed binaries, so macOS and 1Password permission grants survive updates
 

@@ -37,6 +37,7 @@ use codemode_mcp::{
         },
     },
     config::Config,
+    logins::{FieldKind, FocusedField},
     mac::TouchId,
     secrets::PHONE_GRACE,
 };
@@ -50,7 +51,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::{
-    harness::{FakeMac, Harness, Setup, Stop, TestResult, temp_state_dir},
+    harness::{FakeMac, Harness, Setup, Stop, TestResult, approval_id, temp_state_dir, text_of},
     secrets::{VALUE, fake_op, reads},
 };
 
@@ -540,9 +541,13 @@ struct Rig {
     companion: Option<companion::CompanionHandle>,
 }
 
+#[derive(Default)]
 struct Options {
     /// Also list a Mac companion whose Touch ID prompt stays up
     with_mac_companion: bool,
+    /// Also serve `logins`, with a notifier so its fills can be approved
+    /// on the passkey page while the owner is away
+    logins: bool,
 }
 
 impl Rig {
@@ -610,7 +615,8 @@ impl Rig {
              apns = {{ key_file = \"{key_file}\", key_id = \"{KEY_ID}\", team_id = \"{TEAM_ID}\", server = \"http://{apns}\" }}\n\n\
              [servers.twin]\n\
              command = \"{fixture}\"\n\
-             env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n",
+             env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n\n\
+             {logins}",
             op = local_op.display(),
             key = gateway_key.display(),
             phone = phone.id(),
@@ -618,9 +624,18 @@ impl Rig {
             key_file = apns.key_file.display(),
             apns = apns.address,
             fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
+            logins = if options.logins {
+                "[servers.logins]\n\
+                 builtin = \"logins\"\n\
+                 policy = \"ask\"\n\
+                 tools.fill.grant = \"per_call\"\n"
+            } else {
+                ""
+            },
         );
         let Some(harness) = Harness::with(Setup {
             extra: &extra,
+            notify: options.logins,
             mac: Some(Arc::clone(&gateway_mac)),
             ..Setup::default()
         })
@@ -711,6 +726,7 @@ fn files_contain(directory: &Path, needle: &[u8]) -> Result<bool, Box<dyn Error>
 async fn a_push_wakes_the_phone_and_it_opens_the_copy_sealed_to_it() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: false,
+        ..Options::default()
     })
     .await?
     else {
@@ -783,6 +799,7 @@ async fn a_push_wakes_the_phone_and_it_opens_the_copy_sealed_to_it() -> TestResu
 async fn a_phone_that_is_not_listed_is_refused() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: false,
+        ..Options::default()
     })
     .await?
     else {
@@ -817,6 +834,7 @@ async fn a_phone_that_is_not_listed_is_refused() -> TestResult {
 async fn a_phone_that_answers_first_takes_the_other_prompts_down() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: true,
+        ..Options::default()
     })
     .await?
     else {
@@ -893,6 +911,7 @@ async fn a_phone_that_answers_first_takes_the_other_prompts_down() -> TestResult
 async fn a_read_answered_elsewhere_withdraws_the_phone_prompt() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: false,
+        ..Options::default()
     })
     .await?
     else {
@@ -955,6 +974,7 @@ async fn a_check_can_ask_one_device_and_finishes_when_it_answers() -> TestResult
     // that asked it too would not return
     let Some(rig) = Rig::start(Options {
         with_mac_companion: true,
+        ..Options::default()
     })
     .await?
     else {
@@ -1005,6 +1025,7 @@ async fn a_check_can_ask_one_device_and_finishes_when_it_answers() -> TestResult
 async fn a_one_off_run_beside_the_daemon_asks_the_macs_but_not_the_phone() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: true,
+        ..Options::default()
     })
     .await?
     else {
@@ -1044,6 +1065,7 @@ async fn a_one_off_run_beside_the_daemon_asks_the_macs_but_not_the_phone() -> Te
 async fn a_value_entered_on_the_phone_is_sealed_for_the_next_read() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: false,
+        ..Options::default()
     })
     .await?
     else {
@@ -1310,6 +1332,7 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
     // phone is trusted as the config stood then
     let Some(rig) = Rig::start(Options {
         with_mac_companion: false,
+        ..Options::default()
     })
     .await?
     else {
@@ -1495,6 +1518,7 @@ async fn a_phone_added_to_the_config_by_hand_is_used_only_once_trusted() -> Test
 async fn a_program_read_is_answered_on_the_phone_with_one_approval() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: false,
+        ..Options::default()
     })
     .await?
     else {
@@ -1549,6 +1573,85 @@ async fn a_program_read_is_answered_on_the_phone_with_one_approval() -> TestResu
     assert!(push.body.get("reference").is_none(), "{}", push.body);
     // the owner was away, so the gateway's own `op` never ran for it
     assert_eq!(reads(&rig.local_log, REFERENCE), 1);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_owner_away_the_login_for_a_page_is_picked_on_the_phone() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: true,
+        logins: true,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut passkey = rig.harness.enroll_passkey().await?;
+    rig.gateway_mac.set_present(false);
+    rig.gateway_mac.set_focused(FocusedField {
+        kind: FieldKind::Secure,
+        pages: vec!["https://accounts.example.co.uk/signin".to_owned()],
+        browser: Some("Safari".to_owned()),
+        ..FocusedField::default()
+    });
+    rig.phone.set_answer(Answer::Enter("picked-on-the-phone"));
+    let companion_mac = rig.companion_mac.clone().ok_or("no companion Mac")?;
+    let before = companion_mac.shown();
+
+    // 1Password cannot be searched with the owner away, so the owner
+    // approves the page, then picks its login on the phone
+    let pending = rig
+        .harness
+        .execute_body(r#"await logins_fill(field="password")"#)
+        .await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    // the approval page leads with what the gateway found, not only the
+    // arguments
+    let id = approval_id(&pending)?;
+    let page = rig
+        .harness
+        .http
+        .get(format!("{}/approve/{id}", rig.harness.base()))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(
+        page.contains(
+            r#"<p class="summary">password into accounts.example.co.uk in Safari, picked on the phone</p>"#
+        ),
+        "{page}"
+    );
+    let (status, body) = rig
+        .harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let execution = pending["execution_id"].as_str().unwrap_or_default();
+    let done: Value = serde_json::from_str(&text_of(&rig.harness.wait_done(execution).await?))?;
+    assert_eq!(
+        done["result"],
+        json!({ "field": "password", "host": "accounts.example.co.uk" }),
+        "{done}"
+    );
+    assert_eq!(rig.gateway_mac.typed(), "picked-on-the-phone");
+    assert!(!done.to_string().contains("picked-on-the-phone"), "{done}");
+
+    let program = rig
+        .phone
+        .seen()
+        .into_iter()
+        .find(|seen| !seen.items.is_empty())
+        .ok_or("the phone saw no program read")?;
+    assert_eq!(program.items, ["\"password for example.co.uk\"".to_owned()]);
+    assert_eq!(
+        program.reason.as_deref(),
+        Some("sign in on accounts.example.co.uk")
+    );
+    // a Mac can only search, which would answer no value, so the companion
+    // Mac is never asked
+    assert_eq!(companion_mac.shown(), before);
 
     rig.stop().await
 }

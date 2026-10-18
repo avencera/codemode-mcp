@@ -100,6 +100,7 @@ h1 {{ font-size: 1.35rem; margin: 20px 0 8px; overflow-wrap: anywhere; }}
 h2 {{ font-size: 1rem; margin: 20px 0 6px; }}
 .meta {{ color: #777; font-size: .9rem; overflow-wrap: anywhere; }}
 .asked {{ overflow-wrap: anywhere; }}
+.summary {{ font-weight: 600; overflow-wrap: anywhere; }}
 .asked small {{ color: #777; }}
 pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 10px; overflow-x: auto; font-size: .85rem; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .buttons {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 16px; }}
@@ -252,7 +253,18 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
                 String::new()
             };
 
-            format!("{heading}<pre>{}</pre>", highlight::json(&arguments))
+            // the gateway's own words, such as where a login would be typed
+            // and what the owner is warned of, ahead of the arguments
+            let summary = call
+                .summary
+                .as_deref()
+                .map(|summary| format!(r#"<p class="summary">{}</p>"#, escape(summary)))
+                .unwrap_or_default();
+
+            format!(
+                "{heading}{summary}<pre>{}</pre>",
+                highlight::json(&arguments)
+            )
         })
         .collect();
     let grant_buttons = |class: &str, prefix: &str, subject: &str| -> String {

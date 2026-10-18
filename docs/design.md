@@ -860,15 +860,16 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   ordinary upstream client connects through, so the catalog, policies, approvals and usage log treat it like
   any other server. It is in process because it needs the daemon's 1Password reader and the Mac's screen
 - Config refuses a `logins` server unless `fill` resolves to `ask` with `per_call`, and refuses per-tool
-  settings for tools it does not have, so a missing `policy` (the default is `allow`) or a typo cannot let
+  settings for tools it does not have (it has only `fill`), so a missing `policy` (the default is `allow`) or a typo cannot let
   fills through unasked. Fills run one at a time, so two calls in one `asyncio.gather` cannot interleave keys
-- `fill(login, field)` types a `[logins.<name>]` username, password or current one-time code
-  (`one_time_code`) into the field with keyboard focus, for an agent that drives the Mac's screen and must sign
-  in without the value entering its context. `list` names the logins, their sites and fields. The answer is the
-  login, field and host; passwords and one-time password seeds read are added to the redactor (not usernames,
-  which as email addresses appear in other servers' results and would be garbled, nor a password shorter than
-  the redactor's 6-character floor, which would garble ordinary words), and the server is
-  `sensitive` under `ask`, so neither logs nor scripts see them
+- `fill(field, item?)` types the username, password or current one-time code (`one_time_code`) of a 1Password
+  Login item into the field with keyboard focus, for an agent that drives the Mac's screen and must sign in
+  without the value entering its context. There is no config of logins: the item is the one saved for the
+  page's site (see Which login), or the agent's `item`. The answer is the field, host and item name; passwords
+  and one-time password seeds read are added to the redactor (not usernames, which as email addresses appear
+  in other servers' results and would be garbled, nor a password shorter than the redactor's 6-character
+  floor, which would garble ordinary words), and the server is `sensitive` under `ask`, so neither logs nor
+  scripts see them
 - Only code-signed browsers: `AXUIElementGetPid` of the focused element gives the owning process, whose
   `SecCode` (`SecCodeCopyGuestWithAttributes` with the pid) must satisfy one designated requirement in a
   built-in table: Safari and Safari Technology Preview (`anchor apple`), Chrome's four channels (Google's
@@ -891,34 +892,67 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   Access, so anything but "on" becomes a note the owner sees with the request.
   These are read once per check, not per character
 - The gateway checks a `logins` `fill` before asking anyone (`FillCheck`, called from `Gateway::prepare`,
-  which is async for it): it reads the focused field through the `Mac`, runs the login's rule, and refuses
-  without a prompt when it fails. On success it overwrites the `checked` argument with the host, browser and
-  notes, which the approval page shows, and gives the request a summary (`password for github into
-  github.com in Safari; could not check …`) that the Touch ID prompt and the Mac's own notification carry; the
-  phone notification, which crosses ntfy, still names only the tool. `checked` is skipped in the tool's
-  schema, so the stub does not offer it, and any value the agent passes is dropped. The server refuses a call
-  without it and sets the rule's `approved`, so the check before the read and the one before each character
-  also require the field to still be on the approved host, in the approved browser, with no unreadable
-  setting the owner was not shown
+  which is async for it): it reads the focused field through the `Mac`, runs the field rule with any site
+  allowed to learn every page's host, finds the login (below), and refuses without a prompt when either
+  fails. On success it overwrites the `checked` argument with the host, the hosts `around` it, browser,
+  warning, notes and the value's `source`, and gives the request a summary (`password into github.com in
+  Safari from GitHub (Personal); could not check …`; the host and browser lead, since they come from the
+  screen and a name may be the agent's words, which are quoted) that the Touch ID prompt, the Mac's own
+  notification and the approval page, above the arguments, carry; the phone notification, which crosses ntfy, still names only the tool. `checked` is skipped in the
+  tool's schema, so the stub does not offer it, and any value the agent passes is dropped. The server refuses
+  a call without it, reads only the source in it, and sets the rule's `approved`, so the check before the
+  read and the one before each character also require the field to still be on the approved host, in the
+  approved browser, with no unreadable setting the owner was not shown
+- Which login: while the owner is at this Mac (or there is no Mac to find them at, as for any read), the
+  gateway runs `op item list --categories Login` and keeps each item's website hosts (`urls[].href`, a bare
+  host read as `https://`, other schemes dropped; `src/secrets/find.rs`). An item is saved for the page when
+  every page around the field is on one of its sites, a site being the registrable domain by the public
+  suffix list (`psl`): `idmsa.apple.com` and `appleid.apple.com` share `apple.com`, `me.github.io` and
+  `you.github.io` do not, and an address, a one-label host or a bare public suffix is a site of its own. That is how 1Password's autofill
+  matches, rather than exact hosts, so sign-in hosts need no config; a site that serves other people's pages
+  on its own subdomains is the cost. One match is used; several or none refuse, naming up to 10 as
+  `op://vault/title` (by IDs when that would not pick the same item back) so the agent can pass one. An `item` the
+  agent names, matched on vault name or ID and title or ID ignoring case, is used whether or not it is saved
+  for the page; when it is not, its rule allows any site and the summary says `this item is NOT saved for
+  <site>`, leaving the owner to judge. The field is found by `op item get`: the username and password by
+  `purpose`, the one-time password as the first `OTP` field, and the reference built from IDs
+  (`op://<vault id>/<item id>/[<section id>/]<field id>`), so a shared title cannot change which is read.
+  Listing and opening run without codemode's own prompt, since the fill's approval follows; `op item get`
+  answers values too, which serde drops on parsing and nothing keeps. The refusals tell the agent the titles
+  of the logins saved for the site it is on, and whether a named item exists, without asking the owner
+- With the owner away, this Mac's 1Password is not searched, since its prompt would wait on an unattended
+  screen and the phone cannot search. A named `item` becomes `op://vault/item/<username|password|one-time
+  password>`, read like any reference with an unchecked-websites note in the summary. Without one the
+  source is `phone`: after approval the server sends a phones-only program read (`ProgramAsk::phones_only`,
+  so no Mac turns it into a find) describing `password for <site>`, with `sign in on <host>` as the reason
+  and the field, host and browser as the destination, and the owner picks the value with AutoFill or pastes
+  it. A one-time code entered there (6 to 8 digits) is typed as is; anything else is taken as a seed, and a value
+  read from 1Password is always taken as one, however short. With no
+  phone paired the fill is refused before asking. The server's call limit is the companions' approval
+  timeout plus 30 s, as for `secrets`, and a result arriving after the call was cancelled is dropped, not
+  typed into whatever has focus by then. A named `item` read this way may be any category's field with that
+  label
 - Where a value may go is decided from Accessibility, not from the agent: the system-wide focused element, its
   role and subrole (`AXSecureTextField` for a password, `AXTextField` or `AXComboBox` for a username), and the
   `AXURL` of every `AXWebArea` above it, innermost first, so a field in a frame lists the frame's document and
-  each page around it. Every one must be `https` on port 443 with a host that is a site, or under a `*.` site;
-  a web area without a readable address is refused, and so is a field nested deeper than 256 parents. A frame
-  is checked only when the browser exposes it as a web area of its own; one it folds into the page around it is
-  never seen, so its host is not checked. Sites match exactly unless written `*.`, because user content often lives under the same
-  domain (`sites.google.com`). Config takes sites as lowercase host names only, so a site cannot carry a
-  scheme, port or path that would change the match. The rule (`FieldRule`) is
-  platform-independent, so the gateway test runs it against a fake screen
+  each page around it. Every one must be `https` on port 443, with a host not ending in a dot, and on one of
+  the rule's sites (`Sites::Domains`) unless the rule allows any (`Sites::Any`: the first check, an item the
+  owner took for a page it is not saved for, or a value picked on the phone, all still bound to the approved
+  host, and the hosts of the pages around it, recorded as `around`); a web area without a readable address is
+  refused, and so is a field nested deeper than 256 parents.
+  A frame is checked only when the browser exposes it as a web area of its own; one it folds into the page
+  around it is never seen, so its host is not checked. The rule (`FieldRule`) is platform-independent, so the
+  gateway test runs it against a fake screen
 - The field is checked by the gateway before the owner is asked, by the server again before the value is
   read, and again right before typing. Characters are posted as keyboard events (`CGEventKeyboardSetUnicodeString`, flags cleared,
   from a private event source so held keys do not combine) to the field's process, one at a time. Before each, the
   focused element is compared to the original (`CFEqual`) and the whole rule is checked again against the same
   host, so a page that navigates under a still-focused field stops typing too; any change stops it with an
   `Interrupted` error. A character in flight when focus moves can still land in the new element
-- Values come from `OnePassword::read_reference`, the same race and cache as server secrets, so a companion Mac
-  or phone answers while the owner is away and a rotated password needs a restart. `totp` names the one-time
-  password field itself (config refuses `?attribute=`, which would cache a code); its value, an
+- Item values come from `OnePassword::read_reference`, the same race and cache as server secrets, so a
+  companion Mac or phone answers while the owner is away and a rotated password needs a restart. The one-time
+  password field is read itself (an `item` whose vault or title holds `?` is refused, and anything after the
+  title is dropped, since `?attribute=` would cache a code); its value, an
   `otpauth://totp/` URI (SHA1, SHA256 or SHA512, 6 or 8 digits, any period) or a bare base32 secret, is turned
   into the current RFC 6238 code in `src/logins/totp.rs` (`hmac`, `sha1` and `sha2` on the digest 0.11 line).
   The seed's text is redacted with fragments and the whole value without, since its label is often an email

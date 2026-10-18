@@ -140,10 +140,6 @@ pub struct Config {
     /// Upstream MCP servers by name
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
-    /// 1Password logins a `builtin = "logins"` server may type into a page
-    /// on their sites, by name
-    #[serde(default)]
-    pub logins: BTreeMap<String, LoginConfig>,
     /// The file this was loaded from; `None` when parsed from text, and then
     /// nothing can be written back
     #[serde(skip)]
@@ -168,7 +164,6 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             companion: None,
             servers: BTreeMap::new(),
-            logins: BTreeMap::new(),
             path: None,
         }
     }
@@ -432,125 +427,15 @@ impl Config {
             }
             server.validate(name)?;
         }
-        for (name, login) in &self.logins {
-            login.validate(name)?;
-        }
 
         Ok(())
     }
 }
 
 /// The tools of the `logins` builtin, which per-tool settings may name
-const LOGINS_TOOLS: [&str; 2] = ["fill", "list"];
+const LOGINS_TOOLS: [&str; 1] = ["fill"];
 /// The tools of the `secrets` builtin, which per-tool settings may name
 const SECRETS_TOOLS: [&str; 2] = ["write_env", "find_references"];
-
-/// Longest login name; the approval page and prompts show it
-const MAX_LOGIN_NAME_CHARS: usize = 63;
-
-/// A 1Password login the `logins` server may type into the focused field
-/// of a page on one of its sites
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LoginConfig {
-    /// Hosts the login may be typed on: `github.com` is that host only,
-    /// and `*.github.com` any host under it
-    pub sites: Vec<String>,
-    /// Reference of the username, such as `op://Personal/GitHub/username`
-    #[serde(default)]
-    pub username: Option<String>,
-    /// Reference of the password
-    #[serde(default)]
-    pub password: Option<String>,
-    /// Reference of the one-time password field, whose current code `fill`
-    /// types as `one_time_code`; 1Password answers it as an
-    /// `otpauth://totp/...` URI or a base32 secret
-    #[serde(default)]
-    pub totp: Option<String>,
-}
-
-impl LoginConfig {
-    /// The references the login reads, for a companion's or phone's allow
-    /// list
-    pub fn references(&self) -> impl Iterator<Item = &str> {
-        self.username
-            .iter()
-            .chain(self.password.iter())
-            .chain(self.totp.iter())
-            .map(String::as_str)
-    }
-
-    fn validate(&self, name: &str) -> Result<(), ConfigError> {
-        let at = format!("logins.{name}");
-        // agents pass the name and the approval page shows it
-        let plain = name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-        if name.is_empty() || name.chars().count() > MAX_LOGIN_NAME_CHARS || !plain {
-            return Err(ConfigError::Invalid(format!(
-                "{at}: login names must be 1 to {MAX_LOGIN_NAME_CHARS} lowercase letters, digits, \
-                 `-` or `_`"
-            )));
-        }
-        if self.sites.is_empty() {
-            return Err(ConfigError::Invalid(format!(
-                "{at}: `sites` must name at least one host, such as \"github.com\""
-            )));
-        }
-        for site in &self.sites {
-            if !is_site(site) {
-                return Err(ConfigError::Invalid(format!(
-                    "{at}: `{site}` in `sites` must be a lowercase host name with a dot, such as \
-                     \"github.com\" or \"*.github.com\", without a scheme, port or path"
-                )));
-            }
-        }
-        if self.username.is_none() && self.password.is_none() && self.totp.is_none() {
-            return Err(ConfigError::Invalid(format!(
-                "{at}: set at least one of `username`, `password` and `totp`"
-            )));
-        }
-        for (field, reference) in [
-            ("username", &self.username),
-            ("password", &self.password),
-            ("totp", &self.totp),
-        ] {
-            if let Some(reference) = reference
-                && !crate::secrets::is_reference(reference)
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "{at}.{field}: must be an op://vault/item/field reference, without braces"
-                )));
-            }
-        }
-        // `?attribute=totp` reads a code, which the cache would keep past
-        // its period; the field itself holds the seed every code comes from
-        if self.totp.as_ref().is_some_and(|totp| totp.contains('?')) {
-            return Err(ConfigError::Invalid(format!(
-                "{at}.totp: name the one-time password field itself, without `?attribute=`"
-            )));
-        }
-
-        Ok(())
-    }
-}
-
-/// A host a login may be typed on: lowercase labels joined by dots, after
-/// an optional `*.` for the hosts under it
-fn is_site(site: &str) -> bool {
-    let host = site.strip_prefix("*.").unwrap_or(site);
-    let labels: Vec<&str> = host.split('.').collect();
-
-    labels.len() >= 2
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        })
-}
 
 /// The 1Password CLI that reads `{{ op://vault/item/field }}` references in
 /// server `headers` and `env` when a server first connects, and the
@@ -1353,8 +1238,8 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Builtin {
-    /// Types a `[logins]` username or password into the focused field of a
-    /// page on the login's sites
+    /// Types the username, password or one-time code of the 1Password login
+    /// saved for the focused page into its focused field
     Logins,
     /// Writes 1Password values into an env file, approved once on whichever
     /// device the owner is at
@@ -1978,55 +1863,12 @@ mod tests {
     }
 
     #[test]
-    fn logins_take_plain_hosts_and_bare_references() {
-        let login = |body: &str| {
-            parse(&format!(
-                "[servers.logins]\nbuiltin = \"logins\"\npolicy = \"ask\"\n\
-                 tools.fill.grant = \"per_call\"\n\n[logins.github]\n{body}"
-            ))
-        };
-        let password = "password = \"op://Personal/GitHub/password\"";
-
-        assert!(
-            login(&format!(
-                "sites = [\"github.com\", \"*.github.io\"]\n{password}"
-            ))
-            .is_ok()
-        );
-        for site in [
-            "https://github.com",
-            "github.com/login",
-            "github.com:443",
-            "GitHub.com",
-            "com",
-            ".github.com",
-            "*.com",
-            "*github.com",
-            "*.*.github.com",
-        ] {
-            assert!(
-                login(&format!("sites = [\"{site}\"]\n{password}")).is_err(),
-                "{site}"
-            );
-        }
-        assert!(login(&format!("sites = []\n{password}")).is_err());
-        assert!(login("sites = [\"github.com\"]").is_err());
-        assert!(
-            login("sites = [\"github.com\"]\npassword = \"{{ op://Personal/GitHub/password }}\"")
-                .is_err()
-        );
-        assert!(
-            login("sites = [\"github.com\"]\ntotp = \"op://Personal/GitHub/one-time password\"")
-                .is_ok()
-        );
-        assert!(
-            login("sites = [\"github.com\"]\ntotp = \"otpauth://totp/GitHub?secret=GEZDGNBV\"")
-                .is_err()
-        );
-        assert!(
-            login("sites = [\"github.com\"]\ntotp = \"op://Personal/GitHub/otp?attribute=totp\"")
-                .is_err()
-        );
+    fn the_logins_server_asks_on_every_fill() {
+        let server = "[servers.logins]\nbuiltin = \"logins\"\npolicy = \"ask\"\n\
+                      tools.fill.grant = \"per_call\"\n";
+        assert!(parse(server).is_ok());
+        // logins come from 1Password by site now, so `list` is gone
+        assert!(parse(&format!("{server}tools.list.policy = \"allow\"\n")).is_err());
         assert!(parse("[servers.logins]\nbuiltin = \"logins\"\ncommand = \"x\"").is_err());
         assert!(parse("[servers.logins]\nbuiltin = \"logins\"\nlazy = true").is_err());
         // a fill must ask on every call

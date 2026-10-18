@@ -12,7 +12,7 @@ pub mod key_store;
 mod logs;
 mod spawn;
 
-pub use find::FindError;
+pub use find::{FindError, LoginPart, SavedLogin};
 pub use logs::{RedactingMakeWriter, redacting_logs};
 
 use std::{

@@ -534,32 +534,22 @@ An agent that drives this Mac's screen, such as Codex with computer use, can sig
 and the page itself; the agent only learns which host took it. A password stays hidden behind bullets; a
 username or one-time code is typed into a plain field, where the agent can see it on screen (see Limits).
 
-1. List the logins an agent may use, and the hosts each may be typed on:
+1. Add the server:
 
    ```toml
    [servers.logins]
    builtin = "logins"
    policy = "ask"
    tools.fill.grant = "per_call"
-   tools.list.policy = "allow"
-
-   [logins.github]
-   sites = ["github.com"]
-   username = "op://Personal/GitHub/username"
-   password = "op://Personal/GitHub/password"
-   totp = "op://Personal/GitHub/one-time password"
    ```
 
-   `totp` is optional and names the item's one-time password field itself, without `?attribute=totp`. A
-   login with it lists a `one_time_code` field; filling it types the current code, computed in the daemon from
-   the seed, so the seed never reaches the agent. The code itself lands in a plain text field, where the agent
-   can see it on screen until it expires.
-
-   A site is that host only; `*.github.com` covers every host under `github.com`, but not `github.com`
-   itself. Name the exact hosts the login page lives on, such as `accounts.google.com`, and use `*.` only for
-   a domain whose subdomains are all its owner's: under `*.google.com`, any page on `sites.google.com` could
-   take the password. The `logins` server must ask on every call; the config is refused unless `fill` is
-   `ask` with `grant = "per_call"`.
+   There is no list of logins to keep. A fill uses the 1Password Login item saved for the page's site, as
+   1Password's own autofill does: an item whose website is `appleid.apple.com` fills on `idmsa.apple.com`,
+   since both are `apple.com`. Sites are told apart by the public suffix list, so a login for `me.github.io`
+   never fills on `you.github.io`. The `logins` server must ask on every call; the config is refused unless
+   `fill` is `ask` with `grant = "per_call"`.
+   A config from before this, with `[logins.<name>]` tables or `tools.list` under `[servers.logins]`, no
+   longer loads: delete those lines.
 2. Restart the daemon (`codemode-mcp service restart`). The first fill asks macOS to let codemode-mcp use
    Accessibility; turn it on in System Settings > Privacy & Security > Accessibility and fill again. The grant
    belongs to the signed binary, so updates keep it.
@@ -578,32 +568,49 @@ What a fill checks, from Accessibility and the browser's code signature rather t
   you approve. Chrome, Edge, Brave and Arc keep it in each profile's `Preferences`.
 - A password goes only into a password field, the kind that shows bullets. A username or a one-time code goes
   only into a one-line text field.
-- The field's page must be `https` on port 443, and its host one of the login's `sites`. A field inside a
-  frame is checked against the frame and every page around it, so each of those hosts must be listed. This
-  relies on the browser exposing each frame's address to Accessibility; a frame it does not expose goes
-  unchecked.
+- The field's page must be `https` on port 443. A field inside a frame is checked against the frame and every
+  page around it, and each of them must be on a site the login is saved for, so a site's sign-in frame inside
+  another site's page finds no login. This relies on the browser exposing each frame's address to
+  Accessibility; a frame it does not expose goes unchecked.
 - Focus and the page are checked again before each character, and typing stops once either has changed. Keys
   already sent may still land, so a few characters can reach a field in the same app that took focus; keys never
   go to another app. The answer then says to clear the field and fill again.
 
+Which login a fill uses:
+
+- While you are at the Mac, the daemon looks up the Login items saved for the page's site. With exactly one,
+  that one is used. With several, such as a personal and a work account, or none, nothing is asked and the
+  agent is told to pass `item`, an `op://vault/item` reference; with several, the refusal names them.
+- An `item` saved for the page is used like a match. One that is not is still allowed, but the prompt says
+  so, such as `password into login.example.com in Safari from GitHub (Personal); this item is NOT saved for
+  example.com`. Deny it unless you meant that login for that site; a page that asks for another site's
+  password is the usual sign of phishing.
+- While you are away from the Mac, its 1Password is not searched. Without `item`, the companion app on your
+  phone asks for, say, `password for github.com`, and you pick the login there with 1Password's AutoFill or
+  paste it. You can enter a one-time code itself rather than its seed. With `item`, the item's `username`,
+  `password` or `one-time password` field is read as any reference is, and the prompt says its websites
+  were not checked.
+
 These checks run before you are asked, so a fill into the wrong place is refused without a prompt. Each fill
 is then approved like any `per_call` tool: Touch ID while you are at the Mac, otherwise a passkey on the phone.
-The Touch ID prompt and the Mac's notification say what goes where, such as `password for github into
-github.com in Safari`, followed by any setting that could not be checked, and the approval page shows the same
-under `checked`. The phone's notification names only the tool, as for every call. After you approve, the field
-is checked again and must still be on the host you approved; if the page moved to another host, even one of
-the login's sites, nothing is read or typed and the agent must fill again.
+The Touch ID prompt and the Mac's notification say what goes where, such as `password into github.com in
+Safari from GitHub (Personal)`, followed by any warning or setting that could not be checked, and the approval
+page shows the same above the call's arguments, with any warning also under `checked`. The phone's notification names only the tool, as for every call. After
+you approve, the field is checked again and must still be on the host you approved; if the page moved to
+another host, even one of the same site, nothing is read or typed and the agent must fill again.
 
 The value is then read like a server secret, through `op` while you are at the Mac, or a companion Mac or phone
 when you are not, and kept in the daemon's memory until it restarts. After changing a password in 1Password,
 restart the daemon so the next fill reads the new one. A one-time password's seed stays valid, so its codes
-keep working from the cached read.
+keep working from the cached read. A value picked on the phone is not cached or sealed to the phone for the
+next fill; a password picked there is only remembered so later tool results never show it.
 
 Limits:
 
 - Web pages only, in one of the browsers above. Native app fields have no page address and are refused.
 - One-time codes from an authenticator seed (TOTP) only, typed into a single text field; a page that splits
-  the code across six boxes needs it typed by hand. SMS codes and push approvals stay with you.
+  the code across six boxes needs it typed by hand. SMS codes and push approvals, such as Apple's codes sent
+  to your devices, stay with you.
 - A username or one-time code lands in a plain text field, so the agent sees it on screen like any typed
   text. A password shows as bullets, until something clicks the page's show-password button; then the agent
   can read it too.
