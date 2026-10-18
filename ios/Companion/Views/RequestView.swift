@@ -248,14 +248,18 @@ struct RequestView: View {
                         }
                     }
                     .font(.caption)
+                } else if let file = attached[index] {
+                    attachedRow(index: index, file: file)
                 } else {
                     if !sealed {
-                        Text("No copy on this iPhone yet. Paste it, or fill it in from your password manager.")
+                        Text("No copy on this iPhone yet. Paste it, fill it in from your password manager, or attach it if it is a file.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     if !read.status.isFinished {
                         field(index: index)
+                        // a file such as a .p12 has no text to fill in
+                        fileButton(index: index)
                     }
                 }
             case let .describe(description):
@@ -345,24 +349,27 @@ struct RequestView: View {
         .font(.caption)
     }
 
-    /// Attaches the newest shared file to the described item the owner went
-    /// to fetch it for, or to the only described item still empty; a file
-    /// shared before the read showed belongs to some other read
+    /// Attaches the newest shared file to the item the owner went to fetch
+    /// it for, or, when they did not say, to the only described item still
+    /// empty: a reference takes a file only when asked, since most are text.
+    /// A file shared before the read showed belongs to some other read
     private func attachShared() {
         guard let program = read.program, read.status == .waiting,
               let file = SharedInbox.latest(),
               !attached.values.contains(file)
         else { return }
         let open = program.items.indices.filter { index in
-            if case .describe = program.items[index] {
-                return attached[index] == nil && (values[index] ?? "").isEmpty
-            }
+            entersValue(index: index, item: program.items[index])
+                && attached[index] == nil && (values[index] ?? "").isEmpty
+        }
+        let described = open.filter { index in
+            if case .describe = program.items[index] { return true }
             return false
         }
         let since = fetching?.since ?? Date(timeIntervalSince1970: Double(read.expiresAtMs) / 1000 - SharedInbox.lifetime)
         guard file.received >= since,
               let index = fetching.map(\.index).flatMap({ open.contains($0) ? $0 : nil })
-              ?? (open.count == 1 ? open.first : nil)
+              ?? (described.count == 1 && open.count == 1 ? described.first : nil)
         else { return }
 
         if file.size == 0 {

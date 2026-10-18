@@ -255,10 +255,10 @@ approved wherever the owner is
   app closes the stream without an answer, and the gateway reports that it needs updating. There is no fallback
   to per-value reads
 - Sealed items open together with one Face ID on the phone; items without a copy, and descriptions, take an
-  entered value. A description may take a file instead: the app's share extension (`ios/CompanionShare`)
-  keeps what 1Password's share sheet hands it in the app group's `Inbox` with complete file protection, and the
-  app attaches the newest file shared since the owner tapped Attach, or the only empty described item's, to
-  that item. It goes to the core as `EnteredValue::File`, at most `MAX_FILE_BYTES` (44 KiB, so the base64
+  entered value. Any item entered, by reference or description, may take a file instead: the app's share
+  extension (`ios/CompanionShare`) keeps what 1Password's share sheet hands it in the app group's `Inbox` with
+  complete file protection, and the app attaches the newest file shared since the owner tapped Attach on an
+  item to that item; with no tap, only a lone empty described item takes it, since most references are text. It goes to the core as `EnteredValue::File`, at most `MAX_FILE_BYTES` (44 KiB, so the base64
   answer fits `MAX_BODY_BYTES`), and to the gateway as a `ProgramValue`, as base64 unless it is UTF-8. Inbox
   files are deleted once sent or when their read ends; a file no read took is deleted once older than 300 s,
   the next time the app opens or the extension runs. A Mac's find that matches nothing fails that Mac's

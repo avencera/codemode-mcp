@@ -142,8 +142,10 @@ wherever you are.
 - At the gateway Mac, its own Touch ID prompt names every value and the reason the program gave, and then this
   Mac's `op` reads them. A 1Password prompt may follow while `op` is signed out.
 - On the phone, Companion shows the same list. Values it holds a sealed copy of open with one Face ID, and you
-  fill in the others with AutoFill or Paste. A described item can also take a file: tap Attach a file from
-  1Password, then in 1Password open the item, tap the file, tap Share and choose CMCP Companion, and come back.
+  fill in the others with AutoFill or Paste. An item it has no copy of, or a described item, can also take a
+  file such as a `.p12`: tap Attach a file from 1Password, then in 1Password open the item, tap the file, tap
+  Share and choose CMCP Companion, and come back. Phones keep no copy of a file, so a file read by reference
+  always takes it this way on the phone.
 - On a companion Mac, its own Touch ID prompt names every value, and its `op` reads them.
 
 While you are at the gateway Mac it asks first, and the phone and companion Macs are asked 5 seconds later. While
@@ -217,8 +219,8 @@ A file attached to an item, such as a signing certificate's `.p12`, is binary. W
 `codemode-mcp op read "op://Personal/Signing/cert.p12" --out-file cert.p12`, which keeps its exact bytes and adds no
 newline; it is not printed to a terminal. Templates, env files, `write_env`, `op run` and a JSON object of several
 references take text only, so they name such a reference and refuse it after the approval. Phones are never sent a
-sealed copy of a binary value, so a read by reference needs this Mac or a companion Mac; with `--describe`, you can
-share the file from 1Password on the phone instead.
+sealed copy of a binary value, so on the phone you share the file from 1Password instead, whether the read names
+its reference or describes the item.
 
 Every request carries `--reason`, shown quoted as the program's claim. A request holds 1 to 20 values. Only the
 user that runs the daemon can make one: the CLI proves it holds the owner token in the daemon's state directory.
