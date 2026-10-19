@@ -40,6 +40,9 @@ struct PairView: View {
                         manager.dispatch(.pair(scanned: text))
                     }
                 }
+                Text("Version \(Bundle.main.versionText)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical)

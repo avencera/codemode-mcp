@@ -428,7 +428,9 @@ sealed copy. The phone answers by opening the copy, which takes Face ID. So:
 - Changing Face ID's enrolled faces voids the phone's key, and opening a copy then fails; pair again.
 
 Install the app from TestFlight, or build it onto a connected iPhone with `just ios-run` (needs Xcode, xcodegen,
-and the phone's UDID in `IOS_DEVICE_UDID`).
+and the phone's UDID in `IOS_DEVICE_UDID`). The app's version is the codemode-mcp release it was built from, and a
+TestFlight build's number is its upload time in UTC; both show at the bottom of the gateway screen as, for example,
+`0.10.0 (202610182031)`.
 
 1. To wake the phone when a read comes in, give the gateway an APNs key (Certificates, IDs & Profiles, Keys,
    with Apple Push Notifications service enabled) under `[secrets]`:

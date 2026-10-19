@@ -21,6 +21,8 @@ const BUNDLE_ID: &str = "com.avencera.codemode-mcp.companion";
 const TEAM_ID: &str = "Q8UP8C53Y8";
 /// Build products, outside the source tree
 const BUILD_DIR: &str = "target/ios";
+/// The workspace manifest, whose package version the app ships as
+const MANIFEST: &str = include_str!("../../Cargo.toml");
 
 /// An App Store Connect API key, for signing and uploading without Xcode's
 /// account settings
@@ -138,6 +140,10 @@ pub fn project(sh: &Shell) -> Result<()> {
     {
         bail!("xcodegen is missing; install it with `brew install xcodegen`");
     }
+    // the app and the gateway are released together, so `just bump` moves
+    // the app's version too; ios/project.yml reads it from the environment
+    let version = app_version()?;
+    let _version = sh.push_env("COMPANION_VERSION", version);
     cmd!(
         sh,
         "xcodegen generate --quiet --spec ios/project.yml --project ios"
@@ -260,6 +266,22 @@ pub fn testflight(sh: &Shell, key: &ApiKey) -> Result<()> {
     println!("uploaded build {build_number}; it shows in TestFlight once Apple has processed it");
 
     Ok(())
+}
+
+/// The codemode-mcp release the app is built from: the `version` of the
+/// workspace's `[package]`, not of any dependency table
+fn app_version() -> Result<&'static str> {
+    let mut in_package = false;
+    for line in MANIFEST.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package && let Some(value) = line.strip_prefix("version = ") {
+            return Ok(value.trim_matches('"'));
+        }
+    }
+
+    bail!("no [package] version in Cargo.toml")
 }
 
 fn derived_data() -> PathBuf {

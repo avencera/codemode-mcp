@@ -44,6 +44,10 @@ struct GatewayDetails: View {
             } footer: {
                 Text("To pair again, run `codemode-mcp companion invite` on the Mac.")
             }
+
+            Section {
+                LabeledContent("Version", value: Bundle.main.versionText)
+            }
         }
         .navigationTitle("Companion")
         .confirmationDialog(

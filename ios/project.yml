@@ -16,7 +16,9 @@ settings:
     CODE_SIGN_STYLE: Automatic
     # the generated bindings predate Swift 6's concurrency checks
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
+    # the codemode-mcp release, set by xtask; TestFlight uploads replace the
+    # build number with the upload time
+    MARKETING_VERSION: ${COMPANION_VERSION}
     CURRENT_PROJECT_VERSION: "1"
 targets:
   Companion:
