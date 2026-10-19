@@ -58,9 +58,9 @@ App (supervisor)
   a type that derives `Debug`. An answer stays with its request until the stream reports it delivered; one made
   while the link is down, or lost with it, is sent once the gateway offers the read again, unless the read has
   expired. Approve asks the request and waits for its reply, so only one Face ID prompt starts at a time. Only
-  the owner's Deny (the button, or Deny on the Face ID prompt) answers `Denied`, which ends the read on every
-  device; an interrupted, unmatched or unavailable Face ID answers `ReadFailed`, so the gateway's other sources
-  can still answer.
+  the owner's Deny (the button, or Deny on the Face ID prompt) answers `Denied`; an interrupted, unmatched or
+  unavailable Face ID answers `ReadFailed`. Either takes only this phone out of the gateway's race, so another
+  device can still approve, and the gateway reports the read as denied when nobody approves and a device denied.
 - **Program reads** ride the same request actor. A `PhoneProgramRequest` lists several items for a program on the
   gateway Mac: each a reference, with or without a sealed copy, or only a description. Approve opens every sealed
   item with one Face ID through `Platform::open_sealed_batch`, and `FfiApp::answer_program` carries the values

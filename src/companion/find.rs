@@ -5,8 +5,8 @@
 //! program that does not know an item can then read the one it wants with
 //! its own approval. It is asked like a program read: this Mac first while
 //! the owner is there, the companion Macs [`PHONE_GRACE`] later or at once,
-//! and a Deny anywhere ends it. Phones are not asked, since the app cannot
-//! search 1Password
+//! and a Deny takes only its own Mac out. Phones are not asked, since the
+//! app cannot search 1Password
 
 use std::{sync::Arc, time::Duration};
 
@@ -16,7 +16,7 @@ use tokio::{sync::watch, task::JoinSet};
 use super::{
     ASK_TIMEOUT, CompanionErrorCode, CompanionFailure, Companions, MALFORMED_REQUEST,
     ProgramReadError,
-    program::{Miss, checked_query, clean_reason},
+    program::{Miss, checked_query, clean_reason, first_answer},
 };
 use crate::{
     config::CompanionPeer,
@@ -114,30 +114,9 @@ impl OnePassword {
         }
 
         // dropping the set on any exit takes the other prompts down
-        let first = async {
-            let mut failures = Vec::new();
-            while let Some(finished) = sources.join_next().await {
-                match finished {
-                    Ok((source, Ok(found))) => return Ok(ProgramFound { source, found }),
-                    Ok((_, Err(Miss::Denied(message)))) => {
-                        return Err(ProgramReadError::Denied(message));
-                    }
-                    Ok((_, Err(Miss::Failed(message)))) => failures.push(message),
-                    Err(error) => failures.push(format!("a find stopped unexpectedly: {error}")),
-                }
-            }
+        let (source, found) = first_answer(&mut sources, ASK_TIMEOUT + grace, "find").await?;
 
-            Err(ProgramReadError::Failed(failures.join("; ")))
-        };
-
-        tokio::time::timeout(ASK_TIMEOUT + grace, first)
-            .await
-            .unwrap_or_else(|_| {
-                Err(ProgramReadError::Failed(format!(
-                    "nobody approved within {:?}",
-                    ASK_TIMEOUT + grace
-                )))
-            })
+        Ok(ProgramFound { source, found })
     }
 
     /// Asks on this Mac: its own Touch ID prompt naming the query, then the

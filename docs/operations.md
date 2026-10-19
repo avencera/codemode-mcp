@@ -150,9 +150,10 @@ wherever you are.
 
 While you are at the gateway Mac it asks first, and the phone and companion Macs are asked 5 seconds later. While
 you are away they are all asked at once. The first approval sends every value, and the other prompts are taken
-down. A Deny on any device stops the request. Every prompt names the file the values go to, or the command whose
-environment gets them, always in full: `op run` refuses a command line longer than 200 characters or spanning
-lines (put a long script in a file), and a file path that starts or ends with a space is refused. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
+down. A Deny takes only that device's prompt down, so you can turn the request down on one device and approve it
+on another; it is denied once every device has said no or timed out. Every prompt names the file the values go to,
+or the command whose environment gets them, always in full: `op run` refuses a command line longer than 200
+characters or spanning lines (put a long script in a file), and a file path that starts or ends with a space is refused. Nothing is reused unless you ask: every command asks again, and the daemon keeps no value.
 A phone keeps a copy of each value sealed to its Face ID, as for config reads.
 
 When the next few commands need the same values, add `--keep 15m` to the first. Its prompt says the values will

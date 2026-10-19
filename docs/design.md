@@ -222,8 +222,11 @@ approved wherever the owner is
 - Sources: the gateway Mac while `Mac::present` says the owner is there and Touch ID is on, every companion Mac,
   and every phone. Companion Macs and phones wait `PHONE_GRACE` (5 s) while the gateway Mac is asked. The first
   source to send every value wins and the rest are dropped, which takes their prompts down. A `denied` answer
-  from any source ends the read at once; other failures wait for the remaining sources. The whole read gives up
-  after `ASK_TIMEOUT` plus the grace
+  takes only its own source out, like any other failure, so the owner can turn a prompt down on one device and
+  approve on another; a Deny at the gateway Mac also ends the grace, so the others are asked at once. With nobody
+  approving, the read is `denied` when any source denied it and failed otherwise, naming what each said. Finds
+  race the same way (`first_answer` in `src/companion/program.rs`). The whole read gives up after `ASK_TIMEOUT`
+  plus the grace
 - The gateway Mac never runs `op` for a program without its own Touch ID prompt first. 1Password's prompt names
   no item, and one approval lets `op` read anything for about ten minutes, so without the codemode prompt a
   program could read silently after any earlier approval. A companion Mac and a phone hold the same rule for

@@ -2033,7 +2033,7 @@ async fn a_program_prompt_names_every_item_however_many() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_deny_at_the_gateway_mac_reads_nothing_and_asks_no_one_else() -> TestResult {
+async fn a_deny_on_one_mac_leaves_the_others_to_answer() -> TestResult {
     let Some(rig) = Rig::start(Options {
         present: true,
         ..Options::default()
@@ -2042,14 +2042,31 @@ async fn a_deny_at_the_gateway_mac_reads_nothing_and_asks_no_one_else() -> TestR
     else {
         return Ok(());
     };
-    rig.gateway_mac.set_answer(Some(TouchId::Review));
     let local_reads = reads(&rig.local_log, REFERENCE);
 
-    let (_, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
-    assert!(body["denied"].is_object(), "{body}");
+    // a Deny at the gateway Mac reads nothing there and asks the companion
+    // at once, without waiting out the grace, and its approval answers
+    rig.gateway_mac.set_answer(Some(TouchId::Review));
+    rig.companion_mac.set_answer(Some(TouchId::Approved));
+    let started = std::time::Instant::now();
+    let (status, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "values": { "source": "mba", "values": [VALUE] } })
+    );
+    assert!(started.elapsed() < codemode_mcp::secrets::PHONE_GRACE);
     assert_eq!(reads(&rig.local_log, REFERENCE), local_reads);
-    tokio::time::sleep(codemode_mcp::secrets::PHONE_GRACE).await;
-    assert!(program_prompts(&rig.companion_mac).is_empty());
+
+    // with every device saying no, the read is denied, naming each
+    rig.companion_mac.set_answer(Some(TouchId::Review));
+    let (_, body) = program_read(&rig, json!([{ "reference": REFERENCE }])).await?;
+    let message = body["denied"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("this Mac") && message.contains("mba"),
+        "{body}"
+    );
+    assert_eq!(reads(&rig.local_log, REFERENCE), local_reads);
 
     rig.stop().await
 }

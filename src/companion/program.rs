@@ -4,8 +4,9 @@
 //! While the owner is at the gateway Mac it asks first: its own Touch ID
 //! prompt names every item, then the local `op` reads them. The phones and
 //! companion Macs are asked [`PHONE_GRACE`] later, or at once while the owner
-//! is away. The first device to approve answers the whole batch, and a Deny
-//! on any device ends it
+//! is away. The first device to approve answers the whole batch; a Deny
+//! takes only its own device out, and the read is denied once every device
+//! has said no or given up
 //!
 //! Unlike the gateway's own config reads, nothing comes from the cache and
 //! the local `op` never runs without that prompt first: 1Password's prompt
@@ -276,12 +277,56 @@ fn all_references(targets: &[ProgramTarget]) -> Option<Vec<String>> {
         .collect()
 }
 
-/// Why one device gave no values
+/// Why one device gave no values; either way the other devices are still
+/// waited for
 pub(super) enum Miss {
-    /// The owner said no there, which ends the whole read
+    /// The owner said no there
     Denied(String),
-    /// Anything else; the other devices are still waited for
+    /// Anything else
     Failed(String),
+}
+
+/// The first source in `sources` to answer, waiting at most `limit`
+///
+/// A Deny takes only its own device out of the race, so the owner can turn
+/// a prompt down on one device and approve on another. With nobody
+/// approving, the read is denied when any device denied it and failed
+/// otherwise, naming what each device said
+pub(super) async fn first_answer<T: 'static>(
+    sources: &mut JoinSet<(String, Result<T, Miss>)>,
+    limit: Duration,
+    what: &str,
+) -> Result<(String, T), ProgramReadError> {
+    let deadline = Instant::now() + limit;
+    let mut denials = Vec::new();
+    let mut failures = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, sources.join_next()).await {
+            Ok(Some(Ok((source, Ok(answer))))) => return Ok((source, answer)),
+            Ok(Some(Ok((_, Err(Miss::Denied(message)))))) => denials.push(message),
+            Ok(Some(Ok((_, Err(Miss::Failed(message)))))) => failures.push(message),
+            Ok(Some(Err(error))) => {
+                failures.push(format!("a {what} stopped unexpectedly: {error}"));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                failures.push(format!("nobody approved within {limit:?}"));
+                break;
+            }
+        }
+    }
+
+    let denied = !denials.is_empty();
+    let message = denials
+        .into_iter()
+        .chain(failures)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if denied {
+        Err(ProgramReadError::Denied(message))
+    } else {
+        Err(ProgramReadError::Failed(message))
+    }
 }
 
 impl Miss {
@@ -479,29 +524,7 @@ impl OnePassword {
         // dropping the set on any exit takes the other prompts down: the
         // local prompt and `op` die with their task, companion connections
         // hang up and phone streams stop
-        let first = async {
-            let mut failures = Vec::new();
-            while let Some(finished) = sources.join_next().await {
-                match finished {
-                    Ok((source, Ok(answer))) => return Ok((source, answer)),
-                    Ok((_, Err(Miss::Denied(message)))) => {
-                        return Err(ProgramReadError::Denied(message));
-                    }
-                    Ok((_, Err(Miss::Failed(message)))) => failures.push(message),
-                    Err(error) => failures.push(format!("a read stopped unexpectedly: {error}")),
-                }
-            }
-
-            Err(ProgramReadError::Failed(failures.join("; ")))
-        };
-        let (source, answer) = tokio::time::timeout(ASK_TIMEOUT + grace, first)
-            .await
-            .unwrap_or_else(|_| {
-                Err(ProgramReadError::Failed(format!(
-                    "nobody approved within {:?}",
-                    ASK_TIMEOUT + grace
-                )))
-            })?;
+        let (source, answer) = first_answer(&mut sources, ASK_TIMEOUT + grace, "read").await?;
 
         // the losers' prompts come down now, not after the sealing below
         drop(sources);
