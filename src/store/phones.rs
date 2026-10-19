@@ -28,6 +28,17 @@ impl Store {
         Ok(())
     }
 
+    /// Drops every phone's copy of `reference`, for a value no phone can
+    /// hand back, so a wrong copy kept earlier is not offered again
+    pub fn drop_seals(&self, reference: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "DELETE FROM phone_seals WHERE reference = ?1",
+            params![reference],
+        )?;
+
+        Ok(())
+    }
+
     /// The phone's copy of `reference`, when the gateway has read it since
     /// the phone was paired
     pub fn seal(&self, phone: &str, reference: &str) -> Result<Option<Sealed>, StoreError> {

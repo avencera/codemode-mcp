@@ -1578,6 +1578,52 @@ async fn a_program_read_is_answered_on_the_phone_with_one_approval() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_file_read_at_the_gateway_drops_the_text_the_phone_entered_for_it() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: false,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let cert = "op://Dev/signing/cert.p12";
+    let read = json!({ "targets": [{ "reference": cert }], "reason": "signing" });
+
+    // with the owner away, text is entered on the phone for the file by
+    // mistake, and the gateway keeps a copy of it sealed to the phone
+    rig.gateway_mac.set_present(false);
+    rig.phone.set_answer(Answer::Enter("typed-by-mistake"));
+    let (status, body) = rig.harness.admin_json("/admin/op/read", &read).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["values"]["values"], json!(["typed-by-mistake"]));
+
+    // back at the gateway, the owner approves its own `op` reading the
+    // real file
+    rig.gateway_mac.set_present(true);
+    rig.gateway_mac.set_answer(Some(TouchId::Approved));
+    let (status, body) = rig.harness.admin_json("/admin/op/read", &read).await?;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["values"]["values"][0]["base64"].is_string(), "{body}");
+
+    // so the phone is next asked with no copy to open, not the mistaken one
+    rig.gateway_mac.set_present(false);
+    rig.phone.set_answer(Answer::Enter("entered-again"));
+    let (status, body) = rig.harness.admin_json("/admin/op/read", &read).await?;
+    assert_eq!(status, 200, "{body}");
+    let asked: Vec<Vec<String>> = rig
+        .phone
+        .seen()
+        .into_iter()
+        .filter(|seen| !seen.items.is_empty())
+        .map(|seen| seen.items)
+        .collect();
+    assert_eq!(asked.last(), Some(&vec![cert.to_owned()]), "{asked:?}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn with_the_owner_away_the_login_for_a_page_is_picked_on_the_phone() -> TestResult {
     let Some(rig) = Rig::start(Options {
         with_mac_companion: true,

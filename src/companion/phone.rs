@@ -113,6 +113,17 @@ impl Companions {
         matches!(store.seal(&phone.id.to_string(), reference), Ok(Some(_)))
     }
 
+    /// Drops the phones' copies of `reference`, read now as a file a phone
+    /// cannot open as text, so none of them offers an older wrong copy
+    pub fn unseal_for_phones(&self, reference: &str) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(error) = store.drop_seals(reference) {
+            tracing::warn!(%error, "could not drop the phones' copies of a value");
+        }
+    }
+
     /// Seals `value` to every phone, replacing older copies; the value
     /// itself is not kept. Failures are logged: a phone without a fresh
     /// copy answers with the old one or not at all, and the read that

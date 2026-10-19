@@ -515,11 +515,15 @@ impl OnePassword {
 
         if let Some(companions) = &companions {
             for (target, value) in targets.iter().zip(&outcome.values) {
+                let ProgramTarget::Reference(reference) = target else {
+                    continue;
+                };
                 // a phone hands back what it opens as text, so a file such as
-                // a `.p12` is never sealed to it
-                if let (ProgramTarget::Reference(reference), Some(text)) = (target, value.as_text())
-                {
-                    companions.seal_for_phones(reference, text).await;
+                // a `.p12` is never sealed to it; any copy a phone holds, such
+                // as text once entered for the file by mistake, is dropped
+                match value.as_text() {
+                    Some(text) => companions.seal_for_phones(reference, text).await,
+                    None => companions.unseal_for_phones(reference),
                 }
             }
         }

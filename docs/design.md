@@ -285,7 +285,8 @@ approved wherever the owner is
   reject as a malformed answer instead of misreading it. Only `op read` takes a binary value, written as is with no
   newline added. Templates, env files, environments and the JSON object of several references take text only, and
   gateway config reads go through `read_local_text`. A binary value is never sealed to phones, because the app
-  answers with text
+  answers with text, and reading one drops any copy the phones hold for that reference, such as text once entered
+  on the phone for a file by mistake
 - `op read` with several references prints a JSON object of each reference and its value. `--keep` takes `90s`,
   `15m`, `1h` or bare minutes, at most 60 minutes, and is checked before anyone is asked
 - The `secrets` builtin (`src/env_files.rs`) serves `write_env(path, vars, reason, keep_minutes)` in process,

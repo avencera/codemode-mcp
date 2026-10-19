@@ -79,6 +79,7 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/linebreak/credential) printf 'first-line\\nsecond-line' ;;\n\
                op://Dev/totp/credential) printf '%s' 'otpauth://totp/GitHub:me?secret={TOTP_SECRET}&issuer=GitHub' ;;\n\
                op://Dev/big/credential) head -c 70000 /dev/zero | tr '\\0' a ;;\n\
+               op://Dev/signing/cert.p12) printf '\\060\\202\\000\\377\\n' ;;\n\
                *) echo \"[ERROR] could not read secret '$3': no item matched\" >&2; exit 1 ;;\n\
              esac\n",
             log = log.display(),
