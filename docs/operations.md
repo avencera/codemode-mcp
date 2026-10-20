@@ -214,7 +214,9 @@ case, in item titles, vault names, tags and categories, and at most 10 items are
 counting the rest. You approve the search with Touch ID on this Mac while you are there, or on a companion Mac;
 the prompt quotes the words and the reason. The phone cannot search 1Password, so it is not asked. Reading the
 reference picked afterwards asks again and names that item. Scripts can do the same with the `secrets` server's
-`find_references(query, reason)`.
+`find_references(query, reason)`. Finds with the same reason that arrive within 250 ms of each other, such as the
+calls a script starts together under `asyncio.gather`, share one prompt that quotes every query, up to 8 of them;
+each call still gets its own matches.
 
 A file attached to an item, such as a signing certificate's `.p12`, is binary. Write it with
 `codemode-mcp op read "op://Personal/Signing/cert.p12" --out-file cert.p12`, which keeps its exact bytes and adds no

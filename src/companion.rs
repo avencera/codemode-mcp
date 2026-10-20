@@ -26,7 +26,7 @@ pub use client::{CheckOutcome, CompanionFailure, Companions};
 pub use companion_wire::{
     ALPN, ASK_TIMEOUT, MAX_BODY_BYTES, MAX_PHONE_READ_BYTES, MOBILE_ALPN, PAIR_ALPN,
 };
-pub use find::{FindAsk, ProgramFound};
+pub use find::{FindAsk, FindBatches, ProgramFound};
 pub use identity::{IdentityError, Role, load_or_create};
 pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
@@ -41,8 +41,8 @@ pub use wire::{
     CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode, CompanionFault,
     CompanionFindRequest, CompanionFindResponse, CompanionProgramRequest, CompanionRequest,
     CompanionResponse, CreatedItem, FindQuery, Found, FoundField, FoundItem, MALFORMED_REQUEST,
-    NewItem, PairCheck, PairRequest, PairResponse, ProgramBatch, ProgramValue, Registered,
-    Registration,
+    MAX_FIND_QUERIES, NewItem, PairCheck, PairRequest, PairResponse, ProgramBatch, ProgramValue,
+    Registered, Registration,
 };
 
 use std::time::Duration;

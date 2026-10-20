@@ -75,6 +75,10 @@ pub const MAX_FIND_QUERY_CHARS: usize = 80;
 /// Most items one find answers with; the rest are only counted
 pub const MAX_FOUND_ITEMS: usize = 10;
 
+/// Most searches one find prompt covers, so the prompt stays readable and
+/// the answer stays within [`crate::MAX_BODY_BYTES`]
+pub const MAX_FIND_QUERIES: usize = 8;
+
 /// Asks a Mac which 1Password items match a query, for a program that does
 /// not know the exact reference, sent as `{"find": {...}}`; answered with
 /// [`CompanionFindResponse`]
@@ -82,6 +86,9 @@ pub const MAX_FOUND_ITEMS: usize = 10;
 /// The answer names items and their fields' references, never a value, so
 /// the program then reads the one it wants with its own approval. A
 /// companion from before this answers [`MALFORMED_REQUEST`]
+///
+/// One Touch ID prompt covers `query` and every search in `also`, so the
+/// finds a script starts together are approved once
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompanionFindRequest {
     /// The search
@@ -94,6 +101,12 @@ pub struct FindQuery {
     /// Words to look for in item titles, vault names, tags and categories,
     /// at most [`MAX_FIND_QUERY_CHARS`]
     pub query: String,
+    /// Further searches the same prompt approves, each answered on its own,
+    /// so with `query` at most [`MAX_FIND_QUERIES`]; when set, the answer is
+    /// [`CompanionFindResponse::FoundEach`]. A companion from before this
+    /// ignores them and answers `found` for `query` alone
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<String>,
     /// Why the program is looking, in its own words, at most
     /// [`MAX_REASON_CHARS`]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,8 +118,11 @@ pub struct FindQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompanionFindResponse {
-    /// The items that matched
+    /// The items that matched a find with no `also`
     Found(Found),
+    /// The items each search matched, `query` first and then `also` in
+    /// order, answering a find with `also`
+    FoundEach(Vec<Found>),
     /// Nothing was searched
     Error(CompanionFault),
 }

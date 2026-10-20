@@ -7,6 +7,8 @@
 //! each field's reference, label, type, purpose and section, and each file's
 //! name, are copied out of it
 
+use std::collections::HashMap;
+
 use companion_wire::wire::{Found, FoundField, FoundItem, MAX_FOUND_ITEMS};
 use serde::Deserialize;
 
@@ -209,13 +211,16 @@ impl OnePassword {
         }))
     }
 
-    /// The items on this Mac matching `query`, best first, with no cache and
-    /// no companions; the caller asks the owner first
+    /// The items on this Mac matching each of `queries`, in order, best
+    /// first, with no cache and no companions; the caller asks the owner
+    /// first
     ///
-    /// Each word of the query counts once when it is in an item's title,
+    /// Each word of a query counts once when it is in an item's title,
     /// vault, tags or category, ignoring case; items matching no word are
-    /// left out. At most [`MAX_FOUND_ITEMS`] are opened and answered
-    pub async fn find_local(&self, query: &str) -> Result<Found, FindError> {
+    /// left out. At most [`MAX_FOUND_ITEMS`] are opened and answered per
+    /// query. The list is read once, and an item two queries match is
+    /// opened once
+    pub async fn find_local_each(&self, queries: &[String]) -> Result<Vec<Found>, FindError> {
         let list = self
             .op("item list", &["item", "list", "--format", "json"])
             .await?;
@@ -224,54 +229,47 @@ impl OnePassword {
             reason: "the answer was not a JSON list of items".to_owned(),
         })?;
 
-        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-        let mut scored: Vec<(usize, Listed)> = listed
-            .into_iter()
-            .map(|item| {
-                let text = format!(
-                    "{} {} {} {}",
-                    item.title,
-                    item.vault.name,
-                    item.tags.join(" "),
-                    item.category
-                )
-                .to_lowercase();
-                let score = words.iter().filter(|word| text.contains(*word)).count();
+        let mut opened: HashMap<&str, FoundItem> = HashMap::new();
+        let mut answers = Vec::with_capacity(queries.len());
+        for query in queries {
+            let best = best_matches(&listed, query);
+            let more = best.len().saturating_sub(MAX_FOUND_ITEMS);
+            let mut items = Vec::with_capacity(best.len().min(MAX_FOUND_ITEMS));
+            for listed in best.into_iter().take(MAX_FOUND_ITEMS) {
+                let item = match opened.get(listed.id.as_str()) {
+                    Some(item) => item.clone(),
+                    None => {
+                        let item = self.open(listed).await?;
+                        opened.insert(&listed.id, item.clone());
 
-                (score, item)
-            })
-            .filter(|(score, _)| *score > 0)
-            .collect();
-        scored.sort_by(|(left_score, left), (right_score, right)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
-        });
-
-        let more = scored.len().saturating_sub(MAX_FOUND_ITEMS);
-        let mut items = Vec::with_capacity(scored.len().min(MAX_FOUND_ITEMS));
-        for (_, listed) in scored.into_iter().take(MAX_FOUND_ITEMS) {
-            let vault = if listed.vault.id.is_empty() {
-                listed.vault.name.clone()
-            } else {
-                listed.vault.id.clone()
-            };
-            let json = self
-                .op(
-                    "item get",
-                    &[
-                        "item", "get", &listed.id, "--vault", &vault, "--format", "json",
-                    ],
-                )
-                .await?;
-            let opened: Opened = serde_json::from_slice(&json).map_err(|_| FindError::Failed {
-                command: "item get",
-                reason: "the answer was not a JSON item".to_owned(),
-            })?;
-            items.push(found_item(opened, &listed));
+                        item
+                    }
+                };
+                items.push(item);
+            }
+            answers.push(Found { items, more });
         }
 
-        Ok(Found { items, more })
+        Ok(answers)
+    }
+
+    /// The item `listed` names as a find answers it, read with `op item get`
+    async fn open(&self, listed: &Listed) -> Result<FoundItem, FindError> {
+        let vault = first_set(&listed.vault.id, &listed.vault.name);
+        let json = self
+            .op(
+                "item get",
+                &[
+                    "item", "get", &listed.id, "--vault", vault, "--format", "json",
+                ],
+            )
+            .await?;
+        let opened: Opened = serde_json::from_slice(&json).map_err(|_| FindError::Failed {
+            command: "item get",
+            reason: "the answer was not a JSON item".to_owned(),
+        })?;
+
+        Ok(found_item(opened, listed))
     }
 
     /// Runs `op` with `args` and returns what it printed; only one line of
@@ -307,6 +305,36 @@ impl OnePassword {
 
         Ok(output.stdout)
     }
+}
+
+/// The items of `listed` matching any word of `query`, those matching more
+/// words first and then by title
+fn best_matches<'a>(listed: &'a [Listed], query: &str) -> Vec<&'a Listed> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut scored: Vec<(usize, &Listed)> = listed
+        .iter()
+        .map(|item| {
+            let text = format!(
+                "{} {} {} {}",
+                item.title,
+                item.vault.name,
+                item.tags.join(" "),
+                item.category
+            )
+            .to_lowercase();
+            let score = words.iter().filter(|word| text.contains(*word)).count();
+
+            (score, item)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect();
+    scored.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+    });
+
+    scored.into_iter().map(|(_, item)| item).collect()
 }
 
 /// The item as a find answers it: each field `op` gave a reference, and

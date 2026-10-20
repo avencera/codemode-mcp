@@ -103,7 +103,7 @@ enum Answer {
 }
 
 /// Why a program read gave no values; none of the text holds a value
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProgramReadError {
     /// The request itself was refused before anyone was asked
     #[error("{0}")]
@@ -489,10 +489,13 @@ impl OnePassword {
                             let query = description.unwrap_or_default();
                             let find = FindQuery {
                                 query: query.clone(),
+                                also: Vec::new(),
                                 reason: context.reason,
                             };
                             match companions.find_mac(&peer, find).await {
-                                Ok(found) => matched(&peer.name, &query, found),
+                                Ok(mut found) => {
+                                    matched(&peer.name, &query, found.pop().unwrap_or_default())
+                                }
                                 Err(failure) => Err(Miss::from_failure(&peer.name, failure)),
                             }
                         }

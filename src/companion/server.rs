@@ -8,9 +8,9 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use super::{
     ALPN, ASK_TIMEOUT, CompanionCreateRequest, CompanionCreateResponse, CompanionErrorCode,
     CompanionFault, CompanionFindRequest, CompanionFindResponse, CompanionProgramRequest,
-    CompanionRequest, CompanionResponse, FindQuery, HANDSHAKE_TIMEOUT, Hangup, IdentityError,
-    MALFORMED_REQUEST, MAX_BODY_BYTES, NewItem, ProgramBatch, ProgramValue, Role, bind_endpoint,
-    load_or_create, program,
+    CompanionRequest, CompanionResponse, FindQuery, Found, HANDSHAKE_TIMEOUT, Hangup,
+    IdentityError, MALFORMED_REQUEST, MAX_BODY_BYTES, MAX_FIND_QUERIES, NewItem, ProgramBatch,
+    ProgramValue, Role, bind_endpoint, load_or_create, program,
 };
 use crate::{
     config::CompanionConfig,
@@ -384,7 +384,7 @@ impl Companion {
         response
     }
 
-    /// Answers a find: one Touch ID prompt naming the query and the
+    /// Answers a find: one Touch ID prompt naming every query and the
     /// program's reason, then `op` lists and opens the matching items, and
     /// only their references and labels are sent
     async fn find(&self, query: FindQuery) -> CompanionFindResponse {
@@ -395,8 +395,17 @@ impl Companion {
             })
         };
 
-        let text = match program::checked_query(&query.query) {
-            Ok(text) => text,
+        let batched = !query.also.is_empty();
+        let queries: Result<Vec<String>, String> = if 1 + query.also.len() > MAX_FIND_QUERIES {
+            Err(format!("a find asks for 1 to {MAX_FIND_QUERIES} searches"))
+        } else {
+            std::iter::once(&query.query)
+                .chain(&query.also)
+                .map(|text| program::checked_query(text))
+                .collect()
+        };
+        let queries = match queries {
+            Ok(queries) => queries,
             Err(reason) => {
                 tracing::warn!(%reason, "refused a malformed find");
 
@@ -414,7 +423,8 @@ impl Companion {
                 "Touch ID is unavailable on this machine",
             );
         };
-        let prompt = prompt::find_prompt_text(&text, &self.config.gateway_name, reason.as_deref());
+        let prompt =
+            prompt::find_prompt_text(&queries, &self.config.gateway_name, reason.as_deref());
         match mac.touch_id(&prompt, CANCEL_TITLE).await {
             TouchId::Approved => {}
             TouchId::Review => {
@@ -436,7 +446,7 @@ impl Companion {
             }
         }
 
-        let mut found = match self.onepassword.find_local(&text).await {
+        let mut found = match self.onepassword.find_local_each(&queries).await {
             Ok(found) => found,
             Err(error) => {
                 tracing::warn!(%error, "find failed on this Mac");
@@ -444,17 +454,34 @@ impl Companion {
                 return fault(CompanionErrorCode::ReadFailed, &error.to_string());
             }
         };
-        // the gateway reads at most MAX_BODY_BYTES, so the last items are
-        // only counted when all of them would not fit
-        while serde_json::to_vec(&CompanionFindResponse::Found(found.clone()))
-            .map_or(true, |bytes| bytes.len() > MAX_BODY_BYTES)
-            && found.items.pop().is_some()
+        // the gateway reads at most MAX_BODY_BYTES, so the last items of the
+        // longest answer are only counted when all of them would not fit
+        let answer = |found: &[Found]| {
+            if batched {
+                CompanionFindResponse::FoundEach(found.to_vec())
+            } else {
+                CompanionFindResponse::Found(found.first().cloned().unwrap_or_default())
+            }
+        };
+        while serde_json::to_vec(&answer(&found)).map_or(true, |bytes| bytes.len() > MAX_BODY_BYTES)
         {
-            found.more += 1;
+            let Some(longest) = found
+                .iter_mut()
+                .filter(|found| !found.items.is_empty())
+                .max_by_key(|found| found.items.len())
+            else {
+                break;
+            };
+            longest.items.pop();
+            longest.more += 1;
         }
-        tracing::info!(items = found.items.len(), "find approved and answered");
+        tracing::info!(
+            searches = found.len(),
+            items = found.iter().map(|found| found.items.len()).sum::<usize>(),
+            "find approved and answered"
+        );
 
-        CompanionFindResponse::Found(found)
+        answer(&found)
     }
 
     /// Answers one read request: refuses anything that is not a reference,

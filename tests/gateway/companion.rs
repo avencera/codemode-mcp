@@ -1891,6 +1891,73 @@ async fn a_find_on_the_companion_answers_references_and_never_values() -> TestRe
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn finds_a_script_starts_together_share_one_prompt() -> TestResult {
+    let Some(rig) = Rig::start(Options {
+        extra: "[servers.secrets]\nbuiltin = \"secrets\"\n",
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    signing_items(&rig, "hunter2-signing-secret")?;
+    std::fs::write(
+        rig.companion_log.with_file_name("item-tok1.json"),
+        r#"{"id":"tok1","title":"Pushover","category":"API_CREDENTIAL",
+            "vault":{"id":"v1","name":"Personal"},
+            "fields":[{"id":"credential","type":"CONCEALED","label":"credential",
+                        "reference":"op://Personal/Pushover/credential"}]}"#,
+    )?;
+
+    // the agent in the media thread did this and got a prompt per search
+    let body = script(
+        &rig,
+        "import asyncio\n\
+         reason: str = \"set up the release build\"\n\
+         qs: list[str] = [\"signing\", \"pushover\", \"signing\"]\n\
+         rs = await asyncio.gather(*[secrets_find_references(query=q, reason=reason) for q in qs])\n\
+         other = await secrets_find_references(query=\"pushover\", reason=\"something else\")\n\
+         [[i[\"title\"] for i in r[\"items\"]] for r in rs] + [[i[\"title\"] for i in other[\"items\"]]]",
+    )
+    .await?;
+    assert_eq!(
+        body,
+        json!([
+            ["Apple Signing"],
+            ["Pushover"],
+            ["Apple Signing"],
+            ["Pushover"]
+        ])
+    );
+
+    let prompts: Vec<String> = rig
+        .companion_mac
+        .shown()
+        .into_iter()
+        .filter(|prompt| prompt.contains("1Password items match"))
+        .collect();
+    // one prompt for the gathered three, sorted, the repeated query quoted
+    // once; a find with another reason never rides on that approval
+    assert_eq!(
+        prompts,
+        [
+            "touch_id show a program on main which 1Password items match \"pushover\" or \
+             \"signing\", with their references but no values, for \"set up the release build\"",
+            "touch_id show a program on main which 1Password items match \"pushover\", with their \
+             references but no values, for \"something else\"",
+        ]
+    );
+    let argv = op_file(&rig.companion_log, "argv.log");
+    let listed = argv
+        .lines()
+        .filter(|line| line.starts_with("item list"))
+        .count();
+    assert_eq!(listed, 2, "one list per approved batch: {argv}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_description_approved_on_a_mac_answers_its_matches_and_writes_nothing() -> TestResult {
     let Some(rig) = Rig::start(Options {
         extra: "[servers.secrets]\nbuiltin = \"secrets\"\n",

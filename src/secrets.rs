@@ -26,7 +26,7 @@ use tokio::{sync::Mutex, task::JoinSet};
 
 use self::approved::{Approved, Consumer};
 use crate::{
-    companion::{Companions, CreatedItem, DeviceTrust, NewItem, ProgramValue},
+    companion::{Companions, CreatedItem, DeviceTrust, FindBatches, NewItem, ProgramValue},
     config::{Config, SecretsConfig},
     mac::{OnMac, TouchId},
     store::Store,
@@ -873,6 +873,8 @@ pub struct OnePassword {
     approved: Arc<Approved>,
     companions: Option<Arc<Companions>>,
     on_mac: Option<OnMac>,
+    /// Finds waiting to share one prompt with others from the same script
+    finds: Arc<FindBatches>,
 }
 
 /// The keep grants, and how many times they were forgotten, so a read
@@ -916,6 +918,7 @@ impl OnePassword {
             approved: Arc::new(Approved::ungated()),
             companions: None,
             on_mac: None,
+            finds: Arc::default(),
         }
     }
 
@@ -989,6 +992,11 @@ impl OnePassword {
     /// The companions and phones this reader asks, when it has any
     pub fn companions(&self) -> Option<&Arc<Companions>> {
         self.companions.as_ref()
+    }
+
+    /// The finds still gathering others before they are asked
+    pub(crate) fn find_batches(&self) -> &FindBatches {
+        &self.finds
     }
 
     /// The values kept for `references` going to `destination`, when every

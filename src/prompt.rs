@@ -116,13 +116,17 @@ pub fn program_prompt_text(prompt: &ProgramPrompt<'_>) -> String {
     text
 }
 
-/// Text of the Touch ID prompt for a program's find at `place`: the query
+/// Text of the Touch ID prompt for a program's find at `place`: every query
 /// and the reason quoted, as the program's claims
-pub fn find_prompt_text(query: &str, place: &str, reason: Option<&str>) -> String {
+pub fn find_prompt_text(queries: &[String], place: &str, reason: Option<&str>) -> String {
+    let queries: Vec<String> = queries
+        .iter()
+        .map(|query| quoted(query.trim(), REASON_CHARS))
+        .collect();
     let mut text = format!(
         "show a program on {place} which 1Password items match {}, with their references but \
          no values",
-        quoted(query.trim(), REASON_CHARS)
+        queries.join(" or ")
     );
     match reason.filter(|reason| !reason.trim().is_empty()) {
         Some(reason) => {

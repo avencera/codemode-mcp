@@ -82,9 +82,11 @@ pub struct WriteEnvParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindReferencesParams {
     /// Words to look for in item titles, vault names, tags and categories,
-    /// such as `apple signing`
+    /// such as `apple signing`; an item holding any of them matches, and
+    /// those holding more come first. At most 80 characters
     pub query: String,
-    /// Why the program needs to know; every prompt shows it
+    /// Why the program needs to know; every prompt shows it. Calls started
+    /// together under `asyncio.gather` with the same reason share one prompt
     pub reason: String,
 }
 
@@ -335,7 +337,9 @@ impl SecretsServer {
                        query, with each field's and attached file's op:// reference and type but \
                        no values. Use it when you do not know the exact reference, then pass the \
                        one you want to `write_env`, which asks the owner again naming that item. \
-                       The owner approves the search with Touch ID on this Mac or a companion Mac."
+                       The owner approves the search with Touch ID on this Mac or a companion Mac; \
+                       to look for several things, start one call for each together under \
+                       `asyncio.gather` with the same reason, and one prompt approves them all."
     )]
     async fn find_references(
         &self,

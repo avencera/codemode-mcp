@@ -68,7 +68,10 @@ macro_rules! onepassword_rule {
          only when nothing else will do. When you do not know the exact reference, find it first: \
          `codemode-mcp op find WORDS --reason WHY` (or the `secrets` server's `find_references` \
          tool) lists matching items' op:// references and types, never values, after the user \
-         approves on a Mac; then use the reference you picked. Or pass a description in one step: \
+         approves on a Mac; then use the reference you picked. A query matches items holding any of \
+         its words, up to 80 characters and 10 items, so to look for several things, start one \
+         `find_references` call for each together under `asyncio.gather` with the same `reason`: \
+         the user approves them all with one prompt. Or pass a description in one step: \
          `codemode-mcp op read --describe \"Apple signing cert\" --out-file PATH` or `write_env`'s \
          `describe`. If the user approves on a Mac it searches instead, writes nothing and answers the \
          matches (`op read` exits 3), so run again with the exact reference; if they approve on their \

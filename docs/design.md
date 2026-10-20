@@ -276,7 +276,13 @@ approved wherever the owner is
   the owner was approving. References are deduplicated, so a template asks once per item
 - A find (`op find`, `/admin/op/find`, `find_references`; `src/companion/find.rs`) is raced like a program read
   between this Mac, after its own Touch ID prompt, and the companion Macs, sent as `{"find": {"query",
-  "reason"}}`. A companion from before finds answers `malformed request`. Phones are not asked. The Mac that
+  "also", "reason"}}`. A companion from before finds answers `malformed request`. Phones are not asked. Finds
+  with the same cleaned reason that arrive within 250 ms of the first join one batch of up to 8 queries
+  (`FindBatches`, keyed by reason so an unrelated program's find never shares an approval or a Deny), asked
+  on its own task so a caller that gives up cannot strand the rest; the batch is dropped once every caller
+  has. One prompt quotes every query; a companion answers `{"found_each": [...]}`, one `Found` per query in
+  order, and one from before batches, which ignores `also` and answers `found`, is reported as needing an
+  update. The Mac lists items once per batch and opens an item two queries match once The Mac that
   answers runs `op item list --format json`, which holds no values, and scores items by how many query words
   appear in their title, vault, tags or category. It opens only the 10 best with `op item get --format json`
   and copies nothing out of that JSON beyond each field's `reference`, label, type and section, and each
