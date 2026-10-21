@@ -1198,10 +1198,10 @@ impl Gateway {
                 available: upstream.callable(),
             })
             .collect();
-        // a hub shares its own servers; a spoke shares nothing
-        if self.hub.is_none() {
-            self.export(&snapshots);
-        }
+        // a hub shares its own servers once they pass the type check below,
+        // so spokes never list a tool the hub's catalog does not have yet; a
+        // spoke shares nothing
+        let local = self.hub.is_none().then(|| snapshots.clone());
         let hub = self.hub_view();
         snapshots.extend(hub.snapshots());
         let config = if hub.configs.is_empty() {
@@ -1256,6 +1256,10 @@ impl Gateway {
                 generation,
                 catalog: Arc::new(catalog),
             };
+            drop(slot);
+            if let Some(local) = local {
+                self.export(&local);
+            }
         }
 
         true

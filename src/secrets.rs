@@ -965,19 +965,28 @@ impl OnePassword {
         let (Some(hub), Some(consumer)) = (&self.hub, consumer) else {
             return Ok(());
         };
-        let mut known = self.known.lock().await;
-        let mut missing: Vec<String> = Vec::new();
-        for reference in references {
-            let cleared =
-                self.approved.allows(consumer, reference) && known.contains_key(reference);
-            if !cleared && !missing.iter().any(|seen| seen == reference) {
-                missing.push(reference.to_owned());
-            }
+        if references.is_empty() {
+            return Ok(());
         }
+        let missing: Vec<String> = {
+            let known = self.known.lock().await;
+            let mut missing: Vec<String> = Vec::new();
+            for reference in references {
+                let cleared =
+                    self.approved.allows(consumer, reference) && known.contains_key(reference);
+                if !cleared && !missing.iter().any(|seen| seen == reference) {
+                    missing.push(reference.to_owned());
+                }
+            }
+
+            missing
+        };
         if missing.is_empty() {
             return Ok(());
         }
 
+        // the shared cache stays free while the hub waits for trust or the
+        // owner, so other servers resolve meanwhile
         let values = hub
             .config_values(consumer, &missing)
             .await
@@ -985,9 +994,11 @@ impl OnePassword {
                 reference: missing.join(", "),
                 reason: error.to_string(),
             })?;
+        let mut known = self.known.lock().await;
         for (reference, value) in missing.iter().zip(values) {
             known.insert(reference.clone(), value);
         }
+        drop(known);
         // the owner approved them for this server on the hub
         self.approve_for(consumer, &missing);
 
