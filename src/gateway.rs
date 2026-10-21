@@ -379,7 +379,7 @@ impl Gateway {
     /// A server that never connected has no tools for search to find, so
     /// without a note the agent sees an empty result and no way forward
     pub fn offline_notes(&self, query: &str) -> Vec<String> {
-        // lowercased too, so `InfraOps` also matches the one word `infraops`
+        // lowercased too, so the query `InfraOps` also names `infraops`
         let words: BTreeSet<String> = search::tokenize(query)
             .into_iter()
             .chain(search::tokenize(&query.to_lowercase()))
@@ -397,11 +397,17 @@ impl Gateway {
                     .map_or(&[][..], |server| server.aliases.as_slice());
 
                 // every word of a name or alias, so `docs` alone does not
-                // name `google-docs`
+                // name `google-docs`; lowercased too, so the one word
+                // `infraops` also names `InfraOps`
                 std::iter::once(name)
                     .chain(aliases.iter().map(String::as_str))
-                    .any(|named| {
-                        let terms = search::tokenize(named);
+                    .flat_map(|named| {
+                        [
+                            search::tokenize(named),
+                            search::tokenize(&named.to_lowercase()),
+                        ]
+                    })
+                    .any(|terms| {
                         !terms.is_empty() && terms.iter().all(|term| words.contains(term))
                     })
             })

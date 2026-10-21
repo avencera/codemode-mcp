@@ -590,7 +590,7 @@ async fn oauth_login_uses_a_client_registered_ahead_of_time() -> TestResult {
 async fn oauth_sign_in_starts_and_finishes_on_the_public_origin() -> TestResult {
     let mock = start_mock(Client::Registered).await?;
     let extra = format!(
-        "[servers.locked]\nurl = \"{}/mcp\"\noauth = true\naliases = [\"mailbox\"]",
+        "[servers.locked]\nurl = \"{}/mcp\"\noauth = true\naliases = [\"MailBox\"]",
         mock.base
     );
     let Some(harness) = Harness::with(Setup {
@@ -606,8 +606,13 @@ async fn oauth_sign_in_starts_and_finishes_on_the_public_origin() -> TestResult 
     // the server has no tools yet, so search finds none; it says instead
     // where the user signs in
     let page = format!("{ORIGIN}/oauth/login/locked");
-    let search = json!({ "query": "Mailbox messages" });
+    // a camel-case alias splits into words; the query may be one word,
+    // lowercased, or the words themselves
+    let search = json!({ "query": "mailbox messages" });
     let found = text_of(&call(&harness.client, "search_tools", search.clone()).await?);
+    assert!(found.contains(&page), "{found}");
+    let split = json!({ "query": "Mail box" });
+    let found = text_of(&call(&harness.client, "search_tools", split.clone()).await?);
     assert!(found.contains(&page), "{found}");
     let unrelated =
         text_of(&call(&harness.client, "search_tools", json!({ "query": "add" })).await?);
@@ -694,6 +699,7 @@ async fn oauth_sign_in_starts_and_finishes_on_the_public_origin() -> TestResult 
     assert_eq!(called["result"], "hello", "{called}");
     let found = text_of(&call(&harness.client, "search_tools", search).await?);
     assert!(!found.contains("/oauth/login/"), "{found}");
+    let found = text_of(&call(&harness.client, "search_tools", split).await?);
     assert!(found.contains("locked_hello"), "{found}");
 
     harness.stop().await
