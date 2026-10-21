@@ -735,6 +735,74 @@ USER_GOOGLE_EMAIL = "you@example.com"
 - Pairing and invites still append to `config.toml`, never to an included file.
 - Included files are read when the config loads, so restart after editing one.
 
+## Spokes: use the hub from other machines
+
+The Mac you installed above is the hub. Another machine, a Linux box or another Mac, runs codemode-mcp as a
+spoke: agents there connect to their own `http://localhost:7681/mcp`, see the hub's servers next to the
+machine's own, and every approval and 1Password value is decided on the hub, with Touch ID at the hub Mac or a
+passkey on the phone. Sign-ins and tokens stay on the hub.
+
+Both machines must be on the same tailnet. The spoke reaches the hub at its MagicDNS name or tailnet IP on port
+7681, not at the `tailscale serve` HTTPS address, which the hub refuses for these routes.
+
+1. Build on the spoke. There are no Linux release artifacts, so build from source on Linux; `update` and
+   `install.sh` refuse there:
+
+   ```sh
+   cargo build --release
+   cargo install monty-runtime --version =1.1.0 --locked --root .tools
+   ```
+
+2. Write the spoke's config, naming the hub once:
+
+   ```sh
+   codemode-mcp config init --hub mac-mini     # or mac-mini:7681, or the tailnet IP
+   ```
+
+   Under `[hub]`, `servers = [...]` keeps only those hub servers and `exclude = [...]` leaves some out. Add the
+   machine's own servers under `[servers.*]` as on the hub. A name a hub server already uses stops the daemon
+   at startup with the name in the error; rename yours or exclude the hub's. The starter config also adds the
+   `secrets` server, so agents on the spoke can write env files there.
+3. Install the service: `./target/release/codemode-mcp service install`. On Linux this writes the systemd user
+   unit `~/.config/systemd/user/codemode-mcp.service` and starts it; logs go to
+   `~/.local/state/codemode-mcp/logs/`. Enable lingering, or the service stops when you log out
+   (`service install` warns when it is off):
+
+   ```sh
+   sudo loginctl enable-linger $USER
+   ```
+
+4. Trust it on the hub. The spoke's first start asks the hub, and the hub asks you: "Trust “ai5090” at
+   100.x.y.z as a spoke?" by Touch ID at the Mac, or on the phone. The answer is kept: restarts and rebuilds
+   that keep `~/.local/state/codemode-mcp/spoke.id` are not asked again. Until you answer, the spoke's log
+   shows the request's link and confirmation code, and the spoke has only its own servers.
+5. Connect the spoke's agents to `http://localhost:7681/mcp`, as on the hub.
+
+What runs where:
+
+- A hub server's tool runs on the hub, under the hub's policy; an `ask` call is approved there like a local
+  one. The spoke never holds the hub's tokens.
+- The spoke's own `ask` tools are approved on the hub too. Prompts read `ai5090 · <client> · <thread>`, and
+  client and session grants apply to that spoke only. A script waiting on one survives a restart of either
+  machine.
+- `write_env`, `find_references` and `codemode-mcp op inject`/`run`/`read` on the spoke put the values on the
+  spoke; the hub reads and approves them, and its prompt shows where they go as `ai5090:<path>`.
+- `{{ op://... }}` in a spoke server's own `env`, `headers` or `url` is approved once on the hub per server,
+  and asked again when the server's command or destination changes. A server that starts before the spoke is
+  trusted waits for the trust.
+- Calendar, Reminders, Xcode and website sign-in stay on the hub Mac and reach spokes as hub tools.
+
+Manage spokes on the hub:
+
+```sh
+codemode-mcp spokes list                # id, name, version, address, when trusted and last seen
+codemode-mcp spokes remove ai5090       # by name or id, as the user the daemon runs as
+```
+
+Trust is tied to the address the spoke was trusted at. A spoke that comes back at another tailnet address
+(Tailscale reinstalled, a new node) asks to be trusted again, and the prompt says where it was trusted before.
+If you refuse, the spoke stops asking until it restarts.
+
 ## Restarts and in-flight work
 
 `service install`, `service restart`, a crash and a reboot all restart the daemon. State is in
@@ -816,6 +884,12 @@ The "Type strictness" section ends with a verdict line:
 - Requests go to the phone while you are at the Mac: the log says why (`Touch ID is not available`,
   `Mac notification failed`). The daemon must run as a LaunchAgent in your login session to see the screen.
 - Monty worker not found: `service install` again, or set `worker_path`.
+- A spoke has only its own servers: its log says why. "waiting for the owner to trust this spoke" means the
+  request is still open on the hub; "the hub answers only Tailscale peers" means `[hub] host` is not the hub's
+  tailnet name or IP; "the hub refused to trust this spoke" means restart it to ask again. `spokes list` on the
+  hub shows whether it is trusted, and from where.
+- On Linux, `systemctl --user status codemode-mcp` shows systemd's view, and the service stopping at logout
+  means lingering is off.
 - A calendar or reminders tool says macOS denied access, or is asking: see Calendar and Reminders access.
 - An Xcode tool says the agent isn't approved: see Xcode access.
 
