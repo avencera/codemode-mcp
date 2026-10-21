@@ -68,6 +68,7 @@ pub(super) fn signed_out_op() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
                op://Dev/mcpurl/credential) cat '{dir}/url' ;;\n\
                op://Dev/deadurl/credential) cat '{dir}/dead-url' ;;\n\
                op://Dev/urlkey/credential) printf '{URL_KEY}' ;;\n\
+               op://Dev/pastedkey/credential) cat '{dir}/pasted' ;;\n\
                op://Dev/symbolkey/credential) printf '{SYMBOL_KEY}' ;;\n\
                op://Dev/slashkey/credential) printf '%s' 'zk/9f3a71c2d8b4e6' ;;\n\
                op://Dev/mixedkey/credential) printf '%s' '{MIXED_KEY}' ;;\n\
@@ -598,6 +599,90 @@ async fn a_url_key_that_breaks_the_rules_is_a_configuration_error() -> TestResul
     }
     assert_eq!(short["state"], "unavailable", "{short}");
     assert_eq!(short["error"], "configuration", "{short}");
+
+    harness.stop().await
+}
+
+/// The local report of `server` once `ready` accepts it
+async fn report_when(
+    harness: &Harness,
+    server: &str,
+    ready: impl Fn(&Value) -> bool,
+) -> Result<Value, Box<dyn Error>> {
+    let mut report = Value::Null;
+    for _ in 0..80 {
+        report = serde_json::to_value(harness.app.gateway().report())?
+            .as_array()
+            .and_then(|reports| reports.iter().find(|report| report["name"] == server))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if ready(&report) {
+            return Ok(report);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!("{server} never got there: {report}").into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_url_read_in_place_of_its_key_is_refused_and_read_again() -> TestResult {
+    let (op, log) = fake_op()?;
+    let address = serve_keyed_endpoint().await?;
+    // the item's URL, pasted or filled on a phone where its key was asked for
+    let pasted = op.with_file_name("pasted");
+    std::fs::write(&pasted, format!("https://mail.example/mcp/{URL_KEY}/rpc"))?;
+    let reference = "op://Dev/pastedkey/credential";
+    let extra = format!(
+        "[secrets]\n\
+         op = \"{op}\"\n\n\
+         [servers.pasted]\n\
+         url = \"http://{address}/mcp/{{{{ {reference} }}}}/rpc\"\n",
+        op = op.display(),
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // refused before any request, with what went wrong, instead of the
+    // server's own rejection of a mangled path
+    let refused = report_when(&harness, "pasted", |report| {
+        report["state"] == "unavailable"
+    })
+    .await?;
+    assert_eq!(refused["category"], "configuration", "{refused}");
+    let error = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(reference) && error.contains("whole URL"),
+        "{error}"
+    );
+    assert_eq!(reads(&log, reference), 1);
+
+    // the value was dropped, so the next attempt reads the corrected one
+    std::fs::write(&pasted, URL_KEY)?;
+    harness.app.gateway().reconnect("pasted");
+    // the catalog is rebuilt after the state flips
+    let listed = || {
+        harness
+            .app
+            .gateway()
+            .catalog()
+            .entries()
+            .iter()
+            .any(|entry| entry.server == "pasted")
+    };
+    report_when(&harness, "pasted", |report| {
+        report["state"] == "connected" && listed()
+    })
+    .await?;
+    assert_eq!(reads(&log, reference), 2);
+    let called = harness.execute_json("await pasted_hello()").await?;
+    assert_eq!(called["result"], "hello", "{called}");
 
     harness.stop().await
 }
