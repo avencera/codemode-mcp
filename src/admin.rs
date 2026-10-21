@@ -56,6 +56,59 @@ struct AdminState {
     /// What the invite routes require; `None` when the token file could not
     /// be set up, and then they refuse
     owner: Option<Arc<Owner>>,
+    /// The spokes this machine answers, unless it is a spoke
+    hub: Option<Arc<crate::hub::server::Hub>>,
+}
+
+/// One trusted spoke in the answer of `POST /admin/spokes/list`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpokeEntry {
+    /// The spoke's id
+    pub id: String,
+    /// Its host name
+    pub name: String,
+    /// The codemode-mcp version it last reported
+    pub version: Option<String>,
+    /// When the owner trusted it, ms since the epoch
+    pub trusted_ms: i64,
+    /// When it last registered, ms since the epoch
+    pub last_seen_ms: Option<i64>,
+    /// The tailnet address it last registered from
+    pub address: Option<String>,
+}
+
+impl From<crate::store::spokes::StoredSpoke> for SpokeEntry {
+    fn from(spoke: crate::store::spokes::StoredSpoke) -> Self {
+        Self {
+            id: spoke.id,
+            name: spoke.name,
+            version: spoke.version,
+            trusted_ms: spoke.trusted_ms,
+            last_seen_ms: spoke.last_seen_ms,
+            address: spoke.address,
+        }
+    }
+}
+
+/// Answer of `POST /admin/spokes/list`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpokesResponse {
+    /// Every trusted spoke, oldest first
+    pub spokes: Vec<SpokeEntry>,
+}
+
+/// Body of `POST /admin/spokes/remove`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoveSpokeRequest {
+    /// The spoke's id or name
+    pub spoke: String,
+}
+
+/// Answer of `POST /admin/spokes/remove`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoveSpokeResponse {
+    /// The spoke no longer trusted
+    pub removed: SpokeEntry,
 }
 
 /// File in the state directory holding the token the invite routes require
@@ -705,6 +758,7 @@ pub fn router(app: &App) -> Router {
         gateway: Arc::clone(app.gateway()),
         config: Arc::clone(app.config()),
         public_base: app.config().public_base(),
+        hub: app.hub().cloned(),
         owner: match owner_token(app.state_dir()) {
             Ok(token) => Some(Arc::new(Owner {
                 token,
@@ -740,6 +794,8 @@ pub fn router(app: &App) -> Router {
         .route("/admin/oauth/login", post(oauth_login))
         .route("/admin/oauth/status", post(oauth_status))
         .route("/admin/oauth/logout", post(oauth_logout))
+        .route("/admin/spokes/list", post(spokes_list))
+        .route("/admin/spokes/remove", post(spokes_remove))
         // the browser on this Mac lands here after signing in; the CSRF
         // state must match a login started through `/admin/oauth/login`
         .route("/oauth/callback/{server}", get(oauth_callback))
@@ -947,6 +1003,8 @@ fn perform(passkeys: &Passkeys, action: &AdminAction, verdict: &Verdict) {
             }
         }
         (AdminAction::RemovePasskey { .. }, Verdict::Denied { .. }) => {}
+        // the hub carries these out; see `hub::server::Hub::attach_trust`
+        (AdminAction::TrustSpoke { .. }, _) => {}
     }
 }
 
@@ -1160,6 +1218,40 @@ async fn companion_invite_open(
 
 /// The listed companions and phones and whether each is trusted, with any
 /// the config file lists that the daemon has not met yet
+const NOT_A_HUB: &str = "this machine is a spoke; list and remove spokes on its hub";
+
+async fn spokes_list(State(state): State<AdminState>) -> Response {
+    let Some(hub) = &state.hub else {
+        return error(StatusCode::BAD_REQUEST, NOT_A_HUB);
+    };
+    let spokes = hub.spokes().into_iter().map(SpokeEntry::from).collect();
+
+    Json(SpokesResponse { spokes }).into_response()
+}
+
+/// Stops trusting a spoke; it is asked about again only if it registers
+/// again, which asks the owner anew
+async fn spokes_remove(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(request): Json<RemoveSpokeRequest>,
+) -> Response {
+    if let Some(refused) = state.not_owner(&headers, "/admin/spokes/remove") {
+        return refused;
+    }
+    let Some(hub) = &state.hub else {
+        return error(StatusCode::BAD_REQUEST, NOT_A_HUB);
+    };
+
+    match hub.remove(&request.spoke) {
+        Ok(removed) => Json(RemoveSpokeResponse {
+            removed: removed.into(),
+        })
+        .into_response(),
+        Err(message) => error(StatusCode::NOT_FOUND, &message),
+    }
+}
+
 async fn companion_list(State(state): State<AdminState>) -> Response {
     let devices = state
         .gateway
@@ -1316,7 +1408,15 @@ async fn op_read(
             phones_only: false,
         })
         .await;
-    let response = match answer {
+
+    Json(op_read_response(answer)).into_response()
+}
+
+/// The answer of a program read, as `/admin/op/read` and a hub send it
+pub fn op_read_response(
+    answer: Result<companion::ProgramRead, companion::ProgramReadError>,
+) -> OpReadResponse {
+    match answer {
         Ok(companion::ProgramRead::Values(read)) => {
             tracing::info!(
                 source = %read.source,
@@ -1351,9 +1451,32 @@ async fn op_read(
                 companion::ProgramReadError::Failed(_) => OpReadResponse::Failed { message },
             }
         }
-    };
+    }
+}
 
-    Json(response).into_response()
+impl OpReadResponse {
+    /// The program read this answer carries, as a spoke hears its hub's
+    pub fn into_program_read(self) -> Result<companion::ProgramRead, companion::ProgramReadError> {
+        match self {
+            Self::Values { source, values } => {
+                Ok(companion::ProgramRead::Values(companion::ProgramValues {
+                    source,
+                    values,
+                }))
+            }
+            Self::Found {
+                source,
+                items,
+                more,
+            } => Ok(companion::ProgramRead::Found(companion::ProgramFound {
+                source,
+                found: companion::Found { items, more },
+            })),
+            Self::Invalid { message } => Err(companion::ProgramReadError::Invalid(message)),
+            Self::Denied { message } => Err(companion::ProgramReadError::Denied(message)),
+            Self::Failed { message } => Err(companion::ProgramReadError::Failed(message)),
+        }
+    }
 }
 
 /// Finds items for a program on this Mac, such as `codemode-mcp op find`
@@ -1378,7 +1501,15 @@ async fn op_find(
             reason: request.reason,
         })
         .await;
-    let response = match answer {
+
+    Json(op_find_response(answer)).into_response()
+}
+
+/// The answer of a program find, as `/admin/op/find` and a hub send it
+pub fn op_find_response(
+    answer: Result<companion::ProgramFound, companion::ProgramReadError>,
+) -> OpFindResponse {
+    match answer {
         Ok(found) => {
             tracing::info!(
                 source = %found.source,
@@ -1401,9 +1532,28 @@ async fn op_find(
                 companion::ProgramReadError::Failed(_) => OpFindResponse::Failed { message },
             }
         }
-    };
+    }
+}
 
-    Json(response).into_response()
+impl OpFindResponse {
+    /// The program find this answer carries, as a spoke hears its hub's
+    pub fn into_program_found(
+        self,
+    ) -> Result<companion::ProgramFound, companion::ProgramReadError> {
+        match self {
+            Self::Found {
+                source,
+                items,
+                more,
+            } => Ok(companion::ProgramFound {
+                source,
+                found: companion::Found { items, more },
+            }),
+            Self::Invalid { message } => Err(companion::ProgramReadError::Invalid(message)),
+            Self::Denied { message } => Err(companion::ProgramReadError::Denied(message)),
+            Self::Failed { message } => Err(companion::ProgramReadError::Failed(message)),
+        }
+    }
 }
 
 /// Asks the companions, and only them, to read a reference; local `op` and

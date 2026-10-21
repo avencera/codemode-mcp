@@ -99,6 +99,12 @@ impl OnePassword {
     /// reason shown in every prompt; see the module docs for who is asked
     /// and which finds share a prompt
     pub async fn find_for_program(&self, ask: &FindAsk) -> Result<ProgramFound, ProgramReadError> {
+        // a spoke's finds run on the hub, approved there
+        if let Some(hub) = self.hub() {
+            checked_query(&ask.query).map_err(ProgramReadError::Invalid)?;
+
+            return hub.find_for_program(ask).await;
+        }
         let query = checked_query(&ask.query).map_err(ProgramReadError::Invalid)?;
         let reason = clean_reason(ask.reason.as_deref());
         let (answer, answered) = oneshot::channel();

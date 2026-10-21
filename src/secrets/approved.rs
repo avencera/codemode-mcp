@@ -87,6 +87,24 @@ impl Consumer {
             digest: hex::encode(digest(&SHA256, &bytes)),
         }
     }
+
+    /// A server of the spoke `spoke`, as its hub keeps approvals for it:
+    /// `name` for prompts, keyed by the spoke and the spoke's own digest of
+    /// the server, so a changed server or another spoke asks again
+    pub fn of_spoke(spoke: &str, name: String, spoke_digest: &str) -> Self {
+        let bytes = format!("{spoke}\0{spoke_digest}");
+
+        Self {
+            name,
+            digest: hex::encode(digest(&SHA256, bytes.as_bytes())),
+        }
+    }
+
+    /// Hex SHA-256 of what decides where the server's values go, which a
+    /// spoke sends its hub
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
 }
 
 /// Every reference `server` fills in, wherever its config holds one

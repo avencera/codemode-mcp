@@ -16,7 +16,8 @@ use codemode_mcp::{
         CompanionCheckResult, CompanionListResponse, CompanionTrustRequest, CompanionTrustResponse,
         EnrollRequest, EnrollResponse, InviteOpenRequest, InviteOpenResponse, InviteResponse,
         InviteStatusRequest, OAuthLoginResponse, OAuthLogoutResponse, OAuthServerRequest,
-        OAuthStatusResponse, RemoveRequest, RemoveResponse, WarmRequest, WarmResponse,
+        OAuthStatusResponse, RemoveRequest, RemoveResponse, RemoveSpokeRequest,
+        RemoveSpokeResponse, SpokesResponse, WarmRequest, WarmResponse,
     },
     app::App,
     catalog::function_prefix,
@@ -141,6 +142,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// On the hub: the machines trusted as spokes
+    Spokes {
+        #[command(subcommand)]
+        command: SpokesCommand,
     },
     /// Run a built-in MCP adapter on stdio, as an upstream of the gateway
     Adapter {
@@ -310,6 +316,18 @@ enum ConfigCommand {
         /// tailnet IP, such as `mac-mini`; needed off macOS
         #[arg(long)]
         hub: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpokesCommand {
+    /// List the trusted spokes; needs the daemon running
+    List,
+    /// Stop trusting a spoke; it asks the owner again if it registers
+    /// again. Needs the daemon running
+    Remove {
+        /// Its id or name from `spokes list`
+        spoke: String,
     },
 }
 
@@ -573,6 +591,7 @@ async fn main() -> Result<()> {
         Command::Config {
             command: ConfigCommand::Init { print, hub },
         } => config_init_command(&path, print, hub.as_deref()),
+        Command::Spokes { command } => spokes_command(&load_or_default(&path)?, command).await,
         Command::Adapter {
             command: AdapterCommand::Calendar,
         } => eventkit_adapter_command(Entity::Events).await,
@@ -1765,6 +1784,51 @@ async fn update_command(
     Ok(())
 }
 
+async fn spokes_command(config: &Config, command: SpokesCommand) -> Result<()> {
+    match command {
+        SpokesCommand::List => {
+            let response: SpokesResponse =
+                admin_post(config, "/admin/spokes/list", &serde_json::json!({})).await?;
+            if response.spokes.is_empty() {
+                println!(
+                    "No spokes are trusted. A spoke asks to be trusted when it starts with \
+                     `[hub]` naming this machine."
+                );
+            }
+            let now = store::now_ms();
+            for spoke in response.spokes {
+                let seen = spoke.last_seen_ms.map_or_else(
+                    || "never seen".to_owned(),
+                    |seen| format!("seen {} ago", human_duration(now - seen)),
+                );
+                println!(
+                    "{}\t{}\t{}\t{}\ttrusted {} ago, {seen}",
+                    spoke.id,
+                    peer_text(&spoke.name),
+                    spoke.version.as_deref().map(peer_text).unwrap_or_default(),
+                    spoke.address.as_deref().unwrap_or("-"),
+                    human_duration(now - spoke.trusted_ms),
+                );
+            }
+        }
+        SpokesCommand::Remove { spoke } => {
+            let response: RemoveSpokeResponse = admin_post_as_owner(
+                config,
+                "/admin/spokes/remove",
+                &RemoveSpokeRequest { spoke },
+            )
+            .await?;
+            println!(
+                "{} ({}) is no longer trusted.",
+                peer_text(&response.removed.name),
+                response.removed.id
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn config_init_command(path: &std::path::Path, print: bool, hub: Option<&str>) -> Result<()> {
     let home = std::env::var_os("HOME").ok_or_else(|| eyre!("$HOME is not set"))?;
     // the hub's starter is all 1Password, EventKit and Xcode
@@ -1835,6 +1899,8 @@ async fn serve_command(config: Config) -> Result<()> {
     // frozen however this function ends, so tearing tasks down cannot
     // withdraw what the next boot resumes
     let _freeze = app.freeze_on_drop();
+    // a spoke whose servers clash with its hub's stops here, by name
+    app.connect_hub(SETTLE_LIMIT).await?;
 
     // before anything is answered: nothing else may start while the previous
     // process's leftovers are settled

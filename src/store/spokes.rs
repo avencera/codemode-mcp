@@ -12,7 +12,7 @@ use super::{Store, StoreError, now_ms};
 pub struct StoredSpoke {
     /// The spoke's own id
     pub id: String,
-    /// Its host name, as it registered
+    /// Its host name, as the owner trusted it
     pub name: String,
     /// The codemode-mcp version it last reported
     pub version: Option<String>,
@@ -22,7 +22,8 @@ pub struct StoredSpoke {
     pub approval_id: Option<String>,
     /// When it last registered, ms since the epoch
     pub last_seen_ms: Option<i64>,
-    /// The tailnet address it last registered from
+    /// The tailnet address the owner trusted it at, the only one it is
+    /// answered from
     pub address: Option<String>,
 }
 
@@ -61,19 +62,12 @@ impl Store {
         Ok(())
     }
 
-    /// Notes a registration of a trusted spoke: when, from where and which
-    /// version it runs
-    pub fn spoke_seen(
-        &self,
-        id: &str,
-        name: &str,
-        version: &str,
-        address: &str,
-    ) -> Result<(), StoreError> {
+    /// Notes a registration of a trusted spoke: when, and which version it
+    /// runs. Its name and address stay the ones the owner trusted
+    pub fn spoke_seen(&self, id: &str, version: &str) -> Result<(), StoreError> {
         self.connection().execute(
-            "UPDATE spokes SET name = ?1, version = ?2, last_seen_ms = ?3, address = ?4 \
-             WHERE id = ?5",
-            params![name, version, now_ms(), address, id],
+            "UPDATE spokes SET version = ?1, last_seen_ms = ?2 WHERE id = ?3",
+            params![version, now_ms(), id],
         )?;
 
         Ok(())

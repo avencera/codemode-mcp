@@ -5,6 +5,10 @@
 //! through [`Approvals::decide`], so there is one decision path. Admin
 //! actions (adding or removing a passkey) use the same requests and page,
 //! so only an existing passkey can authorize them
+//!
+//! On a spoke every request is decided on its hub (see [`Remote`]): the
+//! spoke keeps a local copy of the hub's request, so an execution parks and
+//! resumes on it like on any other, and follows the hub for the verdict
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,7 +27,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use crate::{
     durable::{Durable, Sensitivity},
     mac::{MacNotification, OnMac, TouchId},
-    notify::{Notification, Notifier, Priority},
+    notify::{BoxFuture, Notification, Notifier, Priority},
     policy::GrantMode,
     prompt::{Asker, calls_text, prompt_text},
     store::{
@@ -32,7 +36,7 @@ use crate::{
         now_ms,
         sessions::SessionState,
     },
-    usage::Caller,
+    usage::{Caller, Machine},
 };
 
 /// Reason given when an `ask` call arrives before any passkey exists
@@ -58,6 +62,12 @@ pub const WITHDRAWN: &str = "the approval request was withdrawn";
 const PRESENCE_CHECK: Duration = Duration::from_secs(2);
 /// Grant lengths offered on the approval page, in minutes
 pub const GRANT_MINUTES: [u64; 2] = [15, 60];
+/// Longest wait between attempts to reach the hub about a request
+const FOLLOW_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Prefix of the admin tools a fingerprint may approve: a spoke's trust and
+/// its config's secrets. Passkey changes stay passkey-only, since they
+/// change who can approve
+const TOUCH_ID_ADMIN_PREFIX: &str = "spoke.";
 /// How long a per-call request waits before it is announced, so the calls
 /// a script makes together under `asyncio.gather` join it and are asked
 /// for as one batch; they all arrive within a few milliseconds
@@ -112,7 +122,8 @@ impl Choice {
 }
 
 /// The answer an execution receives
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Run the call; the id is recorded with the upstream call
     Approved {
@@ -159,6 +170,17 @@ pub enum AdminAction {
         /// Enrollment time that pins the row, in case its id was reused
         created_ms: i64,
     },
+    /// Trust a spoke, so the hub answers it from now on
+    TrustSpoke {
+        /// The spoke's id
+        id: String,
+        /// Its host name
+        name: String,
+        /// The version it registered with
+        version: String,
+        /// The address it registered from
+        address: String,
+    },
 }
 
 impl AdminAction {
@@ -167,8 +189,63 @@ impl AdminAction {
         match self {
             Self::EnrollPasskey { .. } => "passkey.enroll",
             Self::RemovePasskey { .. } => "passkey.remove",
+            Self::TrustSpoke { .. } => SPOKE_TRUST,
         }
     }
+}
+
+/// Tool name of a request to trust a spoke
+pub const SPOKE_TRUST: &str = "spoke.trust";
+/// Tool name of a request to give a spoke's server its config's secrets
+pub const SPOKE_SECRETS: &str = "spoke.secrets";
+
+/// A question for the owner with no action stored behind it: whoever asked
+/// waits on the answer and acts on it
+pub struct OwnerRequest {
+    /// Headline on the page, the Touch ID prompt and the notification
+    pub title: String,
+    /// Details shown on the page
+    pub details: Map<String, Value>,
+    /// Name recorded as the tool, such as [`SPOKE_SECRETS`]
+    pub tool: &'static str,
+    /// The spoke the question is about
+    pub machine: Option<Machine>,
+}
+
+/// How a hub answered a spoke's request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteGate {
+    /// A grant covers the call
+    Open {
+        /// Approval that created the grant
+        approval_id: String,
+    },
+    /// The call cannot be approved at all
+    Closed {
+        /// Shown to the script
+        reason: String,
+    },
+    /// The hub asked the owner; follow request `id`
+    Wait {
+        /// The hub's request id
+        id: String,
+        /// When the hub denies it automatically, ms since the epoch
+        expires_ms: i64,
+    },
+}
+
+/// The hub a spoke's requests are decided on
+pub trait Remote: Send + Sync {
+    /// Asks the hub to decide a call of one of this spoke's own `ask` tools
+    fn gate<'a>(&'a self, request: &'a GateRequest<'a>) -> BoxFuture<'a, RemoteGate>;
+
+    /// The hub's verdict on request `id`, waiting a while for one; `None`
+    /// while it is still pending
+    fn decision<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Verdict>, String>>;
+
+    /// The hub's page for request `id`
+    fn approval_url(&self, id: &str) -> String;
 }
 
 /// An admin action that needs an existing passkey's approval
@@ -258,7 +335,8 @@ impl ApprovalInfo {
 
     /// Whether a client grant may answer this request: a `session` tool call
     /// that did not pass a valid session, from a named client that reached
-    /// the daemon directly from this machine
+    /// the daemon directly from this machine, or reached the spoke that
+    /// passed it on directly from that one
     pub fn client_grant_allowed(&self) -> bool {
         self.kind == ApprovalKind::ToolCall
             && self.grant_mode == GrantMode::Session
@@ -320,6 +398,35 @@ pub enum Gate {
     },
     /// A request was created; wait for its decision
     Wait(Waiting),
+}
+
+/// What a fingerprint may approve: a tool call, or an admin request about a
+/// spoke
+fn touch_id_allowed(info: &ApprovalInfo) -> bool {
+    match &info.kind {
+        ApprovalKind::ToolCall => true,
+        ApprovalKind::Admin { .. } => info.tool.starts_with(TOUCH_ID_ADMIN_PREFIX),
+    }
+}
+
+/// The verdict a decided request stored, as its waiter would have heard it
+fn stored_verdict(stored: &StoredApproval, id: &str, timeout: Duration) -> Option<Verdict> {
+    let verdict = match stored.decision.as_deref()? {
+        "approved" => Verdict::Approved {
+            approval_id: stored.approved_by.clone().unwrap_or_else(|| id.to_owned()),
+        },
+        "denied" => Verdict::Denied {
+            reason: DENIED.to_owned(),
+        },
+        "expired" => Verdict::Denied {
+            reason: expiry_reason(timeout),
+        },
+        _ => Verdict::Denied {
+            reason: WITHDRAWN.to_owned(),
+        },
+    };
+
+    Some(verdict)
 }
 
 /// A pending request owned by the waiting execution; dropping it withdraws
@@ -454,6 +561,8 @@ pub struct Approvals {
     on_mac: Option<OnMac>,
     /// Why requests are refused when there is no notifier
     unavailable: &'static str,
+    /// The hub every request is decided on, on a spoke
+    remote: Option<Arc<dyn Remote>>,
     store: Store,
     state: Mutex<State>,
     /// Set once the process stops writing, because another daemon took over
@@ -472,6 +581,7 @@ impl Approvals {
         notifier: Option<Arc<dyn Notifier>>,
         on_mac: Option<OnMac>,
         unavailable: &'static str,
+        remote: Option<Arc<dyn Remote>>,
         store: Store,
     ) -> Arc<Self> {
         let mut state = State::default();
@@ -498,6 +608,7 @@ impl Approvals {
             notifier,
             on_mac,
             unavailable,
+            remote,
             store,
             state: Mutex::new(state),
             frozen: Arc::new(AtomicBool::new(false)),
@@ -533,14 +644,37 @@ impl Approvals {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Link to the page for approval `id`
+    /// Link to the page for approval `id`, the hub's on a spoke
     pub fn url_for(&self, id: &str) -> String {
-        format!("{}/approve/{id}", self.base_url)
+        match &self.remote {
+            Some(remote) => remote.approval_url(id),
+            None => format!("{}/approve/{id}", self.base_url),
+        }
+    }
+
+    /// Whether requests are decided on a hub
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
     }
 
     /// Decides how a call of an `ask` tool proceeds, creating and announcing
-    /// a request when no grant covers it
-    pub fn gate(self: &Arc<Self>, request: GateRequest<'_>) -> Gate {
+    /// a request when no grant covers it; on a spoke the hub decides
+    pub async fn gate(self: &Arc<Self>, request: GateRequest<'_>) -> Gate {
+        if let Some(remote) = self.remote.clone() {
+            return match remote.gate(&request).await {
+                RemoteGate::Open { approval_id } => Gate::Open { approval_id },
+                RemoteGate::Closed { reason } => Gate::Closed { reason },
+                RemoteGate::Wait { id, expires_ms } => {
+                    Gate::Wait(self.follow(&request, id, expires_ms))
+                }
+            };
+        }
+
+        self.gate_here(request)
+    }
+
+    /// [`Approvals::gate`] on this machine, as a hub decides a spoke's call
+    pub fn gate_here(self: &Arc<Self>, request: GateRequest<'_>) -> Gate {
         if let Some(approval_id) = self.granted(&request) {
             return Gate::Open { approval_id };
         }
@@ -582,6 +716,184 @@ impl Approvals {
         };
 
         Gate::Wait(self.open(info, request.sensitivity, None, Some(notifier)))
+    }
+
+    /// A local copy of the hub's pending request `id`, which an execution
+    /// waits and parks on like any other; it is settled when the hub
+    /// decides, and expires with the hub's own deadline
+    pub fn follow(
+        self: &Arc<Self>,
+        request: &GateRequest<'_>,
+        id: String,
+        expires_ms: i64,
+    ) -> Waiting {
+        let info = Arc::new(ApprovalInfo {
+            id: id.clone(),
+            kind: ApprovalKind::ToolCall,
+            caller: request.caller.clone(),
+            execution_id: request.execution_id.to_owned(),
+            server: request.server.to_owned(),
+            tool: request.tool.to_owned(),
+            arguments: request.arguments.clone(),
+            script: Arc::clone(request.script),
+            grant_mode: request.grant_mode,
+            expires_ms,
+            batch: None,
+            order: self.order.fetch_add(1, Ordering::SeqCst),
+            summary: request.summary.map(str::to_owned),
+        });
+        let (sender, receiver) = oneshot::channel();
+        self.state().pending.insert(
+            id.clone(),
+            Pending {
+                info: Arc::clone(&info),
+                sender,
+                _settled: CancellationToken::new().drop_guard(),
+            },
+        );
+        let payload = Durable::gate(request.sensitivity, || {
+            serde_json::to_string(&*info).unwrap_or_default()
+        });
+        self.persist("a followed approval request", |store| {
+            store.create_approval(
+                &NewApproval {
+                    id: &info.id,
+                    created_ms: now_ms(),
+                    expires_ms,
+                    caller: &info.caller,
+                    execution_id: &info.execution_id,
+                    server: &info.server,
+                    tool: &info.tool,
+                    grant_mode: info.grant_mode.as_str(),
+                    action: None,
+                    notify: false,
+                },
+                &payload,
+            )
+        });
+        let remaining = expires_ms.saturating_sub(now_ms()).max(0);
+        self.expire_after(&id, Duration::from_millis(remaining as u64));
+        self.spawn_follow(&id);
+
+        Waiting {
+            waiting_for: info.waiting_for(),
+            url: self.url_for(&id),
+            id,
+            receiver: Some(receiver),
+            approvals: Arc::downgrade(self),
+            frozen: Arc::clone(&self.frozen),
+        }
+    }
+
+    /// Follows the hub's verdict on pending request `id` until it comes or
+    /// the request leaves this side; an unreachable hub is tried again with
+    /// a growing pause
+    fn spawn_follow(self: &Arc<Self>, id: &str) {
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let mut pause = Duration::from_secs(1);
+            loop {
+                let pending = weak
+                    .upgrade()
+                    .is_some_and(|approvals| approvals.state().pending.contains_key(&id));
+                if !pending {
+                    return;
+                }
+                match remote.decision(&id).await {
+                    Ok(Some(verdict)) => {
+                        let decision = match verdict {
+                            Verdict::Approved { .. } => "approved",
+                            Verdict::Denied { .. } => "denied",
+                        };
+                        if let Some(approvals) = weak.upgrade() {
+                            approvals.settle(&id, Some(verdict), decision, None);
+                        }
+
+                        return;
+                    }
+                    Ok(None) => pause = Duration::from_secs(1),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not ask the hub about a request; trying again");
+                        tokio::time::sleep(pause).await;
+                        pause = (pause * 2).min(FOLLOW_BACKOFF_MAX);
+                    }
+                }
+            }
+        });
+    }
+
+    /// The verdict on request `id`: `None` when no such request exists,
+    /// `Some(None)` while it is pending
+    pub fn verdict_of(&self, id: &str) -> Option<Option<Verdict>> {
+        if self.state().pending.contains_key(id) {
+            return Some(None);
+        }
+        let stored = self.store.approval(id).ok()??;
+
+        Some(Some(
+            stored_verdict(&stored, id, self.timeout).unwrap_or_else(|| {
+                // pending on disk but registered nowhere: nothing will decide it
+                Verdict::Denied {
+                    reason: WITHDRAWN.to_owned(),
+                }
+            }),
+        ))
+    }
+
+    /// The stored request `id`, as a hub checks one a spoke presents
+    pub fn stored(&self, id: &str) -> Option<StoredApproval> {
+        self.store.approval(id).ok()?
+    }
+
+    /// Asks the owner a question no stored action follows, such as whether
+    /// a spoke's server may have its config's secrets; [`SPOKE_SECRETS`]
+    /// and [`SPOKE_TRUST`] questions may be answered with Touch ID
+    pub fn request_owner(self: &Arc<Self>, request: OwnerRequest) -> Waiting {
+        let info = ApprovalInfo {
+            id: random_id(),
+            kind: ApprovalKind::Admin {
+                title: request.title,
+            },
+            caller: Caller {
+                machine: request.machine,
+                ..Caller::default()
+            },
+            execution_id: String::new(),
+            server: ADMIN_SERVER.to_owned(),
+            tool: request.tool.to_owned(),
+            arguments: request.details,
+            script: Arc::from(""),
+            grant_mode: GrantMode::PerCall,
+            expires_ms: self.expiry(),
+            batch: None,
+            order: self.order.fetch_add(1, Ordering::SeqCst),
+            summary: None,
+        };
+        let notifier = self.notifier.clone();
+
+        self.open(info, Sensitivity::PLAIN, None, notifier)
+    }
+
+    /// Puts back in play the requests spokes asked for that were pending at
+    /// the last stop, for the hub to keep answering them
+    pub fn restore_spoke_requests(self: &Arc<Self>) -> Vec<Waiting> {
+        let pending = match self.store.pending_spoke_approvals() {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the spokes' stored requests");
+
+                return Vec::new();
+            }
+        };
+
+        pending
+            .iter()
+            .filter_map(|stored| self.reattach(&stored.id))
+            .collect()
     }
 
     fn expiry(&self) -> i64 {
@@ -629,6 +941,13 @@ impl Approvals {
     /// unexpected request is visible on the phone. Without one the caller
     /// must hand the link to the owner itself
     pub fn request_admin(self: &Arc<Self>, request: AdminRequest) -> Waiting {
+        let machine = match &request.action {
+            AdminAction::TrustSpoke { id, name, .. } => Some(Machine {
+                id: id.clone(),
+                name: name.clone(),
+            }),
+            _ => None,
+        };
         let title = request.title;
         let mut details = request.details;
         // the code is part of the details, so the page, the notification and
@@ -640,6 +959,7 @@ impl Approvals {
             caller: Caller {
                 client_name: Some(ADMIN_CLIENT.to_owned()),
                 client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                machine,
                 ..Caller::default()
             },
             execution_id: String::new(),
@@ -820,7 +1140,7 @@ impl Approvals {
             let calls = approvals.calls(&info);
             let summaries = approvals.summaries(&info);
 
-            if let ApprovalKind::Admin { .. } = &info.kind {
+            if !touch_id_allowed(&info) {
                 approvals.notify(phone, &info);
                 drop(approvals);
                 if present {
@@ -1038,20 +1358,7 @@ impl Approvals {
             reason: WITHDRAWN.to_owned(),
         };
 
-        if let Some(decision) = stored.decision.as_deref() {
-            let verdict = match decision {
-                "approved" => Verdict::Approved {
-                    approval_id: stored.approved_by.clone().unwrap_or_else(|| id.to_owned()),
-                },
-                "denied" => Verdict::Denied {
-                    reason: DENIED.to_owned(),
-                },
-                "expired" => Verdict::Denied {
-                    reason: expiry_reason(self.timeout),
-                },
-                _ => withdrawn(),
-            };
-
+        if let Some(verdict) = stored_verdict(&stored, id, self.timeout) {
             return answered(String::new(), verdict);
         }
 
@@ -1099,6 +1406,8 @@ impl Approvals {
             }
         }
         self.expire_after(id, Duration::from_millis(remaining as u64));
+        // on a spoke the hub decides it, so its verdict is followed again
+        self.spawn_follow(id);
 
         Some(Waiting {
             waiting_for: info.waiting_for(),
@@ -1529,6 +1838,11 @@ impl Approvals {
 /// Unlike the phone notification, which crosses the ntfy server, the prompt
 /// stays on the Mac, so it may carry the agent's thread title and reason
 fn touch_id_reason(info: &ApprovalInfo, calls: &[(String, usize)], summaries: &[String]) -> String {
+    // the admin questions a fingerprint may answer are about a spoke, and
+    // their title names it
+    if let ApprovalKind::Admin { title } = &info.kind {
+        return crate::prompt::one_line(title, usize::MAX);
+    }
     let client = info.caller.client_label();
     let grant = match info.fingerprint_choice() {
         Choice::Session(length) => {

@@ -1292,7 +1292,11 @@ mod tests {
 
         let hub = config.hub.ok_or("no [hub] section")?;
         assert_eq!(hub.host, "mac \"mini\"");
-        assert!(config.servers.is_empty());
+        assert_eq!(
+            config.servers.keys().collect::<Vec<_>>(),
+            ["secrets"],
+            "a spoke's own write_env, nothing else"
+        );
 
         Ok(())
     }

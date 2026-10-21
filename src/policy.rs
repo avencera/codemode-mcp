@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// What the gateway does when a script calls a tool
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
     /// Run the call immediately

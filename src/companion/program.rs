@@ -358,6 +358,12 @@ impl OnePassword {
         &self,
         ask: &ProgramAsk,
     ) -> Result<ProgramRead, ProgramReadError> {
+        // a spoke's owner approves on the hub, whose devices read the values
+        if let Some(hub) = self.hub() {
+            checked_targets(&ask.targets).map_err(ProgramReadError::Invalid)?;
+
+            return hub.read_for_program(ask).await;
+        }
         let targets = checked_targets(&ask.targets).map_err(ProgramReadError::Invalid)?;
         let context = Context {
             reason: clean_reason(ask.reason.as_deref()),

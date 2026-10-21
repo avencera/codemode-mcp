@@ -15,6 +15,11 @@ host = {{HUB}}
 # or every hub server but these
 # exclude = ["xcode"]
 
+# write_env and find_references on this machine: they write 1Password values
+# into files here, approved on the hub, and the agent sees only the names
+[servers.secrets]
+builtin = "secrets"
+
 # This machine's own servers, for work that has to touch it: files, Docker,
 # GPUs. A name a hub server already uses is refused at startup. For example
 # [servers.files]
