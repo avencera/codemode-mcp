@@ -478,6 +478,10 @@ impl Hub {
                 Gate::Open { approval_id } => RemoteGate::Open { approval_id },
                 Gate::Closed { reason } => RemoteGate::Closed { reason },
                 Gate::Wait(waiting) => self.wait_answer(spoke, waiting, None),
+                // the hub decides here and asks no one further
+                Gate::Unreachable(unreachable) => RemoteGate::Closed {
+                    reason: unreachable.reason,
+                },
             });
         }
 

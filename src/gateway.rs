@@ -754,6 +754,20 @@ impl Gateway {
 
                 Err(self.refuse(context, &call, error))
             }
+            // a spoke's hub did not answer: a failure, not a refusal, and a
+            // timeout stays one for the script
+            Gate::Unreachable(unreachable) => {
+                let error = HubError {
+                    kind: if unreachable.timed_out {
+                        HubErrorKind::TimedOut
+                    } else {
+                        HubErrorKind::Failed
+                    },
+                    message: unreachable.reason,
+                };
+
+                Err(self.refuse(context, &call, error.into()))
+            }
         }
     }
 

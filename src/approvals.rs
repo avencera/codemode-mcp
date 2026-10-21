@@ -238,7 +238,10 @@ pub enum RemoteGate {
 /// The hub a spoke's requests are decided on
 pub trait Remote: Send + Sync {
     /// Asks the hub to decide a call of one of this spoke's own `ask` tools
-    fn gate<'a>(&'a self, request: &'a GateRequest<'a>) -> BoxFuture<'a, RemoteGate>;
+    fn gate<'a>(
+        &'a self,
+        request: &'a GateRequest<'a>,
+    ) -> BoxFuture<'a, Result<RemoteGate, Unreachable>>;
 
     /// The hub's verdict on request `id`, waiting a while for one; `None`
     /// while it is still pending
@@ -246,6 +249,16 @@ pub trait Remote: Send + Sync {
 
     /// The hub's page for request `id`
     fn approval_url(&self, id: &str) -> String;
+}
+
+/// Why a spoke could not ask its hub
+#[derive(Debug, Clone)]
+pub struct Unreachable {
+    /// What went wrong, shown to the script
+    pub reason: String,
+    /// Whether the hub did not answer in time, which a script catches as a
+    /// timeout rather than a refusal
+    pub timed_out: bool,
 }
 
 /// An admin action that needs an existing passkey's approval
@@ -398,6 +411,8 @@ pub enum Gate {
     },
     /// A request was created; wait for its decision
     Wait(Waiting),
+    /// On a spoke, the hub could not be asked
+    Unreachable(Unreachable),
 }
 
 /// What a fingerprint may approve: a tool call, or an admin request about a
@@ -678,11 +693,12 @@ impl Approvals {
     pub async fn gate(self: &Arc<Self>, request: GateRequest<'_>) -> Gate {
         if let Some(remote) = self.remote.clone() {
             return match remote.gate(&request).await {
-                RemoteGate::Open { approval_id } => Gate::Open { approval_id },
-                RemoteGate::Closed { reason } => Gate::Closed { reason },
-                RemoteGate::Wait { id, expires_ms } => {
+                Ok(RemoteGate::Open { approval_id }) => Gate::Open { approval_id },
+                Ok(RemoteGate::Closed { reason }) => Gate::Closed { reason },
+                Ok(RemoteGate::Wait { id, expires_ms }) => {
                     Gate::Wait(self.follow(&request, id, expires_ms))
                 }
+                Err(unreachable) => Gate::Unreachable(unreachable),
             };
         }
 

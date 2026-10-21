@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{
     admin::{OpFindRequest, OpFindResponse, OpReadRequest, OpReadResponse},
-    approvals::{GateRequest, Remote, RemoteGate, Verdict},
+    approvals::{GateRequest, Remote, RemoteGate, Unreachable, Verdict},
     companion::{self, FindAsk, ProgramAsk, ProgramFound, ProgramRead, ProgramReadError},
     config::HubConfig,
     gateway::Gateway,
@@ -451,7 +451,10 @@ impl HubClient {
 }
 
 impl Remote for HubClient {
-    fn gate<'a>(&'a self, request: &'a GateRequest<'a>) -> BoxFuture<'a, RemoteGate> {
+    fn gate<'a>(
+        &'a self,
+        request: &'a GateRequest<'a>,
+    ) -> BoxFuture<'a, Result<RemoteGate, Unreachable>> {
         Box::pin(async move {
             let call = GateCall {
                 caller: request.caller.clone(),
@@ -467,13 +470,14 @@ impl Remote for HubClient {
             };
 
             match HubClient::gate(self, &call).await {
-                Ok(GateAnswer::Gate(gate)) => gate,
-                Ok(GateAnswer::Refused(error)) => RemoteGate::Closed {
+                Ok(GateAnswer::Gate(gate)) => Ok(gate),
+                Ok(GateAnswer::Refused(error)) => Ok(RemoteGate::Closed {
                     reason: error.message,
-                },
-                Err(error) => RemoteGate::Closed {
+                }),
+                Err(error) => Err(Unreachable {
+                    timed_out: matches!(error, HubClientError::TimedOut(_)),
                     reason: error.to_string(),
-                },
+                }),
             }
         })
     }
