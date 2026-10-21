@@ -176,6 +176,10 @@ pub struct PreparedCall {
     /// hub's tool with; the hub runs the call it holds with that request
     #[serde(default)]
     hub_request: Option<String>,
+    /// On a spoke, whether the tool is the hub's; kept with a parked call,
+    /// since after a restart its verdict can come before the hub's catalog
+    #[serde(default)]
+    on_hub: bool,
 }
 
 /// How a call proceeds after [`Gateway::prepare`]
@@ -719,11 +723,13 @@ impl Gateway {
             arguments: omit_none_arguments(entry, arguments),
             output: entry.output.clone(),
             hub_request: None,
+            on_hub: false,
         };
         if entry.policy == Policy::Deny {
             return Err(self.refuse(context, &call, ToolCallError::Denied(function.to_owned())));
         }
         if let (Some(server), Some(client)) = (hub.server(&entry.server), &self.hub) {
+            call.on_hub = true;
             let grant_mode = server_config.map(|config| config.grant_for(&entry.tool));
 
             return self
@@ -991,9 +997,16 @@ impl Gateway {
         context: &CallContext,
         call: &PreparedCall,
     ) -> Result<Value, ToolCallError> {
-        if let Some(hub) = &self.hub
-            && self.hub_view().server(&call.server).is_some()
-        {
+        if call.on_hub {
+            let Some(hub) = &self.hub else {
+                return Err(ToolCallError::Hub(HubError {
+                    kind: HubErrorKind::Failed,
+                    message: format!(
+                        "`{}` is a tool of the hub, and this machine no longer has one",
+                        call.function
+                    ),
+                }));
+            };
             let forwarded = ForwardedCall {
                 caller: context.caller.clone(),
                 execution_id: context.execution_id.to_string(),
