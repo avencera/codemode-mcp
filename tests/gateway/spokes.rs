@@ -10,7 +10,12 @@ use axum::{
     extract::connect_info::MockConnectInfo,
     http::{Request, StatusCode},
 };
-use codemode_mcp::{hub, mac::TouchId};
+use codemode_mcp::{
+    hub::{self, CallAnswer, ForwardedCall, GateAnswer, GateCall, HubErrorKind},
+    mac::TouchId,
+    policy::GrantMode,
+    usage::Caller,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -33,6 +38,30 @@ async fn wait_for_tool(harness: &Harness, function: &str) -> TestResult {
     }
 
     Err(format!("{function} never reached the catalog").into())
+}
+
+/// Posts `body` to the hub route `path` as the spoke `id`, from the
+/// address it was trusted at, and reads the answer
+async fn post_as_spoke<T: serde::de::DeserializeOwned>(
+    hub: &Harness,
+    id: &str,
+    path: &str,
+    body: &impl serde::Serialize,
+) -> Result<T, Box<dyn Error>> {
+    let spokes = hub.app.hub().ok_or("the hub has no spokes")?;
+    let response = hub::server::router(Arc::clone(spokes))
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+        .oneshot(
+            Request::post(format!("{}{path}", hub::API))
+                .header(hub::SPOKE_HEADER, id)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(body)?))?,
+        )
+        .await?;
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{error}: {}", String::from_utf8_lossy(&bytes)).into())
 }
 
 /// Runs `code` on `harness`, waiting it out when it outlasts the
@@ -136,6 +165,9 @@ async fn a_spoke_uses_the_hubs_sign_ins_approvals_and_secrets() -> TestResult {
         )
         .await?;
     assert_eq!(elsewhere.status(), StatusCode::FORBIDDEN);
+    let refusal = axum::body::to_bytes(elsewhere.into_body(), usize::MAX).await?;
+    let refusal = String::from_utf8_lossy(&refusal);
+    assert!(refusal.contains("not trusted"), "{refusal}");
     // the hub's fixture stayed out: `add` is the spoke's own, which asks
     let catalog = spoke.app.gateway().catalog();
     let add = catalog.get("fixture_add").ok_or("no fixture_add")?;
@@ -238,9 +270,12 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
     let hub_mac = Arc::new(FakeMac::default());
     hub_mac.set_present(true);
     hub_mac.set_answer(Some(TouchId::Approved));
+    // the hub's own fixture asks too; the spoke leaves it out, and a call
+    // of it is sent to the hub by hand below
     let Some(hub) = Harness::with(Setup {
         notify: true,
         mac: Some(Arc::clone(&hub_mac)),
+        server: "tools.add.policy = \"ask\"\nsensitive = false",
         ..Setup::default()
     })
     .await?
@@ -292,6 +327,45 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
         .to_owned();
     let id = approval_id(&pending)?;
 
+    // a call of the hub's own `ask` tool, held on the hub for these
+    // arguments
+    let spoke_id = spoke
+        .app
+        .gateway()
+        .hub()
+        .ok_or("the spoke has no hub")?
+        .machine()
+        .id
+        .clone();
+    let arguments = |b: i64| {
+        json!({ "a": 1, "b": b })
+            .as_object()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let gated: GateAnswer = post_as_spoke(
+        &hub,
+        &spoke_id,
+        "/gate",
+        &GateCall {
+            caller: Caller::default(),
+            execution_id: "by-hand".to_owned(),
+            script: "await fixture_add(a=1, b=2)".to_owned(),
+            server: "fixture".to_owned(),
+            tool: "add".to_owned(),
+            arguments: arguments(2),
+            hub_tool: true,
+            grant_mode: GrantMode::PerCall,
+            sensitive: false,
+            summary: None,
+        },
+    )
+    .await?;
+    let GateAnswer::Gate(codemode_mcp::approvals::RemoteGate::Wait { id: hub_call, .. }) = gated
+    else {
+        return Err(format!("the hub did not hold the call: {gated:?}").into());
+    };
+
     // the spoke stops and starts while the owner has not answered; its
     // execution is parked on its copy of the hub's request
     let spoke = spoke.restart(super::harness::Stop::Drain).await?;
@@ -308,6 +382,37 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
     let done = spoke.wait_done(&execution).await?;
     let done: Value = serde_json::from_str(&text_of(&done))?;
     assert_eq!(done["result"], 5, "{done}");
+
+    // the held call went with the restart, so its approval covers only the
+    // arguments the owner saw, and runs once
+    let (status, approved) = hub
+        .approve_with_passkey(&mut passkey, &hub_call, "once")
+        .await?;
+    assert_eq!(status, 200, "{approved}");
+    let forwarded = |b: i64| ForwardedCall {
+        caller: Caller::default(),
+        execution_id: "by-hand".to_owned(),
+        script: String::new(),
+        server: "fixture".to_owned(),
+        tool: "add".to_owned(),
+        arguments: arguments(b),
+        approval: Some(hub_call.clone()),
+    };
+    let swapped: CallAnswer = post_as_spoke(&hub, &spoke_id, "/call", &forwarded(100)).await?;
+    assert!(
+        matches!(&swapped, CallAnswer::Error(error) if error.kind == HubErrorKind::Denied),
+        "{swapped:?}"
+    );
+    let original: CallAnswer = post_as_spoke(&hub, &spoke_id, "/call", &forwarded(2)).await?;
+    assert!(
+        matches!(&original, CallAnswer::Value(value) if value.to_string().contains('3')),
+        "{original:?}"
+    );
+    let again: CallAnswer = post_as_spoke(&hub, &spoke_id, "/call", &forwarded(2)).await?;
+    assert!(
+        matches!(&again, CallAnswer::Error(error) if error.kind == HubErrorKind::Denied),
+        "{again:?}"
+    );
 
     spoke.stop().await?;
     hub.stop().await

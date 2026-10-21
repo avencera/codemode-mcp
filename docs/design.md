@@ -818,12 +818,16 @@ spokes as hub tools.
   refused, so spokes reach the hub at its tailnet name or IP on port 7681, not at the HTTPS approval address.
   Past `register`, the spoke must be trusted, at the address it was trusted at
 - Identity: a random UUID in `<state_dir>/spoke.id` (mode 0600) and the short host name. The id is sent only to
-  the hub. Tailscale vouches for peer addresses, so a copied id is useless from another node
+  the hub. Tailscale vouches for peer addresses, so a copied id is useless from another node. A spoke resolves
+  the hub's name to IPv4 when it can, so it always arrives from the same one of its two tailnet addresses
 - Trust: the first `register` opens an admin request `spoke.trust` with a confirmation code. Unlike other admin
   requests it, like `spoke.secrets` below, may be approved with Touch ID at the hub Mac as well as with a
-  passkey, because the person answering is at the hub either way and the prompt names the machine. Approval writes a
+  passkey, because the person answering is at the hub either way and the prompt names the machine. Spoke,
+  server and tool names in prompts are letters, digits, `-`, `_` and `.` only; a spoke registering with any
+  other name is refused. Approval writes a
   `spokes` row, kept until `spokes remove` (owner proof). The name and address stay as approved; a trusted id
-  registering from another address is asked about again, naming where it was trusted before. A pending spoke
+  registering from another address is asked about again, naming where it was trusted before. One address has
+  at most one open trust request, so a peer making up ids cannot pile prompts on the owner. A pending spoke
   asks every 5 s; a refused one stops asking until it restarts, so the owner is not asked again and again
 - Catalog: the hub exports its servers with a version (`catalog::export_tools`): tools whose policy is `deny`
   are left out, inputs are the shapes scripts see, and output schemas stay on the hub, which checks results
@@ -835,17 +839,23 @@ spokes as hub tools.
 - Calls to hub tools: the spoke asks `gate`, and the hub resolves the call in its own catalog under its own
   policy. An `ask` call waits on the hub's request, which the hub keeps with the prepared call; the spoke parks
   its execution on a local copy of that request, which it follows by long poll (`approvals/wait`, 25 s, backing
-  off to 30 s between failures). `call` then runs the tool on the hub with the approval's id, which must match
-  the spoke, server and tool and is used once. The hub's tokens and policy never reach the spoke, which does
+  off to 30 s between failures). `call` then runs the held call with the approval's id, which the store marks
+  used, so it runs once even across restarts. When a restart lost the held call, the stored request stands in
+  only for the same spoke, server, tool and arguments (a digest kept on the row), before its deadline; a
+  sensitive request keeps no digest and is asked again. Only exported tools resolve, so a spoke cannot reach
+  a `deny` tool or the hub's `secrets` builtin. The hub's tokens and policy never reach the spoke, which does
   not gate hub tools again; it checks results against the output once more
 - Approvals of a spoke's own `ask` tools: `gate` with `hub_tool = false` runs the hub's approval path with the
   spoke's caller, so prompts read `<spoke> · <client> · <thread>` and links point at the hub's approval page.
-  Client grants live on the hub, keyed by spoke id and client; session grants by a hash of the spoke id and
-  session. Both copies of a request are in the databases (sensitive ones excepted): after a restart the spoke
+  The hub records the server as `<spoke>:<server>`, so the spoke's own `fixture` never shares a grant or an
+  approval with the hub's. Client grants live on the hub, keyed by spoke id and client; session grants by a
+  hash of the spoke id and session, and the hub files a spoke's executions under the spoke's id, so a request
+  never joins another caller's batch. Both copies of a request are in the databases (sensitive ones excepted): after a restart the spoke
   follows its copies again and the hub restores the requests spokes asked
 - 1Password values: `write_env`, `find_references` and `op inject`/`run`/`read`/`find` run on the spoke, and the
   value is read and approved on the hub (`op/read`, `op/find`), whose prompts show the destination as
-  `<spoke>:<path>`. `{{ op://... }}` references in a spoke's own server config go to `op/config`; the owner
+  `<spoke>:<path>`; values a program asked to keep are kept per spoke id, so two spokes with one name never
+  share them. `{{ op://... }}` references in a spoke's own server config go to `op/config`; the owner
   approves them once per spoke, server, destination digest and reference set, and the hub remembers it. A
   server that starts before its spoke is trusted waits for the trust (up to 10 minutes) rather than failing into
   the 10 minute secret retry
@@ -1245,9 +1255,11 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
   reachable through EventKit. A reminders fetch that times out (30 s) is cancelled, and a completion already
   running is waited for (20 s more) so it does not overlap the next call; one still running after that can
 
-- Which hub approvals a spoke has used is kept in memory, so after a hub restart an approved call not yet run
-  may run once more, for the same spoke, server and tool
 - A spoke whose trust was refused asks again only after it restarts
+- A spoke that gives up on a request (the script was cancelled or timed out) does not tell the hub, so the owner
+  is still asked, and an approved call of a hub tool stays unused until its deadline
+- A spoke's request for `op://` references in its config that was open when the hub restarted is withdrawn; the
+  spoke asks again on its next attempt
 
 ## Open questions
 

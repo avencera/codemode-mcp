@@ -67,10 +67,14 @@ pub struct StoredApproval {
     pub server: String,
     /// Upstream tool name or admin action name
     pub tool: String,
+    /// For a spoke's call of a hub tool, the digest of the arguments it
+    /// covers
+    pub hub_call: Option<String>,
 }
 
 const COLUMNS: &str = "id, created_ms, expires_ms, decision, approved_by, sensitive, payload, \
-                       action, action_done, unnotified, execution_id, spoke, server, tool";
+                       action, action_done, unnotified, execution_id, spoke, server, tool, \
+                       hub_call";
 
 fn stored_approval(row: &Row) -> Result<StoredApproval, turso::Error> {
     let flag = |index: usize| -> Result<bool, turso::Error> {
@@ -92,6 +96,7 @@ fn stored_approval(row: &Row) -> Result<StoredApproval, turso::Error> {
         spoke: row.get(11)?,
         server: row.get(12)?,
         tool: row.get(13)?,
+        hub_call: row.get(14)?,
     })
 }
 
@@ -147,6 +152,28 @@ impl Store {
         Ok(())
     }
 
+    /// Marks a request as a spoke's call of a hub tool with these
+    /// arguments, by their digest
+    pub fn bind_hub_call(&self, id: &str, digest: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE approvals SET hub_call = ?1 WHERE id = ?2",
+            params![digest, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Spends a request's approval on the one call it covers; false when it
+    /// was spent already, or there is no such request
+    pub fn consume_approval(&self, id: &str) -> Result<bool, StoreError> {
+        let changed = self.connection().execute(
+            "UPDATE approvals SET used_ms = ?1 WHERE id = ?2 AND used_ms IS NULL",
+            params![now_ms(), id],
+        )?;
+
+        Ok(changed > 0)
+    }
+
     /// Records the decision of a pending request; false when it was decided
     /// already
     pub fn decide_approval(
@@ -199,9 +226,11 @@ impl Store {
         Ok(self.connection().query_map(
             &format!(
                 "SELECT {COLUMNS} FROM approvals WHERE decision IS NULL AND spoke IS NOT NULL \
-                 AND action IS NULL ORDER BY created_ms"
+                 AND action IS NULL AND server <> ?1 ORDER BY created_ms"
             ),
-            (),
+            // the owner's requests about a spoke are answered to the route
+            // that asked, which a restart ended; they are withdrawn instead
+            params![crate::approvals::ADMIN_SERVER],
             stored_approval,
         )?)
     }

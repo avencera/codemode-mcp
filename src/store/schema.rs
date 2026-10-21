@@ -54,6 +54,11 @@ fn create_spoke_tables(connection: &Connection) -> Result<(), turso::Error> {
         );
         -- the spoke a request came from; NULL for this machine's own
         ALTER TABLE approvals ADD COLUMN spoke TEXT;
+        -- for a spoke's call of a hub tool: a digest of the arguments the
+        -- request covers; NULL for every other request
+        ALTER TABLE approvals ADD COLUMN hub_call TEXT;
+        -- when that call ran; each approval runs one
+        ALTER TABLE approvals ADD COLUMN used_ms INTEGER;
         "#,
     )
 }

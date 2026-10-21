@@ -912,6 +912,7 @@ impl LoginsServer {
             )),
             keep: None,
             phones_only: true,
+            keep_scope: None,
         };
 
         match self.0.onepassword.read_for_program(&ask).await {

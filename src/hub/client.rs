@@ -9,6 +9,7 @@
 
 use std::{
     io::Write,
+    net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
     path::Path,
     sync::{Arc, Mutex, PoisonError, Weak},
@@ -52,6 +53,26 @@ const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// to trust this spoke before it fails; a failed read waits out the
 /// upstream's long retry for secrets
 const TRUST_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// Resolves the hub's name to its IPv4 addresses when it has any, so every
+/// request leaves from this spoke's IPv4 tailnet address: the hub answers a
+/// spoke only from the address it was trusted at, and MagicDNS names have
+/// both kinds
+struct PreferIpv4;
+
+impl reqwest::dns::Resolve for PreferIpv4 {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let found: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let ipv4: Vec<SocketAddr> = found.iter().copied().filter(SocketAddr::is_ipv4).collect();
+            let chosen = if ipv4.is_empty() { found } else { ipv4 };
+
+            Ok(Box::new(chosen.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
 
 /// Why a request to the hub failed
 #[derive(Debug, Clone, thiserror::Error)]
@@ -97,6 +118,7 @@ impl HubClient {
         // the hub answers only on the tailnet, never through a proxy
         let http = reqwest::Client::builder()
             .no_proxy()
+            .dns_resolver(PreferIpv4)
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| error.to_string())?;

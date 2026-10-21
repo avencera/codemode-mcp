@@ -782,8 +782,8 @@ What runs where:
 
 - A hub server's tool runs on the hub, under the hub's policy; an `ask` call is approved there like a local
   one. The spoke never holds the hub's tokens.
-- The spoke's own `ask` tools are approved on the hub too. Prompts read `ai5090 · <client> · <thread>`, and
-  client and session grants apply to that spoke only. A script waiting on one survives a restart of either
+- The spoke's own `ask` tools are approved on the hub too. Prompts read `ai5090 · <client> · <thread>` and
+  name the tool as `ai5090:<server>.<tool>`, and client and session grants apply to that spoke only. A script waiting on one survives a restart of either
   machine.
 - `write_env`, `find_references` and `codemode-mcp op inject`/`run`/`read` on the spoke put the values on the
   spoke; the hub reads and approves them, and its prompt shows where they go as `ai5090:<path>`.

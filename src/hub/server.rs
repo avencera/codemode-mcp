@@ -7,10 +7,12 @@
 //! one the owner saw. Both survive a restart of either side: a spoke parks
 //! on its copy of the request, and the hub restores the requests spokes
 //! asked for (see [`Hub::restore`]) and checks a presented approval against
-//! its stored row when the held call is gone
+//! its stored row when the held call is gone: the row must be a hub tool's
+//! request, for the same arguments, still in time. Each approval runs one
+//! call, which the store records, so a restart does not let it run twice
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::Duration,
@@ -79,14 +81,13 @@ struct HubState {
     trust_requests: HashMap<String, TrustRequest>,
     /// Requests spokes asked for, by request id
     held: HashMap<String, Held>,
-    /// Approved requests a spoke has run its call with, so one approval
-    /// runs one call
-    used: HashSet<String>,
 }
 
 struct TrustRequest {
     url: String,
     code: String,
+    /// The tailnet address that asked
+    address: String,
     /// Why the owner refused, once they did
     denied: Option<String>,
 }
@@ -137,12 +138,13 @@ impl Hub {
     /// `Approvals::abandon_orphans`, which withdraws whatever nothing took
     pub fn restore(self: &Arc<Self>, trust_requests: Vec<(Waiting, AdminAction)>) {
         for (waiting, action) in trust_requests {
-            if let AdminAction::TrustSpoke { id, .. } = &action {
+            if let AdminAction::TrustSpoke { id, address, .. } = &action {
                 self.state().trust_requests.insert(
                     id.clone(),
                     TrustRequest {
                         url: waiting.url().to_owned(),
                         code: String::new(),
+                        address: address.clone(),
                         denied: None,
                     },
                 );
@@ -268,7 +270,7 @@ impl Hub {
 
     fn register(self: &Arc<Self>, peer: SocketAddr, register: Register) -> Registration {
         let id = register.id;
-        let name = one_line(&register.name, MAX_NAME_CHARS);
+        let name = register.name;
         let version = one_line(&register.version, MAX_NAME_CHARS);
         let address = peer.ip().to_canonical().to_string();
 
@@ -300,6 +302,18 @@ impl Hub {
                         url: open.url.clone(),
                         code: open.code.clone(),
                     },
+                };
+            }
+            // one open question per tailnet node, so a peer making up ids
+            // cannot pile prompts on the owner
+            if let Some(open) = state
+                .trust_requests
+                .values()
+                .find(|open| open.address == address && open.denied.is_none())
+            {
+                return Registration::Pending {
+                    url: open.url.clone(),
+                    code: open.code.clone(),
                 };
             }
         }
@@ -341,6 +355,7 @@ impl Hub {
             TrustRequest {
                 url: url.clone(),
                 code: code.clone(),
+                address: address.clone(),
                 denied: None,
             },
         );
@@ -365,9 +380,17 @@ impl Hub {
         caller
     }
 
-    fn context(&self, caller: Caller, execution_id: &str, script: &str) -> CallContext {
+    /// A call of `spoke`'s execution, under an id of the spoke's own, so
+    /// it never joins another caller's batch of requests
+    fn context(
+        &self,
+        spoke: &StoredSpoke,
+        caller: Caller,
+        execution_id: &str,
+        script: &str,
+    ) -> CallContext {
         CallContext {
-            execution_id: Arc::from(execution_id),
+            execution_id: Arc::from(spoke_execution(spoke, execution_id)),
             catalog: self.gateway.catalog(),
             budget: Budget::new(self.config.limits.execution_timeout()),
             caller,
@@ -375,16 +398,40 @@ impl Hub {
         }
     }
 
+    /// The function of a tool the hub shares with spokes; `None` for one it
+    /// keeps to itself, like a `deny` tool or the `secrets` builtin
+    fn exported(&self, context: &CallContext, server: &str, tool: &str) -> Option<String> {
+        let shared = self.gateway.hub_catalog().servers.iter().any(|shared| {
+            shared.name == server
+                && shared
+                    .tools
+                    .iter()
+                    .any(|exported| exported.tool.name == tool)
+        });
+
+        shared
+            .then(|| context.catalog.find(server, tool))
+            .flatten()
+            .map(|entry| entry.function.clone())
+    }
+
     async fn gate(self: &Arc<Self>, spoke: &StoredSpoke, call: GateCall) -> GateAnswer {
         let caller = Self::caller(spoke, call.caller);
         let sensitivity = Sensitivity::of(call.sensitive);
 
         if !call.hub_tool {
+            if !plain_name(&call.server) || !plain_name(&call.tool) {
+                return GateAnswer::Refused(unknown(&call.server, &call.tool));
+            }
+            // the spoke's own server, apart from a hub server of the same
+            // name: in the prompt, in grants and in the stored request
+            let server = format!("{}:{}", spoke.name, call.server);
             let script: Arc<str> = Arc::from(call.script.as_str());
+            let execution_id = spoke_execution(spoke, &call.execution_id);
             let gate = self.approvals().gate_here(GateRequest {
                 caller: &caller,
-                execution_id: &call.execution_id,
-                server: &call.server,
+                execution_id: &execution_id,
+                server: &server,
                 tool: &call.tool,
                 arguments: &call.arguments,
                 script: &script,
@@ -400,14 +447,11 @@ impl Hub {
             });
         }
 
-        let context = self.context(caller, &call.execution_id, &call.script);
-        let Some(function) = context
-            .catalog
-            .find(&call.server, &call.tool)
-            .map(|entry| entry.function.clone())
-        else {
+        let context = self.context(spoke, caller, &call.execution_id, &call.script);
+        let Some(function) = self.exported(&context, &call.server, &call.tool) else {
             return GateAnswer::Refused(unknown(&call.server, &call.tool));
         };
+        let digest = arguments_digest(&call.arguments);
         let plan = self
             .gateway
             .prepare_with(&context, &function, call.arguments, sensitivity, None)
@@ -417,8 +461,20 @@ impl Hub {
             Ok(Plan::Run { approval_id, .. }) => GateAnswer::Gate(RemoteGate::Open {
                 approval_id: approval_id.unwrap_or_default(),
             }),
-            Ok(Plan::Gated { call, waiting }) => {
-                GateAnswer::Gate(self.wait_answer(spoke, waiting, Some(call)))
+            Ok(Plan::Gated {
+                call: prepared,
+                waiting,
+            }) => {
+                // the stored row stands in for the held call after a
+                // restart, for these arguments only; a sensitive request
+                // keeps no trace of them and is asked again instead
+                if !(call.sensitive || prepared.sensitive)
+                    && let Err(error) = self.store.bind_hub_call(waiting.id(), &digest)
+                {
+                    tracing::warn!(%error, "could not record a hub call's arguments");
+                }
+
+                GateAnswer::Gate(self.wait_answer(spoke, waiting, Some(prepared)))
             }
             Err(error) => GateAnswer::Refused(HubError::from(&error)),
         }
@@ -478,12 +534,8 @@ impl Hub {
 
     async fn call(self: &Arc<Self>, spoke: &StoredSpoke, call: ForwardedCall) -> CallAnswer {
         let caller = Self::caller(spoke, call.caller);
-        let context = self.context(caller, &call.execution_id, &call.script);
-        let Some(function) = context
-            .catalog
-            .find(&call.server, &call.tool)
-            .map(|entry| entry.function.clone())
-        else {
+        let context = self.context(spoke, caller, &call.execution_id, &call.script);
+        let Some(function) = self.exported(&context, &call.server, &call.tool) else {
             return CallAnswer::Error(unknown(&call.server, &call.tool));
         };
         let refused = |message: &str| {
@@ -495,10 +547,23 @@ impl Hub {
 
         let (prepared, approval_id) = match call.approval {
             Some(id) => {
-                if !self.state().used.insert(id.clone()) {
-                    return refused("was approved for one call, which has run");
+                let approved =
+                    self.approved_call(spoke, &id, &call.server, &call.tool, &call.arguments);
+                if let Err(message) = approved {
+                    return refused(message);
                 }
-                match self.approved_call(spoke, &id, &call.server, &call.tool) {
+                // checked first, so a call the approval does not cover
+                // leaves it for the one it does
+                match self.store.consume_approval(&id) {
+                    Ok(true) => {}
+                    Ok(false) => return refused("was approved for one call, which has run"),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not record a hub call's approval as used");
+
+                        return refused("could not be checked; run it again");
+                    }
+                }
+                match approved {
                     Ok(Some(held)) => (held, Some(id)),
                     Ok(None) => {
                         // the held call went with a restart; the stored
@@ -556,13 +621,15 @@ impl Hub {
     }
 
     /// The held call approved request `id` lets the spoke run: `Ok(None)`
-    /// when it is approved but its call is no longer held
+    /// when it is approved for exactly this call but the call is no longer
+    /// held, so `arguments` may stand in for it
     fn approved_call(
         &self,
         spoke: &StoredSpoke,
         id: &str,
         server: &str,
         tool: &str,
+        arguments: &Map<String, Value>,
     ) -> Result<Option<PreparedCall>, &'static str> {
         {
             let mut state = self.state();
@@ -590,10 +657,14 @@ impl Hub {
             .approvals()
             .stored(id)
             .ok_or("was not approved for this call")?;
+        // only a hub tool's request carries a digest, so a request for the
+        // spoke's own tool never runs a hub tool
         let fits = stored.spoke.as_deref() == Some(spoke.id.as_str())
             && stored.server == server
             && stored.tool == tool
-            && stored.decision.as_deref() == Some("approved");
+            && stored.decision.as_deref() == Some("approved")
+            && stored.hub_call.as_deref() == Some(arguments_digest(arguments).as_str())
+            && stored.expires_ms.is_some_and(|expires| expires > now_ms());
         if !fits {
             return Err("was not approved for this call");
         }
@@ -619,7 +690,12 @@ impl Hub {
                 "a config read names 1 to {MAX_CONFIG_REFERENCES} op:// references"
             ));
         }
-        let server = one_line(&read.server, MAX_NAME_CHARS);
+        if !plain_name(&read.server) {
+            return ConfigAnswer::Error(
+                "a server name is letters, digits, `-`, `_` and `.`".to_owned(),
+            );
+        }
+        let server = read.server;
         let consumer =
             Consumer::of_spoke(&spoke.id, format!("{}/{server}", spoke.name), &read.digest);
         let onepassword = &self.gateway.secrets().onepassword;
@@ -676,6 +752,29 @@ impl Hub {
     }
 }
 
+/// The hub's id for an execution of `spoke`
+fn spoke_execution(spoke: &StoredSpoke, execution_id: &str) -> String {
+    format!("{}/{execution_id}", spoke.id)
+}
+
+/// Whether `name` is a host, server or tool name and nothing more, fit to
+/// show in the owner's prompts as it is
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_CHARS
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+}
+
+/// Digest of a call's arguments; `Map` keeps its keys sorted, so equal
+/// arguments serialize alike
+fn arguments_digest(arguments: &Map<String, Value>) -> String {
+    let encoded = serde_json::to_vec(arguments).unwrap_or_default();
+
+    hex(&Sha256::digest(&encoded))
+}
+
 fn unknown(server: &str, tool: &str) -> HubError {
     HubError {
         kind: HubErrorKind::Unknown,
@@ -720,15 +819,15 @@ fn refuse(status: StatusCode, error: &str) -> Response {
 
 /// Lets in only tailnet peers and processes on this machine, and past
 /// `register` only trusted spokes; every answer carries the catalog version
-async fn guard(State(hub): State<Arc<Hub>>, mut request: Request, next: Next) -> Response {
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(peer)| *peer);
+async fn guard(
+    State(hub): State<Arc<Hub>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     // the main listener also answers on the LAN, and `tailscale serve`
     // proxies the tailnet in from loopback with its headers
-    let allowed = peer.is_some_and(|peer| is_tailnet_address(peer.ip()))
-        || is_direct_local(peer, request.headers());
+    let allowed = is_tailnet_address(peer.ip()) || is_direct_local(Some(peer), request.headers());
     if !allowed {
         return refuse(
             StatusCode::FORBIDDEN,
@@ -741,8 +840,7 @@ async fn guard(State(hub): State<Arc<Hub>>, mut request: Request, next: Next) ->
             .headers()
             .get(SPOKE_HEADER)
             .and_then(|value| value.to_str().ok())
-            .zip(peer)
-            .and_then(|(id, peer)| hub.trusted(id, peer.ip()));
+            .and_then(|id| hub.trusted(id, peer.ip()));
         let Some(spoke) = spoke else {
             return refuse(
                 StatusCode::FORBIDDEN,
@@ -771,10 +869,12 @@ async fn register(
             .id
             .chars()
             .all(|character| character.is_ascii_hexdigit() || character == '-');
-    if !id_ok || register.name.trim().is_empty() {
+    // the name is in the owner's prompts, so it may not dress up as
+    // anything but a host name
+    if !id_ok || !plain_name(&register.name) {
         return refuse(
             StatusCode::BAD_REQUEST,
-            "a spoke registers with its id and name",
+            "a spoke registers with its id and a host name of letters, digits, `-`, `_` and `.`",
         );
     }
 
@@ -825,6 +925,7 @@ async fn op_read(
             destination: Some(destination_on(&spoke, request.destination)),
             keep: request.keep_secs.map(Duration::from_secs),
             phones_only: read.phones_only,
+            keep_scope: Some(spoke.id.clone()),
         })
         .await;
 
