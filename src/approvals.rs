@@ -565,8 +565,12 @@ pub struct Approvals {
     on_mac: Option<OnMac>,
     /// Why requests are refused when there is no notifier
     unavailable: &'static str,
-    /// The hub every request is decided on, on a spoke
+    /// The hub a spoke's tool requests are decided on
     remote: Option<Arc<dyn Remote>>,
+    /// Requests this spoke follows from its hub, whose pages are the hub's;
+    /// its own admin requests stay here. A lock of its own, since links are
+    /// made while `state` is held
+    followed: Mutex<HashSet<String>>,
     store: Store,
     state: Mutex<State>,
     /// Set once the process stops writing, because another daemon took over
@@ -613,6 +617,7 @@ impl Approvals {
             on_mac,
             unavailable,
             remote,
+            followed: Mutex::new(HashSet::new()),
             store,
             state: Mutex::new(state),
             frozen: Arc::new(AtomicBool::new(false)),
@@ -651,9 +656,16 @@ impl Approvals {
     /// Link to the page for approval `id`, the hub's on a spoke
     pub fn url_for(&self, id: &str) -> String {
         match &self.remote {
-            Some(remote) => remote.approval_url(id),
-            None => format!("{}/approve/{id}", self.base_url),
+            Some(remote) if self.is_followed(id) => remote.approval_url(id),
+            _ => format!("{}/approve/{id}", self.base_url),
         }
+    }
+
+    fn is_followed(&self, id: &str) -> bool {
+        self.followed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(id)
     }
 
     /// Whether requests are decided on a hub
@@ -796,17 +808,31 @@ impl Approvals {
         let Some(remote) = self.remote.clone() else {
             return;
         };
+        self.followed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_owned());
         let weak = Arc::downgrade(self);
         let id = id.to_owned();
+        let unfollow = |approvals: &Self, id: &str| {
+            approvals
+                .followed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        };
         tokio::spawn(async move {
             let mut pause = Duration::from_secs(1);
             loop {
-                let pending = weak
-                    .upgrade()
-                    .is_some_and(|approvals| approvals.state().pending.contains_key(&id));
-                if !pending {
+                let Some(approvals) = weak.upgrade() else {
+                    return;
+                };
+                if !approvals.state().pending.contains_key(&id) {
+                    unfollow(&approvals, &id);
+
                     return;
                 }
+                drop(approvals);
                 match remote.decision(&id).await {
                     Ok(Some(verdict)) => {
                         let decision = match verdict {
@@ -815,6 +841,7 @@ impl Approvals {
                         };
                         if let Some(approvals) = weak.upgrade() {
                             approvals.settle(&id, Some(verdict), decision, None);
+                            unfollow(&approvals, &id);
                         }
 
                         return;
@@ -1410,8 +1437,11 @@ impl Approvals {
             }
         }
         self.expire_after(id, Duration::from_millis(remaining as u64));
-        // on a spoke the hub decides it, so its verdict is followed again
-        self.spawn_follow(id);
+        // on a spoke the hub decides its tool requests, so their verdict is
+        // followed again; its own admin requests are decided here
+        if info.kind == ApprovalKind::ToolCall {
+            self.spawn_follow(id);
+        }
 
         Some(Waiting {
             waiting_for: info.waiting_for(),

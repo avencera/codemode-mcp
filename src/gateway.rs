@@ -304,6 +304,18 @@ impl HubView {
 /// A config for the hub's server that the catalog reads as the hub does:
 /// each tool's policy, grant and output, the server's aliases and
 /// sensitivity
+/// A failed exchange with the hub as a script sees it: a timeout keeps its
+/// kind, so `except TimeoutError` catches it as it would a local one
+fn hub_unreachable(error: &HubClientError) -> HubError {
+    HubError {
+        kind: match error {
+            HubClientError::TimedOut(_) => HubErrorKind::TimedOut,
+            _ => HubErrorKind::Failed,
+        },
+        message: error.to_string(),
+    }
+}
+
 fn hub_server_config(server: &HubServer) -> Result<ServerConfig, String> {
     let mut tools = toml::Table::new();
     for exported in &server.tools {
@@ -827,14 +839,7 @@ impl Gateway {
                 Err(self.refuse(context, &call, error))
             }
             Ok(GateAnswer::Refused(error)) => Err(self.refuse(context, &call, error.into())),
-            Err(error) => {
-                let error = HubError {
-                    kind: HubErrorKind::Failed,
-                    message: error.to_string(),
-                };
-
-                Err(self.refuse(context, &call, error.into()))
-            }
+            Err(error) => Err(self.refuse(context, &call, hub_unreachable(&error).into())),
         }
     }
 
@@ -928,13 +933,7 @@ impl Gateway {
             let answer = hub
                 .call(&forwarded, self.config.tool_timeout())
                 .await
-                .map_err(|error| HubError {
-                    kind: match error {
-                        HubClientError::TimedOut(_) => HubErrorKind::TimedOut,
-                        _ => HubErrorKind::Failed,
-                    },
-                    message: error.to_string(),
-                })?;
+                .map_err(|error| hub_unreachable(&error))?;
             let value = match answer {
                 CallAnswer::Value(value) => value,
                 CallAnswer::Error(error) => return Err(error.into()),

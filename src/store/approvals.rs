@@ -164,10 +164,11 @@ impl Store {
     }
 
     /// Spends a request's approval on the one call it covers; false when it
-    /// was spent already, or there is no such request
+    /// was spent already, its deadline passed, or there is no such request
     pub fn consume_approval(&self, id: &str) -> Result<bool, StoreError> {
         let changed = self.connection().execute(
-            "UPDATE approvals SET used_ms = ?1 WHERE id = ?2 AND used_ms IS NULL",
+            "UPDATE approvals SET used_ms = ?1 WHERE id = ?2 AND used_ms IS NULL \
+             AND expires_ms > ?1",
             params![now_ms(), id],
         )?;
 

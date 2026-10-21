@@ -373,6 +373,12 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
         return Err(format!("the hub did not hold the call: {gated:?}").into());
     };
 
+    // the spoke's own admin requests stay its own: a second passkey asks
+    // the first, here, across a restart
+    let mut spoke_passkey = spoke.enroll_passkey().await?;
+    let (_, second) = spoke.request_enrollment("second").await?;
+    let enrollment = approval_id(&second)?;
+
     // the spoke stops and starts while the owner has not answered; its
     // execution is parked on its copy of the hub's request
     let spoke = spoke.restart(super::harness::Stop::Drain).await?;
@@ -386,6 +392,10 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
 
     let (status, approved) = hub.approve_with_passkey(&mut passkey, &id, "once").await?;
     assert_eq!(status, 200, "{approved}");
+    let (status, enrolled) = spoke
+        .approve_with_passkey(&mut spoke_passkey, &enrollment, "once")
+        .await?;
+    assert_eq!(status, 200, "{enrolled}");
     let done = spoke.wait_done(&execution).await?;
     let done: Value = serde_json::from_str(&text_of(&done))?;
     assert_eq!(done["result"], 5, "{done}");

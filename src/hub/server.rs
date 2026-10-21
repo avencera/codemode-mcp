@@ -681,6 +681,16 @@ impl Hub {
         tool: &str,
         arguments: &Map<String, Value>,
     ) -> Result<Option<PreparedCall>, &'static str> {
+        let stored = self
+            .approvals()
+            .stored(id)
+            .ok_or("was not approved for this call")?;
+        // an approval runs its call before the request's deadline, held or
+        // not, so a spoke cannot save it for later
+        if !stored.expires_ms.is_some_and(|expires| expires > now_ms()) {
+            return Err("was approved too long ago; run it again");
+        }
+
         {
             let mut state = self.state();
             // a request held again after a restart has no call with it, and
@@ -703,18 +713,13 @@ impl Hub {
             }
         }
 
-        let stored = self
-            .approvals()
-            .stored(id)
-            .ok_or("was not approved for this call")?;
         // only a hub tool's request carries a digest, so a request for the
         // spoke's own tool never runs a hub tool
         let fits = stored.spoke.as_deref() == Some(spoke.id.as_str())
             && stored.server == server
             && stored.tool == tool
             && stored.decision.as_deref() == Some("approved")
-            && stored.hub_call.as_deref() == Some(arguments_digest(arguments).as_str())
-            && stored.expires_ms.is_some_and(|expires| expires > now_ms());
+            && stored.hub_call.as_deref() == Some(arguments_digest(arguments).as_str());
         if !fits {
             return Err("was not approved for this call");
         }
