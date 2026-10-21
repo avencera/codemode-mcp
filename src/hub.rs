@@ -52,7 +52,9 @@ pub enum Registration {
         /// Where the hub's approval pages are, for links the spoke hands out
         public_base: String,
     },
-    /// The owner was asked to trust it and has not answered yet
+    /// The owner was asked to trust it and has not answered yet; `url` and
+    /// `code` are empty while another request from the same address is
+    /// open, and the spoke is asked about once that one is answered
     Pending {
         /// The request's page
         url: String,

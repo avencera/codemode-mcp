@@ -379,7 +379,14 @@ impl HubClient {
                         pause = Duration::from_secs(1);
                     }
                     Ok(Registration::Pending { url, code }) => {
-                        if !announced {
+                        // no link: another request from this machine is open,
+                        // and this spoke's own comes once that one is answered
+                        if url.is_empty() {
+                            tracing::debug!(
+                                hub = %self.base,
+                                "another trust request from this machine is open on the hub"
+                            );
+                        } else if !announced {
                             tracing::warn!(
                                 hub = %self.base,
                                 %url,

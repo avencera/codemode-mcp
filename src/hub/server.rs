@@ -305,15 +305,16 @@ impl Hub {
                 };
             }
             // one open question per tailnet node, so a peer making up ids
-            // cannot pile prompts on the owner
-            if let Some(open) = state
+            // cannot pile prompts on the owner. The other id's link and code
+            // stay with it: this one waits its turn with neither
+            let busy = state
                 .trust_requests
                 .values()
-                .find(|open| open.address == address && open.denied.is_none())
-            {
+                .any(|open| open.address == address && open.denied.is_none());
+            if busy {
                 return Registration::Pending {
-                    url: open.url.clone(),
-                    code: open.code.clone(),
+                    url: String::new(),
+                    code: String::new(),
                 };
             }
         }
