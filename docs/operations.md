@@ -14,7 +14,7 @@ binary under a shorter name. Times in logs are UTC.
    codemode-mcp config init --print    # or look first
    ```
 
-   It configures 1Password, the OpenAI docs, Calendar, Reminders and Xcode. Approval notifications use the
+   It configures 1Password, the OpenAI docs, Calendar, Reminders, Superalert and Xcode. Approval notifications use the
    `[notify.ntfy]` section of `~/.config/homebased/config.toml` unless you add one here.
 3. Preview, then install the LaunchAgent from the repository root:
 
@@ -503,6 +503,79 @@ of what was read since the daemon started, as at pairing. An unexpected device i
 prompt you did not ask for, means another program edited the config or holds the admin token; deny it and remove
 the entry. If the trust key goes missing while its records remain, the daemon trusts no device until you run
 `companion trust` for each again, rather than trusting whatever the config then lists.
+
+## Superalert notifications and alarms
+
+The Superalert adapter sends regular phone notifications through ntfy on the existing Superalert topic.
+These use normal priority (3) and do not sound the full-device alarm. Full Superalert alarms use the
+dashboard's `/api/alert` endpoint. They sound on all devices, replace any current alarm, and repeat until
+acknowledged or the server's alarm timeout ends.
+
+The starter config includes this server. To add it to an existing config:
+
+```toml
+[servers.superalert]
+command = "/Users/me/.local/bin/codemode-mcp"
+args = ["adapter", "superalert"]
+sensitive = false
+```
+
+The adapter reads the Mac app's `~/Library/Application Support/superalert/mac.toml`. It uses
+`superalert_url`, `ntfy_server`, and `ntfy_topic`; it never returns the topic in a tool result. The
+environment variables `SUPERALERT_URL`, `SUPERALERT_NTFY_SERVER`, and `SUPERALERT_NTFY_TOPIC` override
+those settings. `adapter superalert --url <dashboard-base-url>` overrides the dashboard URL only. Without
+Mac settings, the dashboard defaults to `https://lookout.camel-scylla.ts.net/alert/` and ntfy to
+`https://ntfy.sh`. Regular alerts need a topic; full alarms do not. These are separate from the gateway's
+approval notification settings.
+
+For a host without the Mac app, use the server's `env` config to supply the topic from 1Password, without
+putting the value in a script or command argument:
+
+```toml
+[servers.superalert.env]
+SUPERALERT_NTFY_TOPIC = "{{ op://Personal/Superalert/ntfy_topic }}"
+```
+
+Restart with `codemode-mcp service restart` after adding the server. The tools are:
+
+- `superalert_alert`: send a regular phone notification now
+- `superalert_super_alert`: sound the full alarm now
+- `superalert_schedule_alert`: send either kind at a future RFC 3339 time with an explicit UTC offset
+- `superalert_delay_alert`: send either kind after a positive number of seconds
+- `superalert_cancel_alert`: cancel with the `kind` and `id` from the scheduling result
+- `superalert_status`: read the alarm, pending super alerts, doorbell state, and device readiness
+- `superalert_acknowledge`: silence the current alarm, as **Got it** does
+- `superalert_arm`, `superalert_disarm`, `superalert_reset`: control doorbell alerts and current alarms
+- `superalert_set_critical`: enable or disable Pushover escalation, if configured on the server
+- `superalert_set_trigger`: enable or disable `chime` or `person` as a doorbell alarm trigger
+
+For a regular reminder before a meeting and a full alarm at the meeting time:
+
+```python
+reminder = await superalert_schedule_alert(
+    kind="regular", title="Meeting in 30 minutes", body="Review the agenda",
+    deliver_at="2026-10-22T10:00:00-05:00",
+)
+alarm = await superalert_schedule_alert(
+    kind="super", title="Meeting starts now", body="Join the meeting", source="calendar",
+    deliver_at="2026-10-22T10:30:00-05:00",
+)
+[reminder, alarm]
+```
+
+Both example times are Central Daylight Time. Scheduling runs on ntfy or Superalert, so the MCP process
+does not need to stay connected. Receipt times use `America/Chicago`. Times already in the past when the
+adapter checks them are refused. If a time passes while the request is in transit, Superalert can sound
+the alarm immediately; the receipt then reports `scheduled = false`. Full alarms can be scheduled up to 366 days ahead and
+survive Superalert restarts. Regular notifications use [ntfy's scheduling limits](https://docs.ntfy.sh/publish/#scheduled-delivery),
+normally 10 seconds to 3 days; the server can set different limits. The server's refusal is returned as
+a tool error. `status` does not list regular notifications scheduled in ntfy. Regular notifications on
+the alarm topic reach phones and show as normal Mac notifications; they do not start the full alarm.
+
+Cancel a pending alert with `superalert_cancel_alert(kind="super", id=alarm["id"])` or the regular
+receipt's kind and id. Regular cancellation uses ntfy's delete API and requires a server version that
+supports it. A full alarm that has already started must be acknowledged instead. Reset does not cancel
+pending alerts. If a send times out, delivery is unknown; check the service before retrying.
 
 ## Calendar and Reminders access
 

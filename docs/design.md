@@ -45,7 +45,7 @@ rmcp 3.x clients, one long-lived connection per configured server
 
 | Kind | Example | Notes |
 |---|---|---|
-| stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
+| stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter calendar`, `reminders`, `superalert`) | child process supervised by the daemon; restart with backoff |
 | HTTP | `openaiDeveloperDocs` | plain Streamable HTTP |
 | HTTP + OAuth | any `url` server with `oauth = true` | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on `/oauth/callback/<server>` on `public_origin` or the admin listener (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
@@ -889,6 +889,23 @@ instead of the one long-lived connection per server everything else uses. The ga
 sessions already have the tools. Seam for later: an upstream kind `caller_auth` whose `Upstream` is created
 lazily per caller (the server is session-less, so keyed by token header rather than a session id; the token comes
 from a header the agent's entry sets), dropped when idle, and excluded from the shared catalog build
+
+### Superalert adapter
+
+- `codemode-mcp adapter superalert` is a cross-platform stdio server over HTTP. Full alarms and their
+  schedules use the Superalert dashboard API with `x-superalert: 1`; regular phone notifications use
+  JSON publishing to ntfy on the same topic, always at priority 3. No timer waits inside the adapter
+- The adapter reads the Mac app's URL, ntfy server and topic, with environment overrides. The topic is
+  private: regular receipts omit it, and errors omit upstream bodies and URLs. Missing ntfy settings
+  disable regular notifications without blocking the full-alarm tools. This configuration is separate
+  from the gateway's approval notifier
+- Explicit-time scheduling requires a future timestamp with an offset. Relative delays must be positive.
+  Superalert stores full-alarm schedules; ntfy owns regular notification schedules and enforces its own
+  delivery limits. Receipts include the kind, cancellation id, schedule state and confirmed time in
+  `America/Chicago`. The dashboard's status API lists pending full alarms, not ntfy schedules
+- HTTP requests have a 20-second timeout, do not follow redirects, and are not retried by the adapter.
+  A transport failure leaves delivery uncertain. The HTTP contract tests run against a local test server;
+  they never send notifications or sound real alarms
 
 ### Our own MCPs: Calendar and Reminders adapters
 

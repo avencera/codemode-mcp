@@ -49,7 +49,8 @@ before the script sees them.
   60 minute session
 - **Durable executions.** A script waiting on an approval is snapshotted and survives agent timeouts and daemon
   restarts
-- **Built-in adapters.** Calendar and Reminders through EventKit, served as MCP tools
+- **Built-in adapters.** Calendar and Reminders through EventKit, plus Superalert phone notifications,
+  full-device alarms, and server-side scheduled alerts, served as MCP tools
 - **Website sign-in.** An agent driving the Mac's screen can sign in to any website with the 1Password login
   saved for it, or one you pick on your phone, typed into the page in a code-signed browser without the
   value reaching the agent

@@ -17,6 +17,7 @@ mod service;
 mod session_less;
 mod sessions;
 mod spokes;
+mod superalert;
 mod typed_outputs;
 #[cfg(target_os = "macos")]
 mod update;

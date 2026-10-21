@@ -81,6 +81,14 @@ output_schema = { type = "object", required = ["hits", "nbHits", "page"], proper
 [servers.openai_docs.tools.list_api_endpoints]
 output_schema = { type = "object", required = ["baseUrls", "paths", "total", "urls"], properties = { baseUrls = { type = "array", items = { type = "string" } }, paths = { type = "array", items = { type = "string" } }, urls = { type = "array", items = { type = "string" } }, total = { type = "integer" } } }
 
+# Superalert: regular phone notifications through ntfy, full-device alarms
+# through the dashboard API, and scheduled delivery for either kind. Reads
+# the Mac app's settings; environment overrides are described in operations
+[servers.superalert]
+command = "{{HOME}}/.local/bin/codemode-mcp"
+args = ["adapter", "superalert"]
+sensitive = false
+
 # Calendar and Reminders through EventKit, covering every account the Mac's
 # apps show. macOS asks once for each, on the Mac, the first time the daemon
 # starts the adapter. Reads run freely; every change asks on the phone, and a

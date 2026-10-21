@@ -333,6 +333,12 @@ enum SpokesCommand {
 
 #[derive(Subcommand)]
 enum AdapterCommand {
+    /// Phone notifications and full-device alarms through Superalert and ntfy
+    Superalert {
+        /// Superalert dashboard base URL; defaults to the Mac app's setting
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// The Calendar app's events as MCP tools, through EventKit (macOS)
     Calendar,
     /// The Reminders app as MCP tools, through EventKit (macOS)
@@ -592,6 +598,12 @@ async fn main() -> Result<()> {
             command: ConfigCommand::Init { print, hub },
         } => config_init_command(&path, print, hub.as_deref()),
         Command::Spokes { command } => spokes_command(&load_or_default(&path)?, command).await,
+        Command::Adapter {
+            command: AdapterCommand::Superalert { url },
+        } => codemode_mcp::adapters::superalert::SuperalertAdapter::from_local(url.as_deref())?
+            .serve_stdio()
+            .await
+            .map_err(|error| eyre!("{error}")),
         Command::Adapter {
             command: AdapterCommand::Calendar,
         } => eventkit_adapter_command(Entity::Events).await,
