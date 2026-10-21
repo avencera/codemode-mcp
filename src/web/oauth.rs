@@ -1,20 +1,27 @@
 //! OAuth sign-in pages on the main listener, so a sign-in can start and
 //! finish on any device that reaches `public_origin`, such as a phone
 //!
-//! The page that starts a sign-in only renders a button: link previews and
-//! prefetching fetch with GET, and a started sign-in registers a client and
-//! may read the server's `url` from 1Password, so only the POST starts one
+//! Whoever starts a sign-in decides which account the gateway's tokens
+//! belong to, and the main listener is reachable from the network, so a
+//! sign-in starts only after a passkey assertion, as an approval does. The
+//! page itself starts nothing, and the JSON bodies keep other sites' forms
+//! out
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
+    Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
+use serde::Deserialize;
+use serde_json::{Value, json};
+use webauthn_rs::prelude::PublicKeyCredential;
 
-use super::{WebState, escape, page};
+use super::{WebState, escape, json_error, page, passkey_error};
 use crate::{
+    approvals::Choice,
     gateway::Gateway,
     oauth::{Callback, OAuthError},
 };
@@ -22,11 +29,12 @@ use crate::{
 /// How long starting or finishing a sign-in may take: discovery,
 /// registration, a 1Password read of the `url` and the token exchange
 pub const OAUTH_TIMEOUT: Duration = Duration::from_secs(60);
-/// Lets the form post to this page and the browser follow the redirect to
-/// the authorization server, which some browsers check against
-/// `form-action` too
-const LOGIN_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; \
-     base-uri 'none'; form-action 'self' https:; frame-ancestors 'none'";
+
+/// What a passkey assertion started here is bound to, so it cannot approve
+/// a tool call or another server's sign-in; approval ids never hold `:`
+fn subject(server: &str) -> String {
+    format!("oauth-login:{server}")
+}
 
 /// `GET /oauth/login/{server}`: what the sign-in is for, and a button
 pub(super) async fn login_page(
@@ -35,7 +43,7 @@ pub(super) async fn login_page(
 ) -> Response {
     let oauth = state.gateway.oauth();
     if oauth.login_page(&server).is_none() {
-        return unknown_server(&server);
+        return unknown_server();
     }
     let signed_in = oauth.status().is_ok_and(|logins| {
         logins
@@ -45,62 +53,93 @@ pub(super) async fn login_page(
     let note = if signed_in {
         "codemode-mcp is already signed in to this server; signing in again replaces that login."
     } else {
-        "codemode-mcp opens the server's sign-in page, then brings you back here."
+        "Confirm with your passkey, then sign in on the server's page; you come back here when it is done."
     };
     let title = format!("Sign in to {server}");
-    let server = escape(&server);
-    let mut response = page(
+
+    page(
         StatusCode::OK,
         &title,
         &format!(
-            "<main><h1>{heading}</h1><p class=\"meta\">{note}</p>\
-             <form method=\"post\" action=\"/oauth/login/{server}\"><div class=\"buttons\">\
-             <button class=\"approve\" type=\"submit\">Continue</button></div></form></main>",
+            r#"<main data-kind="signin" data-base="/oauth/login/{server}">
+<h1>{heading}</h1>
+<p class="meta">{note}</p>
+<div class="buttons"><button class="approve" id="signin">Continue with passkey</button></div>
+<p id="status" role="status"></p>
+</main>
+<script src="/assets/webauthn.js"></script>"#,
+            server = escape(&server),
             heading = escape(&title),
             note = escape(note),
         ),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(LOGIN_CONTENT_SECURITY_POLICY),
-    );
-
-    response
+    )
 }
 
-/// `POST /oauth/login/{server}`: starts the sign-in and sends the browser
-/// to the authorization server
-pub(super) async fn login_start(
+/// `POST /oauth/login/{server}/options`: a passkey challenge for this
+/// sign-in
+pub(super) async fn login_options(
     State(state): State<WebState>,
     Path(server): Path<String>,
-    headers: HeaderMap,
+    // a JSON body keeps cross-site form posts out
+    Json(_body): Json<Value>,
 ) -> Response {
-    // another site's form could otherwise start a sign-in in the owner's
-    // browser; browsers that send no `Sec-Fetch-Site` are let through
-    let site = headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok());
-    if site.is_some_and(|site| site != "same-origin" && site != "none") {
-        return failed(
-            StatusCode::FORBIDDEN,
-            &server,
-            "the request came from another site",
-        );
-    }
-    let oauth = state.gateway.oauth();
-    if oauth.login_page(&server).is_none() {
-        return unknown_server(&server);
+    if state.gateway.oauth().login_page(&server).is_none() {
+        return json_error(StatusCode::NOT_FOUND, "no such sign-in");
     }
 
-    let started = tokio::time::timeout(OAUTH_TIMEOUT, oauth.start_login(&server))
+    match state
+        .passkeys
+        .start_authentication(&subject(&server), Choice::Once)
+    {
+        Ok((ceremony, options)) => {
+            Json(json!({ "ceremony": ceremony, "options": options })).into_response()
+        }
+        Err(error) => passkey_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ConfirmBody {
+    ceremony: String,
+    credential: PublicKeyCredential,
+}
+
+/// `POST /oauth/login/{server}/confirm`: verifies the assertion, starts the
+/// sign-in and answers the authorization URL for the page to open
+pub(super) async fn login_confirm(
+    State(state): State<WebState>,
+    Path(server): Path<String>,
+    Json(body): Json<ConfirmBody>,
+) -> Response {
+    let passkeys = Arc::clone(&state.passkeys);
+    // SQLite reads and signature checks are blocking work
+    let verified = tokio::task::spawn_blocking(move || {
+        passkeys.finish_authentication(&body.ceremony, &body.credential)
+    })
+    .await;
+    let started_for = match verified {
+        Ok(Ok((started_for, _))) => started_for,
+        Ok(Err(error)) => return passkey_error(&error),
+        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "verification failed"),
+    };
+    if started_for != subject(&server) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "this assertion is for another request",
+        );
+    }
+
+    let started = tokio::time::timeout(OAUTH_TIMEOUT, state.gateway.oauth().start_login(&server))
         .await
         .unwrap_or(Err(OAuthError::TimedOut));
     match started {
-        Ok(authorization_url) => Redirect::to(&authorization_url).into_response(),
+        Ok(authorization_url) => {
+            Json(json!({ "authorization_url": authorization_url })).into_response()
+        }
         Err(failure) => {
             tracing::warn!(%server, error = %failure, "oauth login failed to start");
 
-            failed(StatusCode::BAD_GATEWAY, &server, &failure.to_string())
+            json_error(StatusCode::BAD_GATEWAY, &failure.to_string())
         }
     }
 }
@@ -117,6 +156,9 @@ pub(super) async fn callback(
 /// Completes a sign-in from the authorization server's redirect, on either
 /// listener, and reconnects the server
 pub async fn finish(gateway: &Gateway, server: &str, callback: &Callback) -> Response {
+    if !gateway.oauth().servers().any(|name| name == server) {
+        return unknown_server();
+    }
     let finished = tokio::time::timeout(
         OAUTH_TIMEOUT,
         gateway.oauth().finish_login(server, callback),
@@ -157,15 +199,13 @@ fn failed(status: StatusCode, server: &str, reason: &str) -> Response {
     )
 }
 
-fn unknown_server(server: &str) -> Response {
+/// Names nothing from the request, so a crafted link cannot put its own
+/// text on this origin
+fn unknown_server() -> Response {
     page(
         StatusCode::NOT_FOUND,
         "Not found",
-        &format!(
-            "<main><h1>Not found</h1><p>{}</p></main>",
-            escape(&format!(
-                "No server named {server} signs in from this page; on the gateway's Mac, run `codemode-mcp oauth login {server}`."
-            ))
-        ),
+        "<main><h1>Not found</h1><p>No server signs in from this page. On the gateway's Mac, \
+         `codemode-mcp oauth status` lists the servers that sign in.</p></main>",
     )
 }

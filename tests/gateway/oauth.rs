@@ -193,6 +193,19 @@ async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> Response
             .into_response();
     }
 
+    // as OIDC registration rules have it: a `native` client may only use
+    // loopback or custom-scheme redirects
+    let https = body["redirect_uris"][0]
+        .as_str()
+        .is_some_and(|uri| uri.starts_with("https://"));
+    if https && body["application_type"] != "web" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_redirect_uri" })),
+        )
+            .into_response();
+    }
+
     let mut client = json!({
         "client_id": "mock-client",
         "redirect_uris": body["redirect_uris"],
@@ -600,19 +613,20 @@ async fn oauth_sign_in_starts_and_finishes_on_the_public_origin() -> TestResult 
         text_of(&call(&harness.client, "search_tools", json!({ "query": "add" })).await?);
     assert!(!unrelated.contains("/oauth/login/"), "{unrelated}");
 
-    // `ORIGIN` stands for `tailscale serve` in front of the main listener
-    let local = |url: &str| url.replacen(ORIGIN, &harness.base(), 1);
-    let shown = harness.http.get(local(&page)).send().await?;
+    // the page starts nothing; `ORIGIN` stands for `tailscale serve` in
+    // front of the main listener
+    let path = page.trim_start_matches(ORIGIN);
+    let shown = harness
+        .http
+        .get(format!("{}{path}", harness.base()))
+        .send()
+        .await?;
     assert_eq!(shown.status().as_u16(), 200);
-    let policy = shown.headers()[header::CONTENT_SECURITY_POLICY]
-        .to_str()?
-        .to_owned();
-    assert!(policy.contains("form-action 'self' https:"), "{policy}");
     assert!(
         shown
             .text()
             .await?
-            .contains("action=\"/oauth/login/locked\"")
+            .contains(r#"data-kind="signin" data-base="/oauth/login/locked""#)
     );
     let missing = harness
         .http
@@ -621,34 +635,55 @@ async fn oauth_sign_in_starts_and_finishes_on_the_public_origin() -> TestResult 
         .await?;
     assert_eq!(missing.status().as_u16(), 404);
 
-    let browser = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let forged = browser
-        .post(local(&page))
-        .header("sec-fetch-site", "cross-site")
+    // whoever starts a sign-in picks the account the tokens belong to, so
+    // it takes the owner's passkey: none is enrolled yet, so nothing starts
+    let (status, refused) = harness
+        .post_json(&format!("{path}/options"), &json!({}))
+        .await?;
+    assert_eq!(status, 409, "{refused}");
+    // another site's form cannot send JSON
+    let form = harness
+        .http
+        .post(format!("{}{path}/options", harness.base()))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("x=y")
         .send()
         .await?;
-    assert_eq!(forged.status().as_u16(), 403);
+    assert_eq!(form.status().as_u16(), 415);
 
-    let started = browser
-        .post(local(&page))
-        .header("sec-fetch-site", "same-origin")
+    // a made-up link to the callback cannot put its text on this origin
+    let spoofed = harness
+        .http
+        .get(format!(
+            "{}/oauth/callback/locked?error=access_denied&error_description=Call+support",
+            harness.base()
+        ))
         .send()
         .await?;
-    assert_eq!(started.status().as_u16(), 303);
-    let url = started.headers()[header::LOCATION].to_str()?.to_owned();
+    assert_eq!(spoofed.status().as_u16(), 400);
+    let text = spoofed.text().await?;
+    assert!(
+        text.contains("access_denied") && !text.contains("Call support"),
+        "{text}"
+    );
+
+    let mut passkey = harness.enroll_passkey().await?;
+    let (status, started) = harness
+        .assert_with_passkey(&mut passkey, path, &json!({}))
+        .await?;
+    assert_eq!(status, 200, "{started}");
+    let url = started["authorization_url"].as_str().ok_or("no url")?;
     assert!(
         url.starts_with(&format!("{}/authorize?", mock.base)),
         "{url}"
     );
     assert_eq!(
-        query_value(&url, "redirect_uri"),
+        query_value(url, "redirect_uri"),
         Some(format!("{ORIGIN}/oauth/callback/locked"))
     );
     let finished = harness
         .http
-        .get(authorized(&harness, &mock, &url)?)
+        .get(authorized(&harness, &mock, url)?)
         .send()
         .await?;
     assert_eq!(finished.status().as_u16(), 200);

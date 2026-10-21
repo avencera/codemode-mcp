@@ -396,10 +396,14 @@ impl Gateway {
                     .get(name)
                     .map_or(&[][..], |server| server.aliases.as_slice());
 
+                // every word of a name or alias, so `docs` alone does not
+                // name `google-docs`
                 std::iter::once(name)
                     .chain(aliases.iter().map(String::as_str))
-                    .flat_map(search::tokenize)
-                    .any(|term| words.contains(&term))
+                    .any(|named| {
+                        let terms = search::tokenize(named);
+                        !terms.is_empty() && terms.iter().all(|term| words.contains(term))
+                    })
             })
             .filter_map(|upstream| {
                 let name = upstream.name();

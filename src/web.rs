@@ -66,10 +66,9 @@ pub fn router(app: &App) -> Router {
         .route("/enroll/{token}", get(enroll_page))
         .route("/enroll/{token}/options", post(enroll_options))
         .route("/enroll/{token}/finish", post(enroll_finish))
-        .route(
-            "/oauth/login/{server}",
-            get(oauth::login_page).post(oauth::login_start),
-        )
+        .route("/oauth/login/{server}", get(oauth::login_page))
+        .route("/oauth/login/{server}/options", post(oauth::login_options))
+        .route("/oauth/login/{server}/confirm", post(oauth::login_confirm))
         .route("/oauth/callback/{server}", get(oauth::callback))
         .route("/assets/webauthn.js", get(webauthn_js))
         .route("/stats", get(stats_page))
