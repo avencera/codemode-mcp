@@ -69,18 +69,38 @@ fn service_dry_runs_change_nothing() -> TestResult {
         out.contains(&format!("{home_text}/.local/bin/codemode-mcp")),
         "{out}"
     );
-    assert!(out.contains("launchctl bootout gui/"), "{out}");
-    assert!(
-        out.contains("/dev.praveen.codemode-mcp.plist  # retried for up to 10s"),
-        "{out}"
-    );
-    // the plist is shown, pinned to the explicit config
-    assert!(
-        out.contains(&format!(
-            "<string>--config</string>\n    <string>{config}</string>"
-        )),
-        "{out}"
-    );
+    if cfg!(target_os = "macos") {
+        assert!(out.contains("launchctl bootout gui/"), "{out}");
+        assert!(
+            out.contains("/dev.praveen.codemode-mcp.plist  # retried for up to 10s"),
+            "{out}"
+        );
+        // the plist is shown, pinned to the explicit config
+        assert!(
+            out.contains(&format!(
+                "<string>--config</string>\n    <string>{config}</string>"
+            )),
+            "{out}"
+        );
+    } else {
+        // nothing is signed off macOS
+        assert!(!out.contains("signed as"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "{home_text}/.config/systemd/user/codemode-mcp.service"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("systemctl --user restart codemode-mcp.service"),
+            "{out}"
+        );
+        // the unit is shown, pinned to the explicit config
+        assert!(
+            out.contains(&format!("\"--config\" \"{config}\" \"serve\"")),
+            "{out}"
+        );
+    }
     assert!(
         out.contains(&format!(
             "{home_text}/.local/state/codemode-mcp/logs/codemode-mcp.out.log"
@@ -100,10 +120,12 @@ fn service_dry_runs_change_nothing() -> TestResult {
         &home,
         &["--config", &config, "service", "uninstall", "--dry-run"],
     )?;
-    assert!(
-        out.contains("rm -f") && out.contains("LaunchAgents/dev.praveen.codemode-mcp.plist"),
-        "{out}"
-    );
+    let file = if cfg!(target_os = "macos") {
+        "LaunchAgents/dev.praveen.codemode-mcp.plist"
+    } else {
+        "systemd/user/codemode-mcp.service"
+    };
+    assert!(out.contains("rm -f") && out.contains(file), "{out}");
 
     assert_eq!(files(&home), before);
     let _ = std::fs::remove_dir_all(&home);
@@ -116,20 +138,33 @@ fn config_init_prints_writes_and_refuses_to_overwrite() -> TestResult {
     let home = temp_state_dir();
     std::fs::create_dir_all(&home)?;
     let target = home.join(".config/codemode-mcp/config.toml");
+    // off macOS only a spoke's config is offered
+    let init: &[&str] = if cfg!(target_os = "macos") {
+        &["config", "init"]
+    } else {
+        let (ok, _, err) = codemode(&home, &["config", "init", "--print"])?;
+        assert!(!ok && err.contains("--hub"), "{err}");
 
-    let (ok, printed, err) = codemode(&home, &["config", "init", "--print"])?;
+        &["config", "init", "--hub", "mac-mini"]
+    };
+
+    let (ok, printed, err) = codemode(&home, &[init, &["--print"]].concat())?;
     assert!(ok, "{err}");
-    assert!(printed.contains(&format!(
-        "command = \"{}/.local/bin/codemode-mcp\"",
-        home.display()
-    )));
+    if cfg!(target_os = "macos") {
+        assert!(printed.contains(&format!(
+            "command = \"{}/.local/bin/codemode-mcp\"",
+            home.display()
+        )));
+    } else {
+        assert!(printed.contains("\nhost = \"mac-mini\"\n"), "{printed}");
+    }
     assert!(!target.exists());
 
-    let (ok, _, err) = codemode(&home, &["config", "init"])?;
+    let (ok, _, err) = codemode(&home, init)?;
     assert!(ok, "{err}");
     assert_eq!(std::fs::read_to_string(&target)?, printed);
     std::fs::write(&target, "# mine\n")?;
-    let (ok, _, err) = codemode(&home, &["config", "init"])?;
+    let (ok, _, err) = codemode(&home, init)?;
     assert!(!ok);
     assert!(err.contains("already exists"), "{err}");
     assert_eq!(std::fs::read_to_string(&target)?, "# mine\n");

@@ -137,6 +137,9 @@ pub struct Config {
     /// companion Mac
     #[serde(default)]
     pub companion: Option<CompanionConfig>,
+    /// The hub Mac this daemon is a spoke of; unset on the hub itself
+    #[serde(default)]
+    pub hub: Option<HubConfig>,
     /// Upstream MCP servers by name
     #[serde(default)]
     pub servers: BTreeMap<String, ServerConfig>,
@@ -163,6 +166,7 @@ impl Default for Config {
             limits: Limits::default(),
             secrets: SecretsConfig::default(),
             companion: None,
+            hub: None,
             servers: BTreeMap::new(),
             path: None,
         }
@@ -417,6 +421,9 @@ impl Config {
         self.secrets.validate()?;
         if let Some(companion) = &self.companion {
             companion.validate()?;
+        }
+        if let Some(hub) = &self.hub {
+            hub.validate()?;
         }
 
         for (name, server) in &self.servers {
@@ -688,6 +695,88 @@ fn default_idle_secs() -> u64 {
 
 fn default_op() -> String {
     "op".to_owned()
+}
+
+/// The hub a spoke reaches over the tailnet; see the hub and spoke section
+/// of docs/design.md
+///
+/// The hub holds 1Password, the passkeys, ntfy, OAuth sign-ins and
+/// approvals. A spoke forwards calls to the hub's servers, its own `ask`
+/// approvals and its `op://` reads there, and keeps its own sandbox and
+/// local servers
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    /// MagicDNS name or tailnet IP of the hub, with `:port` when the hub
+    /// does not listen on 7681
+    pub host: String,
+    /// Only these hub servers reach this spoke; every one when unset
+    #[serde(default)]
+    pub servers: Option<Vec<String>>,
+    /// Hub servers kept off this spoke
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl HubConfig {
+    /// Base URL of the hub's main listener, without a trailing slash
+    pub fn base_url(&self) -> String {
+        let host = self.host.trim_end_matches('/');
+        let host = host
+            .strip_prefix("http://")
+            .or_else(|| host.strip_prefix("https://"))
+            .map_or(host, |rest| rest);
+        let scheme = if self.host.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        };
+        // a bare IPv6 address needs brackets before a port is added
+        let has_port = match host.rsplit_once(':') {
+            Some((name, port)) => {
+                port.parse::<u16>().is_ok() && (!name.contains(':') || name.ends_with(']'))
+            }
+            None => false,
+        };
+        let host = if host.contains(':') && !host.starts_with('[') && !has_port {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+
+        if has_port {
+            format!("{scheme}://{host}")
+        } else {
+            format!("{scheme}://{host}:{}", default_listen().port())
+        }
+    }
+
+    /// Whether the hub's server `name` reaches this spoke
+    pub fn includes(&self, name: &str) -> bool {
+        let listed = self
+            .servers
+            .as_ref()
+            .is_none_or(|servers| servers.iter().any(|server| server == name));
+
+        listed && !self.exclude.iter().any(|server| server == name)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.host.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "hub.host must name the hub, such as \"mac-mini\"".into(),
+            ));
+        }
+        if self.servers.is_some() && !self.exclude.is_empty() {
+            return Err(ConfigError::Invalid(
+                "hub.servers and hub.exclude cannot both be set; list the servers to keep, or \
+                 the ones to leave out"
+                    .into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 fn default_listen() -> SocketAddr {

@@ -95,7 +95,7 @@ while test $# -gt 0; do
 done
 
 if [ "$(uname -s)/$(uname -m)" != "Darwin/arm64" ]; then
-    err "releases are built for macOS on Apple silicon only, not $(uname -s)/$(uname -m)"
+    err "releases are built for macOS on Apple silicon only, not $(uname -s)/$(uname -m); on Linux, build from source (see docs/operations.md, \"Spokes\")"
 fi
 
 need curl

@@ -1222,6 +1222,13 @@ fn companion_install_dry_run_shows_the_agent_and_changes_nothing() -> TestResult
     let before = files(&home);
 
     let (ok, out, err) = codemode(&home, &["companion", "install", "--dry-run"])?;
+    // a companion answers with a Mac's 1Password and Touch ID
+    if !cfg!(target_os = "macos") {
+        assert!(!ok && err.contains("spoke"), "{err}");
+        assert_eq!(files(&home), before);
+
+        return Ok(());
+    }
     assert!(ok, "{err}");
     let home_text = home.display().to_string();
     assert!(

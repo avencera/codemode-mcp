@@ -1,10 +1,12 @@
-//! launchd service management and the starter config
+//! Service management and the starter config
 //!
-//! Mirrors homebased: a per-user LaunchAgent in `gui/<uid>`, loaded with
-//! `launchctl bootstrap` after a `bootout` of any previous copy. Unlike
-//! homebased, the binary and the Monty worker are copied to stable paths
-//! first, so a rebuild in the repository cannot change the running service.
-//! Every command can print its plan instead of running it (`--dry-run`)
+//! Mirrors homebased. On macOS a per-user LaunchAgent in `gui/<uid>`, loaded
+//! with `launchctl bootstrap` after a `bootout` of any previous copy; on
+//! Linux a systemd user unit, enabled and restarted with `systemctl --user`.
+//! Unlike homebased, the binary and the Monty worker are copied to stable
+//! paths first, so a rebuild in the repository cannot change the running
+//! service. Every command can print its plan instead of running it
+//! (`--dry-run`)
 
 use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
@@ -13,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// launchd label and plist name
+/// launchd label and plist name; the systemd unit is `codemode-mcp.service`
 pub const LABEL: &str = "dev.praveen.codemode-mcp";
 /// launchd label and plist name of the companion agent
 pub const COMPANION_LABEL: &str = "dev.praveen.codemode-mcp.companion";
@@ -37,6 +39,10 @@ const SIGNING_PREFIX: &str = "com.avencera.";
 const DAEMON_ENTITLEMENTS: &str = include_str!("../assets/codemode-mcp.entitlements");
 /// Starter configuration; `{{HOME}}` is replaced with the home directory
 const STARTER_CONFIG: &str = include_str!("../assets/starter-config.toml");
+/// Starter configuration of a spoke; `{{HUB}}` is replaced with the hub
+const SPOKE_CONFIG: &str = include_str!("../assets/spoke-config.toml");
+/// Search path of a systemd unit when the installing shell has none
+const SYSTEMD_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Failures managing the service
 #[derive(Debug, thiserror::Error)]
@@ -83,9 +89,39 @@ fn io(action: impl Into<String>) -> impl FnOnce(std::io::Error) -> ServiceError 
     move |source| ServiceError::Io { action, source }
 }
 
+/// The service manager that runs the daemon
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Manager {
+    /// A launchd LaunchAgent, on macOS
+    Launchd,
+    /// A systemd user unit, on Linux
+    Systemd,
+}
+
+impl Manager {
+    /// The manager of this machine
+    pub fn host() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Launchd
+        } else {
+            Self::Systemd
+        }
+    }
+
+    /// What `service` commands call the installed file in their output
+    pub fn file_kind(self) -> &'static str {
+        match self {
+            Self::Launchd => "plist",
+            Self::Systemd => "unit",
+        }
+    }
+}
+
 /// Where the service lives, all derived from one home directory
 #[derive(Debug, Clone)]
 pub struct ServicePaths {
+    /// The service manager the paths are for
+    pub manager: Manager,
     /// Home directory
     pub home: PathBuf,
     /// Installed binary, `~/.local/bin/codemode-mcp`
@@ -94,25 +130,83 @@ pub struct ServicePaths {
     pub alias: PathBuf,
     /// Installed Monty worker, `~/.local/share/codemode-mcp/monty`
     pub worker: PathBuf,
-    /// LaunchAgent plist
-    pub plist: PathBuf,
-    /// LaunchAgent plist of `companion serve`
-    pub companion_plist: PathBuf,
-    /// launchd stdout and stderr files
+    /// LaunchAgent plist or systemd unit
+    pub service_file: PathBuf,
+    /// LaunchAgent plist of `companion serve`; the companion runs on macOS
+    /// only, so a systemd host never installs it
+    pub companion_service_file: PathBuf,
+    /// The service's stdout and stderr files
     pub logs: PathBuf,
+    /// `PATH` the service runs with
+    pub search_path: String,
 }
 
 impl ServicePaths {
-    /// Paths under `home`; logs go to `<state_dir>/logs`
+    /// Paths under `home` for this machine's manager; logs go to
+    /// `<state_dir>/logs`
     pub fn new(home: &Path, state_dir: &Path) -> Self {
+        let search_path = match Manager::host() {
+            Manager::Launchd => None,
+            Manager::Systemd => std::env::var("PATH").ok(),
+        };
+
+        Self::for_manager(Manager::host(), home, state_dir, search_path.as_deref())
+    }
+
+    /// Paths under `home` for `manager`
+    ///
+    /// launchd starts agents with a minimal `PATH`, so upstream commands get
+    /// Homebrew and `~/.local/bin`. A systemd unit keeps the installing
+    /// shell's `shell_path`, since Linux tools live in many more places
+    /// (`~/.cargo/bin`, nvm, linuxbrew); `~/.local/bin` comes first either
+    /// way
+    pub fn for_manager(
+        manager: Manager,
+        home: &Path,
+        state_dir: &Path,
+        shell_path: Option<&str>,
+    ) -> Self {
+        let local_bin = home.join(".local/bin").display().to_string();
+        let search_path = match manager {
+            Manager::Launchd => format!(
+                "{local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            ),
+            Manager::Systemd => {
+                let rest = shell_path
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(SYSTEMD_DEFAULT_PATH);
+                let rest: Vec<&str> = rest
+                    .split(':')
+                    .filter(|entry| !entry.is_empty() && *entry != local_bin)
+                    .collect();
+
+                std::iter::once(local_bin.as_str())
+                    .chain(rest)
+                    .collect::<Vec<_>>()
+                    .join(":")
+            }
+        };
+        let (service_file, companion_service_file) = match manager {
+            Manager::Launchd => (
+                home.join(format!("Library/LaunchAgents/{LABEL}.plist")),
+                home.join(format!("Library/LaunchAgents/{COMPANION_LABEL}.plist")),
+            ),
+            Manager::Systemd => (
+                home.join(format!(".config/systemd/user/{}", Agent::Daemon.unit())),
+                home.join(format!(".config/systemd/user/{}", Agent::Companion.unit())),
+            ),
+        };
+
         Self {
+            manager,
             home: home.to_owned(),
             binary: home.join(".local/bin/codemode-mcp"),
             alias: home.join(".local/bin").join(ALIAS),
             worker: default_worker_path(home),
-            plist: home.join(format!("Library/LaunchAgents/{LABEL}.plist")),
-            companion_plist: home.join(format!("Library/LaunchAgents/{COMPANION_LABEL}.plist")),
+            service_file,
+            companion_service_file,
             logs: state_dir.join("logs"),
+            search_path,
         }
     }
 
@@ -192,12 +286,15 @@ impl Action {
     pub fn describe(&self) -> String {
         match self {
             Self::CreateDir(path) => format!("mkdir -p {}", path.display()),
-            Self::Install { from, to } => format!(
+            Self::Install { from, to } if cfg!(target_os = "macos") => format!(
                 "install -m 755 {} {}  # signed as {}, hardened runtime",
                 from.display(),
                 to.display(),
                 signing_identifier(to)
             ),
+            Self::Install { from, to } => {
+                format!("install -m 755 {} {}", from.display(), to.display())
+            }
             Self::Write { path, contents } => {
                 format!("write {} ({} bytes)", path.display(), contents.len())
             }
@@ -364,8 +461,11 @@ pub fn team_anchor() -> String {
 /// Whether installing `from` at `to` has to sign it here: false when it is
 /// already there, or already signed by [`TEAM_ID`] under the identifier `to`
 /// gets, as release binaries are in CI
+///
+/// Only macOS signs: the signature exists for its keychain and the 1Password
+/// app, neither of which a Linux spoke has
 fn needs_signing(from: &Path, to: &Path) -> bool {
-    if same_file(from, to) {
+    if !cfg!(target_os = "macos") || same_file(from, to) {
         return false;
     }
 
@@ -447,7 +547,8 @@ pub fn run_command(argv: &[String]) -> Result<String, ServiceError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// The current user's id, for the `gui/<uid>` launchd domain
+/// The current user's id, for the `gui/<uid>` launchd domain; systemd's user
+/// manager needs none
 pub fn current_uid() -> Result<u32, ServiceError> {
     let output = run_command(&["id".to_owned(), "-u".to_owned()])?;
 
@@ -463,22 +564,34 @@ const LAUNCHD_EXIT_TIMEOUT_SECS: u64 = 20;
 /// Time the daemon needs beyond the drain to park, flush and exit
 const EXIT_MARGIN: Duration = Duration::from_secs(10);
 
-/// Warning for an installed plist whose `ExitTimeOut` would cut a drain short
+/// systemd's own default when a unit has no `TimeoutStopSec`
+const SYSTEMD_EXIT_TIMEOUT_SECS: u64 = 90;
+
+/// Warning for an installed plist or unit whose stop timeout would cut a
+/// drain short
 ///
-/// `None` when the plist is fine; `plist` is its text
-pub fn exit_timeout_warning(plist: &str, drain: Duration) -> Option<String> {
-    let configured = plist
-        .split_once("<key>ExitTimeOut</key>")
-        .and_then(|(_, rest)| rest.split_once("<integer>"))
-        .and_then(|(_, rest)| rest.split_once("</integer>"))
-        .and_then(|(number, _)| number.trim().parse::<u64>().ok())
-        .unwrap_or(LAUNCHD_EXIT_TIMEOUT_SECS);
+/// `None` when the file is fine; `text` is its contents
+pub fn exit_timeout_warning(manager: Manager, text: &str, drain: Duration) -> Option<String> {
+    let configured = match manager {
+        Manager::Launchd => text
+            .split_once("<key>ExitTimeOut</key>")
+            .and_then(|(_, rest)| rest.split_once("<integer>"))
+            .and_then(|(_, rest)| rest.split_once("</integer>"))
+            .and_then(|(number, _)| number.trim().parse::<u64>().ok())
+            .unwrap_or(LAUNCHD_EXIT_TIMEOUT_SECS),
+        Manager::Systemd => text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("TimeoutStopSec="))
+            .and_then(|number| number.trim().parse::<u64>().ok())
+            .unwrap_or(SYSTEMD_EXIT_TIMEOUT_SECS),
+    };
     let needed = (drain + EXIT_MARGIN).as_secs();
 
     (configured < needed).then(|| {
         format!(
-            "the installed launchd plist gives the daemon {configured}s to exit, less than the \
+            "the installed service {} gives the daemon {configured}s to exit, less than the \
              {needed}s its {}s drain needs; run `codemode-mcp service install` again",
+            manager.file_kind(),
             drain.as_secs()
         )
     })
@@ -527,11 +640,38 @@ impl Agent {
         }
     }
 
-    fn plist(self, paths: &ServicePaths) -> &Path {
+    /// systemd unit name
+    pub fn unit(self) -> &'static str {
         match self {
-            Self::Daemon => &paths.plist,
-            Self::Companion => &paths.companion_plist,
+            Self::Daemon => "codemode-mcp.service",
+            Self::Companion => "codemode-mcp-companion.service",
         }
+    }
+
+    fn service_file(self, paths: &ServicePaths) -> &Path {
+        match self {
+            Self::Daemon => &paths.service_file,
+            Self::Companion => &paths.companion_service_file,
+        }
+    }
+
+    fn arguments(self, paths: &ServicePaths, config: Option<&Path>) -> Vec<String> {
+        let mut arguments = vec![paths.binary.display().to_string()];
+        if let Some(config) = config {
+            arguments.push("--config".to_owned());
+            arguments.push(config.display().to_string());
+        }
+        arguments.extend(self.subcommand().iter().map(|word| (*word).to_owned()));
+
+        arguments
+    }
+
+    fn log(self, paths: &ServicePaths, stream: &str) -> String {
+        paths
+            .logs
+            .join(format!("{}.{stream}.log", self.log_stem()))
+            .display()
+            .to_string()
     }
 }
 
@@ -546,22 +686,11 @@ pub fn render_plist(
     drain: Duration,
 ) -> String {
     let exit_timeout = (drain + EXIT_GRACE).as_secs();
-    let mut arguments = vec![paths.binary.display().to_string()];
-    if let Some(config) = config {
-        arguments.push("--config".to_owned());
-        arguments.push(config.display().to_string());
-    }
-    arguments.extend(agent.subcommand().iter().map(|word| (*word).to_owned()));
-    let arguments: String = arguments
+    let arguments: String = agent
+        .arguments(paths, config)
         .iter()
         .map(|argument| format!("    <string>{}</string>\n", xml_escape(argument)))
         .collect();
-    // launchd starts agents with a minimal PATH; upstream commands need
-    // Homebrew and ~/.local/bin
-    let path = format!(
-        "{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        paths.home.display()
-    );
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -597,25 +726,73 @@ pub fn render_plist(
 "#,
         label = agent.label(),
         home = xml_escape(&paths.home.display().to_string()),
-        path = xml_escape(&path),
-        stdout = xml_escape(
-            &paths
-                .logs
-                .join(format!("{}.out.log", agent.log_stem()))
-                .display()
-                .to_string()
-        ),
-        stderr = xml_escape(
-            &paths
-                .logs
-                .join(format!("{}.err.log", agent.log_stem()))
-                .display()
-                .to_string()
-        ),
+        path = xml_escape(&paths.search_path),
+        stdout = xml_escape(&agent.log(paths, "out")),
+        stderr = xml_escape(&agent.log(paths, "err")),
     )
 }
 
-/// `gui/<uid>/<label>`
+/// The systemd user unit of `agent`; `config` is passed to it when given
+///
+/// `TimeoutStopSec` is the configured `drain` plus a grace period, like the
+/// plist's `ExitTimeOut`. `KillMode=mixed` sends SIGTERM to the daemon
+/// alone, which tears down its workers and lazy servers itself, and SIGKILL
+/// to whatever is left once the timeout runs out
+pub fn render_unit(
+    agent: Agent,
+    paths: &ServicePaths,
+    config: Option<&Path>,
+    drain: Duration,
+) -> String {
+    let exit_timeout = (drain + EXIT_GRACE).as_secs();
+    let exec: Vec<String> = agent
+        .arguments(paths, config)
+        .iter()
+        .map(|argument| systemd_quote(argument))
+        .collect();
+    let description = match agent {
+        Agent::Daemon => "codemode-mcp gateway",
+        Agent::Companion => "codemode-mcp companion",
+    };
+
+    format!(
+        "[Unit]
+Description={description}
+
+[Service]
+ExecStart={exec}
+WorkingDirectory={home}
+Environment={path}
+Restart=always
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec={exit_timeout}
+StandardOutput=append:{stdout}
+StandardError=append:{stderr}
+
+[Install]
+WantedBy=default.target
+",
+        exec = exec.join(" "),
+        home = systemd_quote(&paths.home.display().to_string()),
+        path = systemd_quote(&format!("PATH={}", paths.search_path)),
+        stdout = systemd_escape(&agent.log(paths, "out")),
+        stderr = systemd_escape(&agent.log(paths, "err")),
+    )
+}
+
+/// Escapes systemd's specifiers (`%`) and variable references (`$`)
+fn systemd_escape(text: &str) -> String {
+    text.replace('%', "%%").replace('$', "$$")
+}
+
+/// One double-quoted word of a unit file, with C-style escapes
+fn systemd_quote(text: &str) -> String {
+    let escaped = systemd_escape(&text.replace('\\', "\\\\").replace('"', "\\\""));
+
+    format!("\"{escaped}\"")
+}
+
 /// Creates the symlink unless something is already at `link`: our own link
 /// is left as is, and anything else (a user's script, another tool's link)
 /// is left alone with a warning rather than failing the install halfway
@@ -638,6 +815,7 @@ fn link_alias(target: &Path, link: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// `gui/<uid>/<label>`
 fn target(uid: u32, agent: Agent) -> String {
     format!("gui/{uid}/{}", agent.label())
 }
@@ -712,7 +890,7 @@ fn binary_steps(paths: &ServicePaths, binary: &Path) -> Vec<Action> {
     ]
 }
 
-/// Writes `agent`'s plist and loads it, replacing a loaded copy
+/// Writes `agent`'s plist or unit and loads it, replacing a loaded copy
 fn agent_steps(
     paths: &ServicePaths,
     uid: u32,
@@ -720,40 +898,67 @@ fn agent_steps(
     config: Option<&Path>,
     drain: Duration,
 ) -> Vec<Action> {
-    let plist_path = agent.plist(paths);
-    let plist = plist_path.display().to_string();
-    // the new plist is linted before it replaces a working one, and before
-    // the running service is booted out
-    let staged = plist_path.with_extension("plist.new");
-
-    vec![
+    let file = agent.service_file(paths);
+    // the new file is checked before it replaces a working one, and before
+    // the running service is stopped
+    let staged = PathBuf::from(format!("{}.new", file.display()));
+    let mut steps = vec![
         Action::CreateDir(paths.logs.clone()),
-        Action::CreateDir(parent(plist_path)),
-        Action::Write {
-            path: staged.clone(),
-            contents: render_plist(agent, paths, config, drain),
-        },
-        Action::run(&["plutil", "-lint", &staged.display().to_string()]),
-        Action::Rename {
-            from: staged,
-            to: plist_path.to_owned(),
-        },
-        Action::Run {
-            argv: vec!["launchctl".into(), "bootout".into(), target(uid, agent)],
-            tolerate_failure: true,
-            retry_for: None,
-        },
-        Action::Run {
-            argv: vec![
-                "launchctl".into(),
-                "bootstrap".into(),
-                format!("gui/{uid}"),
-                plist,
-            ],
-            tolerate_failure: false,
-            retry_for: Some(BOOTSTRAP_WAIT),
-        },
-    ]
+        Action::CreateDir(parent(file)),
+    ];
+
+    match paths.manager {
+        Manager::Launchd => steps.extend([
+            Action::Write {
+                path: staged.clone(),
+                contents: render_plist(agent, paths, config, drain),
+            },
+            Action::run(&["plutil", "-lint", &staged.display().to_string()]),
+            Action::Rename {
+                from: staged,
+                to: file.to_owned(),
+            },
+            Action::Run {
+                argv: vec!["launchctl".into(), "bootout".into(), target(uid, agent)],
+                tolerate_failure: true,
+                retry_for: None,
+            },
+            Action::Run {
+                argv: vec![
+                    "launchctl".into(),
+                    "bootstrap".into(),
+                    format!("gui/{uid}"),
+                    file.display().to_string(),
+                ],
+                tolerate_failure: false,
+                retry_for: Some(BOOTSTRAP_WAIT),
+            },
+        ]),
+        // `restart` starts a stopped unit too, and waits out the old
+        // instance's drain before it starts the new one
+        Manager::Systemd => steps.extend([
+            Action::Write {
+                path: staged.clone(),
+                contents: render_unit(agent, paths, config, drain),
+            },
+            Action::Rename {
+                from: staged,
+                to: file.to_owned(),
+            },
+            systemctl(&["daemon-reload"]),
+            systemctl(&["enable", agent.unit()]),
+            systemctl(&["restart", agent.unit()]),
+        ]),
+    }
+
+    steps
+}
+
+fn systemctl(args: &[&str]) -> Action {
+    let mut argv = vec!["systemctl", "--user"];
+    argv.extend(args);
+
+    Action::run(&argv)
 }
 
 /// Steps of `service uninstall`; state and installed files, including the
@@ -768,48 +973,139 @@ pub fn companion_uninstall_plan(paths: &ServicePaths, uid: u32) -> Vec<Action> {
 }
 
 fn removal_steps(paths: &ServicePaths, uid: u32, agent: Agent) -> Vec<Action> {
-    vec![
-        Action::Run {
-            argv: vec!["launchctl".into(), "bootout".into(), target(uid, agent)],
-            tolerate_failure: true,
-            retry_for: None,
-        },
-        Action::Remove(agent.plist(paths).to_owned()),
-    ]
+    let file = agent.service_file(paths).to_owned();
+
+    match paths.manager {
+        Manager::Launchd => vec![
+            Action::Run {
+                argv: vec!["launchctl".into(), "bootout".into(), target(uid, agent)],
+                tolerate_failure: true,
+                retry_for: None,
+            },
+            Action::Remove(file),
+        ],
+        Manager::Systemd => vec![
+            Action::Run {
+                argv: ["systemctl", "--user", "disable", "--now", agent.unit()]
+                    .map(str::to_owned)
+                    .to_vec(),
+                tolerate_failure: true,
+                retry_for: None,
+            },
+            Action::Remove(file),
+            systemctl(&["daemon-reload"]),
+        ],
+    }
 }
 
 /// Steps of `service restart`, or of restarting the companion after an update
-pub fn restart_plan(uid: u32, agent: Agent) -> Vec<Action> {
-    vec![Action::run(&[
-        "launchctl",
-        "kickstart",
-        "-k",
-        &target(uid, agent),
-    ])]
+pub fn restart_plan(manager: Manager, uid: u32, agent: Agent) -> Vec<Action> {
+    match manager {
+        Manager::Launchd => vec![Action::run(&[
+            "launchctl",
+            "kickstart",
+            "-k",
+            &target(uid, agent),
+        ])],
+        Manager::Systemd => vec![systemctl(&["restart", agent.unit()])],
+    }
 }
 
-/// The read-only command that asks launchd about `agent`
-pub fn status_command(uid: u32, agent: Agent) -> Vec<String> {
-    vec!["launchctl".into(), "print".into(), target(uid, agent)]
+/// The read-only command that asks the service manager about `agent`
+pub fn status_command(manager: Manager, uid: u32, agent: Agent) -> Vec<String> {
+    match manager {
+        Manager::Launchd => vec!["launchctl".into(), "print".into(), target(uid, agent)],
+        Manager::Systemd => [
+            "systemctl",
+            "--user",
+            "show",
+            agent.unit(),
+            "--property=LoadState,ActiveState,SubState,MainPID",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    }
 }
 
-/// The pid launchd reports for the running service, if it is running
-pub fn running_pid(uid: u32) -> Option<u32> {
-    let output = run_command(&status_command(uid, Agent::Daemon)).ok()?;
+/// The state and pid lines of [`status_command`]'s output, or `None` when
+/// the service is not loaded
+///
+/// launchctl fails for an agent it does not know, so its output is always
+/// of a loaded one; systemctl answers for any name, with `LoadState=not-found`
+pub fn status_summary(manager: Manager, output: &str) -> Option<String> {
+    let lines = output.lines().map(str::trim);
+    let summary: Vec<&str> = match manager {
+        Manager::Launchd => lines
+            .filter(|line| line.starts_with("state =") || line.starts_with("pid ="))
+            .collect(),
+        Manager::Systemd => {
+            if output
+                .lines()
+                .any(|line| line.trim() == "LoadState=not-found")
+            {
+                return None;
+            }
+
+            lines
+                .filter(|line| !line.starts_with("LoadState=") && !line.is_empty())
+                .collect()
+        }
+    };
+
+    Some(summary.join(", "))
+}
+
+/// The pid the service manager reports for the running service, if it is
+/// running
+pub fn running_pid(manager: Manager, uid: u32) -> Option<u32> {
+    let output = run_command(&status_command(manager, uid, Agent::Daemon)).ok()?;
+    let prefix = match manager {
+        Manager::Launchd => "pid = ",
+        Manager::Systemd => "MainPID=",
+    };
 
     output
         .lines()
         .map(str::trim)
-        .find_map(|line| line.strip_prefix("pid = ")?.parse().ok())
+        .find_map(|line| line.strip_prefix(prefix)?.parse().ok())
+        // systemd reports 0 for a unit with no running process
+        .filter(|pid| *pid != 0)
 }
 
-/// The starter config for `home`
-pub fn starter_config(home: &Path) -> String {
-    STARTER_CONFIG.replace("{{HOME}}", &home.display().to_string())
+/// Whether the user's systemd manager outlives their logins, so the service
+/// keeps running with nobody logged in; `None` when `loginctl` cannot say
+pub fn lingers() -> Option<bool> {
+    let user = std::env::var("USER").ok()?;
+    let output = run_command(&[
+        "loginctl".into(),
+        "show-user".into(),
+        user,
+        "--property=Linger".into(),
+    ])
+    .ok()?;
+
+    match output.trim() {
+        "Linger=yes" => Some(true),
+        "Linger=no" => Some(false),
+        _ => None,
+    }
 }
 
-/// Writes the starter config to `path`, refusing to replace a file
-pub fn write_starter_config(path: &Path, home: &Path) -> Result<(), ServiceError> {
+/// The starter config for `home`: the hub's own, or with `hub` a spoke's
+pub fn starter_config(home: &Path, hub: Option<&str>) -> String {
+    let home = home.display().to_string();
+
+    match hub {
+        None => STARTER_CONFIG.replace("{{HOME}}", &home),
+        Some(hub) => SPOKE_CONFIG
+            .replace("{{HUB}}", &toml::Value::String(hub.to_owned()).to_string())
+            .replace("{{HOME}}", &home),
+    }
+}
+
+/// Writes `contents` to `path` as the starter config, refusing to replace a
+/// file
+pub fn write_starter_config(path: &Path, contents: &str) -> Result<(), ServiceError> {
     if let Some(parent) = path.parent() {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -833,7 +1129,7 @@ pub fn write_starter_config(path: &Path, home: &Path) -> Result<(), ServiceError
             }
         })?;
 
-    std::io::Write::write_all(&mut file, starter_config(home).as_bytes())
+    std::io::Write::write_all(&mut file, contents.as_bytes())
         .map_err(io(format!("write {}", path.display())))
 }
 
@@ -842,9 +1138,18 @@ mod tests {
     use super::*;
     use crate::{config::Config, policy::Policy};
 
+    fn launchd(home: &str) -> ServicePaths {
+        ServicePaths::for_manager(
+            Manager::Launchd,
+            Path::new(home),
+            &Path::new(home).join("state"),
+            None,
+        )
+    }
+
     #[test]
     fn plist_escapes_paths_and_runs_serve() {
-        let paths = ServicePaths::new(Path::new("/Users/a&b"), Path::new("/Users/a&b/state"));
+        let paths = launchd("/Users/a&b");
         let plist = render_plist(
             Agent::Daemon,
             &paths,
@@ -896,26 +1201,106 @@ mod tests {
 
     #[test]
     fn a_plist_that_cuts_the_drain_short_is_reported() {
-        let paths = ServicePaths::new(Path::new("/Users/a"), Path::new("/Users/a/state"));
+        let paths = launchd("/Users/a");
         let drain = Duration::from_secs(20);
 
         let current = render_plist(Agent::Daemon, &paths, None, drain);
-        assert_eq!(exit_timeout_warning(&current, drain), None);
+        assert_eq!(
+            exit_timeout_warning(Manager::Launchd, &current, drain),
+            None
+        );
 
         // a plist from before the drain existed has no ExitTimeOut at all
         let old = current.replace("<key>ExitTimeOut</key>\n  <integer>50</integer>\n  ", "");
-        let warning = exit_timeout_warning(&old, drain);
+        let warning = exit_timeout_warning(Manager::Launchd, &old, drain);
         assert!(
             warning.is_some_and(|text| text.contains("service install")),
             "{old}"
         );
-        assert!(exit_timeout_warning(&current, Duration::from_secs(60)).is_some());
+        assert!(
+            exit_timeout_warning(Manager::Launchd, &current, Duration::from_secs(60)).is_some()
+        );
+    }
+
+    #[test]
+    fn the_systemd_unit_quotes_paths_keeps_the_shell_path_and_outlasts_the_drain() {
+        let paths = ServicePaths::for_manager(
+            Manager::Systemd,
+            Path::new("/home/a b"),
+            Path::new("/home/a b/state%1"),
+            Some("/home/a b/.local/bin:/home/a b/.cargo/bin::/usr/bin"),
+        );
+        let drain = Duration::from_secs(20);
+        let unit = render_unit(
+            Agent::Daemon,
+            &paths,
+            Some(Path::new("/etc/\"c\".toml")),
+            drain,
+        );
+
+        assert_eq!(
+            paths.service_file,
+            Path::new("/home/a b/.config/systemd/user/codemode-mcp.service")
+        );
+        assert!(unit.contains(
+            "ExecStart=\"/home/a b/.local/bin/codemode-mcp\" \"--config\" \"/etc/\\\"c\\\".toml\" \"serve\"\n"
+        ));
+        // ~/.local/bin once, first, then the installing shell's own entries
+        assert!(
+            unit.contains(
+                "Environment=\"PATH=/home/a b/.local/bin:/home/a b/.cargo/bin:/usr/bin\"\n"
+            )
+        );
+        assert!(
+            unit.contains("StandardError=append:/home/a b/state%%1/logs/codemode-mcp.err.log\n")
+        );
+        assert!(unit.contains("TimeoutStopSec=50\n"));
+        assert_eq!(exit_timeout_warning(Manager::Systemd, &unit, drain), None);
+
+        // without TimeoutStopSec systemd gives 90s, short of a 100s drain
+        let old = unit.replace("TimeoutStopSec=50\n", "");
+        assert_eq!(exit_timeout_warning(Manager::Systemd, &old, drain), None);
+        assert!(
+            exit_timeout_warning(Manager::Systemd, &old, Duration::from_secs(100))
+                .is_some_and(|text| text.contains("service unit"))
+        );
+    }
+
+    #[test]
+    fn systemd_reports_a_missing_unit_as_not_loaded() {
+        assert_eq!(
+            status_summary(
+                Manager::Systemd,
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n"
+            ),
+            None
+        );
+        assert_eq!(
+            status_summary(
+                Manager::Systemd,
+                "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=42\n"
+            )
+            .as_deref(),
+            Some("ActiveState=active, SubState=running, MainPID=42")
+        );
+    }
+
+    #[test]
+    fn the_spoke_starter_names_its_hub() -> Result<(), Box<dyn std::error::Error>> {
+        let text = starter_config(Path::new("/home/someone"), Some("mac \"mini\""));
+        let config = Config::parse(&text, Path::new("spoke.toml"))?;
+
+        let hub = config.hub.ok_or("no [hub] section")?;
+        assert_eq!(hub.host, "mac \"mini\"");
+        assert!(config.servers.is_empty());
+
+        Ok(())
     }
 
     #[test]
     fn starter_config_parses_with_the_intended_policies() -> Result<(), Box<dyn std::error::Error>>
     {
-        let text = starter_config(Path::new("/Users/someone"));
+        let text = starter_config(Path::new("/Users/someone"), None);
         let config = Config::parse(&text, Path::new("starter.toml"))?;
 
         let onepassword = &config.servers["onepassword"];

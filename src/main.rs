@@ -113,7 +113,8 @@ enum Command {
         #[command(subcommand)]
         command: OAuthCommand,
     },
-    /// Manage the launchd service
+    /// Manage the service: a launchd agent on macOS, a systemd user unit on
+    /// Linux
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
@@ -170,13 +171,14 @@ enum OAuthCommand {
 #[derive(Subcommand)]
 enum ServiceCommand {
     /// Copy the binary and Monty worker to stable paths, write the
-    /// LaunchAgent and load it
+    /// LaunchAgent or systemd unit and load it
     Install {
         /// Print what would be done
         #[arg(long)]
         dry_run: bool,
     },
-    /// Unload and remove the LaunchAgent; state and installed files stay
+    /// Unload and remove the LaunchAgent or systemd unit; state and
+    /// installed files stay
     Uninstall {
         /// Print what would be done
         #[arg(long)]
@@ -304,6 +306,10 @@ enum ConfigCommand {
         /// Print it instead of writing it
         #[arg(long)]
         print: bool,
+        /// Write a spoke's config, whose hub is this MagicDNS name or
+        /// tailnet IP, such as `mac-mini`; needed off macOS
+        #[arg(long)]
+        hub: Option<String>,
     },
 }
 
@@ -565,8 +571,8 @@ async fn main() -> Result<()> {
             dry_run,
         } => update_command(&load_or_default(&path)?, tag, force, dry_run).await,
         Command::Config {
-            command: ConfigCommand::Init { print },
-        } => config_init_command(&path, print),
+            command: ConfigCommand::Init { print, hub },
+        } => config_init_command(&path, print, hub.as_deref()),
         Command::Adapter {
             command: AdapterCommand::Calendar,
         } => eventkit_adapter_command(Entity::Events).await,
@@ -698,7 +704,7 @@ async fn service_command(
                     paths.worker.display()
                 );
             }
-            // an explicit config is pinned in the plist; the default path
+            // an explicit config is pinned in the plist or unit; the default path
             // is found by the daemon itself
             let pinned = match explicit_config {
                 Some(path) => Some(std::path::absolute(path)?),
@@ -732,7 +738,10 @@ async fn service_command(
                 );
             }
 
-            (service::restart_plan(uid, service::Agent::Daemon), dry_run)
+            (
+                service::restart_plan(paths.manager, uid, service::Agent::Daemon),
+                dry_run,
+            )
         }
         ServiceCommand::Status { dry_run } => {
             return service_status(config, &paths, uid, dry_run).await;
@@ -745,16 +754,17 @@ async fn service_command(
         return Ok(());
     }
 
-    let previous_pid = service::running_pid(uid);
+    let previous_pid = service::running_pid(paths.manager, uid);
     for action in &plan {
         println!("{}", action.describe());
         action.apply()?;
     }
 
-    // launchctl returns before the new daemon listens, so a follow-up such
-    // as `op warm` would hit a closed admin port
+    // launchctl and systemctl return before the new daemon listens, so a
+    // follow-up such as `op warm` would hit a closed admin port
     if starts_daemon {
-        wait_until_serving(config, uid, previous_pid).await?;
+        wait_until_serving(config, paths.manager, uid, previous_pid).await?;
+        warn_without_linger(paths.manager);
     }
 
     Ok(())
@@ -798,6 +808,22 @@ async fn companion_command(
     explicit_config: Option<&std::path::Path>,
     command: CompanionCommand,
 ) -> Result<()> {
+    // a companion answers with this Mac's 1Password and Touch ID; the
+    // gateway side of the commands runs anywhere
+    let companion_side = matches!(
+        command,
+        CompanionCommand::Pair { .. }
+            | CompanionCommand::Serve
+            | CompanionCommand::Install { .. }
+            | CompanionCommand::Id { .. }
+    );
+    if companion_side && !cfg!(target_os = "macos") {
+        bail!(
+            "a companion is a Mac with 1Password and Touch ID; on Linux, run codemode-mcp as a \
+             spoke of the hub Mac instead (`codemode-mcp config init --hub <mac>`)"
+        );
+    }
+
     match command {
         CompanionCommand::Invite { manual, valid_for } => {
             let config = load_or_default(path)?;
@@ -1507,8 +1533,24 @@ async fn companion_serve_command(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Warns when a systemd user service stops at logout, as it does on a
+/// machine without lingering
+fn warn_without_linger(manager: service::Manager) {
+    if manager == service::Manager::Systemd && service::lingers() == Some(false) {
+        eprintln!(
+            "note: systemd stops user services when you log out; run `sudo loginctl \
+             enable-linger $USER` so the service keeps running"
+        );
+    }
+}
+
 /// Waits until a daemon other than `previous_pid` answers on both listeners
-async fn wait_until_serving(config: &Config, uid: u32, previous_pid: Option<u32>) -> Result<()> {
+async fn wait_until_serving(
+    config: &Config,
+    manager: service::Manager,
+    uid: u32,
+    previous_pid: Option<u32>,
+) -> Result<()> {
     // the old daemon may drain for the full window before launchd starts the
     // new one
     let deadline = Instant::now() + config.limits.drain() + Duration::from_secs(30);
@@ -1516,7 +1558,9 @@ async fn wait_until_serving(config: &Config, uid: u32, previous_pid: Option<u32>
     let client = reqwest::Client::new();
 
     loop {
-        if let Some(pid) = service::running_pid(uid).filter(|pid| Some(*pid) != previous_pid) {
+        if let Some(pid) =
+            service::running_pid(manager, uid).filter(|pid| Some(*pid) != previous_pid)
+        {
             let healthy = client
                 .get(&health)
                 .timeout(Duration::from_secs(2))
@@ -1560,36 +1604,35 @@ async fn service_status(
     uid: u32,
     dry_run: bool,
 ) -> Result<()> {
-    let launchctl = service::status_command(uid, service::Agent::Daemon);
+    let manager = paths.manager;
+    let status = service::status_command(manager, uid, service::Agent::Daemon);
+    let manager_name = status.first().cloned().unwrap_or_default();
     let health = format!("http://127.0.0.1:{}/healthz", config.listen.port());
     if dry_run {
         println!("Dry run; would check:");
-        println!("  test -f {}", paths.plist.display());
-        println!("  {}", launchctl.join(" "));
+        println!("  test -f {}", paths.service_file.display());
+        println!("  {}", status.join(" "));
         println!("  GET {health}");
 
         return Ok(());
     }
 
     println!(
-        "plist: {} ({})",
-        paths.plist.display(),
-        if paths.plist.is_file() {
+        "{}: {} ({})",
+        manager.file_kind(),
+        paths.service_file.display(),
+        if paths.service_file.is_file() {
             "installed"
         } else {
             "missing"
         }
     );
-    match service::run_command(&launchctl) {
-        Ok(output) => {
-            let summary: Vec<&str> = output
-                .lines()
-                .map(str::trim)
-                .filter(|line| line.starts_with("state =") || line.starts_with("pid ="))
-                .collect();
-            println!("launchd: loaded ({})", summary.join(", "));
-        }
-        Err(_) => println!("launchd: not loaded"),
+    match service::run_command(&status)
+        .ok()
+        .and_then(|output| service::status_summary(manager, &output))
+    {
+        Some(summary) => println!("{manager_name}: loaded ({summary})"),
+        None => println!("{manager_name}: not loaded"),
     }
     let answer = reqwest::Client::new()
         .get(&health)
@@ -1626,7 +1669,7 @@ async fn update_command(
     let installed = update::installed_tag(&paths.binary);
 
     // a Mac with only the companion agent never had a Monty worker
-    let companion_only = paths.companion_plist.is_file() && !paths.plist.is_file();
+    let companion_only = paths.companion_service_file.is_file() && !paths.service_file.is_file();
 
     // `cmd fleet update` runs this every time, and a restart drains the
     // running executions, so a current install is left alone; a missing
@@ -1683,11 +1726,16 @@ async fn update_command(
     // the plist is checked first, so a run under another home never asks
     // launchd about the real service
     let uid = service::current_uid()?;
-    let is_loaded = |plist: &std::path::Path, agent| {
-        plist.is_file() && service::run_command(&service::status_command(uid, agent)).is_ok()
+    let manager = paths.manager;
+    let is_loaded = |file: &std::path::Path, agent| {
+        file.is_file()
+            && service::run_command(&service::status_command(manager, uid, agent))
+                .ok()
+                .and_then(|output| service::status_summary(manager, &output))
+                .is_some()
     };
-    let daemon_loaded = is_loaded(&paths.plist, service::Agent::Daemon);
-    let companion_loaded = is_loaded(&paths.companion_plist, service::Agent::Companion);
+    let daemon_loaded = is_loaded(&paths.service_file, service::Agent::Daemon);
+    let companion_loaded = is_loaded(&paths.companion_service_file, service::Agent::Companion);
     if !daemon_loaded && !companion_loaded {
         println!("The service is not installed; `codemode-mcp service install` starts it.");
 
@@ -1698,7 +1746,7 @@ async fn update_command(
     // keeps its drain
     if companion_loaded {
         run_plan(
-            &service::restart_plan(uid, service::Agent::Companion),
+            &service::restart_plan(manager, uid, service::Agent::Companion),
             false,
         )?;
     }
@@ -1717,15 +1765,23 @@ async fn update_command(
     Ok(())
 }
 
-fn config_init_command(path: &std::path::Path, print: bool) -> Result<()> {
+fn config_init_command(path: &std::path::Path, print: bool, hub: Option<&str>) -> Result<()> {
     let home = std::env::var_os("HOME").ok_or_else(|| eyre!("$HOME is not set"))?;
+    // the hub's starter is all 1Password, EventKit and Xcode
+    if hub.is_none() && !cfg!(target_os = "macos") {
+        bail!(
+            "off macOS codemode-mcp runs as a spoke of the hub Mac; pass `--hub <name>` with its \
+             MagicDNS name or tailnet IP"
+        );
+    }
+    let contents = service::starter_config(std::path::Path::new(&home), hub);
     if print {
-        print!("{}", service::starter_config(std::path::Path::new(&home)));
+        print!("{contents}");
 
         return Ok(());
     }
 
-    service::write_starter_config(path, std::path::Path::new(&home))?;
+    service::write_starter_config(path, &contents)?;
     println!("Wrote {}", path.display());
 
     Ok(())
@@ -1806,7 +1862,7 @@ async fn serve_command(config: Config) -> Result<()> {
     Ok(served?)
 }
 
-/// Logs when the installed launchd plist would kill the daemon mid-drain
+/// Logs when the installed plist or unit would kill the daemon mid-drain
 fn warn_on_short_exit_timeout(config: &Config) {
     let Ok(paths) = config
         .state_dir()
@@ -1815,12 +1871,14 @@ fn warn_on_short_exit_timeout(config: &Config) {
     else {
         return;
     };
-    // no plist: the daemon was started by hand
-    let Ok(plist) = std::fs::read_to_string(&paths.plist) else {
+    // no service file: the daemon was started by hand
+    let Ok(text) = std::fs::read_to_string(&paths.service_file) else {
         return;
     };
 
-    if let Some(warning) = service::exit_timeout_warning(&plist, config.limits.drain()) {
+    if let Some(warning) =
+        service::exit_timeout_warning(paths.manager, &text, config.limits.drain())
+    {
         tracing::warn!("{warning}");
     }
 }
