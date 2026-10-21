@@ -748,7 +748,7 @@ pub fn render_unit(
     let exec: Vec<String> = agent
         .arguments(paths, config)
         .iter()
-        .map(|argument| systemd_quote(argument))
+        .map(|argument| systemd_quote(argument, true))
         .collect();
     let description = match agent {
         Agent::Daemon => "codemode-mcp gateway",
@@ -774,21 +774,28 @@ StandardError=append:{stderr}
 WantedBy=default.target
 ",
         exec = exec.join(" "),
-        home = systemd_quote(&paths.home.display().to_string()),
-        path = systemd_quote(&format!("PATH={}", paths.search_path)),
-        stdout = systemd_escape(&agent.log(paths, "out")),
-        stderr = systemd_escape(&agent.log(paths, "err")),
+        home = systemd_specifiers(&paths.home.display().to_string()),
+        path = systemd_quote(&format!("PATH={}", paths.search_path), false),
+        stdout = systemd_specifiers(&agent.log(paths, "out")),
+        stderr = systemd_specifiers(&agent.log(paths, "err")),
     )
 }
 
-/// Escapes systemd's specifiers (`%`) and variable references (`$`)
-fn systemd_escape(text: &str) -> String {
-    text.replace('%', "%%").replace('$', "$$")
+/// Escapes systemd's specifiers (`%`), which every setting expands; a path
+/// setting takes the rest as it is, quotes included
+fn systemd_specifiers(text: &str) -> String {
+    text.replace('%', "%%")
 }
 
-/// One double-quoted word of a unit file, with C-style escapes
-fn systemd_quote(text: &str) -> String {
-    let escaped = systemd_escape(&text.replace('\\', "\\\\").replace('"', "\\\""));
+/// One double-quoted word of a unit file, with C-style escapes; `$` is
+/// escaped only in a command line, the one place systemd expands variables
+fn systemd_quote(text: &str, command: bool) -> String {
+    let escaped = systemd_specifiers(&text.replace('\\', "\\\\").replace('"', "\\\""));
+    let escaped = if command {
+        escaped.replace('$', "$$")
+    } else {
+        escaped
+    };
 
     format!("\"{escaped}\"")
 }
@@ -1228,13 +1235,13 @@ mod tests {
             Manager::Systemd,
             Path::new("/home/a b"),
             Path::new("/home/a b/state%1"),
-            Some("/home/a b/.local/bin:/home/a b/.cargo/bin::/usr/bin"),
+            Some("/home/a b/.local/bin:/data/$user/bin::/usr/bin"),
         );
         let drain = Duration::from_secs(20);
         let unit = render_unit(
             Agent::Daemon,
             &paths,
-            Some(Path::new("/etc/\"c\".toml")),
+            Some(Path::new("/etc/\"c\"$.toml")),
             drain,
         );
 
@@ -1243,14 +1250,14 @@ mod tests {
             Path::new("/home/a b/.config/systemd/user/codemode-mcp.service")
         );
         assert!(unit.contains(
-            "ExecStart=\"/home/a b/.local/bin/codemode-mcp\" \"--config\" \"/etc/\\\"c\\\".toml\" \"serve\"\n"
+            "ExecStart=\"/home/a b/.local/bin/codemode-mcp\" \"--config\" \"/etc/\\\"c\\\"$$.toml\" \"serve\"\n"
         ));
-        // ~/.local/bin once, first, then the installing shell's own entries
+        // ~/.local/bin once, first, then the installing shell's own entries;
+        // only a command line expands `$`, and a path setting is not unquoted
         assert!(
-            unit.contains(
-                "Environment=\"PATH=/home/a b/.local/bin:/home/a b/.cargo/bin:/usr/bin\"\n"
-            )
+            unit.contains("Environment=\"PATH=/home/a b/.local/bin:/data/$user/bin:/usr/bin\"\n")
         );
+        assert!(unit.contains("WorkingDirectory=/home/a b\n"));
         assert!(
             unit.contains("StandardError=append:/home/a b/state%%1/logs/codemode-mcp.err.log\n")
         );
