@@ -906,12 +906,24 @@ impl Harness {
         approval_id: &str,
         choice: &str,
     ) -> Result<(u16, Value), Box<dyn Error>> {
-        let (status, started) = self
-            .post_json(
-                &format!("/approve/{approval_id}/options"),
-                &json!({ "choice": choice }),
-            )
-            .await?;
+        self.assert_with_passkey(
+            authenticator,
+            &format!("/approve/{approval_id}"),
+            &json!({ "choice": choice }),
+        )
+        .await
+    }
+
+    /// Runs the pages' passkey assertion under `base`: `options` with
+    /// `body`, the assertion, then `confirm`; answers the first failure or
+    /// the confirmation
+    pub async fn assert_with_passkey(
+        &self,
+        authenticator: &mut SoftPasskey,
+        base: &str,
+        body: &Value,
+    ) -> Result<(u16, Value), Box<dyn Error>> {
+        let (status, started) = self.post_json(&format!("{base}/options"), body).await?;
         if status != 200 {
             return Ok((status, started));
         }
@@ -921,7 +933,7 @@ impl Harness {
             .map_err(|error| format!("assertion failed: {error:?}"))?;
 
         self.post_json(
-            &format!("/approve/{approval_id}/confirm"),
+            &format!("{base}/confirm"),
             &json!({ "ceremony": started["ceremony"], "credential": credential }),
         )
         .await

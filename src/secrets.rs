@@ -146,6 +146,13 @@ pub enum SecretError {
         "a value read for the `url` may hold only ASCII letters, digits and - . _ ~ + / = : @ ! * , ; characters"
     )]
     UrlValueUnprotectable,
+    /// A value read for a `url` reference is itself a URL: the item's URL
+    /// field was read, pasted or filled in place of the key, which then
+    /// lands percent-encoded in one segment and the server rejects it
+    #[error(
+        "the value read for `{0}` is a whole URL, not the part that goes in its place in the server's `url`; it was dropped and is read again on the next attempt. When a phone asks, paste only that field's value: AutoFill fills the item's password"
+    )]
+    UrlValueIsUrl(String),
     /// `op` could not be started
     #[error("failed to start `{program}`: {source}")]
     Spawn {
@@ -733,6 +740,13 @@ impl<'a> UrlTemplate<'a> {
     }
 }
 
+/// Whether `value` is an `http(s)` URL, which a key never is
+fn is_whole_url(value: &str) -> bool {
+    let value = value.trim_start().to_ascii_lowercase();
+
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
 /// Whether an embedded url value may hold `byte`: ASCII letters, digits and
 /// `- . _ ~ + / = : @ ! * , ;`, which covers hex, base64, base64url, JWT-like
 /// and colon-separated keys
@@ -1169,10 +1183,25 @@ impl OnePassword {
             .await?;
         let mut values = Vec::new();
         for reference in template.references() {
-            values.push(self.value(consumer, reference).await?);
+            let value = self.value(consumer, reference).await?;
+            if is_whole_url(&value) {
+                self.forget_value(reference).await;
+
+                return Err(SecretError::UrlValueIsUrl(reference.to_owned()));
+            }
+            values.push(value);
         }
 
         template.fill(&values)
+    }
+
+    /// Drops what was read for `reference`, here and on the phones, so the
+    /// next read asks again instead of replaying a wrong value
+    async fn forget_value(&self, reference: &str) {
+        self.known.lock().await.remove(reference);
+        if let Some(companions) = &self.companions {
+            companions.unseal_for_phones(reference);
+        }
     }
 
     async fn resolve_text(

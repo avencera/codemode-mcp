@@ -499,6 +499,9 @@ impl CodeModeServer {
         if guidance::asks_for_secrets(&params.query) {
             text = format!("note: {}\n{text}", guidance::ONEPASSWORD_RULE);
         }
+        for note in self.gateway.offline_notes(&params.query) {
+            text = format!("note: {note}\n{text}");
+        }
         let result = text_result(&tagged(session.as_ref(), &text), false);
         self.record(
             Logged {

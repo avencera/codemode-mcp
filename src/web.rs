@@ -1,4 +1,4 @@
-//! Server-rendered approval, enrollment and stats pages
+//! Server-rendered approval, enrollment, OAuth sign-in and stats pages
 //!
 //! Approving needs a passkey assertion; denying does not, since refusing a
 //! call can only make things safer. Every value that came from an agent, an
@@ -22,6 +22,7 @@ use crate::{
     approvals::{
         ApprovalInfo, ApprovalKind, Approvals, Choice, DecideError, GRANT_MINUTES, tool_counts,
     },
+    gateway::Gateway,
     passkeys::{PasskeyError, Passkeys},
     policy::GrantMode,
     prompt::calls_text,
@@ -30,6 +31,7 @@ use crate::{
 };
 
 mod highlight;
+pub mod oauth;
 
 /// Browser-side WebAuthn helpers
 const WEBAUTHN_JS: &str = include_str!("../assets/webauthn.js");
@@ -42,6 +44,7 @@ const DEFAULT_STATS_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 #[derive(Clone)]
 struct WebState {
     approvals: Arc<Approvals>,
+    gateway: Arc<Gateway>,
     passkeys: Arc<Passkeys>,
     state_dir: PathBuf,
 }
@@ -50,6 +53,7 @@ struct WebState {
 pub fn router(app: &App) -> Router {
     let state = WebState {
         approvals: Arc::clone(app.approvals()),
+        gateway: Arc::clone(app.gateway()),
         passkeys: Arc::clone(app.passkeys()),
         state_dir: app.state_dir().clone(),
     };
@@ -62,6 +66,10 @@ pub fn router(app: &App) -> Router {
         .route("/enroll/{token}", get(enroll_page))
         .route("/enroll/{token}/options", post(enroll_options))
         .route("/enroll/{token}/finish", post(enroll_finish))
+        .route("/oauth/login/{server}", get(oauth::login_page))
+        .route("/oauth/login/{server}/options", post(oauth::login_options))
+        .route("/oauth/login/{server}/confirm", post(oauth::login_confirm))
+        .route("/oauth/callback/{server}", get(oauth::callback))
         .route("/assets/webauthn.js", get(webauthn_js))
         .route("/stats", get(stats_page))
         .with_state(state)

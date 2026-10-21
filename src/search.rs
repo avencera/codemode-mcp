@@ -131,7 +131,7 @@ impl SearchIndex {
 
 /// Lowercases and splits on punctuation and camelCase boundaries, with a
 /// crude plural strip so `docs` finds `doc`
-fn tokenize(text: &str) -> Vec<String> {
+pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut previous_lower = false;
