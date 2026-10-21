@@ -954,8 +954,9 @@ impl Upstream {
                 tracing::warn!(server = %self.name, %error, "upstream url key refused");
                 self.mark_unavailable(error.to_string(), error.category());
 
-                // the value is cached until the daemon restarts, so a quick
-                // retry would only fail again
+                // a value kept until the daemon restarts would only fail
+                // again, and one that was dropped is asked for again, which
+                // should not prompt the owner every few seconds
                 Some(SECRET_RETRY)
             }
             error => {
@@ -1007,9 +1008,10 @@ impl Upstream {
         let secret = |error: crate::secrets::SecretError| match error {
             crate::secrets::SecretError::NotAUrl => UpstreamError::Url,
             // 1Password answered; the value itself breaks the url rules, which
-            // no retry or unlock fixes
+            // no unlock fixes
             error @ (crate::secrets::SecretError::UrlValueTooShort
-            | crate::secrets::SecretError::UrlValueUnprotectable) => {
+            | crate::secrets::SecretError::UrlValueUnprotectable
+            | crate::secrets::SecretError::UrlValueIsUrl(_)) => {
                 UpstreamError::UrlValue(error.to_string())
             }
             error => UpstreamError::Secret(error.to_string()),

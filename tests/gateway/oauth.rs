@@ -1,6 +1,7 @@
 //! OAuth against a small local authorization server and an MCP endpoint
 //! that refuses anonymous clients: discovery, registration or a client
-//! registered ahead of time, PKCE, the loopback callback, refresh and logout
+//! registered ahead of time, PKCE, the public and the loopback callback,
+//! the sign-in page, refresh and logout
 
 use std::{
     collections::HashMap,
@@ -30,7 +31,7 @@ use rmcp::{
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use super::harness::{Harness, Setup, TestResult};
+use super::harness::{Harness, ORIGIN, Setup, TestResult, call, text_of};
 
 /// The protected MCP server's only tool
 #[derive(Clone)]
@@ -188,6 +189,19 @@ async fn register(State(mock): State<Mock>, Json(body): Json<Value>) -> Response
                 "error": "invalid_client_metadata",
                 "error_description": format!("cannot register for {echo}"),
             })),
+        )
+            .into_response();
+    }
+
+    // as OIDC registration rules have it: a `native` client may only use
+    // loopback or custom-scheme redirects
+    let https = body["redirect_uris"][0]
+        .as_str()
+        .is_some_and(|uri| uri.starts_with("https://"));
+    if https && body["application_type"] != "web" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_redirect_uri" })),
         )
             .into_response();
     }
@@ -355,7 +369,17 @@ async fn wait_for_state(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     for _ in 0..100 {
         let upstream = health_of(harness, server).await?;
-        if upstream["state"] == state {
+        // the catalog is rebuilt after the state flips, and a script that
+        // runs before then cannot name the server's tools
+        let listed = state != "connected"
+            || harness
+                .app
+                .gateway()
+                .catalog()
+                .entries()
+                .iter()
+                .any(|entry| entry.server == server);
+        if upstream["state"] == state && listed {
             return Ok(upstream);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -397,21 +421,36 @@ async fn begin_login(
         query_value(url, "code_challenge_method").as_deref(),
         Some("S256")
     );
+    let redirect = query_value(url, "redirect_uri").ok_or("no redirect")?;
+    // a registered client comes back through `public_origin`, so the
+    // sign-in can finish on a phone; one registered ahead of time keeps
+    // the loopback URI it was registered with
+    let expected = match mock.client {
+        Client::Registered => format!("{ORIGIN}/oauth/callback/{server}"),
+        Client::Known => format!("{}/oauth/callback/{server}", harness.admin_base()),
+    };
+    assert_eq!(redirect, expected);
+
+    Ok((authorized(harness, mock, url)?, url.to_owned()))
+}
+
+/// Plays the authorization server's part of the browser redirect for the
+/// authorization `url`: issues a code for its PKCE challenge and returns the
+/// callback URL the browser is sent to, on a listener of `harness`
+fn authorized(
+    harness: &Harness,
+    mock: &Mock,
+    url: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let challenge = query_value(url, "code_challenge").ok_or("no challenge")?;
     let redirect = query_value(url, "redirect_uri").ok_or("no redirect")?;
-    assert_eq!(
-        redirect,
-        format!("{}/oauth/callback/{server}", harness.admin_base())
-    );
     let state = query_value(url, "state").ok_or("no state")?;
-
     let code = format!("code-{}", uuid::Uuid::new_v4().simple());
     lock(&mock.issued.codes).insert(code.clone(), challenge);
+    // `ORIGIN` stands for `tailscale serve` in front of the main listener
+    let redirect = redirect.replacen(ORIGIN, &harness.base(), 1);
 
-    Ok((
-        format!("{redirect}?code={code}&state={state}"),
-        url.to_owned(),
-    ))
+    Ok(format!("{redirect}?code={code}&state={state}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -543,6 +582,125 @@ async fn oauth_login_uses_a_client_registered_ahead_of_time() -> TestResult {
     let called = harness.execute_json("await known_hello()").await?;
     assert_eq!(called["result"], "hello", "{called}");
     assert!(mock.issued.refreshes.load(Ordering::SeqCst) > 0);
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_sign_in_starts_and_finishes_on_the_public_origin() -> TestResult {
+    let mock = start_mock(Client::Registered).await?;
+    let extra = format!(
+        "[servers.locked]\nurl = \"{}/mcp\"\noauth = true\naliases = [\"MailBox\"]",
+        mock.base
+    );
+    let Some(harness) = Harness::with(Setup {
+        extra: &extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&harness, "locked", "needs_login").await?;
+
+    // the server has no tools yet, so search finds none; it says instead
+    // where the user signs in
+    let page = format!("{ORIGIN}/oauth/login/locked");
+    // a camel-case alias splits into words; the query may be one word,
+    // lowercased, or the words themselves
+    let search = json!({ "query": "mailbox messages" });
+    let found = text_of(&call(&harness.client, "search_tools", search.clone()).await?);
+    assert!(found.contains(&page), "{found}");
+    let split = json!({ "query": "Mail box" });
+    let found = text_of(&call(&harness.client, "search_tools", split.clone()).await?);
+    assert!(found.contains(&page), "{found}");
+    let unrelated =
+        text_of(&call(&harness.client, "search_tools", json!({ "query": "add" })).await?);
+    assert!(!unrelated.contains("/oauth/login/"), "{unrelated}");
+
+    // the page starts nothing; `ORIGIN` stands for `tailscale serve` in
+    // front of the main listener
+    let path = page.trim_start_matches(ORIGIN);
+    let shown = harness
+        .http
+        .get(format!("{}{path}", harness.base()))
+        .send()
+        .await?;
+    assert_eq!(shown.status().as_u16(), 200);
+    assert!(
+        shown
+            .text()
+            .await?
+            .contains(r#"data-kind="signin" data-base="/oauth/login/locked""#)
+    );
+    let missing = harness
+        .http
+        .get(format!("{}/oauth/login/fixture", harness.base()))
+        .send()
+        .await?;
+    assert_eq!(missing.status().as_u16(), 404);
+
+    // whoever starts a sign-in picks the account the tokens belong to, so
+    // it takes the owner's passkey: none is enrolled yet, so nothing starts
+    let (status, refused) = harness
+        .post_json(&format!("{path}/options"), &json!({}))
+        .await?;
+    assert_eq!(status, 409, "{refused}");
+    // another site's form cannot send JSON
+    let form = harness
+        .http
+        .post(format!("{}{path}/options", harness.base()))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("x=y")
+        .send()
+        .await?;
+    assert_eq!(form.status().as_u16(), 415);
+
+    // a made-up link to the callback cannot put its text on this origin
+    let spoofed = harness
+        .http
+        .get(format!(
+            "{}/oauth/callback/locked?error=access_denied&error_description=Call+support",
+            harness.base()
+        ))
+        .send()
+        .await?;
+    assert_eq!(spoofed.status().as_u16(), 400);
+    let text = spoofed.text().await?;
+    assert!(
+        text.contains("access_denied") && !text.contains("Call support"),
+        "{text}"
+    );
+
+    let mut passkey = harness.enroll_passkey().await?;
+    let (status, started) = harness
+        .assert_with_passkey(&mut passkey, path, &json!({}))
+        .await?;
+    assert_eq!(status, 200, "{started}");
+    let url = started["authorization_url"].as_str().ok_or("no url")?;
+    assert!(
+        url.starts_with(&format!("{}/authorize?", mock.base)),
+        "{url}"
+    );
+    assert_eq!(
+        query_value(url, "redirect_uri"),
+        Some(format!("{ORIGIN}/oauth/callback/locked"))
+    );
+    let finished = harness
+        .http
+        .get(authorized(&harness, &mock, url)?)
+        .send()
+        .await?;
+    assert_eq!(finished.status().as_u16(), 200);
+    assert!(finished.text().await?.contains("You can close this tab"));
+
+    wait_for_state(&harness, "locked", "connected").await?;
+    let called = harness.execute_json("await locked_hello()").await?;
+    assert_eq!(called["result"], "hello", "{called}");
+    let found = text_of(&call(&harness.client, "search_tools", search).await?);
+    assert!(!found.contains("/oauth/login/"), "{found}");
+    let found = text_of(&call(&harness.client, "search_tools", split).await?);
+    assert!(found.contains("locked_hello"), "{found}");
 
     harness.stop().await
 }
@@ -954,30 +1112,32 @@ async fn oauth_callback_error_does_not_echo_a_url_that_cannot_be_read() -> TestR
     };
     let reads_before = super::secrets::reads(&log, reference);
 
-    let description = format!("bad resource http://127.0.0.1:9/mcp/{key}/sse");
-    let mut callback =
-        reqwest::Url::parse(&format!("{}/oauth/callback/locked", harness.admin_base()))?;
-    callback
-        .query_pairs_mut()
-        .append_pair("error", "access_denied")
-        .append_pair("error_description", &description);
-    let page = harness.http.get(callback).send().await?;
-    assert_eq!(page.status().as_u16(), 400);
-    let text = page.text().await?;
-    assert!(text.contains("access_denied"), "{text}");
-    assert!(!text.contains(key), "{text}");
-    // no login is in progress, so the callback must not raise a 1Password
-    // prompt by reading the url
-    assert_eq!(super::secrets::reads(&log, reference), reads_before);
+    // the main listener's callback is reachable from the tailnet, so it
+    // must hold to the same rules as the loopback one
+    for base in [harness.admin_base(), harness.base()] {
+        let description = format!("bad resource http://127.0.0.1:9/mcp/{key}/sse");
+        let mut callback = reqwest::Url::parse(&format!("{base}/oauth/callback/locked"))?;
+        callback
+            .query_pairs_mut()
+            .append_pair("error", "access_denied")
+            .append_pair("error_description", &description);
+        let page = harness.http.get(callback).send().await?;
+        assert_eq!(page.status().as_u16(), 400);
+        let text = page.text().await?;
+        assert!(text.contains("access_denied"), "{text}");
+        assert!(!text.contains(key), "{text}");
+        // no login is in progress, so the callback must not raise a
+        // 1Password prompt by reading the url
+        assert_eq!(super::secrets::reads(&log, reference), reads_before);
 
-    // an error code that is not a standard one may be the key itself
-    let mut callback =
-        reqwest::Url::parse(&format!("{}/oauth/callback/locked", harness.admin_base()))?;
-    callback.query_pairs_mut().append_pair("error", key);
-    let page = harness.http.get(callback).send().await?;
-    assert_eq!(page.status().as_u16(), 400);
-    let text = page.text().await?;
-    assert!(!text.contains(key), "{text}");
+        // an error code that is not a standard one may be the key itself
+        let mut callback = reqwest::Url::parse(&format!("{base}/oauth/callback/locked"))?;
+        callback.query_pairs_mut().append_pair("error", key);
+        let page = harness.http.get(callback).send().await?;
+        assert_eq!(page.status().as_u16(), 400);
+        let text = page.text().await?;
+        assert!(!text.contains(key), "{text}");
+    }
 
     harness.stop().await
 }

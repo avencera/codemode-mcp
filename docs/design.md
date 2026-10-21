@@ -44,7 +44,7 @@ rmcp 3.x clients, one long-lived connection per configured server
 |---|---|---|
 | stdio | `1password-mcp`, `xcrun mcpbridge`, our own MCPs (`codemode-mcp adapter calendar`, `reminders`) | child process supervised by the daemon; restart with backoff |
 | HTTP | `openaiDeveloperDocs` | plain Streamable HTTP |
-| HTTP + OAuth | any `url` server with `oauth = true` | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on the admin listener's `/oauth/callback/<server>` (see OAuth) |
+| HTTP + OAuth | any `url` server with `oauth = true` | rmcp `AuthorizationManager` with SQLite-backed credential and state stores; the browser redirect lands on `/oauth/callback/<server>` on `public_origin` or the admin listener (see OAuth) |
 | HTTP, caller auth | T3 Code (`127.0.0.1:3773/mcp`) | deferred; see T3 Code |
 
 A stdio server with `lazy = true` is for tools used now and then (Blender, video, diagrams): no process runs
@@ -567,14 +567,27 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - `codemode-mcp oauth login <server>` calls `POST /admin/oauth/login` on the admin listener, which runs rmcp's
   discovery (RFC 9728 protected-resource metadata, then authorization-server metadata; servers without
   published metadata are refused), dynamic client registration (public client), and builds a PKCE (S256)
-  authorization URL with redirect URI `http://127.0.0.1:<admin port>/oauth/callback/<server>`. The CLI prints it
-  and runs `open` on macOS (`--no-open` skips that)
+  authorization URL. Its redirect URI is `<public_origin>/oauth/callback/<server>` when `public_origin` is https
+  and the client is registered dynamically, so the sign-in can finish on a phone, and the client registers as
+  `application_type: "web"`, since OIDC registration allows a `native` client only loopback or custom-scheme
+  redirects; otherwise `http://127.0.0.1:<admin port>/oauth/callback/<server>`. The CLI prints it and runs `open` on macOS
+  (`--no-open` skips that)
+- `GET /oauth/login/<server>` on the main listener renders a Continue with passkey button and starts nothing.
+  Whoever starts a sign-in picks the account the tokens belong to, and the main listener is reachable from the
+  network, so `POST .../options` and `.../confirm` run a passkey assertion bound to `oauth-login:<server>`
+  (approval ids never hold `:`, so it cannot approve a tool call), and only then start the login and answer the
+  authorization URL for the page to open. The JSON bodies keep other sites' forms out. Only dynamically
+  registered clients get the page, and only with an https `public_origin`. A callback that answers no login in
+  progress shows only a standard error code, never the provider's text, and unknown servers are not named back
+- `search_tools` adds a note for each server its query names (every word of its name or of an alias) that is `needs_login` (with
+  the page above, or the CLI command without one) or `unavailable`: a server that never connected has no tools
+  for search to find
 - A configured `client_id` skips registration, for authorization servers that offer none, such as Google's.
   Its `client_secret` may hold `op://` references, read through `op` at login only; the resolved secret is
   stored with the registration, as a registered client's is, so refreshes need no 1Password prompt.
   `authorization_params` are added to the authorization URL, replacing any rmcp set; the parameters PKCE, the
   CSRF check and the token exchange rely on are refused at config load
-- `GET /oauth/callback/<server>` on the admin listener exchanges the code (the CSRF state must match a stored
+- `GET /oauth/callback/<server>` on either listener exchanges the code (the CSRF state must match a stored
   flow) and shows a plain "you can close this tab" page; the upstream then reconnects with
   `AuthClient` + `StreamableHttpClientTransport::with_client`
 - Storage in `codemode.sqlite` (mode 0600, as are its WAL files):

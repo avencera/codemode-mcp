@@ -1,4 +1,4 @@
-// Passkey ceremonies for the approval and enrollment pages; no build step
+// Passkey ceremonies for the approval, enrollment and sign-in pages; no build step
 "use strict";
 
 (() => {
@@ -45,6 +45,33 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  // runs an assertion for the challenge `/options` answers and posts it to `/confirm`
+  const assertWithPasskey = async (body) => {
+    const { ceremony, options } = await post("/options", body);
+    const publicKey = options.publicKey;
+    publicKey.challenge = toBuffer(publicKey.challenge);
+    for (const credential of publicKey.allowCredentials || []) {
+      credential.id = toBuffer(credential.id);
+    }
+    const assertion = await navigator.credentials.get({ publicKey });
+    const response = assertion.response;
+    return post("/confirm", {
+      ceremony,
+      credential: {
+        id: assertion.id,
+        rawId: toText(assertion.rawId),
+        type: assertion.type,
+        response: {
+          authenticatorData: toText(response.authenticatorData),
+          clientDataJSON: toText(response.clientDataJSON),
+          signature: toText(response.signature),
+          userHandle: toText(response.userHandle),
+        },
+        extensions: assertion.getClientExtensionResults(),
+      },
+    });
+  };
+
   if (!window.PublicKeyCredential) {
     show("This browser does not support passkeys; open the link in Safari.");
   }
@@ -64,30 +91,7 @@
     }
 
     const approve = async (button) => {
-      const choice = button.dataset.choice;
-      const { ceremony, options } = await post("/options", { choice });
-      const publicKey = options.publicKey;
-      publicKey.challenge = toBuffer(publicKey.challenge);
-      for (const credential of publicKey.allowCredentials || []) {
-        credential.id = toBuffer(credential.id);
-      }
-      const assertion = await navigator.credentials.get({ publicKey });
-      const response = assertion.response;
-      const result = await post("/confirm", {
-        ceremony,
-        credential: {
-          id: assertion.id,
-          rawId: toText(assertion.rawId),
-          type: assertion.type,
-          response: {
-            authenticatorData: toText(response.authenticatorData),
-            clientDataJSON: toText(response.clientDataJSON),
-            signature: toText(response.signature),
-            userHandle: toText(response.userHandle),
-          },
-          extensions: assertion.getClientExtensionResults(),
-        },
-      });
+      await assertWithPasskey({ choice: button.dataset.choice });
       // name the choice so a session or client grant reads differently from a single call
       const label = button.textContent.trim().replace(/^Approve\b/, "Approved");
       finish("approved", `\u2713 ${label}`);
@@ -111,6 +115,22 @@
         }
       });
     }
+  }
+
+  if (main.dataset.kind === "signin") {
+    const button = document.getElementById("signin");
+    button.addEventListener("click", async () => {
+      setBusy(true);
+      show("Waiting for your passkey...");
+      try {
+        const { authorization_url: next } = await assertWithPasskey({});
+        show("Opening the sign-in page...");
+        window.location.assign(next);
+      } catch (error) {
+        show(error.message || String(error));
+        setBusy(false);
+      }
+    });
   }
 
   if (main.dataset.kind === "enroll") {

@@ -19,7 +19,7 @@ use axum::{
     http::HeaderMap,
     http::StatusCode,
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use hmac::{KeyInit, Mac};
@@ -39,12 +39,8 @@ use crate::{
     passkeys::{PasskeyError, Passkeys},
     secrets,
     upstream::UpstreamStatus,
-    web::escape,
+    web,
 };
-
-/// Discovery, registration and the code exchange each make a few HTTP
-/// calls that rmcp does not bound
-const OAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AdminState {
@@ -965,7 +961,7 @@ async fn oauth_login(
     Json(request): Json<OAuthServerRequest>,
 ) -> Response {
     let started = tokio::time::timeout(
-        OAUTH_TIMEOUT,
+        web::oauth::OAUTH_TIMEOUT,
         state.gateway.oauth().start_login(&request.server),
     )
     .await
@@ -1023,54 +1019,7 @@ async fn oauth_callback(
     Path(server): Path<String>,
     Query(callback): Query<Callback>,
 ) -> Response {
-    let finished = tokio::time::timeout(
-        OAUTH_TIMEOUT,
-        state.gateway.oauth().finish_login(&server, &callback),
-    )
-    .await
-    .unwrap_or(Err(OAuthError::TimedOut));
-    let (status, title, message) = match finished {
-        Ok(()) => {
-            tracing::info!(%server, "oauth login completed");
-            state.gateway.reconnect(&server);
-
-            (
-                StatusCode::OK,
-                "Signed in",
-                format!("codemode-mcp is signed in to {server}. You can close this tab."),
-            )
-        }
-        Err(failure) => {
-            tracing::warn!(%server, error = %failure, "oauth callback failed");
-
-            (
-                StatusCode::BAD_REQUEST,
-                "Sign-in failed",
-                format!("Signing in to {server} failed: {failure}"),
-            )
-        }
-    };
-    let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"referrer\" content=\"no-referrer\"><title>{title}</title></head>\
-         <body style=\"font-family: -apple-system, system-ui, sans-serif; margin: 40px\">\
-         <h1>{title}</h1><p>{message}</p></body></html>",
-        title = escape(title),
-        message = escape(&message),
-    );
-
-    (
-        status,
-        [
-            (
-                axum::http::header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'unsafe-inline'",
-            ),
-            (axum::http::header::CACHE_CONTROL, "no-store"),
-        ],
-        Html(html),
-    )
-        .into_response()
+    web::oauth::finish(&state.gateway, &server, &callback).await
 }
 
 async fn warm(State(state): State<AdminState>, Json(request): Json<WarmRequest>) -> Response {
