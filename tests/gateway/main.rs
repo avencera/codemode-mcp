@@ -16,6 +16,7 @@ mod secrets;
 mod service;
 mod session_less;
 mod sessions;
+mod spokes;
 mod typed_outputs;
 #[cfg(target_os = "macos")]
 mod update;
