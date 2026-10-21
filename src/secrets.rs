@@ -28,6 +28,7 @@ use self::approved::{Approved, Consumer};
 use crate::{
     companion::{Companions, CreatedItem, DeviceTrust, FindBatches, NewItem, ProgramValue},
     config::{Config, SecretsConfig},
+    hub::client::HubClient,
     mac::{OnMac, TouchId},
     store::Store,
 };
@@ -889,6 +890,8 @@ pub struct OnePassword {
     on_mac: Option<OnMac>,
     /// Finds waiting to share one prompt with others from the same script
     finds: Arc<FindBatches>,
+    /// On a spoke, the hub that approves and reads every value
+    hub: Option<Arc<HubClient>>,
 }
 
 /// The keep grants, and how many times they were forgotten, so a read
@@ -933,7 +936,73 @@ impl OnePassword {
             companions: None,
             on_mac: None,
             finds: Arc::default(),
+            hub: None,
         }
+    }
+
+    /// Has the hub approve and read every value, as on a spoke: a config's
+    /// references once per server, remembered there, and each program's
+    /// read or find as the hub's own programs' are
+    #[must_use]
+    pub fn with_hub(mut self, hub: Option<Arc<HubClient>>) -> Self {
+        self.hub = hub;
+
+        self
+    }
+
+    /// The hub that reads for this spoke
+    pub(crate) fn hub(&self) -> Option<&Arc<HubClient>> {
+        self.hub.as_ref()
+    }
+
+    /// Reads, through the hub, every reference `consumer` is not cleared
+    /// for yet, as one request the owner approves once
+    async fn prefetch_from_hub(
+        &self,
+        consumer: Option<&Consumer>,
+        references: Vec<&str>,
+    ) -> Result<(), SecretError> {
+        let (Some(hub), Some(consumer)) = (&self.hub, consumer) else {
+            return Ok(());
+        };
+        if references.is_empty() {
+            return Ok(());
+        }
+        let missing: Vec<String> = {
+            let known = self.known.lock().await;
+            let mut missing: Vec<String> = Vec::new();
+            for reference in references {
+                let cleared =
+                    self.approved.allows(consumer, reference) && known.contains_key(reference);
+                if !cleared && !missing.iter().any(|seen| seen == reference) {
+                    missing.push(reference.to_owned());
+                }
+            }
+
+            missing
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        // the shared cache stays free while the hub waits for trust or the
+        // owner, so other servers resolve meanwhile
+        let values = hub
+            .config_values(consumer, &missing)
+            .await
+            .map_err(|error| SecretError::Read {
+                reference: missing.join(", "),
+                reason: error.to_string(),
+            })?;
+        let mut known = self.known.lock().await;
+        for (reference, value) in missing.iter().zip(values) {
+            known.insert(reference.clone(), value);
+        }
+        drop(known);
+        // the owner approved them for this server on the hub
+        self.approve_for(consumer, &missing);
+
+        Ok(())
     }
 
     /// Also asks `companions` for every read, and reads locally only while
@@ -1087,6 +1156,13 @@ impl OnePassword {
             values: BTreeMap::new(),
             secrets: Vec::new(),
         };
+        if self.hub.is_some() {
+            let mut all = Vec::new();
+            for value in values.values() {
+                all.extend(references(value)?);
+            }
+            self.prefetch_from_hub(consumer, all).await?;
+        }
 
         for (key, value) in values {
             let text = self
@@ -1114,6 +1190,8 @@ impl OnePassword {
         template: &str,
     ) -> Result<ResolvedUrl, SecretError> {
         let template = UrlTemplate::parse(template)?;
+        self.prefetch_from_hub(consumer, template.references().collect())
+            .await?;
         let mut values = Vec::new();
         for reference in template.references() {
             let value = self.value(consumer, reference).await?;
@@ -1158,6 +1236,20 @@ impl OnePassword {
         Ok(text)
     }
 
+    /// Whether every reference may go to `consumer` without asking
+    pub fn approved_for(&self, consumer: &Consumer, references: &[String]) -> bool {
+        references
+            .iter()
+            .all(|reference| self.approved.allows(consumer, reference))
+    }
+
+    /// Records that the owner approved `references` for `consumer`
+    pub fn approve_for(&self, consumer: &Consumer, references: &[String]) {
+        for reference in references {
+            self.approved.approve(consumer, reference);
+        }
+    }
+
     /// What 1Password holds for one `op://` reference, through the cache
     /// and every source a configured value would use
     pub async fn read_reference(&self, reference: &str) -> Result<String, SecretError> {
@@ -1181,7 +1273,25 @@ impl OnePassword {
         {
             return Ok(value.clone());
         }
-        let value = self.read(reference, ask).await?;
+        let value = match &self.hub {
+            // the hub asks the owner and remembers; a read with no server
+            // behind it asks as this spoke's own
+            Some(hub) => {
+                let spoke = Consumer::of_spoke("", "codemode-mcp".to_owned(), "");
+                let consumer = consumer.unwrap_or(&spoke);
+                let mut values = hub
+                    .config_values(consumer, &[reference.to_owned()])
+                    .await
+                    .map_err(|error| SecretError::Read {
+                        reference: reference.to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                self.approved.approve(consumer, reference);
+
+                values.pop().unwrap_or_default()
+            }
+            None => self.read(reference, ask).await?,
+        };
         known.insert(reference.to_owned(), value.clone());
         // every source asked the owner, naming the server here, unless
         // there is no Mac to ask on, where `op` answered as it would

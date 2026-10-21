@@ -62,7 +62,7 @@ struct Issued {
 
 /// The client the mock's token endpoint accepts
 #[derive(Clone, Copy)]
-enum Client {
+pub(super) enum Client {
     /// A public client registered dynamically as `mock-client`
     Registered,
     /// `known-client`, registered ahead of time with a secret it sends with
@@ -105,8 +105,8 @@ struct Quirks {
 }
 
 #[derive(Clone)]
-struct Mock {
-    base: String,
+pub(super) struct Mock {
+    pub(super) base: String,
     client: Client,
     issued: Arc<Issued>,
     /// Appended to the issuer the metadata names
@@ -281,7 +281,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Starts the mock and returns its base URL
-async fn start_mock(client: Client) -> Result<Mock, Box<dyn std::error::Error>> {
+pub(super) async fn start_mock(client: Client) -> Result<Mock, Box<dyn std::error::Error>> {
     start_mock_with(client, String::new(), None).await
 }
 
@@ -362,7 +362,7 @@ async fn health_of(harness: &Harness, server: &str) -> Result<Value, Box<dyn std
         .ok_or_else(|| format!("no {server} in {health}").into())
 }
 
-async fn wait_for_state(
+pub(super) async fn wait_for_state(
     harness: &Harness,
     server: &str,
     state: &str,
@@ -388,6 +388,19 @@ async fn wait_for_state(
     Err(format!("{server} never reached {state}").into())
 }
 
+/// Waits until `function` is in the published catalog: an upstream reports
+/// `connected` before the rebuild that type-checks its stubs is done
+async fn wait_for_tool(harness: &Harness, function: &str) -> TestResult {
+    for _ in 0..100 {
+        if harness.app.gateway().catalog().get(function).is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    Err(format!("{function} never reached the catalog").into())
+}
+
 fn query_value(url: &str, key: &str) -> Option<String> {
     reqwest::Url::parse(url).ok().and_then(|url| {
         url.query_pairs()
@@ -399,7 +412,7 @@ fn query_value(url: &str, key: &str) -> Option<String> {
 /// Starts a login and plays the authorization server's part of the
 /// browser redirect: issues a code for the PKCE challenge. Returns the
 /// callback URL and the authorization URL
-async fn begin_login(
+pub(super) async fn begin_login(
     harness: &Harness,
     mock: &Mock,
     server: &str,
@@ -500,6 +513,7 @@ async fn oauth_login_unlocks_a_server_that_refuses_anonymous_clients() -> TestRe
 
     let upstream = wait_for_state(&harness, "locked", "connected").await?;
     assert_eq!(upstream["tools"], 1, "{upstream}");
+    wait_for_tool(&harness, "locked_hello").await?;
     let called = harness.execute_json("await locked_hello()").await?;
     assert_eq!(called["result"], "hello", "{called}");
 
@@ -579,6 +593,7 @@ async fn oauth_login_uses_a_client_registered_ahead_of_time() -> TestResult {
     // the token endpoint takes only the secret, so a working refresh shows
     // the stored login kept it
     wait_for_state(&harness, "known", "connected").await?;
+    wait_for_tool(&harness, "known_hello").await?;
     let called = harness.execute_json("await known_hello()").await?;
     assert_eq!(called["result"], "hello", "{called}");
     assert!(mock.issued.refreshes.load(Ordering::SeqCst) > 0);
@@ -761,6 +776,7 @@ async fn oauth_login_resolves_a_url_with_an_embedded_key_without_storing_it() ->
     assert_eq!(page.status().as_u16(), 200);
 
     wait_for_state(&harness, "locked", "connected").await?;
+    wait_for_tool(&harness, "locked_hello").await?;
     let called = harness.execute_json("await locked_hello()").await?;
     assert_eq!(called["result"], "hello", "{called}");
     assert!(!harness.state_holds(key));

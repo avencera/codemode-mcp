@@ -163,6 +163,22 @@ const PROXY_HEADERS: [&str; 5] = [
     "x-real-ip",
 ];
 
+/// Whether `address` is a Tailscale node: 100.64.0.0/10, or
+/// fd7a:115c:a1e0::/48 for IPv6
+///
+/// The main listener binds every interface, so it also answers on the LAN;
+/// the hub routes take only tailnet peers
+pub fn is_tailnet_address(address: IpAddr) -> bool {
+    match address.to_canonical() {
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+
+            segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
+        }
+        v4 => is_tailscale_ip(v4),
+    }
+}
+
 /// Whether a request carries a header that only a proxy adds
 pub fn proxied(headers: &HeaderMap) -> bool {
     PROXY_HEADERS

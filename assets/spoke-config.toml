@@ -1,0 +1,27 @@
+# codemode-mcp configuration of a spoke
+#
+# Written by `codemode-mcp config init --hub`. This machine is a spoke of the
+# hub Mac, which holds 1Password, the passkeys, sign-ins and approvals. The
+# hub's servers show up here like local ones; calls to them run on the hub,
+# and `ask` tools of this machine's own servers are approved there too. The
+# first start asks on the hub to trust this machine. See docs/operations.md,
+# "Spokes"
+
+[hub]
+# the hub's MagicDNS name or tailnet IP, with :port when it is not 7681
+host = {{HUB}}
+# only these hub servers; every one when unset
+# servers = ["linear", "github"]
+# or every hub server but these
+# exclude = ["xcode"]
+
+# write_env and find_references on this machine: they write 1Password values
+# into files here, approved on the hub, and the agent sees only the names
+[servers.secrets]
+builtin = "secrets"
+
+# This machine's own servers, for work that has to touch it: files, Docker,
+# GPUs. A name a hub server already uses is refused at startup. For example
+# [servers.files]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "{{HOME}}/code"]

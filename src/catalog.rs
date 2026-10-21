@@ -7,6 +7,7 @@ use std::{
 };
 
 use rmcp::model::Tool;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
@@ -32,6 +33,67 @@ pub struct ServerSnapshot {
     pub instructions: Option<String>,
     /// Whether the server is connected right now
     pub available: bool,
+}
+
+/// One tool of a hub's server, as its spokes get it
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedTool {
+    /// The tool with the input scripts pass: configured arguments left out,
+    /// configured parameter types marked in. Its output schema is unset;
+    /// `output` says what scripts get
+    pub tool: Tool,
+    /// The hub's policy for it, which the hub enforces itself
+    pub policy: Policy,
+    /// How far one approval of it reaches
+    pub grant: GrantMode,
+    /// What scripts get back
+    pub output: OutputSpec,
+}
+
+impl PartialEq for OutputSpec {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Untyped, Self::Untyped) | (Self::Text, Self::Text) => true,
+            (Self::Schema(left), Self::Schema(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+/// The tools of `snapshot` a spoke may call, as [`Catalog::build`] would
+/// show them here; denied tools are left out, since they can never run
+pub fn export_tools(config: &Config, snapshot: &ServerSnapshot) -> Vec<ExportedTool> {
+    let server = config.servers.get(&snapshot.name);
+
+    snapshot
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            let policy = server.map_or(Policy::Allow, |server| server.policy_for(&tool.name));
+            if policy == Policy::Deny {
+                return None;
+            }
+            let tool_override = server.and_then(|server| server.tool_override(&tool.name));
+            let input = branded_input(
+                &snapshot.name,
+                &tool.name,
+                shown_input(&tool.input_schema, server),
+                tool_override,
+            )
+            .into_owned();
+            let mut exported = tool.clone();
+            exported.input_schema = Arc::new(input);
+            exported.output_schema = None;
+
+            Some(ExportedTool {
+                policy,
+                grant: server
+                    .map_or_else(GrantMode::default, |server| server.grant_for(&tool.name)),
+                output: effective_output(&snapshot.name, tool, tool_override),
+                tool: exported,
+            })
+        })
+        .collect()
 }
 
 /// One callable tool
@@ -283,6 +345,14 @@ impl Catalog {
     /// Every tool, in server then tool order
     pub fn entries(&self) -> &[ToolEntry] {
         &self.entries
+    }
+
+    /// Looks up a tool by its server and upstream name, as a spoke names
+    /// the hub's tools
+    pub fn find(&self, server: &str, tool: &str) -> Option<&ToolEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.server == server && entry.tool == tool)
     }
 
     /// Looks up a tool by its Python name

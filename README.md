@@ -53,12 +53,16 @@ before the script sees them.
 - **Website sign-in.** An agent driving the Mac's screen can sign in to any website with the 1Password login
   saved for it, or one you pick on your phone, typed into the page in a code-signed browser without the
   value reaching the agent
+- **Hub and spokes.** Your other machines, Linux included, run codemode-mcp as spokes of the Mac: their agents
+  see the Mac's servers next to the machine's own, and every approval and 1Password value is decided on the
+  Mac, over Tailscale. Tokens and sign-ins never leave it
 - **Usage review.** Per-client stats and a Markdown review of how agents use the gateway
 - **launchd service** with signed binaries, so macOS and 1Password permission grants survive updates
 
 ## Requirements
 
-- macOS on Apple silicon
+- macOS on Apple silicon for the hub, the machine that holds 1Password and the approvals. Spokes also run on
+  Linux, built from source, with a systemd user service; see [Spokes](docs/operations.md#spokes-use-the-hub-from-other-machines)
 - A Developer ID certificate in your keychain. Binaries are signed so that macOS and 1Password keep their grants
   across updates, and `service install` refuses to run without the identity. As published, that is the author's
   identity; to run your own copy, set `SIGNING_IDENTITY` and `TEAM_ID` in `src/service.rs` and the signing
@@ -114,8 +118,9 @@ Then run `codemode-mcp service restart` and check the catalog with `codemode-mcp
 
 ## Documentation
 
-- [Operations](docs/operations.md): install, passkeys, approvals, OAuth, updates and troubleshooting
-- [Design](docs/design.md): architecture, approval model, type strictness, durability and threat model
+- [Operations](docs/operations.md): install, passkeys, approvals, OAuth, spokes, updates and troubleshooting
+- [Design](docs/design.md): architecture, approval model, hub and spokes, type strictness, durability and threat
+  model
 
 ## License
 

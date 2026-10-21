@@ -224,6 +224,7 @@ fn decide_error(error: &DecideError) -> Response {
     let status = match error {
         DecideError::NotFound => StatusCode::GONE,
         DecideError::GrantNotAllowed => StatusCode::BAD_REQUEST,
+        DecideError::DecidedOnHub => StatusCode::CONFLICT,
     };
 
     json_error(status, &error.to_string())
@@ -293,7 +294,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
         client_buttons.push_str(&grant_buttons(
             "client",
             "client",
-            &escape(info.caller.client_display()),
+            &escape(&info.caller.client_display()),
         ));
     }
     let mut notes = Vec::new();
@@ -379,7 +380,7 @@ async fn approve_page(State(state): State<WebState>, Path(id): Path<String>) -> 
 <script src="/assets/webauthn.js"></script>"#,
         id = escape(&info.id),
         title = escape(&title),
-        client = escape(info.caller.client_label()),
+        client = escape(&info.caller.client_label()),
         version = escape(info.caller.client_version.as_deref().unwrap_or("")),
         execution = escape(&info.execution_id),
         left = info.time_left().as_secs(),

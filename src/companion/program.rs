@@ -215,6 +215,10 @@ pub struct ProgramAsk {
     /// Ask only the phones, where the owner enters the values, as for a
     /// login picked for a page; no Mac searches or reads
     pub phones_only: bool,
+    /// Whose kept values these are besides the destination: a spoke's id,
+    /// so spokes that share a name never share kept values; `None` for
+    /// this machine
+    pub keep_scope: Option<String>,
 }
 
 /// What every prompt of one program read shows besides the items, cleaned
@@ -223,6 +227,9 @@ struct Context {
     reason: Option<String>,
     destination: Option<String>,
     keep_secs: Option<u64>,
+    /// What kept values are filed under: the destination, after the keep
+    /// scope when there is one
+    kept_for: Option<String>,
 }
 
 /// The destination; `None` when blank. One that a prompt could not show
@@ -358,12 +365,26 @@ impl OnePassword {
         &self,
         ask: &ProgramAsk,
     ) -> Result<ProgramRead, ProgramReadError> {
+        // a spoke's owner approves on the hub, whose devices read the values
+        if let Some(hub) = self.hub() {
+            checked_targets(&ask.targets).map_err(ProgramReadError::Invalid)?;
+
+            return hub.read_for_program(ask).await;
+        }
         let targets = checked_targets(&ask.targets).map_err(ProgramReadError::Invalid)?;
+        let destination =
+            clean_destination(ask.destination.as_deref()).map_err(ProgramReadError::Invalid)?;
+        // a cleaned destination holds no line break, so a scoped key never
+        // equals this machine's own
+        let kept_for = match &ask.keep_scope {
+            Some(scope) => Some(format!("{scope}\n{}", destination.as_deref().unwrap_or(""))),
+            None => destination.clone(),
+        };
         let context = Context {
             reason: clean_reason(ask.reason.as_deref()),
-            destination: clean_destination(ask.destination.as_deref())
-                .map_err(ProgramReadError::Invalid)?,
+            destination,
             keep_secs: clean_keep(ask.keep.map(|keep| keep.as_secs())),
+            kept_for,
         };
         let references = all_references(&targets);
         // a Mac cannot enter a value, but it can find the item one
@@ -381,7 +402,7 @@ impl OnePassword {
         let forgotten = self.forgotten().await;
         if let Some(references) = &references
             && let Some(values) = self
-                .kept_values(context.destination.as_deref(), references)
+                .kept_values(context.kept_for.as_deref(), references)
                 .await
         {
             return Ok(ProgramRead::Values(ProgramValues {
@@ -555,7 +576,7 @@ impl OnePassword {
         }
         if let (Some(keep_secs), Some(references)) = (context.keep_secs, &references) {
             self.keep(
-                context.destination.as_deref(),
+                context.kept_for.as_deref(),
                 references,
                 &outcome.values,
                 Duration::from_secs(keep_secs),

@@ -18,6 +18,7 @@ pub mod executor;
 pub mod gateway;
 mod guidance;
 pub mod host;
+pub mod hub;
 pub mod json_access;
 pub mod logins;
 pub mod mac;

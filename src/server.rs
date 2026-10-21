@@ -1095,12 +1095,15 @@ fn serve_on(
             in_flight.clone(),
             track_in_flight,
         ));
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .with_state(Arc::clone(app.gateway()))
         .merge(web::router(app))
-        .nest_service("/mcp", mcp)
-        .layer(middleware::from_fn_with_state(hosts, host_guard));
+        .nest_service("/mcp", mcp);
+    if let Some(hub) = app.hub() {
+        router = router.merge(crate::hub::server::router(Arc::clone(hub)));
+    }
+    let router = router.layer(middleware::from_fn_with_state(hosts, host_guard));
 
     let token = shutdown.clone();
     let main = tokio::spawn(async move {

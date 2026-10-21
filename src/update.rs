@@ -28,7 +28,10 @@ const WORKER: &str = "monty";
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
     /// This machine cannot run a release build
-    #[error("releases are built for {TARGET} only, not {0}")]
+    #[error(
+        "releases are built for {TARGET} only, not {0}; build from source with `cargo build \
+         --release` and run `codemode-mcp service install` from the repository"
+    )]
     UnsupportedPlatform(String),
     /// A request could not be sent or read
     #[error("request to {url} failed: {source}")]

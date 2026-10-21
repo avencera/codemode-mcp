@@ -61,10 +61,20 @@ pub struct StoredApproval {
     pub unnotified: bool,
     /// Execution waiting on it
     pub execution_id: Option<String>,
+    /// Id of the spoke that asked, on a hub
+    pub spoke: Option<String>,
+    /// Server name
+    pub server: String,
+    /// Upstream tool name or admin action name
+    pub tool: String,
+    /// For a spoke's call of a hub tool, the digest of the arguments it
+    /// covers
+    pub hub_call: Option<String>,
 }
 
 const COLUMNS: &str = "id, created_ms, expires_ms, decision, approved_by, sensitive, payload, \
-                       action, action_done, unnotified, execution_id";
+                       action, action_done, unnotified, execution_id, spoke, server, tool, \
+                       hub_call";
 
 fn stored_approval(row: &Row) -> Result<StoredApproval, turso::Error> {
     let flag = |index: usize| -> Result<bool, turso::Error> {
@@ -83,6 +93,10 @@ fn stored_approval(row: &Row) -> Result<StoredApproval, turso::Error> {
         action_done: flag(8)?,
         unnotified: flag(9)?,
         execution_id: row.get(10)?,
+        spoke: row.get(11)?,
+        server: row.get(12)?,
+        tool: row.get(13)?,
+        hub_call: row.get(14)?,
     })
 }
 
@@ -111,8 +125,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.connection().execute(
             "INSERT OR IGNORE INTO approvals (id, created_ms, expires_ms, session, client_name, \
-             execution_id, server, tool, grant_mode, sensitive, payload, action, unnotified) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             execution_id, server, tool, grant_mode, sensitive, payload, action, unnotified, spoke) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 approval.id,
                 approval.created_ms,
@@ -127,10 +141,38 @@ impl Store {
                 payload.payload().map(String::as_str),
                 approval.action,
                 approval.notify.then_some(1_i64),
+                approval
+                    .caller
+                    .machine
+                    .as_ref()
+                    .map(|machine| machine.id.as_str()),
             ],
         )?;
 
         Ok(())
+    }
+
+    /// Marks a request as a spoke's call of a hub tool with these
+    /// arguments, by their digest
+    pub fn bind_hub_call(&self, id: &str, digest: &str) -> Result<(), StoreError> {
+        self.connection().execute(
+            "UPDATE approvals SET hub_call = ?1 WHERE id = ?2",
+            params![digest, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// Spends a request's approval on the one call it covers; false when it
+    /// was spent already, its deadline passed, or there is no such request
+    pub fn consume_approval(&self, id: &str) -> Result<bool, StoreError> {
+        let changed = self.connection().execute(
+            "UPDATE approvals SET used_ms = ?1 WHERE id = ?2 AND used_ms IS NULL \
+             AND expires_ms > ?1",
+            params![now_ms(), id],
+        )?;
+
+        Ok(changed > 0)
     }
 
     /// Records the decision of a pending request; false when it was decided
@@ -175,6 +217,21 @@ impl Store {
         Ok(self.connection().query_map(
             &format!("SELECT {COLUMNS} FROM approvals WHERE decision IS NULL ORDER BY created_ms"),
             (),
+            stored_approval,
+        )?)
+    }
+
+    /// Requests spokes asked for that nobody has decided yet, which a hub
+    /// keeps answering after a restart
+    pub fn pending_spoke_approvals(&self) -> Result<Vec<StoredApproval>, StoreError> {
+        Ok(self.connection().query_map(
+            &format!(
+                "SELECT {COLUMNS} FROM approvals WHERE decision IS NULL AND spoke IS NOT NULL \
+                 AND action IS NULL AND server <> ?1 ORDER BY created_ms"
+            ),
+            // the owner's requests about a spoke are answered to the route
+            // that asked, which a restart ended; they are withdrawn instead
+            params![crate::approvals::ADMIN_SERVER],
             stored_approval,
         )?)
     }

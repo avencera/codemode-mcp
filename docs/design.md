@@ -9,6 +9,7 @@ context unless it asks for them
 ## Goals
 
 - One MCP endpoint for every agent on this Mac, reachable over LAN and Tailscale
+- The same servers, sign-ins and approvals on the owner's other machines, through this Mac as their hub
 - Add upstream MCPs (including our own) without growing agent context
 - Scripts are type-checked against tool signatures before they run
 - Sensitive tool calls (1Password) pause for approval from a phone, protected by a passkey
@@ -16,8 +17,10 @@ context unless it asks for them
 
 ## Non-goals (v1)
 
-- Authenticating agents to the endpoint: LAN and tailnet are the trust boundary
-- Remote/multi-machine execution; homebased Fleet already covers that
+- Authenticating agents to the endpoint: LAN and tailnet are the trust boundary. Machines are another matter:
+  a spoke is trusted by the owner, once, at its tailnet address (see Hub and spokes)
+- Running one machine's scripts on another: a spoke runs its own scripts in its own sandbox, and only single
+  tool calls cross to the hub
 - Waking agent sessions when an execution finishes (`homebased message send` is a later option)
 
 ## Components
@@ -551,6 +554,10 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - LAN and tailnet peers can reach `/mcp` without authentication (non-goal above); they get the same rights as a
   local MCP-only agent, except that they can never use or create a client grant, so every `ask` call they make
   needs its own approval
+- A trusted spoke can call the hub's servers under the hub's policy and ask for approvals and 1Password values,
+  each of which the owner decides on the hub. It never holds the hub's tokens. A compromised spoke can ask, and
+  word its client and thread as it likes, but the prompt names the spoke as the owner trusted it. `spokes
+  remove` ends it
 - Local same-user processes can still impersonate a client name and ride a live client grant (the fallback for
   calls without a valid session), because the name is self-asserted and loopback gives no identity. Session
   grants close this for agents that pass their session: the token is unguessable, and a caller that presents a
@@ -802,6 +809,76 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - Values read stay in daemon memory only, as with local `op`; hardened runtime keeps other processes from
   injecting code to read them. A live compromise of the gateway Mac during a run still sees them; keeping keys
   off the Mac entirely is the credential broker's job (research note, `agent-credential-broker`)
+
+### Hub and spokes (`src/hub.rs`)
+
+One Mac, the hub, holds 1Password, the passkeys, the OAuth sign-ins and the approvals. Every other machine of
+the owner runs codemode-mcp as a spoke: a full gateway with its own sandbox and its own servers for work that
+has to touch it (files, Docker, GPUs), which also lists the hub's servers and asks the hub for every approval
+and every 1Password value. Mac-only adapters (Calendar, Reminders, Xcode, logins) stay on the hub and reach
+spokes as hub tools.
+
+- Roles: a daemon whose config has `[hub]` is a spoke; one without serves the hub routes. There is no role key.
+  `config init --hub <host>` writes a spoke's starter config (`assets/spoke-config.toml`); off macOS
+  `config init` needs `--hub`, since a hub needs the Mac's 1Password, Touch ID and Keychain
+- Transport: JSON over HTTP under `/hub/v1` on the hub's main listener, always spoke to hub; the hub never dials
+  a spoke and nothing is discovered. Routes: `register`, `catalog`, `gate`, `call`, `approvals/wait`, `op/read`,
+  `op/find`, `op/config`. A spoke names itself in `x-codemode-spoke`, and every answer carries the hub's catalog
+  version in `x-codemode-catalog`
+- Who may call: the guard (`hub::server::guard`, a route layer, so other paths of the main listener are
+  untouched) takes only Tailscale peers (100.64.0.0/10, fd7a:115c:a1e0::/48) and direct loopback connections
+  without proxy headers. Requests through `tailscale serve` arrive from loopback with those headers and are
+  refused, so spokes reach the hub at its tailnet name or IP on port 7681, not at the HTTPS approval address.
+  Past `register`, the spoke must be trusted, at the address it was trusted at
+- Identity: a random UUID in `<state_dir>/spoke.id` (mode 0600) and the short host name. The id is sent only to
+  the hub. Tailscale vouches for peer addresses, so a copied id is useless from another node. A spoke resolves
+  the hub's name to IPv4 when it can, so it always arrives from the same one of its two tailnet addresses
+- Trust: the first `register` opens an admin request `spoke.trust` with a confirmation code. Unlike other admin
+  requests it, like `spoke.secrets` below, may be approved with Touch ID at the hub Mac as well as with a
+  passkey, because the person answering is at the hub either way and the prompt names the machine. Spoke,
+  server and tool names in prompts are letters, digits, `-`, `_` and `.` only; a spoke registering with any
+  other name is refused. Approval writes a
+  `spokes` row, kept until `spokes remove` (owner proof). The name and address stay as approved; a trusted id
+  registering from another address is asked about again, naming where it was trusted before. One address has
+  at most one open trust request, so a peer making up ids cannot pile prompts on the owner. A pending spoke
+  asks every 5 s; a refused one stops asking until it restarts, so the owner is not asked again and again
+- Catalog: the hub exports its servers with a version (`catalog::export_tools`): tools whose policy is `deny`
+  are left out, inputs are the shapes scripts see, and output schemas stay on the hub, which checks results
+  before they leave. The `secrets` builtin is not exported, since a spoke has its own. A spoke keeps the
+  servers `[hub] servers` or `exclude` let through, merges them with its own and type-checks scripts against
+  both. A spoke server with a hub server's name is a startup error naming it; a clash that appears later is
+  logged and the hub server left out. A spoke refetches when an answer carries another version, and every
+  60 s
+- Calls to hub tools: the spoke asks `gate`, and the hub resolves the call in its own catalog under its own
+  policy. An `ask` call waits on the hub's request, which the hub keeps with the prepared call; the spoke parks
+  its execution on a local copy of that request, which it follows by long poll (`approvals/wait`, 25 s, backing
+  off to 30 s between failures). `call` then runs the held call with the approval's id, which the store marks
+  used, so it runs once even across restarts. When a restart lost the held call, the stored request stands in
+  only for the same spoke, server, tool and arguments (a digest kept on the row), before its deadline; a
+  sensitive request keeps no digest and is asked again. Only exported tools resolve, so a spoke cannot reach
+  a `deny` tool or the hub's `secrets` builtin, and a spoke cannot set an argument the hub's config fixes. A
+  call the hub holds sensitive is refused to a spoke that does not, until the spoke has the new catalog, so
+  its result never lands on the spoke's disk by mistake. A timeout talking to the hub raises the same
+  `TimeoutError` a local one does. The hub's tokens and policy never reach the spoke, which does
+  not gate hub tools again; it checks results against the output once more
+- Approvals of a spoke's own `ask` tools: `gate` with `hub_tool = false` runs the hub's approval path with the
+  spoke's caller, so prompts read `<spoke> · <client> · <thread>` and links point at the hub's approval page.
+  The hub records the server as `<spoke>:<server>`, so the spoke's own `fixture` never shares a grant or an
+  approval with the hub's. Client grants live on the hub, keyed by spoke id and client; session grants by a
+  hash of the spoke id and session, and the hub files a spoke's executions under the spoke's id, so a request
+  never joins another caller's batch. Both copies of a request are in the databases (sensitive ones excepted): after a restart the spoke
+  follows its copies again and the hub restores the requests spokes asked. Only the hub's verdict settles a
+  spoke's copy; the spoke's own approval page refuses it, even with a passkey enrolled there
+- 1Password values: `write_env`, `find_references` and `op inject`/`run`/`read`/`find` run on the spoke, and the
+  value is read and approved on the hub (`op/read`, `op/find`), whose prompts show the destination as
+  `<spoke>:<path>`, and every search prompt quotes the reason as `<spoke>: <reason>`, since a Mac or
+  companion search prompt names only where it searches; values a program asked to keep are kept per spoke id, so two spokes with one name never
+  share them. `{{ op://... }}` references in a spoke's own server config go to `op/config`; the owner
+  approves them once per spoke, server, destination digest and reference set, and the hub remembers it. A
+  server that starts before its spoke is trusted waits for the trust (up to 10 minutes) rather than failing into
+  the 10 minute secret retry
+- Linux spokes build from source; there are no Linux release artifacts, and `update` and `install.sh` say so.
+  CI runs fmt, clippy and the tests on Ubuntu as well
 
 ### T3 Code (deferred)
 
@@ -1105,6 +1182,10 @@ in-flight work runs only in the daemon, never in a CLI run, so `exec` does not t
 ### Service
 
 - Rust 2024, tokio, axum 0.8, rmcp, monty-pool, webauthn-rs, turso; conventions match homebased (color-eyre, thiserror, no unwrap/expect)
+- On Linux (spokes) the same commands write a systemd user unit, `~/.config/systemd/user/codemode-mcp.service`
+  (`Restart=always`, `TimeoutStopSec` covering the drain), and run `systemctl --user daemon-reload`, `enable` and
+  `restart`. `service install` warns when the user does not linger, since the unit would stop at logout. Binaries
+  are not signed there, and the companion commands are refused
 - launchd agent `dev.praveen.codemode-mcp`, listening on `0.0.0.0`, Host header rules accept localhost, private, Tailscale and `*.ts.net` names (plus `extra_allowed_hosts`)
 - `codemode-mcp service install` copies the running binary to `~/.local/bin/codemode-mcp` and the Monty worker
   (`worker_path`, else `.tools/bin/monty` in the current directory) to `~/.local/share/codemode-mcp/monty`, both
@@ -1174,6 +1255,9 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - Calendar and Reminders go through EventKit rather than CalDAV: no password to store, every account the Mac
   shows, and a one-time macOS grant kept across rebuilds by the stable signature. They stay local; exposing them
   to ChatGPT would need endpoint authentication first (see Non-goals)
+- Other machines use the hub over the tailnet rather than holding their own 1Password and sign-ins: one place
+  approves, one set of tokens, and Touch ID or a passkey at the owner's hand for every machine. Spokes start
+  every exchange, so the hub needs no inbound path to them and nothing is discovered
 - No tool returns `Any`; `Any`, `cast` and `type: ignore` in scripts are refused; the review decides whether to tighten or relax (see Type strictness)
 
 ## Known gaps
@@ -1188,6 +1272,12 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
   an occurrence moved more than 31 days from its place in the series cannot be found; Reminders' tags, sections, subtasks and flags are not
   reachable through EventKit. A reminders fetch that times out (30 s) is cancelled, and a completion already
   running is waited for (20 s more) so it does not overlap the next call; one still running after that can
+
+- A spoke whose trust was refused asks again only after it restarts
+- A spoke that gives up on a request (the script was cancelled or timed out) does not tell the hub, so the owner
+  is still asked, and an approved call of a hub tool stays unused until its deadline
+- A spoke's request for `op://` references in its config that was open when the hub restarted is withdrawn; the
+  spoke asks again on its next attempt
 
 ## Open questions
 

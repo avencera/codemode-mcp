@@ -7,12 +7,17 @@ use std::{
 
 use crate::{
     admin::attach_action,
-    approvals::{Approvals, NO_APPROVAL_PAGE, NO_NOTIFIER},
+    approvals::{AdminAction, Approvals, NO_APPROVAL_PAGE, NO_NOTIFIER, Remote},
     companion::DeviceTrust,
     config::{Config, ConfigError},
     executions::Executions,
     executor::{Executor, ExecutorError},
     gateway::{Gateway, UpstreamAccess},
+    hub::{
+        Registration,
+        client::{HubClient, HubClientError},
+        server::Hub,
+    },
     mac::{Mac, OnMac},
     notify::{Notifier, Ntfy},
     oauth::OAuth,
@@ -42,6 +47,16 @@ pub enum AppError {
     /// The relying party could not be set up
     #[error(transparent)]
     Passkey(#[from] PasskeyError),
+    /// The spoke's link to its hub could not be set up
+    #[error("{0}")]
+    Hub(String),
+    /// Servers of this spoke have the names of servers its hub shares
+    #[error(
+        "servers of this spoke have the names of servers the hub shares: {}; rename them, or \
+         leave the hub's out with `[hub] exclude`",
+        .0.join(", ")
+    )]
+    HubClash(Vec<String>),
 }
 
 /// Freezes durable state when the last handle to an [`App`] goes away
@@ -95,6 +110,8 @@ pub struct App {
     passkeys: Arc<Passkeys>,
     store: Store,
     log: UsageLog,
+    /// What this machine shares with its spokes, unless it is one
+    hub: Option<Arc<Hub>>,
 }
 
 impl App {
@@ -157,6 +174,14 @@ impl App {
         let config = Arc::new(config);
         let state_dir = config.state_dir()?;
         let store = Store::open(&state_dir)?;
+        // a spoke asks its hub for every approval and secret; a one-off run
+        // of one asks nothing, like any one-off run
+        let hub_client = match (&config.hub, role) {
+            (Some(hub), Role::Daemon) => {
+                Some(HubClient::new(hub, &state_dir).map_err(AppError::Hub)?)
+            }
+            _ => None,
+        };
         let log = UsageLog::start(&state_dir, config.log_retention(), config.session_idle())?;
         let sealer = Sealer::load_or_create(&state_dir).map_err(ExecutorError::from)?;
         let passkeys = Arc::new(Passkeys::new(&config.public_origin(), store.clone())?);
@@ -182,7 +207,7 @@ impl App {
             Role::Daemon => Approved::open(&state_dir, trust.derived_key(approved::KEY_DOMAIN)),
             Role::OneOff => Approved::ungated(),
         };
-        let secrets = Secrets::new(
+        let mut secrets = Secrets::new(
             &config.secrets,
             config.path().map(Path::to_owned),
             presence,
@@ -190,6 +215,7 @@ impl App {
             trust,
             Arc::new(approved),
         );
+        secrets.onepassword = secrets.onepassword.with_hub(hub_client.clone());
         // before any upstream connects, so none asks for what the last
         // daemon already had
         // only by the daemon, which has bound its listeners by now: a one-off
@@ -218,6 +244,9 @@ impl App {
             notifier,
             on_mac.clone(),
             unavailable,
+            hub_client
+                .clone()
+                .map(|client| -> Arc<dyn Remote> { client }),
             store.clone(),
         );
 
@@ -232,8 +261,12 @@ impl App {
                 store: session_store.clone(),
                 secrets,
                 mac: screen,
+                hub: hub_client,
             },
         );
+        // only the daemon answers spokes, and a spoke has no spokes of its own
+        let hub = (role == Role::Daemon && config.hub.is_none())
+            .then(|| Hub::new(Arc::clone(&gateway), store.clone(), Arc::clone(&config)));
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),
             executor,
@@ -257,7 +290,50 @@ impl App {
             passkeys,
             store: session_store,
             log,
+            hub,
         })
+    }
+
+    /// On a spoke, registers with the hub and takes its catalog in, waiting
+    /// up to `limit`, then keeps both current in the background; a hub that
+    /// is unreachable or has not trusted this spoke yet is left to the
+    /// background, which keeps trying
+    ///
+    /// Fails when a server of this spoke has the name of one the hub
+    /// shares, since scripts could not tell them apart
+    pub async fn connect_hub(&self, limit: std::time::Duration) -> Result<(), AppError> {
+        let Some(client) = self.gateway.hub() else {
+            return Ok(());
+        };
+        let first = async {
+            match client.register().await? {
+                Registration::Trusted { .. } => {}
+                _ => return Ok(Vec::new()),
+            }
+            let catalog = client.catalog().await?;
+
+            Ok::<_, HubClientError>(self.gateway.set_hub_catalog(catalog))
+        };
+
+        let first = tokio::time::timeout(limit, first).await;
+        if !matches!(&first, Ok(Ok(clashes)) if !clashes.is_empty()) {
+            tokio::spawn(Arc::clone(client).run(Arc::downgrade(&self.gateway)));
+        }
+
+        match first {
+            Ok(Ok(clashes)) if !clashes.is_empty() => Err(AppError::HubClash(clashes)),
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "the hub is not answering yet; trying in the background");
+
+                Ok(())
+            }
+            Err(_) => {
+                tracing::warn!("the hub did not answer in time; trying in the background");
+
+                Ok(())
+            }
+        }
     }
 
     /// Picks up what the previous process left in the database: parked
@@ -272,8 +348,17 @@ impl App {
         self.executions.start_housekeeping();
 
         let approvals = self.gateway.approvals();
+        let mut trust_requests = Vec::new();
         for (waiting, action) in approvals.restore_admin_actions() {
-            attach_action(Arc::clone(&self.passkeys), waiting, action);
+            match action {
+                AdminAction::TrustSpoke { .. } => trust_requests.push((waiting, action)),
+                action => attach_action(Arc::clone(&self.passkeys), waiting, action),
+            }
+        }
+        // before the orphans go: the requests spokes asked for are held
+        // again, for the spokes that follow them
+        if let Some(hub) = &self.hub {
+            hub.restore(trust_requests);
         }
         // after the restores above: a pending request nothing took up is
         // one whose execution did not survive
@@ -395,5 +480,11 @@ impl App {
     /// Usage log
     pub fn usage(&self) -> &UsageLog {
         &self.log
+    }
+
+    /// What this machine shares with its spokes; `None` on a spoke and in a
+    /// one-off run
+    pub fn hub(&self) -> Option<&Arc<Hub>> {
+        self.hub.as_ref()
     }
 }

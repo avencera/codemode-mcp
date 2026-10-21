@@ -1,7 +1,8 @@
 //! Ties upstreams, the catalog and tool policy together
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -13,17 +14,23 @@ use monty_types::ExcType;
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
-    approvals::{Approvals, Gate, GateRequest, Waiting},
+    approvals::{Approvals, Gate, GateRequest, RemoteGate, Waiting, hex},
     budget::Budget,
-    catalog::{Catalog, ServerSnapshot, ToolEntry},
+    catalog::{Catalog, ServerSnapshot, ToolEntry, export_tools},
     companion::Companions,
-    config::Config,
+    config::{Builtin, Config, ServerConfig},
     convert::json_to_monty,
     durable::Sensitivity,
     executor::Executor,
+    hub::{
+        CallAnswer, ForwardedCall, GateAnswer, GateCall, HubCatalog, HubError, HubErrorKind,
+        HubServer,
+        client::{HubClient, HubClientError},
+    },
     logins::FillCheck,
     mac::Mac,
     oauth::OAuth,
@@ -100,6 +107,10 @@ pub enum ToolCallError {
         /// Which limit it broke
         reason: String,
     },
+    /// The hub refused or failed a call of its tool, or could not be
+    /// reached
+    #[error("{0}")]
+    Hub(#[from] HubError),
 }
 
 impl ToolCallError {
@@ -110,6 +121,13 @@ impl ToolCallError {
             Self::Denied(_) | Self::NotApproved { .. } => ExcType::PermissionError,
             Self::Upstream(UpstreamError::TimedOut { .. }) => ExcType::TimeoutError,
             Self::ResultTooLarge { .. } => ExcType::ValueError,
+            Self::Hub(error) => match error.kind {
+                HubErrorKind::Unknown => ExcType::NameError,
+                HubErrorKind::Denied => ExcType::PermissionError,
+                HubErrorKind::TimedOut => ExcType::TimeoutError,
+                HubErrorKind::TooLarge => ExcType::ValueError,
+                HubErrorKind::Failed => ExcType::RuntimeError,
+            },
             Self::Upstream(_)
             | Self::ToolFailed(_)
             | Self::MissingOutput(_)
@@ -123,6 +141,12 @@ impl ToolCallError {
             Self::Unknown(_) => Outcome::NameError,
             Self::Denied(_) | Self::NotApproved { .. } => Outcome::Denied,
             Self::Upstream(UpstreamError::TimedOut { .. }) => Outcome::Timeout,
+            Self::Hub(error) => match error.kind {
+                HubErrorKind::Unknown => Outcome::NameError,
+                HubErrorKind::Denied => Outcome::Denied,
+                HubErrorKind::TimedOut => Outcome::Timeout,
+                HubErrorKind::TooLarge | HubErrorKind::Failed => Outcome::ToolError,
+            },
             Self::OutputMismatch { .. } => Outcome::OutputMismatch,
             Self::Upstream(_)
             | Self::ToolFailed(_)
@@ -148,6 +172,14 @@ pub struct PreparedCall {
     pub sensitive: bool,
     arguments: Map<String, Value>,
     output: OutputSpec,
+    /// On a spoke, the hub's request the owner approves this call of the
+    /// hub's tool with; the hub runs the call it holds with that request
+    #[serde(default)]
+    hub_request: Option<String>,
+    /// On a spoke, whether the tool is the hub's; kept with a parked call,
+    /// since after a restart its verdict can come before the hub's catalog
+    #[serde(default)]
+    on_hub: bool,
 }
 
 /// How a call proceeds after [`Gateway::prepare`]
@@ -230,6 +262,101 @@ pub struct Gateway {
     fill_check: FillCheck,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
+    /// The hub, on a spoke
+    hub: Option<Arc<HubClient>>,
+    /// On a spoke, the hub's servers it calls through the hub
+    hub_view: RwLock<Arc<HubView>>,
+    /// On a hub, the servers its spokes may call, as of the last rebuild
+    exported: RwLock<Arc<HubCatalog>>,
+}
+
+/// The hub's servers as a spoke has them: what the hub listed, and a config
+/// for each that gives the catalog the hub's policies
+#[derive(Default)]
+struct HubView {
+    /// The version of the hub's catalog this was made from
+    version: Option<String>,
+    servers: Vec<HubServer>,
+    configs: BTreeMap<String, ServerConfig>,
+}
+
+impl HubView {
+    fn snapshots(&self) -> impl Iterator<Item = ServerSnapshot> + '_ {
+        self.servers.iter().map(|server| ServerSnapshot {
+            name: server.name.clone(),
+            tools: server
+                .tools
+                .iter()
+                .map(|exported| {
+                    let mut tool = exported.tool.clone();
+                    if let OutputSpec::Schema(schema) = &exported.output {
+                        tool.output_schema = Some(Arc::clone(schema));
+                    }
+
+                    tool
+                })
+                .collect(),
+            instructions: server.instructions.clone(),
+            available: server.available,
+        })
+    }
+
+    fn server(&self, name: &str) -> Option<&HubServer> {
+        self.servers.iter().find(|server| server.name == name)
+    }
+}
+
+/// A config for the hub's server that the catalog reads as the hub does:
+/// each tool's policy, grant and output, the server's aliases and
+/// sensitivity
+/// A failed exchange with the hub as a script sees it: a timeout keeps its
+/// kind, so `except TimeoutError` catches it as it would a local one
+fn hub_unreachable(error: &HubClientError) -> HubError {
+    HubError {
+        kind: match error {
+            HubClientError::TimedOut(_) => HubErrorKind::TimedOut,
+            _ => HubErrorKind::Failed,
+        },
+        message: error.to_string(),
+    }
+}
+
+fn hub_server_config(server: &HubServer) -> Result<ServerConfig, String> {
+    let mut tools = toml::Table::new();
+    for exported in &server.tools {
+        let mut setting = toml::Table::new();
+        let policy = toml::Value::try_from(exported.policy).map_err(|error| error.to_string())?;
+        setting.insert("policy".to_owned(), policy);
+        setting.insert(
+            "grant".to_owned(),
+            toml::Value::String(exported.grant.as_str().to_owned()),
+        );
+        if let OutputSpec::Text = exported.output {
+            setting.insert("output".to_owned(), toml::Value::String("text".to_owned()));
+        }
+        tools.insert(exported.tool.name.to_string(), toml::Value::Table(setting));
+    }
+    let mut table = toml::Table::new();
+    table.insert(
+        "sensitive".to_owned(),
+        toml::Value::Boolean(server.sensitive),
+    );
+    table.insert(
+        "aliases".to_owned(),
+        toml::Value::Array(
+            server
+                .aliases
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    table.insert("tools".to_owned(), toml::Value::Table(tools));
+
+    toml::Value::Table(table)
+        .try_into()
+        .map_err(|error: toml::de::Error| error.to_string())
 }
 
 struct Published {
@@ -247,6 +374,8 @@ pub struct UpstreamAccess {
     pub secrets: Secrets,
     /// The Mac the `logins` server types on
     pub mac: Option<Arc<dyn Mac>>,
+    /// The hub whose servers this spoke also offers
+    pub hub: Option<Arc<HubClient>>,
 }
 
 impl Gateway {
@@ -265,6 +394,7 @@ impl Gateway {
             store,
             secrets,
             mac,
+            hub,
         } = access;
         let fill_check = FillCheck::new(secrets.onepassword.clone(), mac.clone());
         let builtins = Builtins { mac };
@@ -297,6 +427,9 @@ impl Gateway {
             log,
             oauth,
             rebuild_task: RwLock::new(None),
+            hub,
+            hub_view: RwLock::new(Arc::default()),
+            exported: RwLock::new(Arc::default()),
         });
 
         // the task holds only a weak reference so dropping the gateway stops it
@@ -337,6 +470,82 @@ impl Gateway {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         Arc::clone(&guard.catalog)
+    }
+
+    /// The hub this spoke uses, if it is one
+    pub fn hub(&self) -> Option<&Arc<HubClient>> {
+        self.hub.as_ref()
+    }
+
+    /// The servers this hub's spokes may call
+    pub fn hub_catalog(&self) -> Arc<HubCatalog> {
+        Arc::clone(
+            &self
+                .exported
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Takes the hub's catalog in, keeping the servers `[hub]` lets through,
+    /// and rebuilds; returns the hub servers left out because a server of
+    /// this spoke has the same name
+    pub fn set_hub_catalog(&self, catalog: HubCatalog) -> Vec<String> {
+        // the stubs of an unchanged catalog need no second type check
+        if self.hub_view().version.as_deref() == Some(catalog.version.as_str()) {
+            return Vec::new();
+        }
+        let mut clashes = Vec::new();
+        let mut view = HubView {
+            version: Some(catalog.version),
+            ..HubView::default()
+        };
+        for server in catalog.servers {
+            let included = self
+                .hub
+                .as_ref()
+                .is_some_and(|hub| hub.includes(&server.name));
+            if !included {
+                continue;
+            }
+            if self.config.servers.contains_key(&server.name) {
+                clashes.push(server.name);
+                continue;
+            }
+            match hub_server_config(&server) {
+                Ok(config) => {
+                    view.configs.insert(server.name.clone(), config);
+                    view.servers.push(server);
+                }
+                Err(error) => {
+                    tracing::warn!(server = %server.name, %error, "left out a hub server");
+                }
+            }
+        }
+        if !clashes.is_empty() {
+            tracing::error!(
+                ?clashes,
+                "servers of this spoke have the names of hub servers, which are left out; \
+                 rename them"
+            );
+        }
+
+        *self
+            .hub_view
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(view);
+        self.upstreams.changed().notify_one();
+
+        clashes
+    }
+
+    fn hub_view(&self) -> Arc<HubView> {
+        Arc::clone(
+            &self
+                .hub_view
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Waits for the first connection attempts to finish and the catalog to
@@ -481,11 +690,31 @@ impl Gateway {
         arguments: Map<String, Value>,
         prior: Sensitivity,
     ) -> Result<Plan, ToolCallError> {
+        self.prepare_with(context, function, arguments, prior, None)
+            .await
+    }
+
+    /// [`Gateway::prepare`] for a call a spoke passed on; `preapproved` is
+    /// the request of this hub the owner already approved for the call,
+    /// which stands in for asking again
+    pub async fn prepare_with(
+        &self,
+        context: &CallContext,
+        function: &str,
+        arguments: Map<String, Value>,
+        prior: Sensitivity,
+        preapproved: Option<String>,
+    ) -> Result<Plan, ToolCallError> {
         let entry = context
             .catalog
             .get(function)
             .ok_or_else(|| ToolCallError::Unknown(function.to_owned()))?;
-        let server_config = self.config.servers.get(&entry.server);
+        let hub = self.hub_view();
+        let server_config = self
+            .config
+            .servers
+            .get(&entry.server)
+            .or_else(|| hub.configs.get(&entry.server));
         let mut call = PreparedCall {
             function: function.to_owned(),
             server: entry.server.clone(),
@@ -493,9 +722,27 @@ impl Gateway {
             sensitive: server_config.is_some_and(|server| server.is_sensitive()),
             arguments: omit_none_arguments(entry, arguments),
             output: entry.output.clone(),
+            hub_request: None,
+            on_hub: false,
         };
         if entry.policy == Policy::Deny {
             return Err(self.refuse(context, &call, ToolCallError::Denied(function.to_owned())));
+        }
+        if let (Some(server), Some(client)) = (hub.server(&entry.server), &self.hub) {
+            call.on_hub = true;
+            let grant_mode = server_config.map(|config| config.grant_for(&entry.tool));
+
+            return self
+                .prepare_on_hub(
+                    context,
+                    call,
+                    entry.policy,
+                    server.available,
+                    grant_mode.unwrap_or_default(),
+                    prior,
+                    client,
+                )
+                .await;
         }
 
         let upstream = self
@@ -536,19 +783,28 @@ impl Gateway {
                 approval_id: None,
             });
         }
+        if let Some(approval_id) = preapproved {
+            return Ok(Plan::Run {
+                call,
+                approval_id: Some(approval_id),
+            });
+        }
 
         let grant_mode = server_config.map(|server| server.grant_for(&entry.tool));
-        let gate = self.approvals.gate(GateRequest {
-            caller: &context.caller,
-            execution_id: &context.execution_id,
-            server: &call.server,
-            tool: &call.tool,
-            arguments: &call.arguments,
-            script: &context.script,
-            grant_mode: grant_mode.unwrap_or_default(),
-            sensitivity: Sensitivity::of(call.sensitive).or(prior),
-            summary: summary.as_deref(),
-        });
+        let gate = self
+            .approvals
+            .gate(GateRequest {
+                caller: &context.caller,
+                execution_id: &context.execution_id,
+                server: &call.server,
+                tool: &call.tool,
+                arguments: &call.arguments,
+                script: &context.script,
+                grant_mode: grant_mode.unwrap_or_default(),
+                sensitivity: Sensitivity::of(call.sensitive).or(prior),
+                summary: summary.as_deref(),
+            })
+            .await;
 
         match gate {
             Gate::Open { approval_id } => Ok(Plan::Run {
@@ -564,6 +820,106 @@ impl Gateway {
 
                 Err(self.refuse(context, &call, error))
             }
+            // a spoke's hub did not answer: a failure, not a refusal, and a
+            // timeout stays one for the script
+            Gate::Unreachable(unreachable) => {
+                let error = HubError {
+                    kind: if unreachable.timed_out {
+                        HubErrorKind::TimedOut
+                    } else {
+                        HubErrorKind::Failed
+                    },
+                    message: unreachable.reason,
+                };
+
+                Err(self.refuse(context, &call, error.into()))
+            }
+        }
+    }
+
+    /// [`Gateway::prepare`] for a tool of the hub, on a spoke: an `ask` tool
+    /// is put to the hub, which decides it with its own policy and grants,
+    /// and a pending request is followed here so the execution parks on it
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_on_hub(
+        &self,
+        context: &CallContext,
+        mut call: PreparedCall,
+        policy: Policy,
+        available: bool,
+        grant_mode: crate::policy::GrantMode,
+        prior: Sensitivity,
+        hub: &HubClient,
+    ) -> Result<Plan, ToolCallError> {
+        if !available {
+            let error = HubError {
+                kind: HubErrorKind::Failed,
+                message: format!(
+                    "the hub's server `{}` is not connected on the hub right now",
+                    call.server
+                ),
+            };
+
+            return Err(self.refuse(context, &call, error.into()));
+        }
+        if policy != Policy::Ask {
+            return Ok(Plan::Run {
+                call,
+                approval_id: None,
+            });
+        }
+
+        let sensitivity = Sensitivity::of(call.sensitive).or(prior);
+        let asked = hub
+            .gate(&GateCall {
+                caller: context.caller.clone(),
+                execution_id: context.execution_id.to_string(),
+                script: context.script.to_string(),
+                server: call.server.clone(),
+                tool: call.tool.clone(),
+                arguments: call.arguments.clone(),
+                hub_tool: true,
+                grant_mode,
+                sensitive: sensitivity.is_sensitive(),
+                summary: None,
+            })
+            .await;
+
+        match asked {
+            Ok(GateAnswer::Gate(RemoteGate::Open { approval_id })) => Ok(Plan::Run {
+                call,
+                approval_id: Some(approval_id).filter(|id| !id.is_empty()),
+            }),
+            Ok(GateAnswer::Gate(RemoteGate::Wait { id, expires_ms })) => {
+                let waiting = self.approvals.follow(
+                    &GateRequest {
+                        caller: &context.caller,
+                        execution_id: &context.execution_id,
+                        server: &call.server,
+                        tool: &call.tool,
+                        arguments: &call.arguments,
+                        script: &context.script,
+                        grant_mode,
+                        sensitivity,
+                        summary: None,
+                    },
+                    id.clone(),
+                    expires_ms,
+                );
+                call.hub_request = Some(id);
+
+                Ok(Plan::Gated { call, waiting })
+            }
+            Ok(GateAnswer::Gate(RemoteGate::Closed { reason })) => {
+                let error = ToolCallError::NotApproved {
+                    tool: call.function.clone(),
+                    reason,
+                };
+
+                Err(self.refuse(context, &call, error))
+            }
+            Ok(GateAnswer::Refused(error)) => Err(self.refuse(context, &call, error.into())),
+            Err(error) => Err(self.refuse(context, &call, hub_unreachable(&error).into())),
         }
     }
 
@@ -597,7 +953,23 @@ impl Gateway {
         approval_id: Option<String>,
     ) -> Result<monty_types::MontyObject, ToolCallError> {
         let started = std::time::Instant::now();
-        let result = self.invoke_unlogged(&call).await;
+        let result = self.invoke_unlogged(context, &call).await;
+        let logged = result.as_ref().map(|_| ());
+        self.record(context, &call, &logged, started.elapsed(), approval_id);
+
+        result
+    }
+
+    /// Runs a prepared call like [`Gateway::invoke`], for a spoke: the
+    /// result stays JSON, checked against the tool's output
+    pub async fn invoke_value(
+        &self,
+        context: &CallContext,
+        call: PreparedCall,
+        approval_id: Option<String>,
+    ) -> Result<Value, ToolCallError> {
+        let started = std::time::Instant::now();
+        let result = self.value_unlogged(context, &call).await;
         let logged = result.as_ref().map(|_| ());
         self.record(context, &call, &logged, started.elapsed(), approval_id);
 
@@ -606,8 +978,60 @@ impl Gateway {
 
     async fn invoke_unlogged(
         &self,
+        context: &CallContext,
         call: &PreparedCall,
     ) -> Result<monty_types::MontyObject, ToolCallError> {
+        let value = self.value_unlogged(context, call).await?;
+
+        json_to_monty(&value, self.max_tool_result_bytes).map_err(|error| {
+            ToolCallError::ResultTooLarge {
+                tool: call.function.clone(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// The result of a prepared call, checked against its output
+    async fn value_unlogged(
+        &self,
+        context: &CallContext,
+        call: &PreparedCall,
+    ) -> Result<Value, ToolCallError> {
+        if call.on_hub {
+            let Some(hub) = &self.hub else {
+                return Err(ToolCallError::Hub(HubError {
+                    kind: HubErrorKind::Failed,
+                    message: format!(
+                        "`{}` is a tool of the hub, and this machine no longer has one",
+                        call.function
+                    ),
+                }));
+            };
+            let forwarded = ForwardedCall {
+                caller: context.caller.clone(),
+                execution_id: context.execution_id.to_string(),
+                script: context.script.to_string(),
+                server: call.server.clone(),
+                tool: call.tool.clone(),
+                arguments: call.arguments.clone(),
+                approval: call.hub_request.clone(),
+                sensitive: call.sensitive,
+            };
+            let answer = hub
+                .call(&forwarded, self.config.tool_timeout())
+                .await
+                .map_err(|error| hub_unreachable(&error))?;
+            let value = match answer {
+                CallAnswer::Value(value) => value,
+                CallAnswer::Error(error) => return Err(error.into()),
+            };
+            // the hub checked it against the same schema; this spoke's
+            // scripts rely on the check, so it is not taken on trust
+            self.check_output(call, &value)?;
+
+            return Ok(value);
+        }
+
         let upstream = self
             .upstreams
             .get(&call.server)
@@ -623,19 +1047,20 @@ impl Gateway {
                 error => ToolCallError::Upstream(error),
             })?;
         let value = self.tool_result_value(call, result)?;
+        self.check_output(call, &value)?;
+
+        Ok(value)
+    }
+
+    fn check_output(&self, call: &PreparedCall, value: &Value) -> Result<(), ToolCallError> {
         if let OutputSpec::Schema(schema) = &call.output {
-            validate(schema, &value).map_err(|mismatch| ToolCallError::OutputMismatch {
+            validate(schema, value).map_err(|mismatch| ToolCallError::OutputMismatch {
                 tool: call.function.clone(),
                 mismatch,
             })?;
         }
 
-        json_to_monty(&value, self.max_tool_result_bytes).map_err(|error| {
-            ToolCallError::ResultTooLarge {
-                tool: call.function.clone(),
-                reason: error.to_string(),
-            }
-        })
+        Ok(())
     }
 
     fn record(
@@ -737,10 +1162,45 @@ impl Gateway {
 
     /// Rebuilds the catalog from the current upstream state, returning false
     /// when stub validation could not run and the previous catalog was kept
+    /// Keeps what this hub's spokes get of `snapshots`: every server but
+    /// the `secrets` builtin, which writes on the machine that runs it, so
+    /// each spoke has its own
+    fn export(&self, snapshots: &[ServerSnapshot]) {
+        let servers: Vec<HubServer> = snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                let server = self.config.servers.get(&snapshot.name);
+                if server.is_some_and(|server| server.builtin == Some(Builtin::Secrets)) {
+                    return None;
+                }
+
+                Some(HubServer {
+                    name: snapshot.name.clone(),
+                    instructions: snapshot.instructions.clone(),
+                    available: snapshot.available,
+                    sensitive: server.is_some_and(ServerConfig::is_sensitive),
+                    aliases: server
+                        .map(|server| server.aliases.clone())
+                        .unwrap_or_default(),
+                    tools: export_tools(&self.config, snapshot),
+                })
+            })
+            .collect();
+        let version = hex(&Sha256::digest(
+            serde_json::to_vec(&servers).unwrap_or_default(),
+        ));
+
+        *self
+            .exported
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(HubCatalog { version, servers });
+    }
+
     async fn rebuild(&self) -> bool {
         let _turn = self.rebuild_turn.lock().await;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let snapshots: Vec<ServerSnapshot> = self
+        let mut snapshots: Vec<ServerSnapshot> = self
             .upstreams
             .all()
             .iter()
@@ -751,9 +1211,27 @@ impl Gateway {
                 available: upstream.callable(),
             })
             .collect();
+        // a hub shares its own servers once they pass the type check below,
+        // so spokes never list a tool the hub's catalog does not have yet; a
+        // spoke shares nothing
+        let local = self.hub.is_none().then(|| snapshots.clone());
+        let hub = self.hub_view();
+        snapshots.extend(hub.snapshots());
+        let config = if hub.configs.is_empty() {
+            Cow::Borrowed(&*self.config)
+        } else {
+            let mut merged = (*self.config).clone();
+            merged.servers.extend(
+                hub.configs
+                    .iter()
+                    .map(|(name, config)| (name.clone(), config.clone())),
+            );
+
+            Cow::Owned(merged)
+        };
 
         let started = std::time::Instant::now();
-        let mut catalog = Catalog::build(&self.config, &snapshots, &HashSet::new());
+        let mut catalog = Catalog::build(&config, &snapshots, &HashSet::new());
         let built = started.elapsed();
         let rejected = match self.executor.rejected_stubs(&catalog).await {
             Ok(rejected) => rejected,
@@ -771,7 +1249,7 @@ impl Gateway {
                 ?rejected,
                 "type checker rejected generated stubs; using permissive signatures"
             );
-            catalog = Catalog::build(&self.config, &snapshots, &rejected);
+            catalog = Catalog::build(&config, &snapshots, &rejected);
         }
 
         tracing::info!(
@@ -791,6 +1269,10 @@ impl Gateway {
                 generation,
                 catalog: Arc::new(catalog),
             };
+            drop(slot);
+            if let Some(local) = local {
+                self.export(&local);
+            }
         }
 
         true
