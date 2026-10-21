@@ -355,7 +355,17 @@ async fn wait_for_state(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     for _ in 0..100 {
         let upstream = health_of(harness, server).await?;
-        if upstream["state"] == state {
+        // the catalog is rebuilt after the state flips, and a script that
+        // runs before then cannot name the server's tools
+        let listed = state != "connected"
+            || harness
+                .app
+                .gateway()
+                .catalog()
+                .entries()
+                .iter()
+                .any(|entry| entry.server == server);
+        if upstream["state"] == state && listed {
             return Ok(upstream);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
