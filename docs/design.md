@@ -843,7 +843,10 @@ spokes as hub tools.
   used, so it runs once even across restarts. When a restart lost the held call, the stored request stands in
   only for the same spoke, server, tool and arguments (a digest kept on the row), before its deadline; a
   sensitive request keeps no digest and is asked again. Only exported tools resolve, so a spoke cannot reach
-  a `deny` tool or the hub's `secrets` builtin. The hub's tokens and policy never reach the spoke, which does
+  a `deny` tool or the hub's `secrets` builtin, and a spoke cannot set an argument the hub's config fixes. A
+  call the hub holds sensitive is refused to a spoke that does not, until the spoke has the new catalog, so
+  its result never lands on the spoke's disk by mistake. A timeout talking to the hub raises the same
+  `TimeoutError` a local one does. The hub's tokens and policy never reach the spoke, which does
   not gate hub tools again; it checks results against the output once more
 - Approvals of a spoke's own `ask` tools: `gate` with `hub_tool = false` runs the hub's approval path with the
   spoke's caller, so prompts read `<spoke> · <client> · <thread>` and links point at the hub's approval page.
@@ -851,10 +854,12 @@ spokes as hub tools.
   approval with the hub's. Client grants live on the hub, keyed by spoke id and client; session grants by a
   hash of the spoke id and session, and the hub files a spoke's executions under the spoke's id, so a request
   never joins another caller's batch. Both copies of a request are in the databases (sensitive ones excepted): after a restart the spoke
-  follows its copies again and the hub restores the requests spokes asked
+  follows its copies again and the hub restores the requests spokes asked. Only the hub's verdict settles a
+  spoke's copy; the spoke's own approval page refuses it, even with a passkey enrolled there
 - 1Password values: `write_env`, `find_references` and `op inject`/`run`/`read`/`find` run on the spoke, and the
   value is read and approved on the hub (`op/read`, `op/find`), whose prompts show the destination as
-  `<spoke>:<path>`; values a program asked to keep are kept per spoke id, so two spokes with one name never
+  `<spoke>:<path>`, and every search prompt quotes the reason as `<spoke>: <reason>`, since a Mac or
+  companion search prompt names only where it searches; values a program asked to keep are kept per spoke id, so two spokes with one name never
   share them. `{{ op://... }}` references in a spoke's own server config go to `op/config`; the owner
   approves them once per spoke, server, destination digest and reference set, and the hub remembers it. A
   server that starts before its spoke is trusted waits for the trust (up to 10 minutes) rather than failing into

@@ -85,6 +85,9 @@ pub enum HubClientError {
         /// What went wrong
         reason: String,
     },
+    /// The hub did not answer in time
+    #[error("the hub did not answer within {0:?}")]
+    TimedOut(Duration),
     /// The hub has not trusted this spoke, or no longer does
     #[error("the hub has not trusted this machine yet; the owner is asked when it registers")]
     Untrusted,
@@ -163,16 +166,23 @@ impl HubClient {
         request: reqwest::RequestBuilder,
         timeout: Duration,
     ) -> Result<R, HubClientError> {
-        let unreachable = |reason: String| HubClientError::Unreachable {
-            base: self.base.clone(),
-            reason,
+        // a timeout keeps its kind, so a script's timeout handling sees it
+        let unreachable = |error: reqwest::Error| {
+            if error.is_timeout() {
+                HubClientError::TimedOut(timeout)
+            } else {
+                HubClientError::Unreachable {
+                    base: self.base.clone(),
+                    reason: error.to_string(),
+                }
+            }
         };
         let response = request
             .header(SPOKE_HEADER, &self.machine.id)
             .timeout(timeout)
             .send()
             .await
-            .map_err(|error| unreachable(error.to_string()))?;
+            .map_err(unreachable)?;
         self.saw_catalog(
             response
                 .headers()
@@ -182,10 +192,7 @@ impl HubClient {
 
         let status = response.status();
         if status.is_success() {
-            return response
-                .json()
-                .await
-                .map_err(|error| unreachable(error.to_string()));
+            return response.json().await.map_err(unreachable);
         }
         let reason = response
             .json::<Refusal>()

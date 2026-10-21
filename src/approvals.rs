@@ -518,6 +518,10 @@ pub enum DecideError {
     /// this machine
     #[error("this request can only be approved once")]
     GrantNotAllowed,
+    /// The request is a spoke's copy of one its hub decides; only the hub's
+    /// verdict settles it
+    #[error("this request is decided on the hub")]
+    DecidedOnHub,
 }
 
 struct Pending {
@@ -1636,6 +1640,12 @@ impl Approvals {
     /// client or session for grantable tools of the same server
     pub fn decide(&self, id: &str, choice: Choice) -> Result<(), DecideError> {
         let info = self.info(id).ok_or(DecideError::NotFound)?;
+        // a spoke's tool requests are copies of the hub's, followed until
+        // the hub decides; a passkey enrolled on the spoke must not answer
+        // them here
+        if self.remote.is_some() && matches!(info.kind, ApprovalKind::ToolCall) {
+            return Err(DecideError::DecidedOnHub);
+        }
         self.close_batch(&info);
         let others: Vec<String> = self
             .batch(id)

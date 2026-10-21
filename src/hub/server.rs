@@ -288,35 +288,44 @@ impl Hub {
             };
         }
 
-        {
-            let mut state = self.state();
-            if let Some(open) = state.trust_requests.get(&id) {
-                return match &open.denied {
-                    Some(reason) => {
-                        let reason = reason.clone();
-                        state.trust_requests.remove(&id);
-
-                        Registration::Denied { reason }
-                    }
-                    None => Registration::Pending {
-                        url: open.url.clone(),
-                        code: open.code.clone(),
-                    },
-                };
-            }
-            // one open question per tailnet node, so a peer making up ids
-            // cannot pile prompts on the owner. The other id's link and code
-            // stay with it: this one waits its turn with neither
-            let busy = state
-                .trust_requests
-                .values()
-                .any(|open| open.address == address && open.denied.is_none());
-            if busy {
+        // every check and the new request happen under one lock, so two
+        // registrations at once cannot both pass the one-per-address limit
+        let mut state = self.state();
+        if let Some(open) = state.trust_requests.get(&id) {
+            // the link and code belong to the address that asked; a copied
+            // id elsewhere waits with neither
+            if open.address != address {
                 return Registration::Pending {
                     url: String::new(),
                     code: String::new(),
                 };
             }
+
+            return match &open.denied {
+                Some(reason) => {
+                    let reason = reason.clone();
+                    state.trust_requests.remove(&id);
+
+                    Registration::Denied { reason }
+                }
+                None => Registration::Pending {
+                    url: open.url.clone(),
+                    code: open.code.clone(),
+                },
+            };
+        }
+        // one open question per tailnet node, so a peer making up ids
+        // cannot pile prompts on the owner. The other id's link and code
+        // stay with it: this one waits its turn with neither
+        let busy = state
+            .trust_requests
+            .values()
+            .any(|open| open.address == address && open.denied.is_none());
+        if busy {
+            return Registration::Pending {
+                url: String::new(),
+                code: String::new(),
+            };
         }
 
         let code = confirmation_code();
@@ -326,7 +335,7 @@ impl Hub {
         details.insert("version".to_owned(), Value::String(version.clone()));
         // a trusted id at another address is asked about again, naming
         // where the owner trusted it before
-        let moved = self.state().trusted.get(&id).map(|known| {
+        let moved = state.trusted.get(&id).map(|known| {
             format!(
                 " It was trusted as “{}” at {}",
                 known.name,
@@ -351,15 +360,16 @@ impl Hub {
         });
         let url = waiting.url().to_owned();
         tracing::info!(spoke = %name, %code, "a spoke asked to be trusted");
-        self.state().trust_requests.insert(
+        state.trust_requests.insert(
             id,
             TrustRequest {
                 url: url.clone(),
                 code: code.clone(),
-                address: address.clone(),
+                address,
                 denied: None,
             },
         );
+        drop(state);
         self.attach_trust(waiting, action);
 
         Registration::Pending { url, code }
@@ -397,6 +407,29 @@ impl Hub {
             caller,
             script: Arc::from(script),
         }
+    }
+
+    /// Refuses arguments that set what the hub's config fixes for `server`:
+    /// they are hidden from stubs, so only a spoke sending its own JSON can
+    /// set them, and the upstream would take its value over the hub's
+    fn fixed_override(
+        &self,
+        function: &str,
+        server: &str,
+        arguments: &Map<String, Value>,
+    ) -> Option<HubError> {
+        let fixed = self
+            .config
+            .servers
+            .get(server)?
+            .arguments
+            .keys()
+            .find(|name| arguments.contains_key(*name))?;
+
+        Some(HubError {
+            kind: HubErrorKind::Denied,
+            message: format!("`{function}` cannot set `{fixed}`, which the hub fixes"),
+        })
     }
 
     /// The function of a tool the hub shares with spokes; `None` for one it
@@ -452,6 +485,9 @@ impl Hub {
         let Some(function) = self.exported(&context, &call.server, &call.tool) else {
             return GateAnswer::Refused(unknown(&call.server, &call.tool));
         };
+        if let Some(error) = self.fixed_override(&function, &call.server, &call.arguments) {
+            return GateAnswer::Refused(error);
+        }
         let digest = arguments_digest(&call.arguments);
         let plan = self
             .gateway
@@ -539,6 +575,10 @@ impl Hub {
         let Some(function) = self.exported(&context, &call.server, &call.tool) else {
             return CallAnswer::Error(unknown(&call.server, &call.tool));
         };
+        if let Some(error) = self.fixed_override(&function, &call.server, &call.arguments) {
+            return CallAnswer::Error(error);
+        }
+        let spoke_sensitive = call.sensitive;
         let refused = |message: &str| {
             CallAnswer::Error(HubError {
                 kind: HubErrorKind::Denied,
@@ -610,6 +650,15 @@ impl Hub {
                 }
             }
         };
+
+        // a spoke on an older catalog would keep a now sensitive result on
+        // its disk; it refetches on this answer's catalog version
+        if prepared.sensitive && !spoke_sensitive {
+            return refused(
+                "is sensitive on the hub now; run it again once this machine has the hub's new \
+                 catalog",
+            );
+        }
 
         match self
             .gateway
@@ -783,6 +832,16 @@ fn unknown(server: &str, tool: &str) -> HubError {
     }
 }
 
+/// A spoke program's reason as every prompt quotes it, naming the spoke:
+/// a search prompt on a Mac or companion names only the place it searches,
+/// and the reason is all that reaches it
+fn spoke_reason(spoke: &StoredSpoke, reason: Option<String>) -> String {
+    match reason {
+        Some(reason) => format!("{}: {reason}", spoke.name),
+        None => format!("a program on {}", spoke.name),
+    }
+}
+
 /// Where a spoke's program values go, as the hub's prompts show it
 fn destination_on(spoke: &StoredSpoke, destination: Option<String>) -> String {
     match destination {
@@ -922,7 +981,7 @@ async fn op_read(
         .onepassword
         .read_for_program(&ProgramAsk {
             targets: request.targets,
-            reason: request.reason,
+            reason: Some(spoke_reason(&spoke, request.reason)),
             destination: Some(destination_on(&spoke, request.destination)),
             keep: request.keep_secs.map(Duration::from_secs),
             phones_only: read.phones_only,
@@ -938,10 +997,7 @@ async fn op_find(
     Extension(spoke): Extension<StoredSpoke>,
     Json(find): Json<OpFindRequest>,
 ) -> Response {
-    let reason = Some(match find.reason {
-        Some(reason) => format!("{}: {reason}", spoke.name),
-        None => format!("a program on {}", spoke.name),
-    });
+    let reason = Some(spoke_reason(&spoke, find.reason));
     let answer = hub
         .gateway
         .secrets()

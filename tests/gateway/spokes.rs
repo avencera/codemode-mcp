@@ -218,6 +218,12 @@ async fn a_spoke_uses_the_hubs_sign_ins_approvals_and_secrets() -> TestResult {
     let link = pending["approval_url"].as_str().unwrap_or_default();
     assert!(link.starts_with(ORIGIN), "the hub's page: {pending}");
     let id = approval_id(&pending)?;
+    // a passkey enrolled on the spoke cannot answer the hub's request
+    let mut spoke_passkey = spoke.enroll_passkey().await?;
+    let (status, refused) = spoke
+        .approve_with_passkey(&mut spoke_passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 409, "{refused}");
     // asked at the hub Mac first, naming the spoke and its client
     let asker = format!("{name} · harness-client");
     let prompt = hub_mac
@@ -275,7 +281,8 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
     let Some(hub) = Harness::with(Setup {
         notify: true,
         mac: Some(Arc::clone(&hub_mac)),
-        server: "tools.add.policy = \"ask\"\nsensitive = false",
+        server: "tools.add.policy = \"ask\"\nsensitive = false\n\
+                 arguments = { account = \"acct-1\" }",
         ..Setup::default()
     })
     .await?
@@ -397,6 +404,7 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
         tool: "add".to_owned(),
         arguments: arguments(b),
         approval: Some(hub_call.clone()),
+        sensitive: false,
     };
     let swapped: CallAnswer = post_as_spoke(&hub, &spoke_id, "/call", &forwarded(100)).await?;
     assert!(
@@ -412,6 +420,22 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
     assert!(
         matches!(&again, CallAnswer::Error(error) if error.kind == HubErrorKind::Denied),
         "{again:?}"
+    );
+
+    // an argument the hub fixes is the hub's, whatever a spoke sends
+    let overriding = ForwardedCall {
+        tool: "whoami".to_owned(),
+        arguments: json!({ "account": "acct-2" })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        approval: None,
+        ..forwarded(0)
+    };
+    let overridden: CallAnswer = post_as_spoke(&hub, &spoke_id, "/call", &overriding).await?;
+    assert!(
+        matches!(&overridden, CallAnswer::Error(error) if error.kind == HubErrorKind::Denied),
+        "{overridden:?}"
     );
 
     spoke.stop().await?;

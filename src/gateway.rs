@@ -28,7 +28,8 @@ use crate::{
     executor::Executor,
     hub::{
         CallAnswer, ForwardedCall, GateAnswer, GateCall, HubCatalog, HubError, HubErrorKind,
-        HubServer, client::HubClient,
+        HubServer,
+        client::{HubClient, HubClientError},
     },
     logins::FillCheck,
     mac::Mac,
@@ -922,12 +923,16 @@ impl Gateway {
                 tool: call.tool.clone(),
                 arguments: call.arguments.clone(),
                 approval: call.hub_request.clone(),
+                sensitive: call.sensitive,
             };
             let answer = hub
                 .call(&forwarded, self.config.tool_timeout())
                 .await
                 .map_err(|error| HubError {
-                    kind: HubErrorKind::Failed,
+                    kind: match error {
+                        HubClientError::TimedOut(_) => HubErrorKind::TimedOut,
+                        _ => HubErrorKind::Failed,
+                    },
                     message: error.to_string(),
                 })?;
             let value = match answer {

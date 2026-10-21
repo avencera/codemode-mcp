@@ -216,6 +216,7 @@ fn decide_error(error: &DecideError) -> Response {
     let status = match error {
         DecideError::NotFound => StatusCode::GONE,
         DecideError::GrantNotAllowed => StatusCode::BAD_REQUEST,
+        DecideError::DecidedOnHub => StatusCode::CONFLICT,
     };
 
     json_error(status, &error.to_string())

@@ -148,6 +148,10 @@ pub struct ForwardedCall {
     pub arguments: Map<String, Value>,
     /// The hub's request the owner approved, for an `ask` tool
     pub approval: Option<String>,
+    /// Whether the spoke keeps the result off its disk and out of its logs;
+    /// the hub refuses a call it holds sensitive that the spoke does not
+    #[serde(default)]
+    pub sensitive: bool,
 }
 
 /// Answer of `POST /hub/v1/call`
