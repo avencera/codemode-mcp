@@ -1,0 +1,53 @@
+# Build and test on Linux, where spokes run
+#
+# Releases stay macOS-only (release.yml); spokes build from source, so this
+# keeps the Linux build and the gateway tests working on every push
+
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # monty 1.1.0 needs a newer std than the runner image's toolchain
+      - name: Update Rust
+        run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # the gateway tests run scripts in the Monty worker the lock file pins,
+      # and fail rather than skip without it
+      - name: Monty worker version
+        id: monty
+        run: |
+          version="$(awk '/^name = "monty-pool"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
+          : "${version:?monty-pool is not in Cargo.lock}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: monty-cache
+        with:
+          path: .tools
+          key: monty-${{ runner.os }}-${{ steps.monty.outputs.version }}
+      - name: Install the Monty worker
+        if: steps.monty-cache.outputs.cache-hit != 'true'
+        env:
+          VERSION: ${{ steps.monty.outputs.version }}
+        run: cargo install monty-runtime --version "=$VERSION" --locked --root .tools
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
