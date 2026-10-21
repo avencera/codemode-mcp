@@ -61,10 +61,16 @@ pub struct StoredApproval {
     pub unnotified: bool,
     /// Execution waiting on it
     pub execution_id: Option<String>,
+    /// Id of the spoke that asked, on a hub
+    pub spoke: Option<String>,
+    /// Server name
+    pub server: String,
+    /// Upstream tool name or admin action name
+    pub tool: String,
 }
 
 const COLUMNS: &str = "id, created_ms, expires_ms, decision, approved_by, sensitive, payload, \
-                       action, action_done, unnotified, execution_id";
+                       action, action_done, unnotified, execution_id, spoke, server, tool";
 
 fn stored_approval(row: &Row) -> Result<StoredApproval, turso::Error> {
     let flag = |index: usize| -> Result<bool, turso::Error> {
@@ -83,6 +89,9 @@ fn stored_approval(row: &Row) -> Result<StoredApproval, turso::Error> {
         action_done: flag(8)?,
         unnotified: flag(9)?,
         execution_id: row.get(10)?,
+        spoke: row.get(11)?,
+        server: row.get(12)?,
+        tool: row.get(13)?,
     })
 }
 
@@ -111,8 +120,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.connection().execute(
             "INSERT OR IGNORE INTO approvals (id, created_ms, expires_ms, session, client_name, \
-             execution_id, server, tool, grant_mode, sensitive, payload, action, unnotified) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             execution_id, server, tool, grant_mode, sensitive, payload, action, unnotified, spoke) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 approval.id,
                 approval.created_ms,
@@ -127,6 +136,11 @@ impl Store {
                 payload.payload().map(String::as_str),
                 approval.action,
                 approval.notify.then_some(1_i64),
+                approval
+                    .caller
+                    .machine
+                    .as_ref()
+                    .map(|machine| machine.id.as_str()),
             ],
         )?;
 
@@ -174,6 +188,19 @@ impl Store {
     pub fn pending_approvals(&self) -> Result<Vec<StoredApproval>, StoreError> {
         Ok(self.connection().query_map(
             &format!("SELECT {COLUMNS} FROM approvals WHERE decision IS NULL ORDER BY created_ms"),
+            (),
+            stored_approval,
+        )?)
+    }
+
+    /// Requests spokes asked for that nobody has decided yet, which a hub
+    /// keeps answering after a restart
+    pub fn pending_spoke_approvals(&self) -> Result<Vec<StoredApproval>, StoreError> {
+        Ok(self.connection().query_map(
+            &format!(
+                "SELECT {COLUMNS} FROM approvals WHERE decision IS NULL AND spoke IS NOT NULL \
+                 AND action IS NULL ORDER BY created_ms"
+            ),
             (),
             stored_approval,
         )?)

@@ -238,6 +238,20 @@ pub struct Caller {
     /// asking for approval and not logged
     #[serde(default)]
     pub reason: Option<String>,
+    /// The spoke the call came from, when a spoke passed it to this hub;
+    /// `local` then says whether it reached the spoke straight from that
+    /// machine
+    #[serde(default)]
+    pub machine: Option<Machine>,
+}
+
+/// A spoke, as a caller on its hub
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine {
+    /// The spoke's id, which its trust is kept under
+    pub id: String,
+    /// Its name, such as its host name, shown wherever the owner is asked
+    pub name: String,
 }
 
 impl Caller {
@@ -247,16 +261,38 @@ impl Caller {
         self.session.as_deref().map(short_hash)
     }
 
-    /// Client name for display, `unknown` when the client sent none
-    pub fn client_label(&self) -> &str {
-        self.client_name.as_deref().unwrap_or("unknown")
+    /// Client name for display, `unknown` when the client sent none, after
+    /// the spoke's name when a spoke passed the call on
+    pub fn client_label(&self) -> String {
+        self.on_machine(self.client_name.as_deref().unwrap_or("unknown"))
     }
 
-    /// Client title for display, falling back to the client name
-    pub fn client_display(&self) -> &str {
-        self.client_title
-            .as_deref()
-            .unwrap_or_else(|| self.client_label())
+    /// Client title for display, falling back to the client name, after the
+    /// spoke's name like [`Caller::client_label`]
+    pub fn client_display(&self) -> String {
+        match self.client_title.as_deref() {
+            Some(title) => self.on_machine(title),
+            None => self.client_label(),
+        }
+    }
+
+    fn on_machine(&self, client: &str) -> String {
+        match &self.machine {
+            Some(machine) => format!("{} · {client}", machine.name),
+            None => client.to_owned(),
+        }
+    }
+
+    /// What a client grant for this caller is keyed by: the client name,
+    /// after the spoke's id for a call a spoke passed on, so a grant one
+    /// spoke's client got never covers the same client elsewhere
+    pub fn client_grant_subject(&self) -> Option<String> {
+        let client = self.client_name.as_deref()?;
+
+        Some(match &self.machine {
+            Some(machine) => format!("{}/{client}", machine.id),
+            None => client.to_owned(),
+        })
     }
 }
 

@@ -1218,11 +1218,11 @@ impl Approvals {
         if !request.caller.local {
             return None;
         }
-        let client = request.caller.client_name.as_ref()?;
+        let client = request.caller.client_grant_subject()?;
 
         state
             .grants
-            .get(&(client.clone(), request.server.to_owned()))
+            .get(&(client, request.server.to_owned()))
             .map(|grant| grant.approval_id.clone())
     }
 
@@ -1361,8 +1361,7 @@ impl Approvals {
             Choice::Client(length) => {
                 let Some(client) = info
                     .caller
-                    .client_name
-                    .as_ref()
+                    .client_grant_subject()
                     .filter(|_| info.client_grant_allowed())
                 else {
                     return Err(DecideError::GrantNotAllowed);
@@ -1374,7 +1373,7 @@ impl Approvals {
                 if !self.settle(id, Some(verdict), "approved", minutes) {
                     return Err(DecideError::NotFound);
                 }
-                self.grant(client, &info.server, id, length);
+                self.grant(&client, &info.server, id, length);
             }
             Choice::Session(length) => {
                 let Some(session) = info
@@ -1466,7 +1465,7 @@ impl Approvals {
                 .values()
                 .filter(|pending| {
                     pending.info.client_grant_allowed()
-                        && pending.info.caller.client_name.as_deref() == Some(client)
+                        && pending.info.caller.client_grant_subject().as_deref() == Some(client)
                         && pending.info.server == server
                 })
                 .map(|pending| pending.info.id.clone())
@@ -1556,7 +1555,7 @@ fn touch_id_reason(info: &ApprovalInfo, calls: &[(String, usize)], summaries: &[
         calls,
         &grant,
         Asker {
-            client,
+            client: &client,
             thread: info.caller.thread.as_deref(),
             reason: info.caller.reason.as_deref(),
         },

@@ -8,6 +8,7 @@ pub mod parked;
 pub mod phones;
 pub mod schema;
 pub mod sessions;
+pub mod spokes;
 pub mod sql;
 pub mod tools;
 

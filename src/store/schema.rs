@@ -3,19 +3,20 @@
 use super::{StoreError, sql::Connection};
 
 /// Version a fully migrated database reports
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 type Migration = fn(&Connection) -> Result<(), turso::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     create_tables,
     create_oauth_tables,
     create_sessions,
     add_call_output,
     create_durable_state,
     create_phone_tables,
+    create_spoke_tables,
 ];
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
@@ -34,6 +35,27 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
 
     Ok(())
+}
+
+/// What a hub keeps for its spokes: each one the owner trusted, and which
+/// approval requests a spoke asked for, so a restart can answer them
+fn create_spoke_tables(connection: &Connection) -> Result<(), turso::Error> {
+    connection.execute_batch(
+        r#"
+        -- `id` is the spoke's own id; `name` its host name, as it registered
+        CREATE TABLE spokes (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version TEXT,
+            trusted_ms INTEGER NOT NULL,
+            approval_id TEXT,
+            last_seen_ms INTEGER,
+            address TEXT
+        );
+        -- the spoke a request came from; NULL for this machine's own
+        ALTER TABLE approvals ADD COLUMN spoke TEXT;
+        "#,
+    )
 }
 
 /// What the gateway keeps for its phones: each value it read, sealed to the
