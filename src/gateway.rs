@@ -1,7 +1,7 @@
 //! Ties upstreams, the catalog and tool policy together
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -29,6 +29,7 @@ use crate::{
     oauth::OAuth,
     output::{Mismatch, OutputSpec, validate},
     policy::Policy,
+    search,
     secrets::{Redactor, Secrets},
     store::Store,
     upstream::{Builtins, ErrorCategory, UpstreamError, UpstreamStatus, Upstreams},
@@ -368,6 +369,55 @@ impl Gateway {
                 error: report.status.category(),
                 name: report.name,
                 tools: report.tools,
+            })
+            .collect()
+    }
+
+    /// What to tell an agent whose search names a server, by its name or an
+    /// alias, that cannot serve tools now
+    ///
+    /// A server that never connected has no tools for search to find, so
+    /// without a note the agent sees an empty result and no way forward
+    pub fn offline_notes(&self, query: &str) -> Vec<String> {
+        // lowercased too, so `InfraOps` also matches the one word `infraops`
+        let words: BTreeSet<String> = search::tokenize(query)
+            .into_iter()
+            .chain(search::tokenize(&query.to_lowercase()))
+            .collect();
+
+        self.upstreams
+            .all()
+            .iter()
+            .filter(|upstream| {
+                let name = upstream.name();
+                let aliases = self
+                    .config
+                    .servers
+                    .get(name)
+                    .map_or(&[][..], |server| server.aliases.as_slice());
+
+                std::iter::once(name)
+                    .chain(aliases.iter().map(String::as_str))
+                    .flat_map(search::tokenize)
+                    .any(|term| words.contains(&term))
+            })
+            .filter_map(|upstream| {
+                let name = upstream.name();
+                match upstream.status() {
+                    UpstreamStatus::NeedsLogin => Some(match self.oauth.login_page(name) {
+                        Some(link) => format!(
+                            "server `{name}` needs a sign-in before its tools appear: give the user {link} to open on any of their devices, then search again"
+                        ),
+                        None => format!(
+                            "server `{name}` needs a sign-in before its tools appear: ask the user to run `codemode-mcp oauth login {name}` on the gateway's Mac, then search again"
+                        ),
+                    }),
+                    UpstreamStatus::Unavailable { category, .. } => Some(format!(
+                        "server `{name}` is unavailable ({}); its tools cannot be called until it reconnects",
+                        category.as_str()
+                    )),
+                    _ => None,
+                }
             })
             .collect()
     }

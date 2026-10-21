@@ -634,9 +634,14 @@ codemode-mcp oauth status            # logged in, expiry, refresh token, scopes,
 codemode-mcp oauth logout <server>   # forget the tokens; the server reconnects anonymously
 ```
 
-For a `url` server with `oauth = true`. The browser returns to `http://127.0.0.1:7682/oauth/callback/<server>` on the admin listener, so sign in from a
-browser on this Mac. Tokens refresh automatically. A server that refuses anonymous clients shows
-`needs_login` in `/healthz` and `codemode-mcp tools` until you sign in.
+For a `url` server with `oauth = true`. With `public_origin` set, a client registered dynamically sends the
+browser back to `<public_origin>/oauth/callback/<server>`, so the sign-in can finish on the phone or any device on
+the tailnet, and `<public_origin>/oauth/login/<server>` starts one from there: the page shows a Continue button,
+which opens the server's sign-in. Without `public_origin`, and for a client registered ahead of time
+(`client_id`), the browser returns to `http://127.0.0.1:7682/oauth/callback/<server>` on the admin listener, so
+sign in from a browser on this Mac. Tokens refresh automatically. A server that refuses anonymous clients shows
+`needs_login` in `/healthz` and `codemode-mcp tools` until you sign in, and an agent whose `search_tools` query
+names it, by its name or an alias, gets a note with the sign-in page to pass on.
 
 An authorization server without dynamic client registration needs a client you create there yourself: set
 `client_id`, and `client_secret` for a confidential client. The secret can be an `op://` reference; it is read

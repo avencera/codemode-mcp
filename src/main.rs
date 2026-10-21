@@ -592,7 +592,22 @@ async fn oauth_command(config: &Config, command: OAuthCommand) -> Result<()> {
         OAuthCommand::Login { server, no_open } => {
             let response: OAuthLoginResponse =
                 admin_post(config, "/admin/oauth/login", &OAuthServerRequest { server }).await?;
-            println!("Open this link in a browser on this Mac to sign in:");
+            // a loopback redirect only reaches this Mac's admin listener
+            let on_mac = reqwest::Url::parse(&response.authorization_url)
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(name, _)| name == "redirect_uri")
+                        .map(|(_, redirect)| redirect.starts_with("http://127.0.0.1"))
+                })
+                .unwrap_or(true);
+            if on_mac {
+                println!("Open this link in a browser on this Mac to sign in:");
+            } else {
+                println!(
+                    "Open this link to sign in, on this Mac or any device that reaches the gateway:"
+                );
+            }
             println!("{}", response.authorization_url);
             if !no_open && cfg!(target_os = "macos") {
                 let opened = std::process::Command::new("open")

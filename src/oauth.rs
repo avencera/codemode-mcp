@@ -2,8 +2,11 @@
 //!
 //! A login runs discovery, dynamic client registration (unless the config
 //! names a client registered ahead of time) and an authorization code flow
-//! with PKCE. The browser is sent back to the loopback admin
-//! listener (`/oauth/callback/<server>`), so the flow completes on the Mac.
+//! with PKCE. A registered client sends the browser back to
+//! `/oauth/callback/<server>` on `public_origin` when one is configured, so
+//! the sign-in can finish on a phone; a client registered ahead of time, or
+//! a gateway without `public_origin`, uses the loopback admin listener, so
+//! that flow completes on the Mac.
 //!
 //! rmcp keeps the client registration in memory and stores only the client
 //! id with the tokens. Here the registration and the tokens are written
@@ -338,6 +341,9 @@ pub struct OAuth {
     configured: BTreeSet<String>,
     /// `http://127.0.0.1:<admin port>`, set once the admin listener binds
     callback_base: RwLock<Option<String>>,
+    /// The configured `public_origin` without a trailing slash; the default
+    /// `localhost` origin is not reachable from a phone, so it is not used
+    public_base: Option<String>,
 }
 
 impl OAuth {
@@ -382,6 +388,7 @@ impl OAuth {
             servers,
             configured: config.servers.keys().cloned().collect(),
             callback_base: RwLock::new(None),
+            public_base: config.public_origin.as_ref().map(|_| config.public_base()),
         })
     }
 
@@ -394,15 +401,32 @@ impl OAuth {
     }
 
     /// Redirect URI for `server`
-    pub fn redirect_uri(&self, server: &str) -> Result<String, OAuthError> {
-        let base = self
-            .callback_base
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .ok_or(OAuthError::NoCallback)?;
+    ///
+    /// A client registered ahead of time keeps the loopback URI, since the
+    /// provider only accepts the redirect URIs it was registered with
+    fn redirect_uri(&self, server: &str, client: &ClientSource) -> Result<String, OAuthError> {
+        let base = match (client, &self.public_base) {
+            (ClientSource::Register(_), Some(public)) => public.clone(),
+            _ => self
+                .callback_base
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .ok_or(OAuthError::NoCallback)?,
+        };
 
         Ok(format!("{base}/oauth/callback/{server}"))
+    }
+
+    /// The page on `public_origin` that starts a sign-in to `server` and
+    /// works from any device that reaches it; `None` without a
+    /// `public_origin`, or when that sign-in can only finish on the Mac
+    pub fn login_page(&self, server: &str) -> Option<String> {
+        let public = self.public_base.as_ref()?;
+        let configured = self.servers.get(server)?;
+
+        matches!(configured.client, ClientSource::Register(_))
+            .then(|| format!("{public}/oauth/login/{server}"))
     }
 
     /// Names of the OAuth servers
@@ -498,7 +522,7 @@ impl OAuth {
 
     async fn begin_login(&self, name: &str) -> Result<String, OAuthError> {
         let server = self.server(name)?.clone();
-        let redirect_uri = self.redirect_uri(name)?;
+        let redirect_uri = self.redirect_uri(name, &server.client)?;
         let (mut manager, keys) = self.discovered(name).await?;
 
         let defaults: Vec<&str> = server.scopes.iter().map(String::as_str).collect();
