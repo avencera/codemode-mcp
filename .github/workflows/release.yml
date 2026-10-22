@@ -1,11 +1,12 @@
-# Publish a signed macOS binary when a version tag is pushed.
+# Publish a signed macOS binary and a Linux binary when a version tag is pushed.
 #
 #   git tag v0.1.0
 #   git push origin v0.1.0
 #
 # Asset name: codemode-mcp-<tag>-<target>.tar.gz, holding `codemode-mcp` and the
-# Monty worker it pins, both signed, for `codemode-mcp update`. Only Apple
-# silicon is built, since the service is a launchd agent
+# Monty worker it pins, for `codemode-mcp update`. The hub is Apple silicon
+# only, signed; x86_64 Linux is for spokes and unsigned, since signatures exist
+# for the macOS keychain and the 1Password app
 
 name: Release
 
@@ -107,8 +108,38 @@ jobs:
           shasum -a 256 "$archive.tar.gz" > "$archive.sha256"
           gh release upload "$GITHUB_REF_NAME" "$archive.tar.gz" "$archive.sha256" --repo "$GITHUB_REPOSITORY" --clobber
 
+  upload-linux:
+    needs: create-release
+    # needs glibc 2.39 or newer at run time, as this image has
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # monty 1.1.0 needs a newer std than the runner image's toolchain
+      - name: Update Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Build the Monty worker
+        run: |
+          version="$(awk '/^name = "monty-pool"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
+          : "${version:?monty-pool is not in Cargo.lock}"
+          cargo install monty-runtime --version "=$version" --locked --root "$RUNNER_TEMP/monty"
+      - name: Build codemode-mcp
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu --bin codemode-mcp
+      - name: Upload the archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="codemode-mcp-$GITHUB_REF_NAME-x86_64-unknown-linux-gnu"
+          staging="$RUNNER_TEMP/staging"
+          mkdir "$staging"
+          cp target/x86_64-unknown-linux-gnu/release/codemode-mcp "$RUNNER_TEMP/monty/bin/monty" "$staging/"
+          tar -C "$staging" -czf "$archive.tar.gz" codemode-mcp monty
+          sha256sum "$archive.tar.gz" > "$archive.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$archive.tar.gz" "$archive.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+
   publish-release:
-    needs: upload-assets
+    needs: [upload-assets, upload-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

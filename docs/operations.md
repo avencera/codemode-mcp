@@ -55,7 +55,10 @@ It signs both with the same identity and identifiers as a local install and atta
 `codemode-mcp-<tag>-aarch64-apple-darwin.tar.gz` (holding `codemode-mcp` and `monty`), its `.sha256` and
 `install.sh`. It
 reads the `MACOS_SIGNING_P12_BASE64` and `MACOS_SIGNING_P12_PASSWORD` secrets and the `MACOS_SIGNING_IDENTITY`
-variable, the same names homebased uses, and fails rather than ship unsigned.
+variable, the same names homebased uses, and fails rather than ship unsigned. A parallel job builds
+`x86_64-unknown-linux-gnu` on Ubuntu 24.04 (so it needs glibc 2.39 or newer) and attaches
+`codemode-mcp-<tag>-x86_64-unknown-linux-gnu.tar.gz` and its `.sha256`, unsigned, for Linux spokes. The release is
+published only once both archives are attached.
 
 ## Update
 
@@ -72,6 +75,9 @@ certificate in the keychain and the 1Password and EventKit grants carry over. No
 installed binary already reports the tag, or reports a newer version than the latest release, as a local build
 can; `--force` reinstalls anyway. To roll back, pass the previous release with `--tag`. `cmd fleet update` runs
 it on the Mac.
+
+On x86_64 Linux, `update` installs the Linux archive and restarts the systemd unit. Linux has no codesign and the
+Linux archive is unsigned, so there the published checksum is the only check.
 
 The LaunchAgent plist is not rewritten. When a release changes it, run `codemode-mcp service install` once.
 
@@ -828,8 +834,13 @@ passkey on the phone. Sign-ins and tokens stay on the hub.
 Both machines must be on the same tailnet. The spoke reaches the hub at its MagicDNS name or tailnet IP on port
 7681, not at the `tailscale serve` HTTPS address, which the hub refuses for these routes.
 
-1. Build on the spoke. There are no Linux release artifacts, so build from source on Linux; `update` and
-   `install.sh` refuse there:
+1. Install on the spoke. On x86_64 Linux, use the release, as on the Mac:
+
+   ```sh
+   curl -LSfs https://github.com/avencera/codemode-mcp/releases/latest/download/install.sh | sh
+   ```
+
+   On other Linux machines, which have no release, build from source:
 
    ```sh
    cargo build --release
@@ -846,7 +857,8 @@ Both machines must be on the same tailnet. The spoke reaches the hub at its Magi
    machine's own servers under `[servers.*]` as on the hub. A name a hub server already uses stops the daemon
    at startup with the name in the error; rename yours or exclude the hub's. The starter config also adds the
    `secrets` server, so agents on the spoke can write env files there.
-3. Install the service: `./target/release/codemode-mcp service install`. On Linux this writes the systemd user
+3. Install the service: `codemode-mcp service install`, or `./target/release/codemode-mcp service install` after
+   a source build. On Linux this writes the systemd user
    unit `~/.config/systemd/user/codemode-mcp.service` and starts it; logs go to
    `~/.local/state/codemode-mcp/logs/`. Enable lingering, or the service stops when you log out
    (`service install` warns when it is off):

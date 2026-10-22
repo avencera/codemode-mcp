@@ -882,8 +882,9 @@ spokes as hub tools.
   approves them once per spoke, server, destination digest and reference set, and the hub remembers it. A
   server that starts before its spoke is trusted waits for the trust (up to 10 minutes) rather than failing into
   the 10 minute secret retry
-- Linux spokes build from source; there are no Linux release artifacts, and `update` and `install.sh` say so.
-  CI runs fmt, clippy and the tests on Ubuntu as well
+- x86_64 Linux spokes install the release's unsigned Linux archive with `install.sh` and `update`, checked only
+  against its published checksum; other Linux machines build from source, and `update` and `install.sh` say
+  so. CI runs fmt, clippy and the tests on Ubuntu as well
 
 ### T3 Code (deferred)
 

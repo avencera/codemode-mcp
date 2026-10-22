@@ -1,5 +1,6 @@
 //! `update` against a release served locally, run as the real binary under a
-//! temporary home so the installed service is never touched
+//! temporary home so the installed service is never touched. Signatures are
+//! checked on macOS only, so Linux covers the checksum and the install
 
 use std::{
     path::Path,
@@ -18,8 +19,14 @@ use sha2::{Digest, Sha256};
 use super::harness::{TestResult, temp_state_dir};
 
 const TAG: &str = "v9.9.9";
+#[cfg(target_os = "macos")]
 const ASSET: &str = "codemode-mcp-v9.9.9-aarch64-apple-darwin.tar.gz";
+#[cfg(target_os = "macos")]
 const SUMS: &str = "codemode-mcp-v9.9.9-aarch64-apple-darwin.sha256";
+#[cfg(target_os = "linux")]
+const ASSET: &str = "codemode-mcp-v9.9.9-x86_64-unknown-linux-gnu.tar.gz";
+#[cfg(target_os = "linux")]
+const SUMS: &str = "codemode-mcp-v9.9.9-x86_64-unknown-linux-gnu.sha256";
 
 /// What the fake GitHub serves: the archive and its checksum file
 type Served = Arc<Mutex<(Vec<u8>, String)>>;
@@ -61,8 +68,8 @@ fn run(program: &str, args: &[&str]) -> TestResult {
     Ok(())
 }
 
-/// A release archive whose two executables are ad hoc signed as `binary_id`
-/// and `worker_id`, and the checksum file that lists it
+/// A release archive whose two executables are, on macOS, ad hoc signed as
+/// `binary_id` and `worker_id`, and the checksum file that lists it
 fn release(
     dir: &Path,
     binary_id: &str,
@@ -72,10 +79,12 @@ fn release(
     for (name, identifier) in [("codemode-mcp", binary_id), ("monty", worker_id)] {
         let path = dir.join(name).display().to_string();
         std::fs::copy(env!("CARGO_BIN_EXE_codemode-fixture"), &path)?;
-        run(
-            "codesign",
-            &["--force", "--sign", "-", "--identifier", identifier, &path],
-        )?;
+        if cfg!(target_os = "macos") {
+            run(
+                "codesign",
+                &["--force", "--sign", "-", "--identifier", identifier, &path],
+            )?;
+        }
     }
     let archive = dir.join(ASSET).display().to_string();
     let root = dir.display().to_string();
@@ -141,15 +150,17 @@ async fn update_installs_only_a_checked_release() -> TestResult {
     unchanged()?;
 
     // a worker signed under another identifier is refused
-    let forged = release(
-        &home.join("forged"),
-        "com.avencera.codemode-mcp",
-        "com.example.monty",
-    )?;
-    *served.lock().map_err(|_| "poisoned")? = forged;
-    let (ok, text) = update(&home, &base_url).await?;
-    assert!(!ok && text.contains("does not satisfy"), "{text}");
-    unchanged()?;
+    if cfg!(target_os = "macos") {
+        let forged = release(
+            &home.join("forged"),
+            "com.avencera.codemode-mcp",
+            "com.example.monty",
+        )?;
+        *served.lock().map_err(|_| "poisoned")? = forged;
+        let (ok, text) = update(&home, &base_url).await?;
+        assert!(!ok && text.contains("does not satisfy"), "{text}");
+        unchanged()?;
+    }
 
     *served.lock().map_err(|_| "poisoned")? = good;
     let (ok, text) = update(&home, &base_url).await?;
@@ -160,6 +171,11 @@ async fn update_installs_only_a_checked_release() -> TestResult {
         (&binary, "com.avencera.codemode-mcp"),
         (&worker, "com.avencera.monty"),
     ] {
+        if !cfg!(target_os = "macos") {
+            assert_eq!(std::fs::read(path)?, fixture);
+            continue;
+        }
+
         // same code as the fixture, with the signature the release carried
         assert_ne!(std::fs::read(path)?, fixture);
         let requirement = format!("=identifier \"{identifier}\"");

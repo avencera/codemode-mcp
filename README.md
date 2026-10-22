@@ -63,7 +63,7 @@ before the script sees them.
 ## Requirements
 
 - macOS on Apple silicon for the hub, the machine that holds 1Password and the approvals. Spokes also run on
-  Linux, built from source, with a systemd user service; see [Spokes](docs/operations.md#spokes-use-the-hub-from-other-machines)
+  Linux with a systemd user service, from the release on x86_64 or built from source elsewhere; see [Spokes](docs/operations.md#spokes-use-the-hub-from-other-machines)
 - A Developer ID certificate in your keychain. Binaries are signed so that macOS and 1Password keep their grants
   across updates, and `service install` refuses to run without the identity. As published, that is the author's
   identity; to run your own copy, set `SIGNING_IDENTITY` and `TEAM_ID` in `src/service.rs` and the signing

@@ -1,10 +1,11 @@
 //! Replace the installed binary and Monty worker from a GitHub release
 //!
-//! A release archive holds both, already signed in CI with the Developer ID
-//! `service install` signs local builds with, so the files are swapped as
-//! they are and macOS and the 1Password app keep their grants. Nothing is
-//! replaced unless the archive matches its published checksum and both
-//! signatures satisfy that team and the expected identifiers
+//! A release archive holds both. On macOS they are already signed in CI with
+//! the Developer ID `service install` signs local builds with, so the files
+//! are swapped as they are and macOS and the 1Password app keep their grants.
+//! Nothing is replaced unless the archive matches its published checksum and,
+//! on macOS, both signatures satisfy that team and the expected identifiers.
+//! Linux has no codesign, so a Linux spoke checks the checksum only
 
 use std::{
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -18,9 +19,13 @@ use crate::service::{self, ServiceError, ServicePaths};
 
 /// GitHub repository that publishes the releases
 pub const REPOSITORY: &str = "avencera/codemode-mcp";
-/// The only target releases are built for, since the service is a launchd
-/// agent
-const TARGET: &str = "aarch64-apple-darwin";
+/// Target of this machine's release archive: Apple silicon for the hub and
+/// Mac spokes, x86_64 Linux for Linux spokes
+const TARGET: &str = if cfg!(target_os = "macos") {
+    "aarch64-apple-darwin"
+} else {
+    "x86_64-unknown-linux-gnu"
+};
 /// Name of the Monty worker inside a release archive
 const WORKER: &str = "monty";
 
@@ -29,8 +34,8 @@ const WORKER: &str = "monty";
 pub enum UpdateError {
     /// This machine cannot run a release build
     #[error(
-        "releases are built for {TARGET} only, not {0}; build from source with `cargo build \
-         --release` and run `codemode-mcp service install` from the repository"
+        "releases are built for macOS/aarch64 and linux/x86_64 only, not {0}; build from source \
+         with `cargo build --release` and run `codemode-mcp service install` from the repository"
     )]
     UnsupportedPlatform(String),
     /// A request could not be sent or read
@@ -165,7 +170,7 @@ impl Source {
 /// Fails unless this machine can run a release build
 pub fn check_platform() -> Result<(), UpdateError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Ok(()),
+        ("macos", "aarch64") | ("linux", "x86_64") => Ok(()),
         (os, arch) => Err(UpdateError::UnsupportedPlatform(format!("{os}/{arch}"))),
     }
 }
@@ -202,7 +207,7 @@ pub struct Release {
 
 impl Release {
     /// Downloads `tag`, checks it against its published checksum, unpacks it
-    /// and checks both signatures
+    /// and, on macOS, checks both signatures
     pub async fn fetch(
         source: &Source,
         tag: &str,
@@ -275,6 +280,12 @@ impl Release {
             .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
         if !executable {
             return Err(UpdateError::MissingFile(name.to_owned()));
+        }
+
+        // the signature exists for the macOS keychain and the 1Password app,
+        // neither of which a Linux spoke has, and Linux has no codesign
+        if !cfg!(target_os = "macos") {
+            return Ok(());
         }
 
         let requirement = format!(

@@ -1,18 +1,17 @@
 #!/bin/sh
 # Install codemode-mcp from GitHub Releases.
 #
-# One-liner (macOS on Apple silicon):
+# One-liner (macOS on Apple silicon, or x86_64 Linux for a spoke):
 #   curl -LSfs https://github.com/avencera/codemode-mcp/releases/latest/download/install.sh | sh
 #
-# The archive is checked against the release checksum and the Developer ID
-# signature before anything in it runs. The downloaded binary then installs
+# The archive is checked against the release checksum and, on macOS, the
+# Developer ID signature before anything in it runs. The downloaded binary then installs
 # itself with `codemode-mcp update`, so the binary, the Monty worker and the
 # service restart follow one code path
 
 set -eu
 
 REPO="avencera/codemode-mcp"
-TARGET="aarch64-apple-darwin"
 # the team and identifier `service install` and the release workflow sign with
 REQUIREMENT='anchor apple generic and certificate leaf[subject.OU] = "Q8UP8C53Y8" and identifier "com.avencera.codemode-mcp"'
 
@@ -94,15 +93,34 @@ while test $# -gt 0; do
     shift
 done
 
-if [ "$(uname -s)/$(uname -m)" != "Darwin/arm64" ]; then
-    err "releases are built for macOS on Apple silicon only, not $(uname -s)/$(uname -m); on Linux, build from source (see docs/operations.md, \"Spokes\")"
+case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64)
+        TARGET="aarch64-apple-darwin"
+        ;;
+    Linux/x86_64)
+        TARGET="x86_64-unknown-linux-gnu"
+        ;;
+    *)
+        err "releases are built for macOS on Apple silicon and x86_64 Linux only, not $(uname -s)/$(uname -m); build from source (see docs/operations.md, \"Spokes\")"
+        ;;
+esac
+
+# the companion is a macOS LaunchAgent
+if [ -n "$pair" ] && [ "$TARGET" != "aarch64-apple-darwin" ]; then
+    err "--pair sets up a Mac companion; on Linux, set up a spoke instead (see docs/operations.md, \"Spokes\")"
 fi
 
 need curl
 need tar
-need shasum
-need codesign
 need mktemp
+if [ "$TARGET" = "aarch64-apple-darwin" ]; then
+    need shasum
+    need codesign
+    sha256_check() { shasum -a 256 -c "$1"; }
+else
+    need sha256sum
+    sha256_check() { sha256sum -c "$1"; }
+fi
 
 url="https://github.com/$REPO"
 
@@ -124,12 +142,15 @@ curl -fsSL "$url/releases/download/$tag/$archive.tar.gz" -o "$td/$archive.tar.gz
     || err "$url/releases/download/$tag/$archive.tar.gz does not exist"
 curl -fsSL "$url/releases/download/$tag/$archive.sha256" -o "$td/$archive.sha256" \
     || err "the checksum for $tag does not exist"
-(cd "$td" && shasum -a 256 -c "$archive.sha256" > /dev/null) \
+(cd "$td" && sha256_check "$archive.sha256" > /dev/null) \
     || err "$archive.tar.gz does not match its published checksum"
 
 tar -C "$td" -xzf "$td/$archive.tar.gz" || err "failed to extract $archive.tar.gz"
-codesign --verify --strict -R "=$REQUIREMENT" "$td/codemode-mcp" \
-    || err "the codemode-mcp in $tag is not signed by the expected Developer ID"
+# Linux releases are unsigned, so there only the checksum vouches for them
+if [ "$TARGET" = "aarch64-apple-darwin" ]; then
+    codesign --verify --strict -R "=$REQUIREMENT" "$td/codemode-mcp" \
+        || err "the codemode-mcp in $tag is not signed by the expected Developer ID"
+fi
 
 # `update` downloads and checks the release again on its own, then installs
 # the binary and worker and restarts a loaded service
