@@ -340,7 +340,8 @@ impl SecretsServer {
                        one you want to `write_env`, which asks the owner again naming that item. \
                        The owner approves the search with Touch ID on this Mac or a companion Mac; \
                        to look for several things, start one call for each together under \
-                       `asyncio.gather` with the same reason, and one prompt approves them all."
+                       `asyncio.gather` with the same reason, and one prompt approves them all. \
+                       The same query and reason is answered again for 10 minutes without asking."
     )]
     async fn find_references(
         &self,
@@ -350,6 +351,7 @@ impl SecretsServer {
         let ask = FindAsk {
             query: params.query,
             reason: Some(params.reason),
+            scope: None,
         };
         let found = tokio::select! {
             found = self.0.onepassword.find_for_program(&ask) => found.map_err(failed)?,

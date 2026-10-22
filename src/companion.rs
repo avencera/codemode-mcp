@@ -31,7 +31,9 @@ pub use identity::{IdentityError, Role, load_or_create};
 pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
 pub use pair::{PairError, Paired, Pairing, companion_id, pair};
-pub use program::{ProgramAsk, ProgramRead, ProgramReadError, ProgramTarget, ProgramValues};
+pub use program::{
+    ProgramAsk, ProgramRead, ProgramReadError, ProgramTarget, ProgramValues, checked_query,
+};
 pub use server::{CompanionHandle, ServeError, serve};
 pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,

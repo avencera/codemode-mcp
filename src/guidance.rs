@@ -69,9 +69,13 @@ macro_rules! onepassword_rule {
          `codemode-mcp op find WORDS --reason WHY` (or the `secrets` server's `find_references` \
          tool) lists matching items' op:// references and types, never values, after the user \
          approves on a Mac; then use the reference you picked. A query matches items holding any of \
-         its words, up to 80 characters and 10 items, so to look for several things, start one \
-         `find_references` call for each together under `asyncio.gather` with the same `reason`: \
-         the user approves them all with one prompt. Or pass a description in one step: \
+         its words, up to 80 characters and 10 items, so put other names for the same thing in one \
+         query. To look for several things, pass each extra query as `--also WORDS` to one `op \
+         find`, or start one `find_references` call for each together under `asyncio.gather` with \
+         the same `reason`: the user approves them all with one prompt. Never run separate finds \
+         one after another, since each asks the user again. The same query and reason is answered \
+         again for 10 minutes without asking, so rerun it rather than rewording it if you misread \
+         the output. Or pass a description in one step: \
          `codemode-mcp op read --describe \"Apple signing cert\" --out-file PATH` or `write_env`'s \
          `describe`. If the user approves on a Mac it searches instead, writes nothing and answers the \
          matches (`op read` exits 3), so run again with the exact reference; if they approve on their \
