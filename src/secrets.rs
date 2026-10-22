@@ -1066,15 +1066,19 @@ impl OnePassword {
     /// find answer kept, so the next read or find asks again, as after a
     /// rotated key; how many config values were held
     pub async fn forget(&self) -> usize {
-        {
-            let mut kept = self.kept.lock().await;
-            kept.grants.clear();
-            kept.finds.clear();
-            kept.forgotten += 1;
-        }
-        let mut known = self.known.lock().await;
-        let count = known.len();
-        known.clear();
+        let count = {
+            let mut known = self.known.lock().await;
+            let count = known.len();
+            known.clear();
+
+            count
+        };
+        // cleared last, after any wait for `known`, so nothing kept while
+        // this waited outlasts the forget
+        let mut kept = self.kept.lock().await;
+        kept.grants.clear();
+        kept.finds.clear();
+        kept.forgotten += 1;
 
         count
     }
