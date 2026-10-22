@@ -1449,6 +1449,7 @@ async fn op_find(
         .find_for_program(&companion::FindAsk {
             query: request.query,
             reason: request.reason,
+            scope: None,
         })
         .await;
 

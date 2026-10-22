@@ -902,7 +902,8 @@ pub struct OnePassword {
 #[derive(Default)]
 struct KeptValues {
     grants: HashMap<(Option<String>, String), Kept<ProgramValue>>,
-    /// Find answers by cleaned reason and query
+    /// Find answers by the key their batch was filed under, its scope and
+    /// cleaned reason, and query
     finds: HashMap<(Option<String>, String), Kept<ProgramFound>>,
     forgotten: u64,
 }
@@ -1145,28 +1146,24 @@ impl OnePassword {
         }
     }
 
-    /// The answer kept for a find of `query` with `reason`, both as cleaned,
-    /// while it is live
-    pub(crate) async fn kept_find(
-        &self,
-        reason: Option<&str>,
-        query: &str,
-    ) -> Option<ProgramFound> {
+    /// The answer kept for a find of `query` filed under `key`, the scope
+    /// and cleaned reason of its batch, while it is live
+    pub(crate) async fn kept_find(&self, key: Option<&str>, query: &str) -> Option<ProgramFound> {
         let mut kept = self.kept.lock().await;
         kept.finds.retain(|_, entry| entry.live());
 
         kept.finds
-            .get(&(reason.map(str::to_owned), query.to_owned()))
+            .get(&(key.map(str::to_owned), query.to_owned()))
             .map(|entry| entry.value.clone())
     }
 
     /// Keeps each approved find answer of `answers`, by query, for finds
-    /// with the same `reason` to get again without asking until `keep` has
-    /// passed; nothing is kept when the finds were forgotten since
+    /// filed under the same `key` to get again without asking until `keep`
+    /// has passed; nothing is kept when the finds were forgotten since
     /// `forgotten` was read
     pub(crate) async fn keep_finds(
         &self,
-        reason: Option<&str>,
+        key: Option<&str>,
         answers: impl IntoIterator<Item = (String, ProgramFound)>,
         keep: Duration,
         forgotten: u64,
@@ -1179,7 +1176,7 @@ impl OnePassword {
         }
         for (query, found) in answers {
             kept.finds.insert(
-                (reason.map(str::to_owned), query),
+                (key.map(str::to_owned), query),
                 Kept {
                     value: found,
                     until,

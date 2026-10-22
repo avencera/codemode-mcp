@@ -351,6 +351,7 @@ impl SecretsServer {
         let ask = FindAsk {
             query: params.query,
             reason: Some(params.reason),
+            scope: None,
         };
         let found = tokio::select! {
             found = self.0.onepassword.find_for_program(&ask) => found.map_err(failed)?,

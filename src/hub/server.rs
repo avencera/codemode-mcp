@@ -1014,6 +1014,8 @@ async fn op_find(
         .find_for_program(&FindAsk {
             query: find.query,
             reason,
+            // spokes that share a name never share a batch or kept answers
+            scope: Some(spoke.id.clone()),
         })
         .await;
 

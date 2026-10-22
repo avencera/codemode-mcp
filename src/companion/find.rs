@@ -64,6 +64,10 @@ pub struct FindAsk {
     pub query: String,
     /// Why, shown quoted as the program's claim
     pub reason: Option<String>,
+    /// Whose finds these are, such as a spoke's ID, so one requester's find
+    /// never joins another's batch or gets its kept answer whatever reason
+    /// it claims; `None` for this machine
+    pub scope: Option<String>,
 }
 
 /// The items a find matched and the Mac that searched
@@ -75,7 +79,8 @@ pub struct ProgramFound {
     pub found: Found,
 }
 
-/// The finds waiting to be asked together, by their cleaned reason
+/// The finds waiting to be asked together, by their scope and cleaned
+/// reason, as [`batch_key`] joins them
 ///
 /// Keying by reason keeps one script's searches together without letting an
 /// unrelated program's find ride on the same approval or fall with its Deny
@@ -117,7 +122,8 @@ impl OnePassword {
         }
         let query = checked_query(&ask.query).map_err(ProgramReadError::Invalid)?;
         let reason = clean_reason(ask.reason.as_deref());
-        if let Some(found) = self.kept_find(reason.as_deref(), &query).await {
+        let key = batch_key(ask.scope.as_deref(), reason.as_deref());
+        if let Some(found) = self.kept_find(key.as_deref(), &query).await {
             tracing::info!("find answered from one approved earlier");
 
             return Ok(found);
@@ -129,19 +135,19 @@ impl OnePassword {
             // one lock, so a batch cannot be taken for asking between the
             // check and the push
             let mut forming = self.find_batches().forming();
-            match forming.get(&reason).cloned() {
+            match forming.get(&key).cloned() {
                 Some(batch) => {
                     let mut queued = batch.waiting();
                     queued.push(waiting);
                     if queued.len() >= MAX_FIND_QUERIES {
-                        forming.remove(&reason);
+                        forming.remove(&key);
                     }
 
                     None
                 }
                 None => {
                     let batch = Arc::new(Forming(Mutex::new(vec![waiting])));
-                    forming.insert(reason.clone(), Arc::clone(&batch));
+                    forming.insert(key.clone(), Arc::clone(&batch));
 
                     Some(batch)
                 }
@@ -151,7 +157,7 @@ impl OnePassword {
         // cannot strand the others that joined it
         if let Some(batch) = opened {
             let onepassword = self.clone();
-            tokio::spawn(async move { onepassword.ask_batch(&batch, reason).await });
+            tokio::spawn(async move { onepassword.ask_batch(&batch, key, reason).await });
         }
 
         answered.await.unwrap_or_else(|_| {
@@ -162,18 +168,18 @@ impl OnePassword {
     }
 
     /// Waits out the window, then asks once for every find that joined
-    /// `batch` and hands each its own items
-    async fn ask_batch(&self, batch: &Arc<Forming>, reason: Option<String>) {
+    /// `batch`, filed under `key`, and hands each its own items
+    async fn ask_batch(&self, batch: &Arc<Forming>, key: Option<String>, reason: Option<String>) {
         tokio::time::sleep(FIND_BATCH_WINDOW).await;
         let mut waiting = {
             let mut forming = self.find_batches().forming();
             // a full batch already left the map, and a newer one may hold
             // its place
             if forming
-                .get(&reason)
+                .get(&key)
                 .is_some_and(|current| Arc::ptr_eq(current, batch))
             {
-                forming.remove(&reason);
+                forming.remove(&key);
             }
 
             std::mem::take(&mut *batch.waiting())
@@ -206,7 +212,7 @@ impl OnePassword {
 
                 (query.clone(), found)
             });
-            self.keep_finds(reason.as_deref(), answers, FIND_KEEP, forgotten)
+            self.keep_finds(key.as_deref(), answers, FIND_KEEP, forgotten)
                 .await;
         }
 
@@ -339,6 +345,16 @@ impl OnePassword {
     }
 }
 
+/// What finds are batched and kept under: the cleaned reason alone for this
+/// machine, otherwise the scope and the reason on separate lines; a cleaned
+/// reason holds no line break, so a scoped key never equals an unscoped one
+fn batch_key(scope: Option<&str>, reason: Option<&str>) -> Option<String> {
+    match scope {
+        Some(scope) => Some(format!("{scope}\n{}", reason.unwrap_or(""))),
+        None => reason.map(str::to_owned),
+    }
+}
+
 impl Companions {
     /// Asks the companion Mac `peer` to search for `find.query` and each of
     /// `find.also`, answering their items in that order
@@ -395,6 +411,25 @@ impl Companions {
                 message: fault.message,
             }),
             Err(error) => Err(exchange(&format!("malformed answer: {error}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{batch_key, clean_reason};
+
+    #[test]
+    fn no_reason_this_machine_claims_files_its_find_under_a_spokes_key() {
+        let spoke = batch_key(Some("spoke1"), clean_reason(Some("set up")).as_deref());
+        for claimed in [
+            "set up",
+            "spoke1\nset up",
+            "spoke1\r\nset up",
+            "spoke1: set up",
+        ] {
+            let local = batch_key(None, clean_reason(Some(claimed)).as_deref());
+            assert_ne!(local, spoke, "{claimed:?}");
         }
     }
 }
