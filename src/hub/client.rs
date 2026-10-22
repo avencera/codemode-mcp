@@ -40,6 +40,8 @@ use crate::{
 pub const ID_FILE: &str = "spoke.id";
 /// How long a request that needs no person may take
 const QUICK: Duration = Duration::from_secs(30);
+/// The longest call timeout a forwarded call is waited out for
+const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a request that may wait for the owner may take: a long poll,
 /// or a read the owner approves on a device
 const PATIENT: Duration = Duration::from_secs(15 * 60);
@@ -287,8 +289,11 @@ impl HubClient {
         call: &ForwardedCall,
         tool_timeout: Duration,
     ) -> Result<CallAnswer, HubClientError> {
-        self.post("/call", call, tool_timeout.saturating_mul(2) + QUICK)
-            .await
+        // the hub names its own timeout, so a huge one is held to a day
+        // rather than overflowing the deadline
+        let wait = tool_timeout.min(LONGEST_CALL).saturating_mul(2) + QUICK;
+
+        self.post("/call", call, wait).await
     }
 
     /// The hub's verdict on request `id`, after a long poll; `None` while it
