@@ -1,7 +1,7 @@
 //! The agent-facing MCP server and its HTTP wiring
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -933,6 +933,7 @@ fn with_output(message: &str, output: &str) -> String {
 /// Handle to the running HTTP servers
 pub struct RunningServer {
     address: SocketAddr,
+    loopback_v6_address: Option<SocketAddr>,
     admin_address: SocketAddr,
     shutdown: CancellationToken,
     in_flight: InFlight,
@@ -943,6 +944,12 @@ impl RunningServer {
     /// Address actually bound, useful when the config asked for port 0
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Address of the `[::1]` listener that serves the same routes as
+    /// [`RunningServer::local_addr`], when one is bound
+    pub fn loopback_v6_addr(&self) -> Option<SocketAddr> {
+        self.loopback_v6_address
     }
 
     /// Address of the loopback admin listener
@@ -957,7 +964,7 @@ impl RunningServer {
         self.finished().await
     }
 
-    /// Waits until both listeners stop, e.g. after a signal
+    /// Waits until every listener stops, e.g. after a signal
     pub async fn finished(self) -> std::io::Result<()> {
         for task in self.tasks {
             task.await.map_err(std::io::Error::other)??;
@@ -1038,37 +1045,75 @@ pub async fn serve(app: &App) -> std::io::Result<RunningServer> {
     Listeners::bind(app.config()).await?.serve(app)
 }
 
-/// The two sockets, bound but not yet answering
+/// The sockets, bound but not yet answering
 ///
 /// Binding first lets the daemon fail on a taken port before it touches any
 /// state, and start answering only once it has settled what the previous
 /// process left behind
 pub struct Listeners {
     listener: TcpListener,
+    /// `[::1]` on the main listener's port, beside an IPv4 `listen`
+    loopback_v6: Option<TcpListener>,
     admin_listener: TcpListener,
 }
 
 impl Listeners {
-    /// Binds the main and the admin listener of `config`
+    /// Binds the main and the admin listener of `config`, and the IPv6
+    /// loopback beside an IPv4 main listener this machine can reach
     pub async fn bind(config: &Config) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(config.listen).await?;
+        let loopback_v6 = bind_loopback_v6(listener.local_addr()?).await;
+
         Ok(Self {
-            listener: TcpListener::bind(config.listen).await?,
+            listener,
+            loopback_v6,
             admin_listener: TcpListener::bind(config.admin_listen).await?,
         })
     }
 
     /// Starts answering requests for `app`
     pub fn serve(self, app: &App) -> std::io::Result<RunningServer> {
-        serve_on(app, self.listener, self.admin_listener)
+        serve_on(app, self)
     }
 }
 
-fn serve_on(
-    app: &App,
-    listener: TcpListener,
-    admin_listener: TcpListener,
-) -> std::io::Result<RunningServer> {
+/// `localhost` resolves to `::1` first on Linux and macOS, so a client that
+/// does not fall back to IPv4 is refused by an IPv4-only listener. A second
+/// listener rather than a dual-stack `[::]` one, so remote peers keep their
+/// IPv4 addresses for the tailnet checks. A host without IPv6, or something
+/// else on that port, only costs the fallback, so failing to bind is a warning
+async fn bind_loopback_v6(main: SocketAddr) -> Option<TcpListener> {
+    let IpAddr::V4(ip) = main.ip() else {
+        return None;
+    };
+    if !ip.is_unspecified() && !ip.is_loopback() {
+        return None;
+    }
+
+    let address = SocketAddr::from((Ipv6Addr::LOCALHOST, main.port()));
+    TcpListener::bind(address)
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(
+                %address,
+                %error,
+                "not listening on IPv6 loopback; clients reach `localhost` only by falling back to 127.0.0.1"
+            );
+        })
+        .ok()
+}
+
+fn serve_on(app: &App, listeners: Listeners) -> std::io::Result<RunningServer> {
+    let Listeners {
+        listener,
+        loopback_v6,
+        admin_listener,
+    } = listeners;
     let address = listener.local_addr()?;
+    let loopback_v6_address = loopback_v6
+        .as_ref()
+        .map(TcpListener::local_addr)
+        .transpose()?;
     let admin_address = admin_listener.local_addr()?;
     // OAuth redirect URIs point at the admin listener's real port
     app.gateway().oauth().set_callback_address(admin_address);
@@ -1105,33 +1150,43 @@ fn serve_on(
     }
     let router = router.layer(middleware::from_fn_with_state(hosts, host_guard));
 
-    let token = shutdown.clone();
-    let main = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { token.cancelled().await })
-        .await
-    });
+    let mut tasks = Vec::new();
+    for listener in std::iter::once(listener).chain(loopback_v6) {
+        let token = shutdown.clone();
+        let router = router.clone();
+        tasks.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { token.cancelled().await })
+            .await
+        }));
+    }
     let token = shutdown.clone();
     let admin_router = admin::router(app);
-    let admin = tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         axum::serve(
             admin_listener,
             admin_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move { token.cancelled().await })
         .await
-    });
-    tracing::info!(%address, %admin_address, "listening");
+    }));
+    tracing::info!(
+        %address,
+        loopback_v6_address = loopback_v6_address.map(tracing::field::display),
+        %admin_address,
+        "listening"
+    );
 
     Ok(RunningServer {
         address,
+        loopback_v6_address,
         admin_address,
         shutdown,
         in_flight,
-        tasks: vec![main, admin],
+        tasks,
     })
 }
 

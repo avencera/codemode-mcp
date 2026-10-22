@@ -29,12 +29,44 @@ use std::{
     time::{Duration, Instant},
 };
 
-use harness::{Harness, Setup, TestResult, call, execute, text_of};
+use harness::{Harness, Setup, TestResult, call, connect_as, execute, text_of};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
+
+// `localhost` resolves to `::1` first, and a client that does not fall back
+// to IPv4 must still reach a gateway listening on 127.0.0.1
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gateway_answers_on_ipv6_loopback() -> TestResult {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return Ok(());
+    }
+    let Some(harness) = Harness::start("", "").await? else {
+        return Ok(());
+    };
+
+    let address = harness
+        .server
+        .loopback_v6_addr()
+        .ok_or("no IPv6 loopback listener")?;
+    assert_eq!(address.port(), harness.server.local_addr().port());
+    let client = connect_as(&format!("http://{address}"), "ipv6-client/1.0").await?;
+    let found = call(
+        &client,
+        "search_tools",
+        json!({ "query": "add two integers" }),
+    )
+    .await?;
+    assert!(
+        text_of(&found).contains("fixture_add"),
+        "{}",
+        text_of(&found)
+    );
+
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scripts_run_against_the_fixture_upstream() -> TestResult {

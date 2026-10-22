@@ -828,7 +828,7 @@ USER_GOOGLE_EMAIL = "you@example.com"
 ## Spokes: use the hub from other machines
 
 The Mac you installed above is the hub. Another machine, a Linux box or another Mac, runs codemode-mcp as a
-spoke: agents there connect to their own `http://localhost:7681/mcp`, see the hub's servers next to the
+spoke: agents there connect to their own `http://127.0.0.1:7681/mcp`, see the hub's servers next to the
 machine's own, and every approval and 1Password value is decided on the hub, with Touch ID at the hub Mac or a
 passkey on the phone. Sign-ins and tokens stay on the hub.
 
@@ -872,7 +872,7 @@ Both machines must be on the same tailnet. The spoke reaches the hub at its Magi
    100.x.y.z as a spoke?" by Touch ID at the Mac, or on the phone. The answer is kept: restarts and rebuilds
    that keep `~/.local/state/codemode-mcp/spoke.id` are not asked again. Until you answer, the spoke's log
    shows the request's link and confirmation code, and the spoke has only its own servers.
-5. Connect the spoke's agents to `http://localhost:7681/mcp`, as on the hub.
+5. Connect the spoke's agents to `http://127.0.0.1:7681/mcp`, as on the hub.
 
 What runs where:
 

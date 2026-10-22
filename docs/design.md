@@ -554,6 +554,10 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
   which takes the owner's Touch ID at the gateway Mac (see Companions). Such code can edit the SQLite file
   (insert a passkey, read OAuth tokens), edit the config (set a tool to `allow`), replace the binary, or talk to
   upstreams directly. Defending against it needs OS-user separation (daemon and state under another account)
+- An IPv4 `listen` on `0.0.0.0` or a loopback address gets a second listener on `[::1]` at the same port,
+  since `localhost` resolves to `::1` first and some clients never fall back to IPv4. It is separate rather
+  than one dual-stack `[::]` socket, so remote peers keep their IPv4 addresses for the tailnet checks; a host
+  without IPv6 logs a warning and runs without it
 - The admin listener is loopback-only and refuses proxied requests and non-loopback `Host` headers; its JSON
   bodies keep cross-site form posts out. `op warm` bypasses approvals by design, and only from the Mac
 - LAN and tailnet peers can reach `/mcp` without authentication (non-goal above); they get the same rights as a

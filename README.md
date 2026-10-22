@@ -87,17 +87,18 @@ The script checks the release against its checksum and Developer ID signature, t
 
 ## Connect an agent
 
-The gateway listens on port 7681:
+The gateway listens on port 7681. Use `127.0.0.1` rather than `localhost`, since
+`localhost` resolves to IPv6 first and versions before 0.12.4 listen on IPv4 only:
 
 ```sh
-claude mcp add --transport http codemode http://localhost:7681/mcp
+claude mcp add --transport http codemode http://127.0.0.1:7681/mcp
 ```
 
 For Codex, add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.codemode]
-url = "http://localhost:7681/mcp"
+url = "http://127.0.0.1:7681/mcp"
 ```
 
 ## Add a server
