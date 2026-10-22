@@ -147,6 +147,10 @@ pub struct Config {
     /// nothing can be written back
     #[serde(skip)]
     path: Option<PathBuf>,
+    /// For servers set up across included files, the file that sets each
+    /// one's `max_concurrent`, or else the file holding its table
+    #[serde(skip)]
+    server_files: BTreeMap<String, PathBuf>,
 }
 
 impl Default for Config {
@@ -169,6 +173,7 @@ impl Default for Config {
             hub: None,
             servers: BTreeMap::new(),
             path: None,
+            server_files: BTreeMap::new(),
         }
     }
 }
@@ -261,6 +266,15 @@ impl Config {
         self.path.as_deref()
     }
 
+    /// The file to change `servers.<server>.max_concurrent` in: the one
+    /// that sets it, or else the one holding the server's table
+    pub fn max_concurrent_file(&self, server: &str) -> Option<&Path> {
+        self.server_files
+            .get(server)
+            .map(PathBuf::as_path)
+            .or(self.path())
+    }
+
     /// Parses and validates configuration text; `path` is used in errors and
     /// to resolve relative `include` paths
     ///
@@ -309,21 +323,35 @@ impl Config {
                 }
                 merged.add(table, path)?;
 
-                merged
-                    .table
-                    .try_into()
-                    .map_err(|source| ConfigError::ParseIncluded {
-                        files: format!(
-                            "{} together with {}",
-                            path.display(),
-                            included_paths
-                                .iter()
-                                .map(|included| included.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                        source,
-                    })?
+                let Merged { table, origins } = merged;
+                let mut config: Self =
+                    table
+                        .try_into()
+                        .map_err(|source| ConfigError::ParseIncluded {
+                            files: format!(
+                                "{} together with {}",
+                                path.display(),
+                                included_paths
+                                    .iter()
+                                    .map(|included| included.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            source,
+                        })?;
+                // a value already set must be changed where it is, or the
+                // files would clash
+                for name in config.servers.keys() {
+                    let key = ["servers", name, "max_concurrent"].map(str::to_owned);
+                    if let Some(file) = (1..=key.len())
+                        .rev()
+                        .find_map(|end| origins.get(&key[..end]))
+                    {
+                        config.server_files.insert(name.clone(), file.clone());
+                    }
+                }
+
+                config
             }
         };
         config.validate()?;
@@ -691,6 +719,14 @@ fn default_gateway_name() -> String {
 
 fn default_idle_secs() -> u64 {
     10 * 60
+}
+
+/// Highest `max_concurrent`; more is no limit in practice, and the
+/// semaphore that enforces it panics past its own maximum
+const MAX_CONCURRENT: usize = 4096;
+
+fn default_max_concurrent() -> usize {
+    8
 }
 
 fn default_op() -> String {
@@ -1254,6 +1290,11 @@ pub struct ServerConfig {
     /// Seconds a `lazy` server may go without calls before it is stopped
     #[serde(default = "default_idle_secs")]
     pub idle_secs: u64,
+    /// Calls the gateway sends this server at once; the rest wait their
+    /// turn, so a script's `asyncio.gather` cannot trip the server's rate
+    /// limit. Builtin servers answer inside the daemon and are not limited
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
     /// Endpoint of a Streamable HTTP server; may hold `{{ op://... }}`
     /// references for a URL that carries a key, and is then never shown
     /// resolved
@@ -1485,6 +1526,11 @@ impl ServerConfig {
     }
 
     fn validate(&self, name: &str) -> Result<(), ConfigError> {
+        if !(1..=MAX_CONCURRENT).contains(&self.max_concurrent) {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}.max_concurrent must be from 1 to {MAX_CONCURRENT}"
+            )));
+        }
         for (tool, tool_override) in &self.tools {
             tool_override.validate(name, tool)?;
         }

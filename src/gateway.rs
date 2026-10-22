@@ -119,7 +119,9 @@ impl ToolCallError {
         match self {
             Self::Unknown(_) => ExcType::NameError,
             Self::Denied(_) | Self::NotApproved { .. } => ExcType::PermissionError,
-            Self::Upstream(UpstreamError::TimedOut { .. }) => ExcType::TimeoutError,
+            Self::Upstream(UpstreamError::TimedOut { .. } | UpstreamError::Busy { .. }) => {
+                ExcType::TimeoutError
+            }
             Self::ResultTooLarge { .. } => ExcType::ValueError,
             Self::Hub(error) => match error.kind {
                 HubErrorKind::Unknown => ExcType::NameError,
@@ -140,7 +142,9 @@ impl ToolCallError {
         match self {
             Self::Unknown(_) => Outcome::NameError,
             Self::Denied(_) | Self::NotApproved { .. } => Outcome::Denied,
-            Self::Upstream(UpstreamError::TimedOut { .. }) => Outcome::Timeout,
+            Self::Upstream(UpstreamError::TimedOut { .. } | UpstreamError::Busy { .. }) => {
+                Outcome::Timeout
+            }
             Self::Hub(error) => match error.kind {
                 HubErrorKind::Unknown => Outcome::NameError,
                 HubErrorKind::Denied => Outcome::Denied,
@@ -1017,8 +1021,19 @@ impl Gateway {
                 approval: call.hub_request.clone(),
                 sensitive: call.sensitive,
             };
+            // the hub's own limit governs how long the call may queue and
+            // run there; an older hub does not say, so ours stands in
+            let timeout = self
+                .hub_view()
+                .servers
+                .iter()
+                .find(|server| server.name == call.server)
+                .and_then(|server| server.call_timeout_secs)
+                .map_or(self.config.tool_timeout(), |secs| {
+                    Duration::from_secs(secs).max(self.config.tool_timeout())
+                });
             let answer = hub
-                .call(&forwarded, self.config.tool_timeout())
+                .call(&forwarded, timeout)
                 .await
                 .map_err(|error| hub_unreachable(&error))?;
             let value = match answer {
@@ -1042,7 +1057,7 @@ impl Gateway {
             .map_err(|error| match error {
                 // the upstream's own error message can echo configured secrets
                 UpstreamError::Service(rmcp::service::ServiceError::McpError(_)) => {
-                    ToolCallError::ToolFailed(self.redactor.apply(&error.public_message()))
+                    self.tool_failed(&call.server, self.redactor.apply(&error.public_message()))
                 }
                 error => ToolCallError::Upstream(error),
             })?;
@@ -1183,6 +1198,10 @@ impl Gateway {
                         .map(|server| server.aliases.clone())
                         .unwrap_or_default(),
                     tools: export_tools(&self.config, snapshot),
+                    call_timeout_secs: self
+                        .upstreams
+                        .get(&snapshot.name)
+                        .map(|upstream| upstream.call_timeout().as_secs()),
                 })
             })
             .collect();
@@ -1298,6 +1317,33 @@ fn omit_none_arguments(entry: &ToolEntry, mut arguments: Map<String, Value>) -> 
 }
 
 impl Gateway {
+    /// A tool's error, with where to lower `max_concurrent` when it reads
+    /// as the server's rate limit, so the agent can say what to change
+    fn tool_failed(&self, server: &str, message: String) -> ToolCallError {
+        let limit = self
+            .config
+            .servers
+            .get(server)
+            .filter(|config| config.builtin.is_none())
+            .map(|config| config.max_concurrent);
+        let Some(limit) = limit.filter(|_| looks_rate_limited(&message)) else {
+            return ToolCallError::ToolFailed(message);
+        };
+        let config = self.config.max_concurrent_file(server).map_or_else(
+            || "the codemode-mcp config".to_owned(),
+            |path| format!("`{}`", path.display()),
+        );
+
+        // the path is the owner's own, but anything shown passes the
+        // redactor, which a value read from 1Password may share text with
+        ToolCallError::ToolFailed(self.redactor.apply(&format!(
+            "{message}\n\n`{server}` looks rate limited. codemode sends it at most {limit} calls \
+             at once; make fewer calls at once, or ask the user to set a lower `max_concurrent` under \
+             `[servers.{server}]` in {config} on the machine that runs `{server}`, then run \
+             `codemode-mcp service restart`"
+        )))
+    }
+
     /// Converts an MCP tool result to the value a script receives
     ///
     /// Structured content wins. Without it, text that is a JSON object or
@@ -1335,7 +1381,7 @@ impl Gateway {
                 self.redactor.apply(&text.join("\n"))
             };
 
-            return Err(ToolCallError::ToolFailed(message));
+            return Err(self.tool_failed(&call.server, message));
         }
         if matches!(call.output, OutputSpec::Text) {
             // a text tool that sends only structured content still gives the
@@ -1359,6 +1405,22 @@ impl Gateway {
 
         Ok(Value::String(text.join("\n")))
     }
+}
+
+/// Whether an upstream's error reads as a rate limit, such as HTTP 429's
+/// `Too Many Requests`
+fn looks_rate_limited(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    [
+        "rate limit",
+        "rate-limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
 }
 
 /// Parses text blocks as one JSON object or array; scalars stay text because

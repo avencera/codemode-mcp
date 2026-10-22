@@ -32,7 +32,7 @@ use serde_json::{Map, Value};
 use tokio::{
     io::{AsyncBufReadExt, BufReader, DuplexStream},
     process::Command,
-    sync::{Mutex, Notify, watch},
+    sync::{Mutex, Notify, Semaphore, SemaphorePermit, watch},
     task::JoinHandle,
 };
 
@@ -140,6 +140,20 @@ pub enum UpstreamError {
         /// Timeout that elapsed
         timeout: Duration,
     },
+    /// Every `max_concurrent` slot stayed taken for the call's timeout; the
+    /// call was never sent, so failing it is safe
+    #[error(
+        "`{server}` had {limit} calls running and this one got no turn within {waited:?}; \
+         it was not sent. Make fewer calls at once"
+    )]
+    Busy {
+        /// Server name
+        server: String,
+        /// Its `max_concurrent`
+        limit: usize,
+        /// How long the call waited
+        waited: Duration,
+    },
     /// The server asked for something other than a tool result
     #[error("server asked for interactive input, which is not supported")]
     InputRequired,
@@ -170,7 +184,9 @@ impl UpstreamError {
             Self::Header(_) | Self::Url | Self::UrlValue(_) => ErrorCategory::Configuration,
             Self::Secret(_) => ErrorCategory::Secret,
             Self::Initialize(_) => ErrorCategory::Initialize,
-            Self::ConnectTimeout(_) | Self::TimedOut { .. } => ErrorCategory::Timeout,
+            Self::ConnectTimeout(_) | Self::TimedOut { .. } | Self::Busy { .. } => {
+                ErrorCategory::Timeout
+            }
             Self::Service(_) | Self::InputRequired | Self::SetupFailed { .. } => {
                 ErrorCategory::Protocol
             }
@@ -188,6 +204,7 @@ impl UpstreamError {
         match self {
             Self::Unavailable { .. }
             | Self::TimedOut { .. }
+            | Self::Busy { .. }
             | Self::InputRequired
             | Self::SetupFailed { .. }
             | Self::NeedsLogin(_) => self.to_string(),
@@ -346,6 +363,9 @@ pub struct Upstream {
     setup_epoch: AtomicU64,
     /// Serializes setup, so concurrent first calls run it once
     setup_turn: Mutex<()>,
+    /// Caps the calls in flight at `max_concurrent`; none for a builtin
+    /// server, whose finds must all reach the owner as one prompt
+    call_slots: Option<Semaphore>,
     /// Logins for `oauth = true` servers
     oauth: Option<Arc<OAuth>>,
     /// Where the last tool list is kept for the next start
@@ -437,6 +457,11 @@ impl Upstream {
         }
 
         self.connected_peer().map(|_| ())
+    }
+
+    /// How long one call may wait for a turn, and then how long it may run
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
     }
 
     /// Whether the catalog offers this server's tools as callable
@@ -554,11 +579,33 @@ impl Upstream {
         arguments: Map<String, Value>,
     ) -> Result<CallToolResult, UpstreamError> {
         let _in_use = self.begin_use();
+        let _slot = self.call_slot().await?;
         let (peer, epoch) = self.awake_peer().await?;
         self.ensure_setup(&peer, epoch, tool).await?;
 
         self.send_call(&peer, tool, self.with_fixed_arguments(tool, arguments))
             .await
+    }
+
+    /// Waits for one of the `max_concurrent` slots, so the server is never
+    /// sent more calls at once and nothing has to be retried
+    ///
+    /// The wait is bounded by the call's own timeout, so a call forwarded
+    /// from a spoke answers before the spoke stops waiting for it
+    async fn call_slot(&self) -> Result<Option<SemaphorePermit<'_>>, UpstreamError> {
+        let Some(slots) = &self.call_slots else {
+            return Ok(None);
+        };
+
+        match tokio::time::timeout(self.call_timeout, slots.acquire()).await {
+            // the semaphore is never closed
+            Ok(permit) => Ok(permit.ok()),
+            Err(_) => Err(UpstreamError::Busy {
+                server: self.name.clone(),
+                limit: self.config.max_concurrent,
+                waited: self.call_timeout,
+            }),
+        }
     }
 
     /// Adds the server's configured `arguments` that `tool` declares and the
@@ -1386,6 +1433,10 @@ impl Upstreams {
                 refresh_turn: Mutex::new(()),
                 setup_epoch: AtomicU64::new(0),
                 setup_turn: Mutex::new(()),
+                call_slots: config
+                    .builtin
+                    .is_none()
+                    .then(|| Semaphore::new(config.max_concurrent)),
                 oauth: oauth.clone(),
                 store: store.clone(),
                 reconnect: watch::channel(0).0,
