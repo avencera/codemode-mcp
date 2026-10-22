@@ -195,9 +195,10 @@ impl From<&ToolCallError> for HubError {
         let kind = match error {
             ToolCallError::Unknown(_) => HubErrorKind::Unknown,
             ToolCallError::Denied(_) | ToolCallError::NotApproved { .. } => HubErrorKind::Denied,
-            ToolCallError::Upstream(crate::upstream::UpstreamError::TimedOut { .. }) => {
-                HubErrorKind::TimedOut
-            }
+            ToolCallError::Upstream(
+                crate::upstream::UpstreamError::TimedOut { .. }
+                | crate::upstream::UpstreamError::Busy { .. },
+            ) => HubErrorKind::TimedOut,
             ToolCallError::ResultTooLarge { .. } => HubErrorKind::TooLarge,
             ToolCallError::Hub(error) => error.kind,
             _ => HubErrorKind::Failed,

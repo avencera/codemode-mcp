@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -63,6 +63,28 @@ struct EchoParams {
     /// How long to wait before answering
     delay_ms: u64,
 }
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct OverlapParams {
+    /// How long to stay in flight
+    delay_ms: u64,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+struct Overlap {
+    /// Most calls of this tool in flight at once so far
+    peak: usize,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FailParams {
+    /// Text of the error to answer with
+    message: String,
+}
+
+/// Calls of `overlap` running now, and the most seen at once
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct UseTokenParams {
@@ -313,6 +335,26 @@ impl Fixture {
 
         Json(EchoResult {
             echoed: params.text,
+        })
+    }
+
+    #[tool(description = "Answer with an error carrying the message")]
+    fn fail(
+        &self,
+        Parameters(FailParams { message }): Parameters<FailParams>,
+    ) -> Result<String, String> {
+        Err(message)
+    }
+
+    #[tool(description = "Stay in flight for delay_ms, then report the most calls seen at once")]
+    async fn overlap(&self, Parameters(params): Parameters<OverlapParams>) -> Json<Overlap> {
+        let running = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK.fetch_max(running, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(params.delay_ms)).await;
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+
+        Json(Overlap {
+            peak: PEAK.load(Ordering::SeqCst),
         })
     }
 

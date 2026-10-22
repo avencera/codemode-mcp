@@ -279,12 +279,16 @@ impl HubClient {
 
     /// Runs a call of the hub's tool there; `tool_timeout` is the spoke's
     /// own limit, which the hub's may exceed
+    ///
+    /// The hub may first queue the call behind the server's
+    /// `max_concurrent` for up to its timeout, so the wait covers that too
     pub async fn call(
         &self,
         call: &ForwardedCall,
         tool_timeout: Duration,
     ) -> Result<CallAnswer, HubClientError> {
-        self.post("/call", call, tool_timeout + QUICK).await
+        self.post("/call", call, tool_timeout.saturating_mul(2) + QUICK)
+            .await
     }
 
     /// The hub's verdict on request `id`, after a long poll; `None` while it
