@@ -1021,8 +1021,19 @@ impl Gateway {
                 approval: call.hub_request.clone(),
                 sensitive: call.sensitive,
             };
+            // the hub's own limit governs how long the call may queue and
+            // run there; an older hub does not say, so ours stands in
+            let timeout = self
+                .hub_view()
+                .servers
+                .iter()
+                .find(|server| server.name == call.server)
+                .and_then(|server| server.call_timeout_secs)
+                .map_or(self.config.tool_timeout(), |secs| {
+                    Duration::from_secs(secs).max(self.config.tool_timeout())
+                });
             let answer = hub
-                .call(&forwarded, self.config.tool_timeout())
+                .call(&forwarded, timeout)
                 .await
                 .map_err(|error| hub_unreachable(&error))?;
             let value = match answer {
@@ -1187,6 +1198,10 @@ impl Gateway {
                         .map(|server| server.aliases.clone())
                         .unwrap_or_default(),
                     tools: export_tools(&self.config, snapshot),
+                    call_timeout_secs: self
+                        .upstreams
+                        .get(&snapshot.name)
+                        .map(|upstream| upstream.call_timeout().as_secs()),
                 })
             })
             .collect();

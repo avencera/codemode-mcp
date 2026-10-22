@@ -93,6 +93,10 @@ pub struct HubServer {
     pub aliases: Vec<String>,
     /// Its tools
     pub tools: Vec<ExportedTool>,
+    /// Seconds the hub lets a call of it wait for a turn under
+    /// `max_concurrent`, and then run; absent from older hubs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_timeout_secs: Option<u64>,
 }
 
 /// Body of `POST /hub/v1/gate`: asks the hub whether a call may run now

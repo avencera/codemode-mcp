@@ -277,11 +277,11 @@ impl HubClient {
         self.post("/gate", call, QUICK).await
     }
 
-    /// Runs a call of the hub's tool there; `tool_timeout` is the spoke's
-    /// own limit, which the hub's may exceed
+    /// Runs a call of the hub's tool there; `tool_timeout` is the longer of
+    /// the spoke's limit and the one the hub lists for the server
     ///
     /// The hub may first queue the call behind the server's
-    /// `max_concurrent` for up to its timeout, so the wait covers that too
+    /// `max_concurrent` for up to that timeout, so the wait covers that too
     pub async fn call(
         &self,
         call: &ForwardedCall,

@@ -459,6 +459,11 @@ impl Upstream {
         self.connected_peer().map(|_| ())
     }
 
+    /// How long one call may wait for a turn, and then how long it may run
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
+
     /// Whether the catalog offers this server's tools as callable
     pub fn callable(&self) -> bool {
         self.config.lazy || self.status() == UpstreamStatus::Connected
