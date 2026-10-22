@@ -1965,6 +1965,74 @@ async fn finds_a_script_starts_together_share_one_prompt() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn one_op_find_asks_once_for_every_query_and_a_rerun_asks_nothing() -> TestResult {
+    let Some(rig) = Rig::start(Options::default()).await? else {
+        return Ok(());
+    };
+    signing_items(&rig, "hunter2-signing-secret")?;
+    std::fs::write(
+        rig.companion_log.with_file_name("item-tok1.json"),
+        r#"{"id":"tok1","title":"Pushover","category":"API_CREDENTIAL",
+            "vault":{"id":"v1","name":"Personal"},
+            "fields":[{"id":"credential","type":"CONCEALED","label":"credential",
+                        "reference":"op://Personal/Pushover/credential"}]}"#,
+    )?;
+    let find_prompts = || {
+        rig.companion_mac
+            .shown()
+            .into_iter()
+            .filter(|prompt| prompt.contains("1Password items match"))
+            .count()
+    };
+    let args = [
+        "op",
+        "find",
+        "signing",
+        "--also",
+        "pushover",
+        "--reason",
+        "set up the release build",
+    ];
+
+    // an agent ran each of these as its own `op find` and got a prompt each
+    let (ok, stdout, stderr) = cli(&rig, &args).await?;
+    assert!(ok, "{stderr}");
+    let found: Value = serde_json::from_str(&stdout)?;
+    let titles: Vec<(&str, &str)> = found
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|answer| {
+            let query = answer["query"].as_str().unwrap_or_default();
+            answer["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |item| (query, item["title"].as_str().unwrap_or_default()))
+        })
+        .collect();
+    assert_eq!(
+        titles,
+        [("signing", "Apple Signing"), ("pushover", "Pushover")]
+    );
+    assert_eq!(find_prompts(), 1);
+
+    // the same searches again, as after misreading the output, are answered
+    // without asking; another reason is asked
+    rig.companion_mac.set_answer(Some(TouchId::Review));
+    let (ok, again, stderr) = cli(&rig, &args).await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(again, stdout);
+    assert_eq!(find_prompts(), 1);
+
+    let (ok, _, stderr) = cli(&rig, &["op", "find", "signing", "--reason", "other"]).await?;
+    assert!(!ok && stderr.contains("denied"), "{stderr}");
+    assert_eq!(find_prompts(), 2);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_description_approved_on_a_mac_answers_its_matches_and_writes_nothing() -> TestResult {
     let Some(rig) = Rig::start(Options {
         extra: "[servers.secrets]\nbuiltin = \"secrets\"\n",

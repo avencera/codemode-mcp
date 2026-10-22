@@ -423,10 +423,21 @@ enum OpCommand {
     /// the JSON printed, then read it with `op read`, `op inject` or `op run`,
     /// which ask again and name that item. Words are matched in item titles,
     /// vaults, tags and categories, ignoring case; at most 10 items are listed
+    /// per query
+    ///
+    /// Each `--also` is another query searched under the same approval, and
+    /// the JSON printed is then a list of each query with its items. The same
+    /// query with the same reason is answered again for 10 minutes after an
+    /// approval without asking
     Find {
-        /// Words to look for, such as `apple signing`
+        /// Words to look for, such as `apple signing`; an item matching any
+        /// of them is listed
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
+        /// Another query to search under the same approval, such as `--also
+        /// "signing cert"`; up to 7
+        #[arg(long, value_name = "WORDS")]
+        also: Vec<String>,
         /// Why the program is looking; every prompt shows it
         #[arg(long)]
         reason: Option<String>,
@@ -2263,36 +2274,95 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                 }
             }
         }
-        OpCommand::Find { query, reason } => {
-            let request = admin::OpFindRequest {
-                query: query.join(" "),
-                reason,
-            };
+        OpCommand::Find {
+            query,
+            also,
+            reason,
+        } => {
+            let several = !also.is_empty();
+            let queries: Vec<String> = std::iter::once(query.join(" ")).chain(also).collect();
+            if queries.len() > companion::MAX_FIND_QUERIES {
+                bail!(
+                    "at most {} queries share one approval; pass the query and up to {} --also",
+                    companion::MAX_FIND_QUERIES,
+                    companion::MAX_FIND_QUERIES - 1
+                );
+            }
+            // checked before any is sent, so a malformed query cannot leave
+            // the others asking for nothing
+            for query in &queries {
+                companion::checked_query(query).map_err(|message| eyre!("refused: {message}"))?;
+            }
+
             eprintln!(
                 "Asking the owner to approve a 1Password search: Touch ID on this Mac or a \
                  companion Mac..."
             );
-            let response: admin::OpFindResponse =
-                admin_post_as_owner(config, "/admin/op/find", &request).await?;
-            match response {
-                admin::OpFindResponse::Found {
-                    source,
-                    items,
-                    more,
-                } => {
-                    eprintln!("Approved on {source}");
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
+            // the daemon asks once for finds with the same reason that arrive
+            // together, so every query is sent at once
+            let mut finds = tokio::task::JoinSet::new();
+            for (index, query) in queries.iter().enumerate() {
+                let config = config.clone();
+                let request = admin::OpFindRequest {
+                    query: query.clone(),
+                    reason: reason.clone(),
+                };
+                finds.spawn(async move {
+                    let response: Result<admin::OpFindResponse> =
+                        admin_post_as_owner(&config, "/admin/op/find", &request).await;
+
+                    (index, response)
+                });
+            }
+            let mut responses: Vec<Option<admin::OpFindResponse>> = std::iter::repeat_with(|| None)
+                .take(queries.len())
+                .collect();
+            while let Some(joined) = finds.join_next().await {
+                let (index, response) = joined?;
+                responses[index] = Some(response?);
+            }
+
+            let mut sources = Vec::new();
+            let mut answers = Vec::new();
+            for (query, response) in queries.iter().zip(responses) {
+                match response {
+                    Some(admin::OpFindResponse::Found {
+                        source,
+                        items,
+                        more,
+                    }) => {
+                        if !sources.contains(&source) {
+                            sources.push(source);
+                        }
+                        answers.push(serde_json::json!({
+                            "query": query,
                             "items": items,
                             "more": more,
-                        }))?
-                    );
+                        }));
+                    }
+                    Some(admin::OpFindResponse::Invalid { message }) => {
+                        bail!("refused: {message}")
+                    }
+                    Some(admin::OpFindResponse::Denied { message }) => bail!("denied: {message}"),
+                    Some(admin::OpFindResponse::Failed { message }) => {
+                        bail!("no items: {message}")
+                    }
+                    None => bail!("the daemon did not answer the search for {query:?}"),
                 }
-                admin::OpFindResponse::Invalid { message } => bail!("refused: {message}"),
-                admin::OpFindResponse::Denied { message } => bail!("denied: {message}"),
-                admin::OpFindResponse::Failed { message } => bail!("no items: {message}"),
             }
+
+            eprintln!("Approved on {}", sources.join(", "));
+            let printed = if several {
+                serde_json::Value::Array(answers)
+            } else {
+                let mut answer = answers.pop().unwrap_or_default();
+                if let Some(answer) = answer.as_object_mut() {
+                    answer.remove("query");
+                }
+
+                answer
+            };
+            println!("{}", serde_json::to_string_pretty(&printed)?);
         }
         OpCommand::Inject {
             in_file,

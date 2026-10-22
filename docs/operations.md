@@ -216,7 +216,11 @@ the prompt quotes the words and the reason. The phone cannot search 1Password, s
 reference picked afterwards asks again and names that item. Scripts can do the same with the `secrets` server's
 `find_references(query, reason)`. Finds with the same reason that arrive within 250 ms of each other, such as the
 calls a script starts together under `asyncio.gather`, share one prompt that quotes every query, up to 8 of them;
-each call still gets its own matches.
+each call still gets its own matches. One `op find` can do the same with `--also`:
+`codemode-mcp op find apple signing --also pushover --reason "set up the release build"` asks once and prints a
+JSON list with each query, its items and `more`. Once approved, the same query with the same reason is answered
+again for 10 minutes without asking, so a program rerun after misreading the output does not prompt again; a
+different query or reason asks, and `codemode-mcp service restart --fresh` forgets every kept answer.
 
 A file attached to an item, such as a signing certificate's `.p12`, is binary. Write it with
 `codemode-mcp op read "op://Personal/Signing/cert.p12" --out-file cert.p12`, which keeps its exact bytes and adds no

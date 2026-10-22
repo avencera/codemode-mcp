@@ -10,7 +10,13 @@
 //!
 //! Finds with the same reason that arrive within [`FIND_BATCH_WINDOW`] of
 //! the first are asked as one, up to [`MAX_FIND_QUERIES`], so the searches a
-//! script starts together under `asyncio.gather` need one approval
+//! script starts together under `asyncio.gather`, or the queries of one
+//! `op find`, need one approval
+//!
+//! An approved answer is kept for [`FIND_KEEP`], so the same query with the
+//! same reason, such as a program run again after it misread the output, is
+//! answered without asking. It names items and references, never a value,
+//! that the owner already let a program with that reason see
 
 use std::{
     collections::HashMap,
@@ -46,6 +52,10 @@ const CANCEL_TITLE: &str = "Deny";
 /// milliseconds
 const FIND_BATCH_WINDOW: Duration = Duration::from_millis(250);
 
+/// How long an approved find answers the same query and reason again
+/// without asking; long enough for a program to be fixed and rerun
+const FIND_KEEP: Duration = Duration::from_secs(10 * 60);
+
 /// What a program looks for, as the admin route and the `secrets` builtin
 /// server pass it on
 #[derive(Debug, Clone, Default)]
@@ -57,7 +67,7 @@ pub struct FindAsk {
 }
 
 /// The items a find matched and the Mac that searched
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProgramFound {
     /// `this Mac`, or the name of the companion that answered
     pub source: String,
@@ -107,6 +117,11 @@ impl OnePassword {
         }
         let query = checked_query(&ask.query).map_err(ProgramReadError::Invalid)?;
         let reason = clean_reason(ask.reason.as_deref());
+        if let Some(found) = self.kept_find(reason.as_deref(), &query).await {
+            tracing::info!("find answered from one approved earlier");
+
+            return Ok(found);
+        }
         let (answer, answered) = oneshot::channel();
         let waiting = Waiting { query, answer };
 
@@ -169,6 +184,9 @@ impl OnePassword {
         let mut queries: Vec<String> = waiting.iter().map(|find| find.query.clone()).collect();
         queries.sort();
         queries.dedup();
+        // read before asking, so a forget while the prompt is up drops this
+        // answer instead of keeping it
+        let forgotten = self.forgotten().await;
         // every caller giving up takes the prompts down, as a lone find's did
         let all_gone = async {
             for find in &mut waiting {
@@ -179,6 +197,18 @@ impl OnePassword {
             answer = self.find_each(&queries, reason.as_deref()) => answer,
             () = all_gone => return,
         };
+        if let Ok((source, found)) = &answer {
+            let answers = queries.iter().zip(found).map(|(query, found)| {
+                let found = ProgramFound {
+                    source: source.clone(),
+                    found: found.clone(),
+                };
+
+                (query.clone(), found)
+            });
+            self.keep_finds(reason.as_deref(), answers, FIND_KEEP, forgotten)
+                .await;
+        }
 
         for find in waiting {
             let own = match &answer {

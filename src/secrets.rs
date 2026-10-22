@@ -26,7 +26,9 @@ use tokio::{sync::Mutex, task::JoinSet};
 
 use self::approved::{Approved, Consumer};
 use crate::{
-    companion::{Companions, CreatedItem, DeviceTrust, FindBatches, NewItem, ProgramValue},
+    companion::{
+        Companions, CreatedItem, DeviceTrust, FindBatches, NewItem, ProgramFound, ProgramValue,
+    },
     config::{Config, SecretsConfig},
     hub::client::HubClient,
     mac::{OnMac, TouchId},
@@ -894,23 +896,26 @@ pub struct OnePassword {
     hub: Option<Arc<HubClient>>,
 }
 
-/// The keep grants, and how many times they were forgotten, so a read
-/// approved before a forget cannot keep its values after it
+/// The keep grants and approved finds, and how many times they were
+/// forgotten, so a read or find approved before a forget cannot be kept
+/// after it
 #[derive(Default)]
 struct KeptValues {
-    grants: HashMap<(Option<String>, String), Kept>,
+    grants: HashMap<(Option<String>, String), Kept<ProgramValue>>,
+    /// Find answers by cleaned reason and query
+    finds: HashMap<(Option<String>, String), Kept<ProgramFound>>,
     forgotten: u64,
 }
 
-/// A value a program may get again without asking until both clocks pass
-/// its end: `Instant` stops while the Mac sleeps, the wall clock can be set
-struct Kept {
-    value: ProgramValue,
+/// What a program may get again without asking until both clocks pass its
+/// end: `Instant` stops while the Mac sleeps, the wall clock can be set
+struct Kept<T> {
+    value: T,
     until: std::time::Instant,
     until_wall: std::time::SystemTime,
 }
 
-impl Kept {
+impl<T> Kept<T> {
     fn live(&self) -> bool {
         std::time::Instant::now() < self.until && std::time::SystemTime::now() < self.until_wall
     }
@@ -1056,13 +1061,14 @@ impl OnePassword {
         Ok(count)
     }
 
-    /// Forgets every value read, and every value kept for programs, so the
-    /// next read of each asks again, as after a rotated key; how many config
-    /// values were held
+    /// Forgets every value read, every value kept for programs and every
+    /// find answer kept, so the next read or find asks again, as after a
+    /// rotated key; how many config values were held
     pub async fn forget(&self) -> usize {
         {
             let mut kept = self.kept.lock().await;
             kept.grants.clear();
+            kept.finds.clear();
             kept.forgotten += 1;
         }
         let mut known = self.known.lock().await;
@@ -1104,6 +1110,7 @@ impl OnePassword {
     }
 
     /// How many times the grants were forgotten; pass it to [`Self::keep`]
+    /// or [`Self::keep_finds`]
     pub(crate) async fn forgotten(&self) -> u64 {
         self.kept.lock().await.forgotten
     }
@@ -1131,6 +1138,50 @@ impl OnePassword {
                 (destination.map(str::to_owned), reference.clone()),
                 Kept {
                     value: value.clone(),
+                    until,
+                    until_wall,
+                },
+            );
+        }
+    }
+
+    /// The answer kept for a find of `query` with `reason`, both as cleaned,
+    /// while it is live
+    pub(crate) async fn kept_find(
+        &self,
+        reason: Option<&str>,
+        query: &str,
+    ) -> Option<ProgramFound> {
+        let mut kept = self.kept.lock().await;
+        kept.finds.retain(|_, entry| entry.live());
+
+        kept.finds
+            .get(&(reason.map(str::to_owned), query.to_owned()))
+            .map(|entry| entry.value.clone())
+    }
+
+    /// Keeps each approved find answer of `answers`, by query, for finds
+    /// with the same `reason` to get again without asking until `keep` has
+    /// passed; nothing is kept when the finds were forgotten since
+    /// `forgotten` was read
+    pub(crate) async fn keep_finds(
+        &self,
+        reason: Option<&str>,
+        answers: impl IntoIterator<Item = (String, ProgramFound)>,
+        keep: Duration,
+        forgotten: u64,
+    ) {
+        let until = std::time::Instant::now() + keep;
+        let until_wall = std::time::SystemTime::now() + keep;
+        let mut kept = self.kept.lock().await;
+        if kept.forgotten != forgotten {
+            return;
+        }
+        for (query, found) in answers {
+            kept.finds.insert(
+                (reason.map(str::to_owned), query),
+                Kept {
+                    value: found,
                     until,
                     until_wall,
                 },

@@ -283,7 +283,11 @@ approved wherever the owner is
   with the same cleaned reason that arrive within 250 ms of the first join one batch of up to 8 queries
   (`FindBatches`, keyed by reason so an unrelated program's find never shares an approval or a Deny), asked
   on its own task so a caller that gives up cannot strand the rest; the batch is dropped once every caller
-  has. One prompt quotes every query; a companion answers `{"found_each": [...]}`, one `Found` per query in
+  has. `op find --also` sends each query as its own `/admin/op/find` request at once, so the batch joins them.
+  An approved batch's answers are kept for 10 minutes in `KeptValues::finds`, by cleaned reason and query, and
+  a later find with both the same is answered from there without asking; a forget clears them, and a batch
+  approved while a forget ran keeps nothing. On a hub the reason carries the spoke's name, so a spoke's kept
+  answers serve only that spoke One prompt quotes every query; a companion answers `{"found_each": [...]}`, one `Found` per query in
   order, and one from before batches, which ignores `also` and answers `found`, is reported as needing an
   update. The Mac lists items once per batch and opens an item two queries match once The Mac that
   answers runs `op item list --format json`, which holds no values, and scores items by how many query words
