@@ -37,7 +37,7 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$version" || { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
       # a draft until the archive is attached: `update` follows
       # releases/latest, which would otherwise point at a release with no assets
-      - uses: taiki-e/create-gh-release-action@v1
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
         with:
           draft: true
 
