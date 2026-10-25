@@ -35,7 +35,7 @@ jobs:
           version="$(awk '/^name = "monty-pool"$/ { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
           : "${version:?monty-pool is not in Cargo.lock}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: monty-cache
         with:
           path: .tools
