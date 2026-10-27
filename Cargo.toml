@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "codemode-mcp"
-version = "0.12.4"
+version = "0.12.5"
 edition = "2024"
 publish = false
 license = "MIT OR Apache-2.0"
