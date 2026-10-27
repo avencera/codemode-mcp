@@ -11,11 +11,15 @@
 //! `op://` reads are decided on the hub too
 //!
 //! Every route is JSON over HTTP under [`API`], spoke to hub, on the hub's
-//! main listener. Each answer carries the hub's catalog version in
-//! [`CATALOG_HEADER`], so a spoke refetches the catalog when it changes
+//! main listener. A spoke holds a catalog request open on the hub, which
+//! answers as soon as its catalog changes. Each answer also carries the
+//! hub's catalog version in [`CATALOG_HEADER`], so a spoke of a hub that
+//! does not hold requests still refetches when it changes
 
 pub mod client;
 pub mod server;
+
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -31,6 +35,9 @@ pub const API: &str = "/hub/v1";
 pub const SPOKE_HEADER: &str = "x-codemode-spoke";
 /// Header carrying the hub's catalog version on every answer
 pub const CATALOG_HEADER: &str = "x-codemode-catalog";
+/// How long the hub holds `GET /hub/v1/catalog?after=<version>` before
+/// answering `null` for a catalog still at that version
+pub const CATALOG_WAIT: Duration = Duration::from_secs(25);
 
 /// Body of `POST /hub/v1/register`
 #[derive(Debug, Clone, Serialize, Deserialize)]

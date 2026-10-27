@@ -21,9 +21,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Notify, watch};
 
 use super::{
-    API, CATALOG_HEADER, CallAnswer, ConfigAnswer, ConfigRead, ForwardedCall, GateAnswer, GateCall,
-    HubCatalog, ProgramReadCall, Refusal, Register, Registration, SPOKE_HEADER, WaitAnswer,
-    WaitFor,
+    API, CATALOG_HEADER, CATALOG_WAIT, CallAnswer, ConfigAnswer, ConfigRead, ForwardedCall,
+    GateAnswer, GateCall, HubCatalog, ProgramReadCall, Refusal, Register, Registration,
+    SPOKE_HEADER, WaitAnswer, WaitFor,
 };
 use crate::{
     admin::{OpFindRequest, OpFindResponse, OpReadRequest, OpReadResponse},
@@ -47,7 +47,8 @@ const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
 const PATIENT: Duration = Duration::from_secs(15 * 60);
 /// How often a spoke the owner has not answered yet asks again
 const PENDING_POLL: Duration = Duration::from_secs(5);
-/// How often a trusted spoke checks the hub's catalog when nothing changed
+/// How often a trusted spoke checks the catalog of a hub that answers at
+/// once instead of holding the request until it changes
 const CATALOG_POLL: Duration = Duration::from_secs(60);
 /// Longest pause between attempts to reach a hub that does not answer
 const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -263,13 +264,27 @@ impl HubClient {
     }
 
     /// The hub's servers this spoke may call, as the hub lists them
-    pub async fn catalog(&self) -> Result<HubCatalog, HubClientError> {
-        let request = self.http.get(format!("{}{API}/catalog", self.base));
-        let catalog: HubCatalog = self.send(request, QUICK).await?;
-        *self
-            .catalog_version
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(catalog.version.clone());
+    ///
+    /// With `after`, the hub holds the request until its catalog's version
+    /// is another one, answering `None` if it stays `after` for
+    /// [`CATALOG_WAIT`]. A hub from before held requests answers at once
+    pub async fn catalog(&self, after: Option<&str>) -> Result<Option<HubCatalog>, HubClientError> {
+        let (request, timeout) = match after {
+            // versions are the hub's hex digests, so they need no escaping
+            Some(after) => (
+                self.http
+                    .get(format!("{}{API}/catalog?after={after}", self.base)),
+                CATALOG_WAIT + QUICK,
+            ),
+            None => (self.http.get(format!("{}{API}/catalog", self.base)), QUICK),
+        };
+        let catalog: Option<HubCatalog> = self.send(request, timeout).await?;
+        if let Some(catalog) = &catalog {
+            *self
+                .catalog_version
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(catalog.version.clone());
+        }
 
         Ok(catalog)
     }
@@ -431,14 +446,32 @@ impl HubClient {
                 }
             }
 
-            match self.catalog().await {
-                Ok(catalog) => {
+            let held = self
+                .catalog_version
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match self.catalog(held.as_deref()).await {
+                Ok(Some(catalog)) => {
+                    // only a hub that does not hold requests answers at once
+                    // with the version this spoke has; polling it keeps the
+                    // loop from spinning
+                    let polled = held.as_deref() == Some(catalog.version.as_str());
                     let Some(gateway) = gateway.upgrade() else {
                         return;
                     };
                     gateway.set_hub_catalog(catalog);
+                    drop(gateway);
                     pause = Duration::from_secs(1);
+                    if polled {
+                        tokio::select! {
+                            () = self.catalog_changed.notified() => {}
+                            () = tokio::time::sleep(CATALOG_POLL) => {}
+                        }
+                    }
                 }
+                // the hub held the request and nothing changed
+                Ok(None) => {}
                 Err(HubClientError::Untrusted) => {
                     tracing::warn!("the hub no longer trusts this spoke");
                     continue;
@@ -449,11 +482,6 @@ impl HubClient {
                     pause = (pause * 2).min(UNREACHABLE_BACKOFF_MAX);
                     continue;
                 }
-            }
-
-            tokio::select! {
-                () = self.catalog_changed.notified() => {}
-                () = tokio::time::sleep(CATALOG_POLL) => {}
             }
         }
     }

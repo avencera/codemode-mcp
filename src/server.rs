@@ -1146,7 +1146,10 @@ fn serve_on(app: &App, listeners: Listeners) -> std::io::Result<RunningServer> {
         .merge(web::router(app))
         .nest_service("/mcp", mcp);
     if let Some(hub) = app.hub() {
-        router = router.merge(crate::hub::server::router(Arc::clone(hub)));
+        router = router.merge(crate::hub::server::router(
+            Arc::clone(hub),
+            shutdown.clone(),
+        ));
     }
     let router = router.layer(middleware::from_fn_with_state(hosts, host_guard));
 

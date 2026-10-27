@@ -862,8 +862,11 @@ spokes as hub tools.
   before they leave. The `secrets` builtin is not exported, since a spoke has its own. A spoke keeps the
   servers `[hub] servers` or `exclude` let through, merges them with its own and type-checks scripts against
   both. A spoke server with a hub server's name is a startup error naming it; a clash that appears later is
-  logged and the hub server left out. A spoke refetches when an answer carries another version, and every
-  60 s
+  logged and the hub server left out. A spoke holds `GET catalog?after=<version>` open on the hub, which answers
+  as soon as its catalog's version changes, such as when a server signs in, or with `null` after 25 s (or at
+  once when the hub stops), and the spoke asks again. A hub from before held requests answers at once with the
+  same version; the spoke then falls back to refetching every 60 s and whenever an answer's
+  `x-codemode-catalog` names another version
 - Calls to hub tools: the spoke asks `gate`, and the hub resolves the call in its own catalog under its own
   policy. An `ask` call waits on the hub's request, which the hub keeps with the prepared call; the spoke parks
   its execution on a local copy of that request, which it follows by long poll (`approvals/wait`, 25 s, backing

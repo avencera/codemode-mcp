@@ -15,7 +15,10 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, watch},
+    task::JoinHandle,
+};
 
 use crate::{
     approvals::{Approvals, Gate, GateRequest, RemoteGate, Waiting, hex},
@@ -270,8 +273,9 @@ pub struct Gateway {
     hub: Option<Arc<HubClient>>,
     /// On a spoke, the hub's servers it calls through the hub
     hub_view: RwLock<Arc<HubView>>,
-    /// On a hub, the servers its spokes may call, as of the last rebuild
-    exported: RwLock<Arc<HubCatalog>>,
+    /// On a hub, the servers its spokes may call, as of the last rebuild;
+    /// a spoke's held catalog request waits on it
+    exported: watch::Sender<Arc<HubCatalog>>,
 }
 
 /// The hub's servers as a spoke has them: what the hub listed, and a config
@@ -433,7 +437,7 @@ impl Gateway {
             rebuild_task: RwLock::new(None),
             hub,
             hub_view: RwLock::new(Arc::default()),
-            exported: RwLock::new(Arc::default()),
+            exported: watch::Sender::new(Arc::default()),
         });
 
         // the task holds only a weak reference so dropping the gateway stops it
@@ -483,12 +487,27 @@ impl Gateway {
 
     /// The servers this hub's spokes may call
     pub fn hub_catalog(&self) -> Arc<HubCatalog> {
-        Arc::clone(
-            &self
-                .exported
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Arc::clone(&self.exported.borrow())
+    }
+
+    /// The servers this hub's spokes may call, once their version is other
+    /// than `version`; `None` when it stays `version` for `limit`
+    pub async fn hub_catalog_after(
+        &self,
+        version: &str,
+        limit: Duration,
+    ) -> Option<Arc<HubCatalog>> {
+        let mut changes = self.exported.subscribe();
+        let changed = tokio::time::timeout(
+            limit,
+            changes.wait_for(|catalog| catalog.version != version),
         )
+        .await;
+
+        match changed {
+            Ok(Ok(catalog)) => Some(Arc::clone(&catalog)),
+            _ => None,
+        }
     }
 
     /// Takes the hub's catalog in, keeping the servers `[hub]` lets through,
@@ -1209,11 +1228,15 @@ impl Gateway {
             serde_json::to_vec(&servers).unwrap_or_default(),
         ));
 
-        *self
-            .exported
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Arc::new(HubCatalog { version, servers });
+        // an unchanged export wakes no spoke
+        self.exported.send_if_modified(|exported| {
+            if exported.version == version {
+                return false;
+            }
+            *exported = Arc::new(HubCatalog { version, servers });
+
+            true
+        });
     }
 
     async fn rebuild(&self) -> bool {

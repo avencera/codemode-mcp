@@ -20,7 +20,7 @@ use std::{
 
 use axum::{
     Extension, Json, Router,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
@@ -29,11 +29,12 @@ use axum::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use super::{
-    API, CATALOG_HEADER, CallAnswer, ConfigAnswer, ConfigRead, ForwardedCall, GateAnswer, GateCall,
-    HubError, HubErrorKind, ProgramReadCall, Refusal, Register, Registration, SPOKE_HEADER,
-    WaitAnswer, WaitFor,
+    API, CATALOG_HEADER, CATALOG_WAIT, CallAnswer, ConfigAnswer, ConfigRead, ForwardedCall,
+    GateAnswer, GateCall, HubError, HubErrorKind, ProgramReadCall, Refusal, Register, Registration,
+    SPOKE_HEADER, WaitAnswer, WaitFor,
 };
 use crate::{
     admin::{OpFindRequest, op_find_response, op_read_response},
@@ -859,11 +860,15 @@ fn destination_on(spoke: &StoredSpoke, destination: Option<String>) -> String {
     }
 }
 
-/// The `/hub/v1` routes
-pub fn router(hub: Arc<Hub>) -> Router {
+/// The `/hub/v1` routes; `stopping` ends held catalog requests when the
+/// listener stops
+pub fn router(hub: Arc<Hub>, stopping: CancellationToken) -> Router {
     Router::new()
         .route(&format!("{API}/register"), post(register))
-        .route(&format!("{API}/catalog"), get(catalog))
+        .route(
+            &format!("{API}/catalog"),
+            get(catalog).layer(Extension(stopping)),
+        )
         .route(&format!("{API}/gate"), post(gate))
         .route(&format!("{API}/call"), post(call))
         .route(&format!("{API}/approvals/wait"), post(wait))
@@ -950,8 +955,43 @@ async fn register(
     Json(hub.register(peer, register)).into_response()
 }
 
-async fn catalog(State(hub): State<Arc<Hub>>) -> Response {
-    Json(&*hub.gateway.hub_catalog()).into_response()
+/// Query of `GET /hub/v1/catalog`
+#[derive(serde::Deserialize)]
+struct CatalogQuery {
+    /// The version the spoke holds; the answer waits for another one
+    after: Option<String>,
+}
+
+/// The catalog, or with `after`, the catalog once it changes, so a spoke
+/// learns of a server signing in or reconnecting at once; `null` when it
+/// stays the same for [`CATALOG_WAIT`], and the spoke asks again
+async fn catalog(
+    State(hub): State<Arc<Hub>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(spoke): Extension<StoredSpoke>,
+    Extension(stopping): Extension<CancellationToken>,
+    Query(query): Query<CatalogQuery>,
+) -> Response {
+    let Some(after) = query.after else {
+        return Json(&*hub.gateway.hub_catalog()).into_response();
+    };
+
+    let changed = tokio::select! {
+        changed = hub.gateway.hub_catalog_after(&after, CATALOG_WAIT) => changed,
+        // a stop waits for answers in flight, so a held one would hold it up
+        // for the rest of its wait
+        () = stopping.cancelled() => None,
+    };
+    // the guard checked trust before the wait; a spoke removed during it
+    // gets nothing more
+    if hub.trusted(&spoke.id, peer.ip()).is_none() {
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "this spoke is not trusted; it asks the owner when it registers",
+        );
+    }
+
+    Json(changed.as_deref()).into_response()
 }
 
 async fn gate(

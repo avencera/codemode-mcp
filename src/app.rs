@@ -310,9 +310,13 @@ impl App {
                 Registration::Trusted { .. } => {}
                 _ => return Ok(Vec::new()),
             }
-            let catalog = client.catalog().await?;
+            // asked without a version, a hub always answers with its catalog
+            let clashes = match client.catalog(None).await? {
+                Some(catalog) => self.gateway.set_hub_catalog(catalog),
+                None => Vec::new(),
+            };
 
-            Ok::<_, HubClientError>(self.gateway.set_hub_catalog(catalog))
+            Ok::<_, HubClientError>(clashes)
         };
 
         let first = tokio::time::timeout(limit, first).await;

@@ -17,6 +17,7 @@ use codemode_mcp::{
     usage::Caller,
 };
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use super::{
@@ -49,7 +50,7 @@ async fn post_as_spoke<T: serde::de::DeserializeOwned>(
     body: &impl serde::Serialize,
 ) -> Result<T, Box<dyn Error>> {
     let spokes = hub.app.hub().ok_or("the hub has no spokes")?;
-    let response = hub::server::router(Arc::clone(spokes))
+    let response = hub::server::router(Arc::clone(spokes), CancellationToken::new())
         .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
         .oneshot(
             Request::post(format!("{}{path}", hub::API))
@@ -156,7 +157,7 @@ async fn a_spoke_uses_the_hubs_sign_ins_approvals_and_secrets() -> TestResult {
     assert_eq!(trusted.len(), 1, "{trusted:?}");
     assert_eq!(trusted[0].name, name);
     // the spoke's id from another tailnet address is not the spoke
-    let elsewhere = hub::server::router(Arc::clone(spokes))
+    let elsewhere = hub::server::router(Arc::clone(spokes), CancellationToken::new())
         .layer(MockConnectInfo(SocketAddr::from(([100, 64, 9, 9], 40000))))
         .oneshot(
             Request::get(format!("{}/catalog", hub::API))
@@ -268,6 +269,97 @@ async fn a_spoke_uses_the_hubs_sign_ins_approvals_and_secrets() -> TestResult {
 
     let _ = std::fs::remove_dir_all(&directory);
     spoke.stop().await?;
+    hub.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spoke_sees_hub_changes_without_waiting_for_a_poll() -> TestResult {
+    let mock = start_mock(Client::Known).await?;
+    let hub_mac = Arc::new(FakeMac::default());
+    hub_mac.set_present(true);
+    hub_mac.set_answer(Some(TouchId::Approved));
+    // `hubfix` is there from the start, so the spoke can be seen holding the
+    // catalog from before the sign-in
+    let hub_extra = format!(
+        "[servers.known]\nurl = \"{base}/mcp\"\noauth = true\n\
+         client_id = \"known-client\"\nclient_secret = \"known-secret\"\n\n\
+         [servers.hubfix]\ncommand = \"{fixture}\"\n",
+        base = mock.base,
+        fixture = env!("CARGO_BIN_EXE_codemode-fixture"),
+    );
+    let Some(hub) = Harness::with(Setup {
+        notify: true,
+        mac: Some(Arc::clone(&hub_mac)),
+        extra: &hub_extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&hub, "known", "needs_login").await?;
+
+    let spoke_extra = format!(
+        "[hub]\nhost = \"127.0.0.1:{}\"\nexclude = [\"fixture\"]\n",
+        hub.server.local_addr().port()
+    );
+    let Some(spoke) = Harness::with(Setup {
+        extra: &spoke_extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    spoke.app.connect_hub(Duration::from_secs(5)).await?;
+    wait_for_tool(&spoke, "hubfix_add").await?;
+    assert!(spoke.app.gateway().catalog().get("known_hello").is_none());
+
+    // the sign-in happens while the spoke already holds the catalog; it
+    // must arrive well inside the 60 s a polling spoke would wait
+    let (callback, _) = begin_login(&hub, &mock, "known").await?;
+    assert_eq!(hub.http.get(&callback).send().await?.status().as_u16(), 200);
+    wait_for_state(&hub, "known", "connected").await?;
+    let signed_in = std::time::Instant::now();
+    wait_for_tool(&spoke, "known_hello").await?;
+    assert!(
+        signed_in.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        signed_in.elapsed()
+    );
+    spoke.stop().await?;
+
+    // a spoke removed while its catalog request is held gets nothing more;
+    // asking again stays unanswered, so it cannot be trusted anew meanwhile
+    hub_mac.set_answer(Some(TouchId::Unavailable));
+    let spokes = Arc::clone(hub.app.hub().ok_or("the hub has no spokes")?);
+    let id = spokes
+        .spokes()
+        .first()
+        .ok_or("no trusted spoke")?
+        .id
+        .clone();
+    let version = hub.app.gateway().hub_catalog().version.clone();
+    let held = tokio::spawn(
+        hub::server::router(Arc::clone(&spokes), CancellationToken::new())
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+            .oneshot(
+                Request::get(format!("{}/catalog?after={version}", hub::API))
+                    .header(hub::SPOKE_HEADER, &id)
+                    .body(Body::empty())?,
+            ),
+    );
+    // past the guard and waiting, so only the check after the wait can refuse
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!held.is_finished());
+    spokes.remove(&id)?;
+    let (status, _) = hub
+        .admin_json("/admin/oauth/logout", &json!({ "server": "known" }))
+        .await?;
+    assert_eq!(status, 200);
+    let answer = tokio::time::timeout(Duration::from_secs(10), held).await???;
+    assert_eq!(answer.status(), StatusCode::FORBIDDEN);
+
     hub.stop().await
 }
 
