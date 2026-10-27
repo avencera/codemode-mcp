@@ -230,7 +230,8 @@ asked as well: `codemode-mcp op find pushover token --out-file token.txt` (one q
 `find_references` with `env_file` and `var`. A Mac that answers first prints the matches and writes nothing, as
 before. On the phone you enter the value the words describe, or pick it with AutoFill, and it is written there;
 `op find` then prints `{"written": PATH}` and `find_references` answers `written` with the path and variable and
-no items.
+no items. As with `op read`, text gets a trailing newline; pass `--no-newline` to keep a text file shared from
+1Password byte for byte.
 
 Finds with the same reason that arrive within 250 ms of each other, such as the
 calls a script starts together under `asyncio.gather`, share one prompt that quotes every query, up to 8 of them;

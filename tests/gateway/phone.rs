@@ -1631,6 +1631,24 @@ async fn a_find_with_a_destination_is_entered_on_the_phone_while_a_companion_mac
         .ok_or("the phone saw no program read")?;
     assert_eq!(program.items, ["\"pushover token\"".to_owned()]);
 
+    // byte for byte, as a text file shared from 1Password needs
+    let exact = directory.join("token.pem");
+    let exact_arg = exact.display().to_string();
+    let (ok, _, stderr) = rig
+        .harness
+        .cli(&[
+            "op",
+            "find",
+            "pushover",
+            "token",
+            "--out-file",
+            exact_arg.as_str(),
+            "--no-newline",
+        ])
+        .await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(std::fs::read(&exact)?, b"pushover-token-entered");
+
     // a script's find writes the entered value into an env file instead
     let env = directory.join("superalert.secrets.env");
     let code = format!(

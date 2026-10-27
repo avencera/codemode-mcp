@@ -457,6 +457,10 @@ enum OpCommand {
         /// Mode of `--out-file`, in octal
         #[arg(long, default_value = "0600", value_parser = parse_mode)]
         file_mode: u32,
+        /// Write an entered text value without a trailing newline, such as
+        /// a text file shared from 1Password that must stay byte for byte
+        #[arg(short, long, requires = "out_file")]
+        no_newline: bool,
     },
     /// Fill each `{{ op://… }}` in a template, like `op inject`, with one
     /// approval for the whole template
@@ -2297,8 +2301,15 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
             out_file: Some(out_file),
             force,
             file_mode,
+            no_newline,
             ..
-        } => find_or_enter(config, query.join(" "), reason, out_file, force, file_mode).await?,
+        } => {
+            let query = query.join(" ");
+            find_or_enter(
+                config, query, reason, out_file, force, file_mode, no_newline,
+            )
+            .await?
+        }
         OpCommand::Find {
             query,
             also,
@@ -2577,6 +2588,7 @@ async fn find_or_enter(
     out_file: PathBuf,
     force: bool,
     file_mode: u32,
+    no_newline: bool,
 ) -> Result<()> {
     companion::checked_query(&query).map_err(|message| eyre!("refused: {message}"))?;
     // the file written is the one the prompt names
@@ -2602,8 +2614,9 @@ async fn find_or_enter(
                 .next()
                 .ok_or_else(|| eyre!("the daemon sent no value"))?
                 .into_bytes();
-            // a file is written exactly as 1Password holds it
-            if std::str::from_utf8(&contents).is_ok() {
+            // binary is written exactly as 1Password holds it; text gets
+            // a newline, as `op read` gives it, unless `--no-newline`
+            if !no_newline && std::str::from_utf8(&contents).is_ok() {
                 contents.push(b'\n');
             }
             op::write_private(&out_file, &contents, file_mode, force)
