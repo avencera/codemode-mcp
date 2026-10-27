@@ -1659,37 +1659,10 @@ async fn a_deny_on_the_companion_ends_a_program_read() -> TestResult {
     rig.stop().await
 }
 
-/// A CLI config that talks to the rig's daemon
-fn cli_config(rig: &Rig) -> Result<PathBuf, Box<dyn Error>> {
-    let directory = rig.harness.state_dir();
-    let config = directory.join("cli.toml");
-    std::fs::write(
-        &config,
-        format!(
-            "admin_listen = \"{admin}\"\nstate_dir = \"{state}\"\n",
-            admin = rig.harness.admin_base().trim_start_matches("http://"),
-            state = directory.display(),
-        ),
-    )?;
-
-    Ok(config)
-}
-
 /// Runs the CLI against the rig's daemon, as a program on the gateway Mac
 /// does; its success, stdout and stderr
 async fn cli(rig: &Rig, args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp"))
-        .arg("--config")
-        .arg(cli_config(rig)?)
-        .args(args)
-        .output()
-        .await?;
-
-    Ok((
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    rig.harness.cli(args).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2054,7 +2027,7 @@ async fn a_description_approved_on_a_mac_answers_its_matches_and_writes_nothing(
 
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp"))
         .arg("--config")
-        .arg(cli_config(&rig)?)
+        .arg(rig.harness.cli_config()?)
         .args([
             "op",
             "read",

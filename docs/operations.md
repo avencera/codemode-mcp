@@ -218,9 +218,21 @@ A program that does not know the exact reference can look it up first:
 with its fields' and attached files' references, labels and types, and never a value. Words are matched, ignoring
 case, in item titles, vault names, tags and categories, and at most 10 items are listed, best first, with `more`
 counting the rest. You approve the search with Touch ID on this Mac while you are there, or on a companion Mac;
-the prompt quotes the words and the reason. The phone cannot search 1Password, so it is not asked. Reading the
-reference picked afterwards asks again and names that item. Scripts can do the same with the `secrets` server's
-`find_references(query, reason)`. Finds with the same reason that arrive within 250 ms of each other, such as the
+the prompt quotes the words and the reason. Reading the reference picked afterwards asks again and names that
+item. Scripts can do the same with the `secrets` server's `find_references(query, reason)`. A program that only
+needs the value written is better off describing the item to `op read --describe` or `write_env`, which reaches
+your phone too.
+
+The phone cannot search 1Password, so a plain find is not sent to it, and a find that no Mac answers within 30
+seconds fails with an error that points at the phone. A companion Mac is asked whether or not you are at it, so
+this keeps a find from waiting the full 5 minutes while you are away. Give the find a destination and the phone is
+asked as well: `codemode-mcp op find pushover token --out-file token.txt` (one query, no `--also`), or
+`find_references` with `env_file` and `var`. A Mac that answers first prints the matches and writes nothing, as
+before. On the phone you enter the value the words describe, or pick it with AutoFill, and it is written there;
+`op find` then prints `{"written": PATH}` and `find_references` answers `written` with the path and variable and
+no items.
+
+Finds with the same reason that arrive within 250 ms of each other, such as the
 calls a script starts together under `asyncio.gather`, share one prompt that quotes every query, up to 8 of them;
 each call still gets its own matches. One `op find` can do the same with `--also`:
 `codemode-mcp op find apple signing --also pushover --reason "set up the release build"` asks once and prints a

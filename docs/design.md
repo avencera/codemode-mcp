@@ -279,7 +279,11 @@ approved wherever the owner is
   the owner was approving. References are deduplicated, so a template asks once per item
 - A find (`op find`, `/admin/op/find`, `find_references`; `src/companion/find.rs`) is raced like a program read
   between this Mac, after its own Touch ID prompt, and the companion Macs, sent as `{"find": {"query",
-  "also", "reason"}}`. A companion from before finds answers `malformed request`. Phones are not asked. Finds
+  "also", "reason"}}`. A companion from before finds answers `malformed request`. Phones are not asked, and a find
+  no Mac answers within `FIND_WAIT` (30 s, not `ASK_TIMEOUT`) fails with `PHONE_HINT`, since a companion Mac is
+  asked whether or not the owner is at it. A find with a destination (`op find --out-file`, `find_references`
+  with `env_file` and `var`) is not a find on the daemon: it is a program read of one `Describe` target, so the
+  phone answers it with an entered value and a Mac with its matches. Finds
   with the same cleaned reason that arrive within 250 ms of the first join one batch of up to 8 queries
   (`FindBatches`, keyed by reason so an unrelated program's find never shares an approval or a Deny), asked
   on its own task so a caller that gives up cannot strand the rest; the batch is dropped once every caller

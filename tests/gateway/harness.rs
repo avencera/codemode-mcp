@@ -785,6 +785,38 @@ impl Harness {
         &self.state_dir
     }
 
+    /// A CLI config that talks to this daemon
+    pub fn cli_config(&self) -> Result<PathBuf, Box<dyn Error>> {
+        let config = self.state_dir.join("cli.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "admin_listen = \"{admin}\"\nstate_dir = \"{state}\"\n",
+                admin = self.admin_base().trim_start_matches("http://"),
+                state = self.state_dir.display(),
+            ),
+        )?;
+
+        Ok(config)
+    }
+
+    /// Runs the CLI against this daemon, as a program on the gateway Mac
+    /// does; its success, stdout and stderr
+    pub async fn cli(&self, args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_codemode-mcp"))
+            .arg("--config")
+            .arg(self.cli_config()?)
+            .args(args)
+            .output()
+            .await?;
+
+        Ok((
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+
     /// Posts JSON to the admin listener
     pub async fn admin_json(
         &self,
