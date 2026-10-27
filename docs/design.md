@@ -442,7 +442,9 @@ return type is `Any`.
   upstream schema; an upstream-declared schema wins over `output_schema`, so a schema written for a server that
   later documents its own stops applying without an edit; `force_output_schema = true` makes the configured schema
   win. `output` and `output_schema` cannot be combined. The starter config types the OpenAI docs search, list and
-  endpoint tools and marks `fetch_openai_doc` as text
+  endpoint tools and marks `fetch_openai_doc` as text. A key must be a tool the server lists, exactly as
+  listed: a list missing one is refused, the server shows `unavailable` with `configuration`, and none of its
+  tools are served, so a renamed tool cannot run without its `per_call` grant or policy
 - Server-level helpers (`[servers.<s>]`): `arguments` is a table the gateway passes to every tool that declares
   one of its keys, and those parameters are dropped from the stubs, so a script cannot guess them (1Password's
   `accountId`). `setup` lists calls made once per connection, lazily, before the first other call on it, inside

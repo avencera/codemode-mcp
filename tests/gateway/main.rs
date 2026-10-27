@@ -520,6 +520,49 @@ async fn healthz_reports_categories_not_raw_errors() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_setting_for_an_unlisted_tool_keeps_the_server_out() -> TestResult {
+    // the shape of a Zoho rename: the grant names a tool the server lists
+    // under another name, so serving the rest would drop it silently
+    let Some(harness) = Harness::start("", "tools.addition.grant = \"per_call\"").await? else {
+        return Ok(());
+    };
+
+    let health: Value = harness
+        .http
+        .get(format!("{}/healthz", harness.base()))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let fixture = health["upstreams"]
+        .as_array()
+        .and_then(|upstreams| {
+            upstreams
+                .iter()
+                .find(|upstream| upstream["name"] == "fixture")
+        })
+        .ok_or("fixture missing from /healthz")?;
+    assert_eq!(fixture["state"], "unavailable", "{health}");
+    assert_eq!(fixture["error"], "configuration", "{health}");
+    assert_eq!(fixture["tools"], 0, "{health}");
+
+    let report = serde_json::to_string(&harness.app.gateway().report())?;
+    assert!(report.contains("addition"), "{report}");
+
+    let found = text_of(
+        &call(
+            &harness.client,
+            "search_tools",
+            json!({ "query": "add two integers" }),
+        )
+        .await?,
+    );
+    assert!(!found.contains("fixture_add"), "{found}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn configured_arguments_setup_and_aliases_serve_the_script() -> TestResult {
     let Some(harness) = Harness::start(
         "",

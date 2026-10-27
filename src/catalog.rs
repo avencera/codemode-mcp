@@ -200,20 +200,6 @@ impl Catalog {
 
         for ((snapshot, function_names), outputs) in snapshots.iter().zip(&names).zip(outputs) {
             let server = config.servers.get(&snapshot.name);
-            if let Some(server) = server
-                && !snapshot.tools.is_empty()
-            {
-                for configured in server.tools.keys() {
-                    if !snapshot.tools.iter().any(|tool| tool.name == *configured) {
-                        tracing::warn!(
-                            server = %snapshot.name,
-                            tool = %configured,
-                            "policy override names a tool the server does not list"
-                        );
-                    }
-                }
-            }
-
             for ((tool, function), output) in snapshot.tools.iter().zip(function_names).zip(outputs)
             {
                 let function = function.clone();

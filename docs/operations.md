@@ -107,7 +107,9 @@ the thread title and reason the agent passed to `execute`; those two are the age
 
 - Touch the sensor to approve the call and every tool of that server not marked `grant = "per_call"` for 60
   minutes in the agent's session. Mark writes you want asked every time, such as calendar deletes,
-  `per_call`. A tool with `grant = "per_call"`, such as a
+  `per_call`, under the server's exact name for the tool, which `codemode-mcp tools` shows as `(tools.<name>)`
+  after each function name. A tool with
+  `grant = "per_call"`, such as a
   1Password write, is approved for that one call only, and the prompt says `once`. When a script starts
   several such calls together, such as a set of deletes under `asyncio.gather`, one prompt names them all
   (`calendar.delete_event ×5 once`) and one touch approves the set. The phone push and the page cover the
@@ -990,6 +992,9 @@ The "Type strictness" section ends with a verdict line:
   path; launchd's PATH is `~/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 - `ask` calls are refused at once: no notifier (add `[notify.ntfy]`) or no passkey (enroll one).
 - An approval link does not open on the phone: check `tailscale serve status` and `public_origin`.
+- A server is `unavailable` with `configuration` and `codemode-mcp service status` says `tools` names tools the
+  server does not list: a per-tool setting names a tool the server lists under another name, such as Zoho's
+  `ZohoMail_moveMessages`, not `moveMessages`. Rename the setting and restart; until then none of its tools run.
 - A Zoho (or other key-in-the-URL) server answers HTTP 400 or shows `configuration` with "is a whole URL": the
   value read for the key is the item's whole URL, usually pasted or AutoFilled on the phone, where AutoFill fills
   the item's password. The daemon drops it and asks again on the next attempt; paste only the key field.

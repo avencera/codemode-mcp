@@ -2049,7 +2049,14 @@ async fn tools_command(config: Config, stubs: bool) -> Result<()> {
         } else {
             " [unavailable]"
         };
-        println!("{}{marker}: {}", entry.function, entry.summary());
+        // the server's own name is what `tools.<name>` settings must use; the
+        // function name has it sanitized
+        println!(
+            "{}{marker} (tools.{}): {}",
+            entry.function,
+            entry.tool,
+            entry.summary()
+        );
     }
 
     Ok(())

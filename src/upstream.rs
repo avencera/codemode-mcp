@@ -163,6 +163,18 @@ pub enum UpstreamError {
     /// The OAuth client could not be prepared (discovery or stored login)
     #[error("oauth: {0}")]
     OAuth(String),
+    /// The config has per-tool settings for tools the server does not list
+    #[error(
+        "`servers.{server}.tools` names tools the server does not list: {}; \
+         fix the names and restart the service",
+        .tools.join(", ")
+    )]
+    UnlistedTools {
+        /// Server name
+        server: String,
+        /// Configured tool names missing from its list
+        tools: Vec<String>,
+    },
     /// A configured setup call answered with an error, so the call that
     /// needed it was not sent; its text stays out, since the server may be
     /// sensitive
@@ -181,7 +193,9 @@ impl UpstreamError {
         match self {
             Self::Unavailable { category, .. } => *category,
             Self::Spawn { .. } => ErrorCategory::Spawn,
-            Self::Header(_) | Self::Url | Self::UrlValue(_) => ErrorCategory::Configuration,
+            Self::Header(_) | Self::Url | Self::UrlValue(_) | Self::UnlistedTools { .. } => {
+                ErrorCategory::Configuration
+            }
             Self::Secret(_) => ErrorCategory::Secret,
             Self::Initialize(_) => ErrorCategory::Initialize,
             Self::ConnectTimeout(_) | Self::TimedOut { .. } | Self::Busy { .. } => {
@@ -220,6 +234,7 @@ impl UpstreamError {
             | Self::Header(_)
             | Self::Url
             | Self::UrlValue(_)
+            | Self::UnlistedTools { .. }
             | Self::Secret(_)
             | Self::Initialize(_)
             | Self::OAuth(_)
@@ -774,13 +789,16 @@ impl Upstream {
     ///
     /// Refreshes run one at a time. Passing the `ticket` of a list-changed
     /// notification skips the refresh when a newer notification has arrived,
-    /// and a refresh belonging to an earlier connection is dropped
+    /// and a refresh belonging to an earlier connection is dropped. A list
+    /// missing a tool the config has settings for is refused and the stored
+    /// one cleared: a renamed tool would otherwise run without its settings,
+    /// such as a `per_call` grant
     async fn refresh_tools(
         &self,
         peer: &Peer<RoleClient>,
         epoch: u64,
         ticket: Option<u64>,
-    ) -> Result<bool, ServiceError> {
+    ) -> Result<bool, UpstreamError> {
         let _turn = self.refresh_turn.lock().await;
         if ticket.is_some_and(|ticket| self.refresh_seq.load(Ordering::SeqCst) != ticket)
             || self.epoch.load(Ordering::SeqCst) != epoch
@@ -789,7 +807,29 @@ impl Upstream {
         }
 
         let tools = peer.list_all_tools().await?;
+        let unlisted: Vec<String> = self
+            .config
+            .tools
+            .keys()
+            .filter(|configured| !tools.iter().any(|tool| tool.name == **configured))
+            .cloned()
+            .collect();
         let mut inner = self.write();
+        if !unlisted.is_empty() {
+            if !inner.tools.is_empty() {
+                inner.tools.clear();
+                self.changed.notify_one();
+            }
+            if let Err(error) = self.store.forget_tool_cache(&self.name) {
+                tracing::warn!(server = %self.name, %error, "could not forget a cached tool list");
+            }
+
+            return Err(UpstreamError::UnlistedTools {
+                server: self.name.clone(),
+                tools: unlisted,
+            });
+        }
+
         let changed = inner.tools != tools;
         if changed {
             tracing::info!(server = %self.name, count = tools.len(), "tool list changed");
@@ -1328,6 +1368,12 @@ impl ClientHandler for UpstreamHandler {
             {
                 Ok(true) => upstream.changed.notify_one(),
                 Ok(false) => {}
+                // reconnecting reports it the way a fresh connect would, and
+                // keeps the server unavailable until the config is fixed
+                Err(error @ UpstreamError::UnlistedTools { .. }) => {
+                    tracing::warn!(server = %upstream.name, %error, "tool list refused");
+                    upstream.request_reconnect();
+                }
                 Err(error) => {
                     let error = upstream.redactor.apply(&error.to_string());
                     tracing::warn!(server = %upstream.name, %error, "tool list refresh failed");
