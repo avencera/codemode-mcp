@@ -613,6 +613,8 @@ impl Rig {
              {companion_line}\
              phones = [{{ name = \"iphone\", id = \"{phone}\", seal_key = \"{seal}\" }}]\n\
              apns = {{ key_file = \"{key_file}\", key_id = \"{KEY_ID}\", team_id = \"{TEAM_ID}\", server = \"http://{apns}\" }}\n\n\
+             [servers.secrets]\n\
+             builtin = \"secrets\"\n\n\
              [servers.twin]\n\
              command = \"{fixture}\"\n\
              env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n\n\
@@ -1573,6 +1575,102 @@ async fn a_program_read_is_answered_on_the_phone_with_one_approval() -> TestResu
     assert!(push.body.get("reference").is_none(), "{}", push.body);
     // the owner was away, so the gateway's own `op` never ran for it
     assert_eq!(reads(&rig.local_log, REFERENCE), 1);
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_find_with_a_destination_is_entered_on_the_phone_while_a_companion_mac_waits()
+-> TestResult {
+    let Some(rig) = Rig::start(Options {
+        with_mac_companion: true,
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    // away from every Mac: the companion's prompt stays up, and only the
+    // phone can answer
+    rig.gateway_mac.set_present(false);
+    rig.phone
+        .set_answer(Answer::Enter("pushover-token-entered"));
+    let directory = std::fs::canonicalize({
+        let directory = temp_state_dir();
+        std::fs::create_dir_all(&directory)?;
+        directory
+    })?;
+    let out = directory.join("token.txt");
+    let out_arg = out.display().to_string();
+
+    let (ok, stdout, stderr) = rig
+        .harness
+        .cli(&[
+            "op",
+            "find",
+            "pushover",
+            "token",
+            "--out-file",
+            out_arg.as_str(),
+            "--reason",
+            "freezerwatch alerts",
+        ])
+        .await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout)?,
+        json!({ "written": out_arg })
+    );
+    assert_eq!(std::fs::read_to_string(&out)?, "pushover-token-entered\n");
+    assert_eq!(std::fs::metadata(&out)?.permissions().mode() & 0o777, 0o600);
+    let program = rig
+        .phone
+        .seen()
+        .into_iter()
+        .find(|seen| !seen.items.is_empty())
+        .ok_or("the phone saw no program read")?;
+    assert_eq!(program.items, ["\"pushover token\"".to_owned()]);
+
+    // byte for byte, as a text file shared from 1Password needs
+    let exact = directory.join("token.pem");
+    let exact_arg = exact.display().to_string();
+    let (ok, _, stderr) = rig
+        .harness
+        .cli(&[
+            "op",
+            "find",
+            "pushover",
+            "token",
+            "--out-file",
+            exact_arg.as_str(),
+            "--no-newline",
+        ])
+        .await?;
+    assert!(ok, "{stderr}");
+    assert_eq!(std::fs::read(&exact)?, b"pushover-token-entered");
+
+    // a script's find writes the entered value into an env file instead
+    let env = directory.join("superalert.secrets.env");
+    let code = format!(
+        "await secrets_find_references(query=\"pushover token\", reason=\"freezerwatch alerts\", \
+         env_file=\"{path}\", var=\"APP_TOKEN\")",
+        path = env.display()
+    );
+    let body = rig.harness.execute_body(&code).await?;
+    assert_eq!(body["status"], "completed", "{body}");
+    assert_eq!(
+        body["result"],
+        json!({
+            "items": [],
+            "more": 0,
+            "approved_on": "iphone",
+            "written": { "path": env.display().to_string(), "var": "APP_TOKEN" },
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(&env)?,
+        "APP_TOKEN=pushover-token-entered\n"
+    );
 
     rig.stop().await
 }

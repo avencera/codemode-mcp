@@ -52,6 +52,17 @@ const CANCEL_TITLE: &str = "Deny";
 /// milliseconds
 const FIND_BATCH_WINDOW: Duration = Duration::from_millis(250);
 
+/// How long a find waits for a Mac to answer; the owner at a Mac approves
+/// within seconds, and one away from every Mac is better asked on the phone
+/// than kept waiting the whole [`ASK_TIMEOUT`]
+const FIND_WAIT: Duration = Duration::from_secs(30);
+
+/// Added to the error of a find no Mac answered, so the program asks the
+/// phone next
+const PHONE_HINT: &str = "no Mac answered, so ask on the owner's phone instead, where they enter \
+     the value: `codemode-mcp op find WORDS --out-file PATH`, or `find_references` with \
+     `env_file` and `var`";
+
 /// How long an approved find answers the same query and reason again
 /// without asking; long enough for a program to be fixed and rerun
 const FIND_KEEP: Duration = Duration::from_secs(10 * 60);
@@ -252,11 +263,9 @@ impl OnePassword {
             .map(|companions| companions.peers())
             .unwrap_or_default();
         if !local && peers.is_empty() {
-            return Err(ProgramReadError::Failed(
-                "nobody can approve this: the owner is away from this Mac and no companion Mac is \
-                 paired; a phone cannot search 1Password"
-                    .to_owned(),
-            ));
+            return Err(ProgramReadError::Failed(format!(
+                "the owner is away from this Mac and no companion Mac is paired; {PHONE_HINT}"
+            )));
         }
 
         let mut sources: JoinSet<(String, Result<Vec<Found>, Miss>)> = JoinSet::new();
@@ -304,7 +313,14 @@ impl OnePassword {
         }
 
         // dropping the set on any exit takes the other prompts down
-        first_answer(&mut sources, ASK_TIMEOUT + grace, "find").await
+        first_answer(&mut sources, FIND_WAIT + grace, "find")
+            .await
+            .map_err(|error| match error {
+                ProgramReadError::Failed(message) => {
+                    ProgramReadError::Failed(format!("{message}; {PHONE_HINT}"))
+                }
+                other => other,
+            })
     }
 
     /// Asks on this Mac: its own Touch ID prompt naming the query, then the

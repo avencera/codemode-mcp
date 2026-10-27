@@ -88,6 +88,15 @@ pub struct FindReferencesParams {
     /// Why the program needs to know; every prompt shows it. Calls started
     /// together under `asyncio.gather` with the same reason share one prompt
     pub reason: String,
+    /// Absolute path of an env file, as `write_env` takes it, for when the
+    /// owner answers on their phone: they enter the value the query
+    /// describes and it is written there as `var`. A Mac that answers first
+    /// lists the matches and writes nothing. Give with `var`
+    #[serde(default)]
+    pub env_file: Option<String>,
+    /// The variable the entered value is written as; give with `env_file`
+    #[serde(default)]
+    pub var: Option<String>,
 }
 
 /// The answer to `find_references`; never holds a value
@@ -99,6 +108,19 @@ pub struct ReferencesFound {
     pub more: usize,
     /// Where the owner approved
     pub approved_on: String,
+    /// Set when the owner entered the value on their phone, in which case
+    /// `items` is empty
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written: Option<VarWritten>,
+}
+
+/// The variable `find_references` wrote when the owner entered its value
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct VarWritten {
+    /// The env file written
+    pub path: String,
+    /// The variable whose line was written
+    pub var: String,
 }
 
 /// One item `find_references` matched
@@ -336,18 +358,52 @@ impl SecretsServer {
     #[tool(
         description = "Lists the 1Password items whose title, vault, tags or category match the \
                        query, with each field's and attached file's op:// reference and type but \
-                       no values. Use it when you do not know the exact reference, then pass the \
-                       one you want to `write_env`, which asks the owner again naming that item. \
-                       The owner approves the search with Touch ID on this Mac or a companion Mac; \
-                       to look for several things, start one call for each together under \
-                       `asyncio.gather` with the same reason, and one prompt approves them all. \
-                       The same query and reason is answered again for 10 minutes without asking."
+                       no values. Use it when you need the reference itself, such as for a \
+                       template; when you only need the value in an env file, call `write_env` \
+                       with `describe` instead. The owner approves the search with Touch ID on \
+                       this Mac or a companion Mac; the phone cannot search, so without \
+                       `env_file` and `var` a find no Mac answers within 30 seconds fails. With \
+                       them the phone is asked too, and the value the owner enters there is \
+                       written as `var`, answering `written` with no items. To look for several \
+                       things, start one call for each together under `asyncio.gather` with the \
+                       same reason, and one prompt approves them all. The same query and reason \
+                       is answered again for 10 minutes without asking."
     )]
     async fn find_references(
         &self,
         Parameters(params): Parameters<FindReferencesParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<ReferencesFound>, CallToolResult> {
+        match (params.env_file, params.var) {
+            (Some(path), Some(var)) => {
+                // the query is the description `write_env` sends: a Mac
+                // searches for it, the phone has the owner enter the value
+                let write = WriteEnvParams {
+                    path,
+                    vars: BTreeMap::new(),
+                    describe: BTreeMap::from([(var.clone(), params.query)]),
+                    reason: params.reason,
+                    keep_minutes: None,
+                };
+                let Json(written) = self.write_env(Parameters(write), context).await?;
+
+                return Ok(Json(match written.found {
+                    Some(found) => found,
+                    None => ReferencesFound {
+                        items: Vec::new(),
+                        more: 0,
+                        approved_on: written.approved_on,
+                        written: Some(VarWritten {
+                            path: written.path,
+                            var,
+                        }),
+                    },
+                }));
+            }
+            (None, None) => {}
+            _ => return Err(failed("give env_file and var together")),
+        }
+
         let ask = FindAsk {
             query: params.query,
             reason: Some(params.reason),
@@ -395,6 +451,7 @@ fn references_found(found: ProgramFound) -> ReferencesFound {
             .collect(),
         more: found.found.more,
         approved_on: found.source,
+        written: None,
     }
 }
 

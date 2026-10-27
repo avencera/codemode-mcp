@@ -429,6 +429,12 @@ enum OpCommand {
     /// the JSON printed is then a list of each query with its items. The same
     /// query with the same reason is answered again for 10 minutes after an
     /// approval without asking
+    ///
+    /// The phone cannot search 1Password, so without `--out-file` a find
+    /// that no Mac answers within 30 seconds fails. With `--out-file` the
+    /// phone is asked too: the owner enters the value the words describe and
+    /// it is written there, printing `{"written": PATH}`; a Mac that answers
+    /// first prints the matches as usual and writes nothing
     Find {
         /// Words to look for, such as `apple signing`; an item matching any
         /// of them is listed
@@ -441,6 +447,20 @@ enum OpCommand {
         /// Why the program is looking; every prompt shows it
         #[arg(long)]
         reason: Option<String>,
+        /// Where the value goes when the owner enters it on the phone,
+        /// created with `--file-mode`; takes one query, without `--also`
+        #[arg(short = 'o', long, conflicts_with = "also")]
+        out_file: Option<PathBuf>,
+        /// Replace `--out-file` if it exists
+        #[arg(short, long, requires = "out_file")]
+        force: bool,
+        /// Mode of `--out-file`, in octal
+        #[arg(long, default_value = "0600", value_parser = parse_mode)]
+        file_mode: u32,
+        /// Write an entered text value without a trailing newline, such as
+        /// a text file shared from 1Password that must stay byte for byte
+        #[arg(short, long, requires = "out_file")]
+        no_newline: bool,
     },
     /// Fill each `{{ op://… }}` in a template, like `op inject`, with one
     /// approval for the whole template
@@ -2274,10 +2294,28 @@ async fn op_command(config: &Config, command: OpCommand) -> Result<()> {
                 }
             }
         }
+        // clap keeps `--also` out of this one
+        OpCommand::Find {
+            query,
+            reason,
+            out_file: Some(out_file),
+            force,
+            file_mode,
+            no_newline,
+            ..
+        } => {
+            let query = query.join(" ");
+            find_or_enter(
+                config, query, reason, out_file, force, file_mode, no_newline,
+            )
+            .await?
+        }
         OpCommand::Find {
             query,
             also,
             reason,
+            out_file: None,
+            ..
         } => {
             let several = !also.is_empty();
             let queries: Vec<String> = std::iter::once(query.join(" ")).chain(also).collect();
@@ -2538,6 +2576,71 @@ async fn op_run(
     }
 
     Ok(exit_code(status))
+}
+
+/// `op find --out-file`: the query goes out as a description, so a Mac
+/// searches for it and the phone has the owner enter the value, which is
+/// written to `out_file`
+async fn find_or_enter(
+    config: &Config,
+    query: String,
+    reason: Option<String>,
+    out_file: PathBuf,
+    force: bool,
+    file_mode: u32,
+    no_newline: bool,
+) -> Result<()> {
+    companion::checked_query(&query).map_err(|message| eyre!("refused: {message}"))?;
+    // the file written is the one the prompt names
+    let out_file = resolved_path(&out_file);
+    op::check_writable(&out_file, force)?;
+
+    eprintln!(
+        "Asking the owner to approve a 1Password search on a Mac, or to enter the value on \
+         the phone..."
+    );
+    let request = admin::OpReadRequest {
+        targets: vec![ProgramTarget::Describe(query)],
+        reason,
+        destination: Some(out_file.display().to_string()),
+        keep_secs: None,
+    };
+    let response: admin::OpReadResponse =
+        admin_post_as_owner(config, "/admin/op/read", &request).await?;
+    let printed = match response {
+        admin::OpReadResponse::Values { source, values } => {
+            let mut contents = values
+                .into_iter()
+                .next()
+                .ok_or_else(|| eyre!("the daemon sent no value"))?
+                .into_bytes();
+            // binary is written exactly as 1Password holds it; text gets
+            // a newline, as `op read` gives it, unless `--no-newline`
+            if !no_newline && std::str::from_utf8(&contents).is_ok() {
+                contents.push(b'\n');
+            }
+            op::write_private(&out_file, &contents, file_mode, force)
+                .wrap_err_with(|| format!("cannot write {}", out_file.display()))?;
+            eprintln!("Entered on {source}");
+
+            serde_json::json!({ "written": out_file.display().to_string() })
+        }
+        admin::OpReadResponse::Found {
+            source,
+            items,
+            more,
+        } => {
+            eprintln!("Approved on {source}; nothing was written");
+
+            serde_json::json!({ "items": items, "more": more })
+        }
+        admin::OpReadResponse::Invalid { message } => bail!("refused: {message}"),
+        admin::OpReadResponse::Denied { message } => bail!("denied: {message}"),
+        admin::OpReadResponse::Failed { message } => bail!("no answer: {message}"),
+    };
+    println!("{}", serde_json::to_string_pretty(&printed)?);
+
+    Ok(())
 }
 
 /// Exit code of `op read --describe` when a Mac searched instead of reading
