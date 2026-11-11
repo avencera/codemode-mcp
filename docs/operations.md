@@ -1006,9 +1006,10 @@ What runs where:
   path = "/Users/you/.agent-browser/screenshots/github.png"
 
   [servers.agent_browser_github.tools]
-  agent_browser_open.policy = "allow"
+  agent_browser_snapshot.policy = "allow"
+  agent_browser_open = { policy = "ask", grant = "per_call" }
   agent_browser_click = { policy = "ask", grant = "per_call" }
-  # and so on: reads and navigation allowed, page actions asked, the rest denied
+  # and so on: reading the open page allowed; opening a URL and page actions asked; the rest denied
   ```
 
   `arguments` are set on every call that takes them and replace any a script passes, so the server cannot be
@@ -1016,6 +1017,10 @@ What runs where:
   a screenshot elsewhere. With `policy = "deny"`, every tool not listed, such as `agent_browser_eval`, cookies,
   flows and new tabs, is refused. A shared server would take any `session`, including ones logged in to
   accounts no agent may drive.
+- `agent_browser_open` and `agent_browser_read` ask on every call. The browser opens `file://` URLs, so an
+  allowed `open` would let a spoke read any file on the hub through the page's text, and `read` fetches any
+  http URL it is given from the hub, local network included. agent-browser's `allowedDomains` would narrow
+  both but cannot be used with a profile.
 
 Manage spokes on the hub:
 

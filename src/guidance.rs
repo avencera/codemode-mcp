@@ -103,8 +103,8 @@ macro_rules! browser_rule {
          the user, such as a passkey, a captcha or a consent screen, call its `handoff` with what they \
          should do; it returns once they finish or cancel on their phone. To browse as one of the \
          user's logged-in browser sessions, use that session's `agent_browser_<name>` server \
-         (search_tools \"agent_browser\"): reading and navigating run freely and every click or typed \
-         text asks the user."
+         (search_tools \"agent_browser\"): reading the open page, scrolling and going back run freely; \
+         opening a URL, every click and typed text ask the user."
     };
 }
 
