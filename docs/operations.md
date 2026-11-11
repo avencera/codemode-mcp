@@ -724,6 +724,91 @@ Limits:
   you allowed to control the browser through Apple Events still could: when macOS asks whether the agent's
   app may control Safari or Chrome, choose Don't Allow.
 
+## Sign in to websites in agent-browser sessions
+
+The `browser` server does for an [agent-browser](https://github.com/vercel-labs/agent-browser) session what
+`logins` does for the screen: it fills a 1Password username, password or one-time code into the focused field
+of the session's page, and the agent gets back only `{filled, url}`. It reaches the session's browser over the
+Chrome DevTools Protocol, found with `agent-browser --session NAME get cdp-url`, which never starts a browser;
+the value goes straight into the page with `Input.insertText` and never through an agent-browser command, a
+file, a command line or a log. When a step needs you, such as a passkey, a captcha or a consent screen, the
+agent hands the session to your phone instead.
+
+1. Add the server:
+
+   ```toml
+   [servers.browser]
+   builtin = "browser"
+   policy = "ask"
+   tools.fill.grant = "per_call"
+   tools.handoff.policy = "allow"
+   ```
+
+   `fill` must ask on every call; the config is refused unless it is `ask` with `grant = "per_call"`. A
+   handoff asks you on your phone anyway, so it can be `allow`. agent-browser is found on the daemon's `PATH`,
+   then in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`; set `agent_browser_path` at the top of
+   the config for another place.
+2. Restart the daemon. The agent opens the page in its session, clicks the field, and calls
+   `browser_fill(session="github", kind="password", site="github.com", submit=True)`.
+
+What a fill checks before you are asked, from the page itself:
+
+- The session's active tab is `https` on the `site` the agent names, by registrable domain as for `logins`,
+  with no port.
+- The focused element is that kind of field: a password goes only into `input type=password`; a username
+  into a field marked `autocomplete=username` or `email`, an email field, or one named like a login; a code
+  into a field marked `autocomplete=one-time-code`, or a short numeric field named like a code.
+- No frame around the field, nor the field's own frame, is on another site.
+- The browser is on this Mac: a session pointed at a remote browser is refused.
+
+Which value a fill uses:
+
+- While you are at the Mac, the login saved in 1Password for the page's host is found as for `logins` (pass
+  `item` when there are several), and the field is read by reference. A one-time code is computed from the
+  seed right before it is typed. The site's item, account and field references are remembered in the
+  daemon's database, as references only, for when you are away.
+- While you are away, your phone is asked at once, for the whole sign-in: the first fill of a site asks for
+  the username and password together, plus the one-time code's seed when the phone holds a sealed copy of it,
+  and the request reads `github.com · praveenperera` with the browser session. One Face ID or one AutoFill
+  answers it. The values wait in the daemon's memory for up to 5 minutes, each wiped once it is filled. A code
+  without a sealed seed is asked for on its own, right before it is filled, so it has not expired.
+- Each fill is still approved like any `per_call` call, showing what goes where, such as `password into
+  github.com (browser session github) from GitHub (Personal)`. After you approve, the page is read again and
+  must still be on the host you approved. The page's address and its focused field are read from the same
+  document, and the value is typed only after the checked field itself is focused; if focus leaves it during
+  the fill, the agent is told to check the page, since part of the value may have gone elsewhere on it.
+- A one-time code you enter on the phone is used once and never kept as the item's seed.
+
+### Take over a browser session from your iPhone
+
+`browser_handoff(session="github", reason="approve the passkey prompt")` pushes to your phone and waits, up to
+30 minutes by default and at most 120, without using the script's time limit. Tapping the notification opens
+the session live in the Companion app:
+
+- The page is laid out as a phone at your screen's size while you have it, and put back as the agent had it
+  when you finish. You see it as live images, each sent only after the last was drawn.
+- Tap to click, drag to scroll, long-press for a right click, and pinch to zoom the picture on the phone. A
+  focused text field brings up the keyboard, with AutoFill for usernames, passwords and one-time codes; the key
+  bar adds Enter, Tab, Shift-Tab, Backspace, Esc and Back.
+- **Fill from 1Password** fills the focused field from a copy sealed to the phone, after Face ID, checked as an
+  agent's fill is, and only while the page is still on the site the copy is saved for; if the page moved while
+  Face ID was up, nothing is filled.
+- **Done** or **Cancel** ends the handoff and the agent's call returns `done` or `cancelled`. **Leave** closes
+  the screen without answering, so you can take over again from the card.
+
+A takeover runs over its own iroh connection from a paired, trusted phone, and only while the app is open. A
+phone can also open one with a `codemode-companion://takeover?session=NAME` link, without a handoff.
+
+Limits:
+
+- Anything that can drive the browser, the agent included, could read a field once it is filled, or script the
+  page before a fill. That is the same-user boundary the design leaves out of scope (see `docs/design.md`); the
+  fill only keeps the value out of the agent's context, transcript, commands and logs.
+- The daemon and the app wipe their own copies of a value after use, including the frames that carry it and
+  values a sign-in did not use once its 5 minutes are up, but not the copies inside the WebSocket, QUIC and
+  JSON libraries' buffers on the way to the browser.
+- Spokes do not get the `browser` server: a spoke's call is gated on the hub without the page check.
+
 ## OAuth sign-in
 
 ```sh
@@ -901,7 +986,36 @@ What runs where:
 - `{{ op://... }}` in a spoke server's own `env`, `headers` or `url` is approved once on the hub per server,
   and asked again when the server's command or destination changes. A server that starts before the spoke is
   trusted waits for the trust.
-- Calendar, Reminders, Xcode and website sign-in stay on the hub Mac and reach spokes as hub tools.
+- Calendar, Reminders, Xcode and website sign-in stay on the hub Mac and reach spokes as hub tools. The
+  `browser` server is the exception and stays off spokes, since its fill checks run before the hub's gate.
+- A browser session on the hub reaches spokes through agent-browser's own MCP server, one server per logged-in
+  session, so an agent there drives only that profile:
+
+  ```toml
+  [servers.agent_browser_github]
+  command = "/opt/homebrew/bin/agent-browser"
+  args = ["mcp"]
+  policy = "deny"
+  env = { AGENT_BROWSER_SESSION = "github", AGENT_BROWSER_PROFILE = "/Users/you/.agent-browser/github" }
+
+  [servers.agent_browser_github.arguments]
+  session = "github"
+  extraArgs = ["--engine", "chrome"]
+  restore = false
+  all = false
+  path = "/Users/you/.agent-browser/screenshots/github.png"
+
+  [servers.agent_browser_github.tools]
+  agent_browser_open.policy = "allow"
+  agent_browser_click = { policy = "ask", grant = "per_call" }
+  # and so on: reads and navigation allowed, page actions asked, the rest denied
+  ```
+
+  `arguments` are set on every call that takes them and replace any a script passes, so the server cannot be
+  pointed at another session, given other browser flags, made to save state or close every session, or write
+  a screenshot elsewhere. With `policy = "deny"`, every tool not listed, such as `agent_browser_eval`, cookies,
+  flows and new tabs, is refused. A shared server would take any `session`, including ones logged in to
+  accounts no agent may drive.
 
 Manage spokes on the hub:
 

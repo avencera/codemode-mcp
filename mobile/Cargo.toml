@@ -22,6 +22,8 @@ serde_json = "1"
 thiserror = "2.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
+# typed text and filled values in takeover frames are wiped once sent
+zeroize = "1.8.2"
 # pinned to Cove's revision, with proc-macros and no UDL
 uniffi = { git = "https://github.com/mozilla/uniffi-rs", rev = "42e834a4371547d9da47fd06e34062a91fa25b57", features = ["tokio"] }
 

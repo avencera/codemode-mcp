@@ -216,8 +216,63 @@ pub struct PhoneProgramRead {
     /// [`ProgramBatch::keep_secs`](crate::wire::ProgramBatch::keep_secs)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_secs: Option<u64>,
+    /// Set when the values sign in to a website in the gateway's browser,
+    /// so the prompt names the site and account; a phone from before this
+    /// ignores it and shows the reason and destination as for any program
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignIn>,
     /// Milliseconds until the gateway gives up on this read
     pub expires_in_ms: u64,
+}
+
+/// The website a [`PhoneProgramRead`] signs in to
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignIn {
+    /// The site, a registrable domain such as `github.com`
+    pub site: String,
+    /// The account, such as the username of the 1Password login the gateway
+    /// last used for the site; `None` when it knows none
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The browser session the values go to, such as `github`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+impl SignIn {
+    /// The site and account as prompts name them, such as
+    /// `github.com · praveenperera`
+    pub fn title(&self) -> String {
+        match &self.account {
+            Some(account) => format!("{} · {account}", self.site),
+            None => self.site.clone(),
+        }
+    }
+}
+
+/// Which login field a value goes into, so the phone offers the matching
+/// AutoFill: a username, a password or a one-time code
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginField {
+    /// A username or email address
+    Username,
+    /// A password
+    Password,
+    /// A one-time code, such as a TOTP code; an item read by reference holds
+    /// the seed instead, which the gateway turns into the current code
+    Code,
+}
+
+impl LoginField {
+    /// The field as prompts name it
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Username => "username",
+            Self::Password => "password",
+            Self::Code => "one-time code",
+        }
+    }
 }
 
 /// One value of a [`PhoneProgramRead`]: an `op://` reference, or only a
@@ -233,6 +288,9 @@ pub enum ProgramItem {
         /// The value sealed to this phone, as in [`PhoneRead::sealed`]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sealed: Option<Sealed>,
+        /// The login field it goes into, for a sign-in
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<LoginField>,
     },
     /// Only a description, such as `Pushover app token`; the owner picks the
     /// item with AutoFill or pastes the value. Nothing is sealed for it
@@ -240,7 +298,65 @@ pub enum ProgramItem {
         /// The program's description, at most
         /// [`MAX_DESCRIPTION_CHARS`](crate::wire::MAX_DESCRIPTION_CHARS)
         description: String,
+        /// The login field it goes into, for a sign-in, so the phone offers
+        /// that field's AutoFill
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<LoginField>,
     },
+}
+
+impl ProgramItem {
+    /// The login field the item goes into, for a sign-in
+    pub fn field(&self) -> Option<LoginField> {
+        match self {
+            Self::Reference { field, .. } | Self::Describe { field, .. } => *field,
+        }
+    }
+}
+
+/// Asks a phone to let the owner take over a browser session for a step an
+/// agent cannot do, such as a passkey or a captcha, sent as
+/// `{"handoff": {...}}` on a stream the gateway opens, like a [`PhoneRead`]
+///
+/// The phone shows the agent's reason with Take over and Cancel. Take over
+/// opens the session on [`TAKEOVER_ALPN`](crate::takeover::TAKEOVER_ALPN)
+/// with this id; the owner's Done or Cancel there ends the handoff, and the
+/// gateway then stops this stream. Cancel on the request itself answers
+/// [`HandoffAnswer::Cancelled`] here. A phone from before this cannot parse
+/// the request and closes the stream, which the gateway reports as an app
+/// that needs updating
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneHandoffRequest {
+    /// The handoff
+    pub handoff: PhoneHandoff,
+}
+
+/// One handoff the gateway asks a phone for
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhoneHandoff {
+    /// The id the push named, which the takeover opens with
+    pub id: RequestId,
+    /// The browser session to take over, such as `github`
+    pub session: String,
+    /// What the agent needs done, in its own words, at most
+    /// [`MAX_REASON_CHARS`](crate::wire::MAX_REASON_CHARS)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The page the session shows, when the gateway could read it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Milliseconds until the gateway gives up on this handoff
+    pub expires_in_ms: u64,
+}
+
+/// A phone's answer to a [`PhoneHandoffRequest`] on its stream
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffAnswer {
+    /// The owner finished the step
+    Done,
+    /// The owner will not do it
+    Cancelled,
 }
 
 /// Which APNs environment a push token belongs to: a build installed from
@@ -327,8 +443,14 @@ pub mod push_keys {
     /// The [`KIND`] of a program read
     pub const PROGRAM: &str = "program";
     /// One line naming a program read's items, such as `2 items: op://…,
-    /// Pushover app token`
+    /// Pushover app token`, a sign-in's site and account, or a handoff's
+    /// reason
     pub const SUMMARY: &str = "summary";
+    /// The [`KIND`] of a [`PhoneHandoff`](super::PhoneHandoff), which
+    /// carries [`SESSION`] and [`SUMMARY`]
+    pub const HANDOFF: &str = "handoff";
+    /// The browser session a handoff takes over
+    pub const SESSION: &str = "session";
 }
 
 mod base64_bytes {

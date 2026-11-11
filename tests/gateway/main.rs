@@ -7,6 +7,7 @@ mod approvals;
 mod companion;
 mod concurrency;
 mod durable;
+mod fake_cdp;
 mod harness;
 mod lazy;
 mod logins;

@@ -1,7 +1,8 @@
 //! The connection actor: owns the phone's iroh endpoint, dials the gateway,
-//! hands each read the gateway sends (a single read or a program's batch) to
-//! the app actor, and dials again when the link drops while the app is in the
-//! foreground
+//! hands each read the gateway sends (a single read or a program's batch)
+//! and each handoff to the app actor, and dials again when the link drops
+//! while the app is in the foreground. A takeover dials its own connection
+//! from the same endpoint
 //!
 //! Dials, accepts and stream answers run in spawned tasks that report back
 //! as messages, so a handler never waits on the network
@@ -13,18 +14,21 @@ use std::{
 
 use companion_wire::{
     ASK_TIMEOUT, MAX_PHONE_READ_BYTES, MOBILE_ALPN,
-    mobile::{PhoneProgramRequest, PhoneRead, PhoneRequest, PhoneResponse, RequestId},
-    wire::CompanionResponse,
+    mobile::{
+        HandoffAnswer, PhoneHandoffRequest, PhoneProgramRequest, PhoneRead, PhoneRequest,
+        PhoneResponse, RequestId,
+    },
 };
 use iroh::{
     Endpoint, SecretKey,
     endpoint::{Connection, SendStream},
 };
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use serde::Serialize;
 use tokio::sync::oneshot;
 
 use crate::{
-    app::{AppMsg, Incoming, StreamEnd},
+    app::{AppMsg, Incoming, IncomingHandoff, StreamEnd},
     ffi::ConnectionState,
     net,
     record::GatewayRecord,
@@ -40,6 +44,11 @@ const STABLE_LINK: Duration = Duration::from_secs(10);
 
 /// How long the gateway may take to send a read once it opened its stream
 const READ_WINDOW: Duration = Duration::from_secs(10);
+
+/// Longest a handoff's card waits; the gateway's own wait is half an hour
+/// unless the agent asks for another, so this only bounds a deadline that
+/// makes no sense
+const MAX_HANDOFF_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Numbers each stream the gateway opens, so a read offered again after a
 /// reconnect is told apart from the stream it replaces
@@ -59,6 +68,9 @@ pub enum ConnMsg {
     Lost(usize, String),
     /// Sends one request of the phone's own on the current link
     Request(PhoneRequest, RpcReplyPort<Result<PhoneResponse, String>>),
+    /// Lends the endpoint, for a takeover to dial its own connection as
+    /// the same phone
+    Endpoint(RpcReplyPort<Option<Endpoint>>),
 }
 
 /// What the connection actor starts with
@@ -232,6 +244,9 @@ impl Actor for ConnectionActor {
                     let _ = reply.send(Err("not connected to the gateway".to_owned()));
                 }
             },
+            ConnMsg::Endpoint(reply) => {
+                let _ = reply.send(Some(state.endpoint.clone()));
+            }
         }
 
         Ok(())
@@ -251,11 +266,20 @@ impl Actor for ConnectionActor {
 }
 
 /// 1, 2, 4… seconds, up to [`MAX_BACKOFF`]
-fn backoff(failures: u32) -> Duration {
+pub(crate) fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1_u64 << failures.saturating_sub(1).min(5)).min(MAX_BACKOFF)
 }
 
-/// Hands each read the gateway opens a stream for to the app actor
+/// What the gateway sent on a stream it opened
+enum Offered {
+    /// A read or a program's batch
+    Read(Asked),
+    /// A handoff
+    Handoff(PhoneHandoffRequest),
+}
+
+/// Hands each read or handoff the gateway opens a stream for to the app
+/// actor
 async fn accept_reads(connection: Connection, app: ActorRef<AppMsg>) {
     while let Ok((send, mut receive)) = connection.accept_bi().await {
         let app = app.clone();
@@ -265,48 +289,80 @@ async fn accept_reads(connection: Connection, app: ActorRef<AppMsg>) {
             let Ok(Ok(body)) = body else {
                 return;
             };
-            let Some(mut asked) = parse(&body) else {
-                tracing::warn!("the gateway sent a read this phone cannot parse");
-
-                return;
-            };
-            // the gateway never waits longer than this, so neither does the
-            // phone's prompt
-            asked.cap_expiry(u64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
-            let id = asked.id().clone();
             let seq = STREAMS.fetch_add(1, Ordering::Relaxed);
-            let (responder, answered) = oneshot::channel();
-            let incoming = Incoming {
-                asked,
-                seq,
-                responder,
-            };
-            if app.cast(AppMsg::Incoming(Box::new(incoming))).is_err() {
-                return;
+            match parse(&body) {
+                Some(Offered::Read(asked)) => offer_read(send, asked, seq, app).await,
+                Some(Offered::Handoff(request)) => {
+                    offer_handoff(send, request, seq, app).await;
+                }
+                None => tracing::warn!("the gateway sent a read this phone cannot parse"),
             }
-
-            answer(send, answered, id, seq, app).await;
         });
     }
 }
 
+async fn offer_read(send: SendStream, mut asked: Asked, seq: u64, app: ActorRef<AppMsg>) {
+    // the gateway never waits longer than this, so neither does the
+    // phone's prompt
+    asked.cap_expiry(u64::try_from(ASK_TIMEOUT.as_millis()).unwrap_or(u64::MAX));
+    let id = asked.id().clone();
+    let (responder, answered) = oneshot::channel();
+    let incoming = Incoming {
+        asked,
+        seq,
+        responder,
+    };
+    if app.cast(AppMsg::Incoming(Box::new(incoming))).is_err() {
+        return;
+    }
+
+    answer(send, answered, id, seq, app).await;
+}
+
+async fn offer_handoff(
+    send: SendStream,
+    request: PhoneHandoffRequest,
+    seq: u64,
+    app: ActorRef<AppMsg>,
+) {
+    let mut handoff = request.handoff;
+    let longest = u64::try_from(MAX_HANDOFF_WAIT.as_millis()).unwrap_or(u64::MAX);
+    handoff.expires_in_ms = handoff.expires_in_ms.min(longest);
+    let id = handoff.id.clone();
+    let (responder, answered) = oneshot::channel::<HandoffAnswer>();
+    let incoming = IncomingHandoff {
+        handoff,
+        seq,
+        responder,
+    };
+    if app.cast(AppMsg::Handoff(Box::new(incoming))).is_err() {
+        return;
+    }
+
+    answer(send, answered, id, seq, app).await;
+}
+
 /// Reads what the gateway sent on a stream it opened: a program's batch,
-/// keyed `program_read`, or a single read, which has no such key
-fn parse(body: &[u8]) -> Option<Asked> {
+/// keyed `program_read`, a handoff, keyed `handoff`, or a single read, which
+/// has neither key
+fn parse(body: &[u8]) -> Option<Offered> {
     if let Ok(request) = serde_json::from_slice::<PhoneProgramRequest>(body) {
-        return Some(Asked::Program(request.program_read));
+        return Some(Offered::Read(Asked::Program(request.program_read)));
+    }
+    if let Ok(request) = serde_json::from_slice::<PhoneHandoffRequest>(body) {
+        return Some(Offered::Handoff(request));
     }
 
     serde_json::from_slice::<PhoneRead>(body)
         .ok()
-        .map(Asked::Read)
+        .map(|read| Offered::Read(Asked::Read(read)))
 }
 
-/// Writes the read's answer, or tells the app the gateway stopped wanting
-/// it; a read the phone gives up on (it expired) is reset
-async fn answer(
+/// Writes the answer to a read or handoff, or tells the app the gateway
+/// stopped wanting it; one the phone gives up on (it expired) is reset
+async fn answer<T: Serialize>(
     mut send: SendStream,
-    answered: oneshot::Receiver<CompanionResponse>,
+    answered: oneshot::Receiver<T>,
     id: RequestId,
     seq: u64,
     app: ActorRef<AppMsg>,

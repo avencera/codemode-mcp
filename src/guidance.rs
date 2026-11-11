@@ -94,6 +94,20 @@ macro_rules! onepassword_rule {
     };
 }
 
+macro_rules! browser_rule {
+    () => {
+        "To sign in to a website in an agent-browser session, never type a username, password or \
+         one-time code yourself: click the field so it has focus, then call the `browser` server's \
+         `fill` (search_tools \"browser fill\") with the session, the kind of field and the site; the \
+         value goes from the user's 1Password into the page without reaching you. When a step needs \
+         the user, such as a passkey, a captcha or a consent screen, call its `handoff` with what they \
+         should do; it returns once they finish or cancel on their phone. To browse as one of the \
+         user's logged-in browser sessions, use that session's `agent_browser_<name>` server \
+         (search_tools \"agent_browser\"): reading and navigating run freely and every click or typed \
+         text asks the user."
+    };
+}
+
 pub(crate) use {script_rules, session_rule, tool_call_rule};
 
 /// Shown with `search_tools` results for a query about 1Password or secrets
@@ -119,6 +133,8 @@ pub const INSTRUCTIONS: &str = concat!(
     session_rule!(),
     "\n\n",
     onepassword_rule!(),
+    "\n\n",
+    browser_rule!(),
     "\n\n",
     script_rules!()
 );

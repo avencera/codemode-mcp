@@ -10,9 +10,11 @@
 mod app;
 mod connection;
 pub mod ffi;
+mod handoff;
 mod net;
 mod pairing;
 mod record;
 mod request;
+mod takeover;
 
 uniffi::setup_scaffolding!();

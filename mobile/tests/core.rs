@@ -13,17 +13,24 @@ use std::{
 };
 
 use companion_core::ffi::{
-    AppAction, AppState, ConnectionState, EnteredValue, FfiApp, OpenBatch, OpenError, OpenRequest,
-    PairingState, PendingRead, Platform, PlatformError, ProgramItem as ShownItem, PushEnvironment,
-    ReadStatus, Reconciler, Update,
+    AppAction, AppState, ConnectionState, EnteredValue, FfiApp, HandoffStatus, LoginField,
+    OpenBatch, OpenError, OpenRequest, PairingState, PendingRead, Platform, PlatformError,
+    ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, ScreenImage, TakeoverInput,
+    TakeoverNotice, TakeoverStatus, Update,
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
     mobile::{
+        HandoffAnswer, LoginField as WireField, PhoneHandoff, PhoneHandoffRequest,
         PhoneProgramRead, PhoneProgramRequest, PhoneRead, PhoneRequest, PhoneResponse, ProgramItem,
-        PushToken, RequestId, SealKey, Sealed,
+        PushToken, RequestId, SealKey, Sealed, SignIn,
     },
     seal::{SoftwareKey, seal},
+    takeover::{
+        EndReason, FillOffer, Focus, GatewayMessage, HEADER_BYTES, PhoneMessage, Point, Screen,
+        ScreenHeader, Secret as WireSecret, TAKEOVER_ALPN, Viewport, decode_phone, encode_message,
+        encode_screen, read_header,
+    },
     ticket::{InviteSecret, InviteTicket},
     wire::{
         CompanionErrorCode, CompanionResponse, PairCheck, PairRequest, PairResponse, ProgramValue,
@@ -32,9 +39,9 @@ use companion_wire::{
 };
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{Connection, presets},
+    endpoint::{Connection, RecvStream, SendStream, presets},
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -302,13 +309,20 @@ struct FakeGateway {
     /// The references the gateway names at pairing, which the phone no
     /// longer keeps
     references: Vec<String>,
+    /// Takeover connections the phone dialed, in order
+    takeover_sender: mpsc::UnboundedSender<Connection>,
+    takeovers: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Connection>>>,
 }
 
 impl FakeGateway {
     async fn start() -> Result<Self, Box<dyn Error>> {
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(iroh::SecretKey::generate())
-            .alpns(vec![PAIR_ALPN.to_vec(), MOBILE_ALPN.to_vec()])
+            .alpns(vec![
+                PAIR_ALPN.to_vec(),
+                MOBILE_ALPN.to_vec(),
+                TAKEOVER_ALPN.to_vec(),
+            ])
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))?
             .bind()
             .await?;
@@ -317,6 +331,7 @@ impl FakeGateway {
             .into_iter()
             .find(SocketAddr::is_ipv4)
             .ok_or("no IPv4 socket")?;
+        let (takeover_sender, takeovers) = mpsc::unbounded_channel();
         let gateway = Self {
             endpoint,
             address,
@@ -325,6 +340,8 @@ impl FakeGateway {
             link: watch::channel(None).0,
             requests: Arc::new(Mutex::new(Vec::new())),
             references: vec![REFERENCE.to_owned()],
+            takeover_sender,
+            takeovers: Arc::new(tokio::sync::Mutex::new(takeovers)),
         };
 
         let accepting = gateway.clone();
@@ -337,6 +354,8 @@ impl FakeGateway {
                     };
                     if connection.alpn() == PAIR_ALPN {
                         gateway.pairing(connection).await;
+                    } else if connection.alpn() == TAKEOVER_ALPN {
+                        let _ = gateway.takeover_sender.send(connection);
                     } else {
                         gateway.mobile(connection).await;
                     }
@@ -514,6 +533,7 @@ impl FakeGateway {
             reason: reason.map(str::to_owned),
             destination: None,
             keep_secs: None,
+            sign_in: None,
             expires_in_ms: 30_000,
         })
         .await
@@ -527,9 +547,29 @@ impl FakeGateway {
         self.ask(&PhoneProgramRequest { program_read }).await
     }
 
+    /// Offers a handoff over the phone's link, as `browser.handoff` does,
+    /// and waits for the phone's answer on its stream
+    async fn offer_handoff(&self, handoff: PhoneHandoff) -> Result<HandoffAnswer, String> {
+        self.ask(&PhoneHandoffRequest { handoff }).await
+    }
+
+    /// The next takeover the phone dials, with the stream it opens on it
+    async fn next_takeover(&self) -> Result<(Connection, SendStream, RecvStream), Box<dyn Error>> {
+        let mut takeovers = self.takeovers.lock().await;
+        let connection = tokio::time::timeout(Duration::from_secs(10), takeovers.recv())
+            .await?
+            .ok_or("the gateway stopped")?;
+        let (send, receive) = connection.accept_bi().await?;
+
+        Ok((connection, send, receive))
+    }
+
     /// Opens a stream on the phone's link, sends `request` and waits for
     /// the answer
-    async fn ask(&self, request: &impl serde::Serialize) -> Result<CompanionResponse, String> {
+    async fn ask<R: serde::de::DeserializeOwned>(
+        &self,
+        request: &impl serde::Serialize,
+    ) -> Result<R, String> {
         let connection = self
             .link
             .subscribe()
@@ -1219,6 +1259,7 @@ fn reference_item(
     Ok(ProgramItem::Reference {
         reference: reference.to_owned(),
         sealed,
+        field: None,
     })
 }
 
@@ -1246,6 +1287,7 @@ async fn a_program_read_opens_its_sealed_items_with_one_face_id() -> TestResult 
                     reason: Some("deploy\nApprove all \u{202e}now".to_owned()),
                     destination: Some(format!("/srv/app.env\n{}", "d".repeat(300))),
                     keep_secs: Some(2 * 60 * 60),
+                    sign_in: None,
                     expires_in_ms: 30_000,
                 })
                 .await
@@ -1271,6 +1313,7 @@ async fn a_program_read_opens_its_sealed_items_with_one_face_id() -> TestResult 
         .map(|reference| ShownItem::Reference {
             reference: reference.to_owned(),
             sealed: true,
+            field: None,
         })
         .collect();
     assert_eq!(program.items, references);
@@ -1310,6 +1353,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
         reference_item(&gateway, "op://Dev/new/credential", None)?,
         ProgramItem::Describe {
             description: "Pushover app token".to_owned(),
+            field: None,
         },
     ];
     let reading = tokio::spawn({
@@ -1328,7 +1372,8 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
     assert_eq!(
         program.items[2],
         ShownItem::Describe {
-            description: "Pushover app token".to_owned()
+            description: "Pushover app token".to_owned(),
+            field: None,
         }
     );
 
@@ -1362,6 +1407,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
         reference_item(&gateway, REFERENCE, Some(VALUE))?,
         ProgramItem::Describe {
             description: "Pushover user key".to_owned(),
+            field: None,
         },
     ];
     let reading = tokio::spawn({
@@ -1382,6 +1428,7 @@ async fn a_program_read_sends_entered_values_with_opened_ones_in_item_order() ->
     let items = (0..2)
         .map(|index| ProgramItem::Describe {
             description: format!("large value {index}"),
+            field: None,
         })
         .collect();
     let reading = tokio::spawn({
@@ -1560,6 +1607,7 @@ async fn an_approval_made_while_another_prompt_is_up_runs_when_it_ends() -> Test
         reference_item(&gateway, REFERENCE, Some(VALUE))?,
         ProgramItem::Describe {
             description: "Pushover app token".to_owned(),
+            field: None,
         },
     ];
     let second_reading = tokio::spawn({
@@ -1584,6 +1632,388 @@ async fn an_approval_made_while_another_prompt_is_up_runs_when_it_ends() -> Test
     assert!(matches!(first_reading.await??, CompanionResponse::Error(_)));
     assert_eq!(second_reading.await??, texts(&[VALUE, "app-token"]));
     assert_eq!(platform.batch_prompts().len(), 2);
+
+    Ok(())
+}
+
+/// What a fake gateway reads the bytes of when a test types or fills
+const TYPED: &str = "hunter2";
+
+/// The next message the phone sends on a takeover
+async fn read_phone(receive: &mut RecvStream) -> Result<PhoneMessage, Box<dyn Error>> {
+    let mut header = [0_u8; HEADER_BYTES];
+    tokio::time::timeout(Duration::from_secs(10), receive.read_exact(&mut header)).await??;
+    let (kind, length) = read_header(header)?;
+    let mut body = vec![0_u8; length];
+    receive.read_exact(&mut body).await?;
+
+    Ok(decode_phone(kind, &body)?)
+}
+
+fn updates(recorder: &Recorder) -> Vec<Update> {
+    recorder.0.lock().map(|u| u.clone()).unwrap_or_default()
+}
+
+fn takeover_status(state: &AppState) -> Option<TakeoverStatus> {
+    state
+        .takeover
+        .as_ref()
+        .map(|takeover| takeover.status.clone())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_shows_the_page_paces_its_images_and_sends_the_owners_input() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, platform, recorder) = paired(&gateway).await?;
+    let handoff = RequestId::generate();
+
+    app.dispatch(AppAction::OpenTakeover {
+        session: "github".to_owned(),
+        handoff: Some(handoff.to_string()),
+    });
+    let state = until(&app, |state| state.takeover.is_some()).await?;
+    let takeover = state.takeover.ok_or("no takeover")?;
+    assert_eq!(takeover.session, "github");
+    assert_eq!(takeover.handoff, Some(handoff.to_string()));
+    assert_eq!(takeover.status, TakeoverStatus::Connecting);
+    // nothing is dialed before the app says how big the image area is
+    app.takeover(TakeoverInput::Resize {
+        width: 390,
+        height: 664,
+        scale: 2.0,
+    });
+
+    let open = PhoneMessage::Open {
+        session: "github".to_owned(),
+        handoff: Some(handoff.clone()),
+        viewport: Viewport {
+            width: 390,
+            height: 664,
+            scale: 2.0,
+        },
+    };
+    let (connection, _, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, open);
+
+    // a link that drops is dialed again, and the takeover opens anew on it
+    connection.close(0_u32.into(), b"restart");
+    until(&app, |state| {
+        matches!(
+            takeover_status(state),
+            Some(TakeoverStatus::Retrying { .. })
+        )
+    })
+    .await?;
+    let (_connection, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, open);
+
+    let reference = "op://Private/GitHub/password";
+    let page = GatewayMessage::Page {
+        url: "https://github.com/login".to_owned(),
+        title: "Sign in to GitHub".to_owned(),
+        focus: Some(Focus {
+            field: Some(WireField::Password),
+            editable: true,
+            secure: true,
+            numeric: false,
+            origin: "https://github.com".to_owned(),
+            cross_site: false,
+        }),
+        offers: vec![FillOffer {
+            field: WireField::Password,
+            reference: reference.to_owned(),
+            sealed: gateway.seal(reference, TYPED)?,
+            item: "GitHub".to_owned(),
+            account: Some("praveenperera".to_owned()),
+            site: "github.com".to_owned(),
+        }],
+    };
+    send.write_all(&encode_message(&page)?).await?;
+    let jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+    let screen = Screen {
+        header: ScreenHeader {
+            seq: 0,
+            width: 780,
+            height: 1328,
+        },
+        jpeg: jpeg.clone(),
+    };
+    send.write_all(&encode_screen(&screen)?).await?;
+
+    let state = until(&app, |state| {
+        state
+            .takeover
+            .as_ref()
+            .is_some_and(|takeover| takeover.page.is_some())
+    })
+    .await?;
+    let takeover = state.takeover.ok_or("no takeover")?;
+    assert_eq!(takeover.status, TakeoverStatus::Live);
+    let page = takeover.page.ok_or("no page")?;
+    assert_eq!(page.url, "https://github.com/login");
+    assert_eq!(page.title, "Sign in to GitHub");
+    let focus = page.focus.ok_or("no focus")?;
+    assert_eq!(focus.field, Some(LoginField::Password));
+    assert!(focus.editable && focus.secure && !focus.numeric);
+    assert_eq!(page.offers.len(), 1);
+    assert_eq!(page.offers[0].reference, reference);
+    assert_eq!(page.offers[0].field, LoginField::Password);
+    assert_eq!(page.offers[0].account.as_deref(), Some("praveenperera"));
+
+    // the image reaches the app, and is acknowledged once it is drawn
+    let mut image = None;
+    for _ in 0..200 {
+        image = updates(&recorder)
+            .into_iter()
+            .find_map(|update| match update {
+                Update::Screen(image) => Some(image),
+                _ => None,
+            });
+        if image.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        image,
+        Some(ScreenImage {
+            seq: 0,
+            width: 780,
+            height: 1328,
+            jpeg,
+        })
+    );
+    app.takeover(TakeoverInput::Drawn { seq: 0 });
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        PhoneMessage::Ack { seq: 0 }
+    );
+    // an image drawn twice is acknowledged once, and a tap goes as fractions
+    // of the image
+    app.takeover(TakeoverInput::Drawn { seq: 0 });
+    app.takeover(TakeoverInput::Tap {
+        x: 0.5,
+        y: 0.25,
+        seq: 0,
+    });
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        PhoneMessage::Tap {
+            at: Point { x: 0.5, y: 0.25 },
+            seq: 0,
+        }
+    );
+    app.takeover_text(TYPED.to_owned());
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        PhoneMessage::Text {
+            text: WireSecret::new(TYPED.to_owned()),
+        }
+    );
+
+    // Fill from 1Password opens the offer's sealed copy with Face ID
+    app.takeover(TakeoverInput::FillOffer {
+        reference: reference.to_owned(),
+    });
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        PhoneMessage::Fill {
+            field: WireField::Password,
+            value: WireSecret::new(TYPED.to_owned()),
+            submit: false,
+            site: Some("github.com".to_owned()),
+        }
+    );
+    assert_eq!(
+        platform.prompts().last(),
+        Some(&(reference.to_owned(), "mini".to_owned()))
+    );
+    send.write_all(&encode_message(&GatewayMessage::Filled {
+        field: WireField::Password,
+    })?)
+    .await?;
+    until(&app, |state| {
+        state.takeover.as_ref().is_some_and(|takeover| {
+            takeover.notice
+                == Some(TakeoverNotice::Filled {
+                    field: LoginField::Password,
+                })
+        })
+    })
+    .await?;
+
+    // Done ends it; the gateway's Ended closes the screen
+    app.takeover(TakeoverInput::Done);
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Done);
+    send.write_all(&encode_message(&GatewayMessage::Ended {
+        reason: EndReason::Done,
+        message: None,
+    })?)
+    .await?;
+    until(&app, |state| state.takeover.is_none()).await?;
+
+    // nothing typed or filled is in any state, update or Debug output
+    assert!(!format!("{:?}", app.state()).contains(TYPED));
+    assert!(!format!("{:?}", updates(&recorder)).contains(TYPED));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_offered_again_shows_once_and_cancel_answers_it() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _, _) = paired(&gateway).await?;
+    let id = RequestId::generate();
+    let handoff = PhoneHandoff {
+        id: id.clone(),
+        session: "github".to_owned(),
+        reason: Some("Approve the passkey prompt\nplease".to_owned()),
+        url: Some("https://github.com/sessions/two-factor".to_owned()),
+        expires_in_ms: 60_000,
+    };
+
+    let first = tokio::spawn({
+        let gateway = gateway.clone();
+        let handoff = handoff.clone();
+        async move { gateway.offer_handoff(handoff).await }
+    });
+    let state = until(&app, |state| {
+        state
+            .handoffs
+            .iter()
+            .any(|shown| shown.status == HandoffStatus::Waiting)
+    })
+    .await?;
+    let [card] = state.handoffs.as_slice() else {
+        return Err(format!("not one handoff: {:?}", state.handoffs).into());
+    };
+    assert_eq!(card.id, id.to_string());
+    assert_eq!(card.session, "github");
+    // the agent's words stay on one line
+    assert_eq!(
+        card.reason.as_deref(),
+        Some("Approve the passkey prompt⏎please")
+    );
+    assert_eq!(
+        card.url.as_deref(),
+        Some("https://github.com/sessions/two-factor")
+    );
+    assert_eq!(card.gateway_name, "mini");
+
+    // the link drops before the owner answers; the gateway offers it again
+    gateway.drop_link();
+    assert!(first.await?.is_err());
+    let second = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.offer_handoff(handoff).await }
+    });
+    app.dispatch(AppAction::CancelHandoff { id: id.to_string() });
+    assert_eq!(second.await??, HandoffAnswer::Cancelled);
+    let state = until(&app, |state| {
+        state
+            .handoffs
+            .iter()
+            .any(|shown| shown.status == HandoffStatus::Cancelled)
+    })
+    .await?;
+    assert_eq!(state.handoffs.len(), 1, "{:?}", state.handoffs);
+
+    // one the gateway stops (a takeover or another phone ended it) is over
+    let other = RequestId::generate();
+    let connection = gateway.link.borrow().clone().ok_or("no link")?;
+    let (mut send, mut receive) = connection.open_bi().await?;
+    let request = PhoneHandoffRequest {
+        handoff: PhoneHandoff {
+            id: other.clone(),
+            session: "github".to_owned(),
+            reason: None,
+            url: None,
+            expires_in_ms: 60_000,
+        },
+    };
+    send.write_all(&serde_json::to_vec(&request)?).await?;
+    send.finish()?;
+    until(&app, |state| {
+        state
+            .handoffs
+            .iter()
+            .any(|shown| shown.id == other.to_string() && shown.status == HandoffStatus::Waiting)
+    })
+    .await?;
+    receive.stop(0_u32.into())?;
+    until(&app, |state| {
+        state
+            .handoffs
+            .iter()
+            .any(|shown| shown.id == other.to_string() && shown.status == HandoffStatus::Over)
+    })
+    .await?;
+
+    // finished handoffs are dismissed one by one
+    app.dispatch(AppAction::Dismiss { id: id.to_string() });
+    let state = until(&app, |state| state.handoffs.len() == 1).await?;
+    assert_eq!(state.handoffs[0].id, other.to_string());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_names_its_site_and_each_items_login_field() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _, _) = paired(&gateway).await?;
+    let id = RequestId::generate();
+    let read = PhoneProgramRead {
+        id: id.clone(),
+        items: vec![
+            ProgramItem::Describe {
+                description: "github.com username".to_owned(),
+                field: Some(WireField::Username),
+            },
+            ProgramItem::Describe {
+                description: "github.com password".to_owned(),
+                field: Some(WireField::Password),
+            },
+        ],
+        reason: Some("sign in to GitHub".to_owned()),
+        destination: None,
+        keep_secs: None,
+        sign_in: Some(SignIn {
+            site: "github.com".to_owned(),
+            account: Some("praveenperera".to_owned()),
+            session: Some("github".to_owned()),
+        }),
+        expires_in_ms: 30_000,
+    };
+    let reading = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.offer_program_read(read).await }
+    });
+
+    until(&app, |_| {
+        shown(&app, &id).is_some_and(|read| read.status == ReadStatus::Waiting)
+    })
+    .await?;
+    let read = shown(&app, &id).ok_or("no read")?;
+    assert_eq!(read.reference, "github.com · praveenperera");
+    let program = read.program.ok_or("not a program read")?;
+    let sign_in = program.sign_in.ok_or("no sign-in")?;
+    assert_eq!(sign_in.title, "github.com · praveenperera");
+    assert_eq!(sign_in.session.as_deref(), Some("github"));
+    let fields: Vec<Option<LoginField>> = program
+        .items
+        .iter()
+        .map(|item| match item {
+            ShownItem::Reference { field, .. } | ShownItem::Describe { field, .. } => *field,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        [Some(LoginField::Username), Some(LoginField::Password)]
+    );
+
+    // one Send answers both, as AutoFill filled them
+    app.answer_program(id.to_string(), typed(&[(0, "praveenperera"), (1, TYPED)]));
+    assert_eq!(reading.await??, texts(&["praveenperera", TYPED]));
 
     Ok(())
 }

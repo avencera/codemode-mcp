@@ -3,13 +3,13 @@
 use super::{StoreError, sql::Connection};
 
 /// Version a fully migrated database reports
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 type Migration = fn(&Connection) -> Result<(), turso::Error>;
 
 /// Steps from version `n` to `n + 1`, applied in order; a fresh database
 /// runs all of them
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     create_tables,
     create_oauth_tables,
     create_sessions,
@@ -17,6 +17,7 @@ const MIGRATIONS: [Migration; 7] = [
     create_durable_state,
     create_phone_tables,
     create_spoke_tables,
+    create_site_logins,
 ];
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
@@ -35,6 +36,26 @@ pub fn migrate(connection: &Connection) -> Result<(), StoreError> {
     }
 
     Ok(())
+}
+
+/// The 1Password login the `browser` builtin last used for each site, found
+/// while the owner was at this Mac, so a sign-in while they are away names
+/// the account and sends the phone its sealed copies. References and an
+/// account name only, never a value
+fn create_site_logins(connection: &Connection) -> Result<(), turso::Error> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE site_logins (
+            site TEXT PRIMARY KEY,
+            item TEXT NOT NULL,
+            account TEXT,
+            username_ref TEXT,
+            password_ref TEXT,
+            code_ref TEXT,
+            updated_ms INTEGER NOT NULL
+        );
+        "#,
+    )
 }
 
 /// What a hub keeps for its spokes: each one the owner trusted, and which

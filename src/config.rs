@@ -98,6 +98,11 @@ pub struct Config {
     /// on `$PATH`
     #[serde(default)]
     pub worker_path: Option<PathBuf>,
+    /// Path of `agent-browser`, whose sessions the `browser` builtin signs
+    /// in to; when unset, `agent-browser` on `$PATH`, then Homebrew's and
+    /// `~/.local/bin`
+    #[serde(default)]
+    pub agent_browser_path: Option<PathBuf>,
     /// How long one upstream tool call may run before it is cancelled
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
@@ -159,6 +164,7 @@ impl Default for Config {
             listen: default_listen(),
             extra_allowed_hosts: Vec::new(),
             worker_path: None,
+            agent_browser_path: None,
             tool_timeout_secs: default_tool_timeout_secs(),
             admin_listen: default_admin_listen(),
             state_dir: None,
@@ -471,6 +477,8 @@ impl Config {
 const LOGINS_TOOLS: [&str; 1] = ["fill"];
 /// The tools of the `secrets` builtin, which per-tool settings may name
 const SECRETS_TOOLS: [&str; 2] = ["write_env", "find_references"];
+/// The tools of the `browser` builtin, which per-tool settings may name
+const BROWSER_TOOLS: [&str; 2] = ["fill", "handoff"];
 
 /// The 1Password CLI that reads `{{ op://vault/item/field }}` references in
 /// server `headers` and `env` when a server first connects, and the
@@ -1374,6 +1382,9 @@ pub enum Builtin {
     /// Writes 1Password values into an env file, approved once on whichever
     /// device the owner is at
     Secrets,
+    /// Signs agents in to websites in their agent-browser sessions, and
+    /// hands a step to the owner's phone
+    Browser,
 }
 
 /// Per-tool settings that override the server defaults
@@ -1657,6 +1668,7 @@ impl ServerConfig {
         match self.builtin {
             Some(Builtin::Logins) => self.validate_logins(name),
             Some(Builtin::Secrets) => self.validate_secrets(name),
+            Some(Builtin::Browser) => self.validate_browser(name),
             None => Ok(()),
         }
     }
@@ -1677,6 +1689,29 @@ impl ServerConfig {
         if self.policy_for("fill") != Policy::Ask || self.grant_for("fill") != GrantMode::PerCall {
             return Err(ConfigError::Invalid(format!(
                 "servers.{name}: the logins server's `fill` must ask on every call; set \
+                 `policy = \"ask\"` and `tools.fill.grant = \"per_call\"`"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Every fill must ask, once per call, as for the logins server; a
+    /// handoff asks the owner on their phone anyway, so it may be allowed
+    fn validate_browser(&self, name: &str) -> Result<(), ConfigError> {
+        if let Some(tool) = self
+            .tools
+            .keys()
+            .find(|tool| !BROWSER_TOOLS.contains(&tool.as_str()))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}.tools.{tool}: the browser server has only {}",
+                BROWSER_TOOLS.join(" and ")
+            )));
+        }
+        if self.policy_for("fill") != Policy::Ask || self.grant_for("fill") != GrantMode::PerCall {
+            return Err(ConfigError::Invalid(format!(
+                "servers.{name}: the browser server's `fill` must ask on every call; set \
                  `policy = \"ask\"` and `tools.fill.grant = \"per_call\"`"
             )));
         }

@@ -260,6 +260,7 @@ impl SecretsServer {
             keep,
             phones_only: false,
             keep_scope: None,
+            sign_in: None,
         };
         // a caller that stops waiting takes the prompts down, and nothing is
         // written for it after a late approval

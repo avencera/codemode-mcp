@@ -65,6 +65,16 @@ pub enum Subject {
     Reference(String),
     /// A program read, by its one-line summary
     Program(String),
+    /// A sign-in to a website, by its site and account, such as
+    /// `github.com · praveenperera`
+    SignIn(String),
+    /// A handoff of a browser session
+    Handoff {
+        /// The session, such as `github`
+        session: String,
+        /// The agent's reason, one line
+        reason: String,
+    },
 }
 
 /// Sends pushes to the phones; cheap to clone
@@ -100,16 +110,32 @@ impl Apns {
             return Err(PushFailure::Gone);
         }
         let expires = alert.expires.duration_since(UNIX_EPOCH).unwrap_or_default();
-        let (subtitle, text) = match &alert.subject {
-            Subject::Reference(reference) => {
-                (format!("codemode-mcp on {}", alert.gateway), reference)
-            }
-            Subject::Program(summary) => (format!("A program on {}", alert.gateway), summary),
+        let (title, subtitle, text) = match &alert.subject {
+            Subject::Reference(reference) => (
+                "Approve a 1Password read",
+                format!("codemode-mcp on {}", alert.gateway),
+                reference.clone(),
+            ),
+            Subject::Program(summary) => (
+                "Approve a 1Password read",
+                format!("A program on {}", alert.gateway),
+                summary.clone(),
+            ),
+            Subject::SignIn(site) => (
+                "Sign in to a website",
+                format!("An agent on {}", alert.gateway),
+                site.clone(),
+            ),
+            Subject::Handoff { session, reason } => (
+                "Take over the browser",
+                format!("Session {session} on {}", alert.gateway),
+                reason.clone(),
+            ),
         };
         let mut body = json!({
             "aps": {
                 "alert": {
-                    "title": "Approve a 1Password read",
+                    "title": title,
                     "subtitle": subtitle,
                     "body": text,
                 },
@@ -126,9 +152,14 @@ impl Apns {
             Subject::Reference(reference) => {
                 body[push_keys::REFERENCE] = json!(reference);
             }
-            Subject::Program(summary) => {
+            Subject::Program(summary) | Subject::SignIn(summary) => {
                 body[push_keys::KIND] = json!(push_keys::PROGRAM);
                 body[push_keys::SUMMARY] = json!(summary);
+            }
+            Subject::Handoff { session, reason } => {
+                body[push_keys::KIND] = json!(push_keys::HANDOFF);
+                body[push_keys::SESSION] = json!(session);
+                body[push_keys::SUMMARY] = json!(reason);
             }
         }
 

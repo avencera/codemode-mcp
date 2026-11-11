@@ -37,6 +37,7 @@ use tokio::{
 };
 
 use crate::{
+    browser::{BROWSER_CALL_TIMEOUT, BrowserServer},
     config::{Builtin, ServerConfig, Transport},
     env_files::SecretsServer,
     logins::LoginsServer,
@@ -55,6 +56,8 @@ const BUILTIN_PIPE_BYTES: usize = 64 * 1024;
 pub struct Builtins {
     /// The Mac whose screen the `logins` server types on; `None` off macOS
     pub mac: Option<Arc<dyn Mac>>,
+    /// The sign-ins and handoffs every `browser` server shares
+    pub browsers: Option<Arc<crate::browser::Browsers>>,
 }
 
 /// Least time a `secrets` or `logins` server call is given: the companions'
@@ -623,8 +626,10 @@ impl Upstream {
         }
     }
 
-    /// Adds the server's configured `arguments` that `tool` declares and the
-    /// caller left out; the stubs hide them, so scripts never pass them
+    /// Sets the server's configured `arguments` that `tool` declares; the
+    /// stubs hide them, and one a script passes anyway is replaced, so a
+    /// server pinned to, say, one browser session cannot be pointed at
+    /// another
     fn with_fixed_arguments(
         &self,
         tool: &str,
@@ -645,7 +650,7 @@ impl Upstream {
             return arguments;
         };
         for (name, value) in &self.config.arguments {
-            if declared.contains_key(name) && !arguments.contains_key(name) {
+            if declared.contains_key(name) {
                 arguments.insert(name.clone(), value.clone());
             }
         }
@@ -1247,6 +1252,14 @@ impl Upstream {
                 SecretsServer::new(self.onepassword.clone(), Arc::clone(&self.redactor))
                     .serve_on(io),
             ),
+            Builtin::Browser => match &self.builtins.browsers {
+                Some(browsers) => Box::pin(BrowserServer::new(Arc::clone(browsers)).serve_on(io)),
+                None => {
+                    tracing::warn!(server = %self.name, "no browser state, so not serving it");
+
+                    return;
+                }
+            },
         };
         let name = self.name.clone();
         tokio::spawn(async move {
@@ -1459,11 +1472,13 @@ impl Upstreams {
                 // a write, or a login picked on the phone, waits on the owner
                 // for up to the approval's own timeout, then writes or types;
                 // the gateway's limit must outlast both
-                call_timeout: if matches!(config.builtin, Some(Builtin::Secrets | Builtin::Logins))
-                {
-                    call_timeout.max(BUILTIN_CALL_TIMEOUT)
-                } else {
-                    call_timeout
+                // a handoff waits on the owner far longer
+                call_timeout: match config.builtin {
+                    Some(Builtin::Secrets | Builtin::Logins) => {
+                        call_timeout.max(BUILTIN_CALL_TIMEOUT)
+                    }
+                    Some(Builtin::Browser) => call_timeout.max(BROWSER_CALL_TIMEOUT),
+                    None => call_timeout,
                 },
                 cache_unshown: AtomicBool::new(!tools.is_empty()),
                 inner: RwLock::new(Inner {

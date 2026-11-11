@@ -273,6 +273,7 @@ impl RequestState {
                 ProgramItem::Reference {
                     reference,
                     sealed: Some(copy),
+                    ..
                 } => sealed.push(SealedItem {
                     reference: reference.clone(),
                     info: seal_info(&self.record.id, reference),

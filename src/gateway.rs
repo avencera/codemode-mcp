@@ -22,6 +22,7 @@ use tokio::{
 
 use crate::{
     approvals::{Approvals, Gate, GateRequest, RemoteGate, Waiting, hex},
+    browser::{Browsers, page::AgentBrowser},
     budget::Budget,
     catalog::{Catalog, ServerSnapshot, ToolEntry, export_tools},
     companion::Companions,
@@ -177,6 +178,10 @@ pub struct PreparedCall {
     pub tool: String,
     /// Whether logs must omit this call's arguments and error text
     pub sensitive: bool,
+    /// Whether the call waits on the owner rather than working, such as a
+    /// browser handoff, so it does not use the script's time allowance
+    #[serde(default)]
+    pub waits_on_owner: bool,
     arguments: Map<String, Value>,
     output: OutputSpec,
     /// On a spoke, the hub's request the owner approves this call of the
@@ -267,6 +272,8 @@ pub struct Gateway {
     /// The `logins` server's check of the focused field before a `fill`
     /// is put to the owner
     fill_check: FillCheck,
+    /// The `browser` servers' shared state, when one is configured
+    browsers: Option<Arc<Browsers>>,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
     /// The hub, on a spoke
@@ -405,7 +412,30 @@ impl Gateway {
             hub,
         } = access;
         let fill_check = FillCheck::new(secrets.onepassword.clone(), mac.clone());
-        let builtins = Builtins { mac };
+        // only a configured browser server lets phones take a session over
+        let browsers = config
+            .servers
+            .values()
+            .any(|server| server.builtin == Some(Builtin::Browser))
+            .then(|| {
+                Browsers::new(
+                    secrets.onepassword.clone(),
+                    Arc::clone(&redactor),
+                    Some(store.clone()),
+                    match &config.agent_browser_path {
+                        Some(path) => AgentBrowser::at(path.clone()),
+                        None => AgentBrowser::find(
+                            std::env::var_os("HOME")
+                                .map(std::path::PathBuf::from)
+                                .as_deref(),
+                        ),
+                    },
+                )
+            });
+        let builtins = Builtins {
+            mac,
+            browsers: browsers.clone(),
+        };
         let upstreams = Upstreams::start(
             &config.servers,
             config.tool_timeout(),
@@ -421,6 +451,7 @@ impl Gateway {
             secrets,
             redactor,
             fill_check,
+            browsers,
             max_tool_result_bytes: config.limits.max_tool_result_bytes,
             config,
             upstreams,
@@ -743,6 +774,9 @@ impl Gateway {
             server: entry.server.clone(),
             tool: entry.tool.clone(),
             sensitive: server_config.is_some_and(|server| server.is_sensitive()),
+            waits_on_owner: server_config
+                .is_some_and(|server| server.builtin == Some(Builtin::Browser))
+                && entry.tool == "handoff",
             arguments: omit_none_arguments(entry, arguments),
             output: entry.output.clone(),
             hub_request: None,
@@ -788,14 +822,24 @@ impl Gateway {
 
             return Err(self.refuse(context, &call, error));
         }
-        let summary = match self
-            .fill_check
-            .prepare(server_config, &call.tool, &mut call.arguments)
-            .await
-        {
+        let prepared = match &self.browsers {
+            Some(browsers)
+                if server_config.is_some_and(|s| s.builtin == Some(Builtin::Browser)) =>
+            {
+                browsers
+                    .prepare(server_config, &call.tool, &mut call.arguments)
+                    .await
+            }
+            _ => self
+                .fill_check
+                .prepare(server_config, &call.tool, &mut call.arguments)
+                .await
+                .map_err(|error| error.to_string()),
+        };
+        let summary = match prepared {
             Ok(summary) => summary,
             Err(error) => {
-                let error = ToolCallError::ToolFailed(error.to_string());
+                let error = ToolCallError::ToolFailed(error);
 
                 return Err(self.refuse(context, &call, error));
             }
@@ -1198,13 +1242,17 @@ impl Gateway {
     /// when stub validation could not run and the previous catalog was kept
     /// Keeps what this hub's spokes get of `snapshots`: every server but
     /// the `secrets` builtin, which writes on the machine that runs it, so
-    /// each spoke has its own
+    /// each spoke has its own, and the `browser` builtin, whose fills are
+    /// checked against the page before the owner is asked, which a spoke's
+    /// call through the hub's gate would skip
     fn export(&self, snapshots: &[ServerSnapshot]) {
         let servers: Vec<HubServer> = snapshots
             .iter()
             .filter_map(|snapshot| {
                 let server = self.config.servers.get(&snapshot.name);
-                if server.is_some_and(|server| server.builtin == Some(Builtin::Secrets)) {
+                if server.is_some_and(|server| {
+                    matches!(server.builtin, Some(Builtin::Secrets | Builtin::Browser))
+                }) {
                     return None;
                 }
 

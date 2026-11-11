@@ -29,7 +29,9 @@ struct RequestView: View {
 
     var body: some View {
         Group {
-            if let program = read.program {
+            if let program = read.program, let signIn = program.signIn {
+                signInBody(program, signIn)
+            } else if let program = read.program {
                 programBody(program)
             } else {
                 singleBody
@@ -57,7 +59,7 @@ struct RequestView: View {
         .onChange(of: scenePhase, initial: true) { _, phase in
             if phase == .active { attachShared() }
         }
-        .navigationTitle(read.program == nil ? "Approve a read" : "Approve a program's read")
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -156,6 +158,108 @@ struct RequestView: View {
         value = ""
     }
 
+    private var title: String {
+        if read.program?.signIn != nil { return "Approve a sign-in" }
+        return read.program == nil ? "Approve a read" : "Approve a program's read"
+    }
+
+    // MARK: A sign-in
+
+    /// A program read that signs in to a website in the gateway's browser:
+    /// the site and account, then the values entered here in one form, so
+    /// AutoFill fills the username and password together
+    private func signInBody(_ program: ProgramRead, _ signIn: SignIn) -> some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: read.status.isFinished ? icon : "person.badge.key.fill")
+                    .font(.system(size: 48))
+                    .foregroundStyle(tint)
+                VStack(spacing: 8) {
+                    Text("Sign in to \(signIn.title)")
+                        .font(.headline)
+                        .multilineTextAlignment(.center)
+                    if let session = signIn.session {
+                        Label("Browser session \(session) on \(read.gatewayName)", systemImage: "safari")
+                            .font(.callout)
+                            .multilineTextAlignment(.center)
+                    }
+                    Text("Approving sends these to codemode-mcp on \(read.gatewayName), which fills them into the page.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                if let reason = program.reason {
+                    VStack(spacing: 4) {
+                        Text("The agent says")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("“\(reason)”")
+                            .italic()
+                            .multilineTextAlignment(.center)
+                    }
+                }
+                if program.items.isEmpty {
+                    Text(read.reference)
+                        .font(.system(.callout, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                } else {
+                    signInItems(program)
+                }
+                status
+                programActions(program)
+            }
+            .padding(24)
+        }
+    }
+
+    /// Sealed items as one line each; the entered ones together, in item
+    /// order, as one form
+    private func signInItems(_ program: ProgramRead) -> some View {
+        let entered = program.items.indices.filter { entersValue(index: $0, item: program.items[$0]) }
+        let sealed = program.items.indices.filter { !entered.contains($0) }
+        return VStack(spacing: 10) {
+            ForEach(sealed, id: \.self) { index in
+                HStack {
+                    Label(fieldLabel(program.items[index]), systemImage: "faceid")
+                    Spacer()
+                    if !read.status.isFinished {
+                        Button("Enter instead") { replacing.insert(index) }
+                            .disabled(read.status != .waiting)
+                    }
+                }
+                .font(.callout)
+                .padding(12)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+            }
+            if !entered.isEmpty, !read.status.isFinished {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(entered, id: \.self) { index in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(fieldLabel(program.items[index]))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            ValueField(field: program.items[index].field, text: Binding(
+                                get: { values[index] ?? "" },
+                                set: { values[index] = $0 }
+                            ))
+                        }
+                    }
+                }
+                .padding(12)
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
+    }
+
+    /// The login field an item goes into, or what the program called it
+    private func fieldLabel(_ item: ProgramItem) -> String {
+        if let field = item.field { return field.label }
+        switch item {
+        case let .reference(reference, _, _): return reference
+        case let .describe(description, _): return description
+        }
+    }
+
     // MARK: A program's read
 
     private func programBody(_ program: ProgramRead) -> some View {
@@ -233,7 +337,7 @@ struct RequestView: View {
     private func itemRow(index: Int, item: ProgramItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             switch item {
-            case let .reference(reference, sealed):
+            case let .reference(reference, sealed, field):
                 Text(reference)
                     .font(.system(.callout, design: .monospaced))
                     .textSelection(.enabled)
@@ -257,12 +361,12 @@ struct RequestView: View {
                             .foregroundStyle(.secondary)
                     }
                     if !read.status.isFinished {
-                        field(index: index)
+                        valueField(index: index, field: field)
                         // a file such as a .p12 has no text to fill in
                         fileButton(index: index)
                     }
                 }
-            case let .describe(description):
+            case let .describe(description, field):
                 Text("“\(description)”")
                     .italic()
                 if let file = attached[index] {
@@ -272,7 +376,7 @@ struct RequestView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                     if !read.status.isFinished {
-                        field(index: index)
+                        valueField(index: index, field: field)
                         fileButton(index: index)
                     }
                 }
@@ -283,18 +387,14 @@ struct RequestView: View {
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    /// One item's value field, filled through AutoFill or pasted
-    private func field(index: Int) -> some View {
+    /// One item's value field, filled through AutoFill or pasted; its
+    /// keyboard and AutoFill match the login field it goes into
+    private func valueField(index: Int, field: LoginField?) -> some View {
         HStack {
-            SecureField("Value", text: Binding(
+            ValueField(field: field, text: Binding(
                 get: { values[index] ?? "" },
                 set: { values[index] = $0 }
             ))
-            .textContentType(.password)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .privacySensitive()
-            .textFieldStyle(.roundedBorder)
             PasteButton(payloadType: String.self) { strings in
                 let pasted = strings.first ?? ""
                 DispatchQueue.main.async { values[index] = pasted }
@@ -390,7 +490,7 @@ struct RequestView: View {
     /// Whether the owner enters item `index` rather than Face ID opening it
     private func entersValue(index: Int, item: ProgramItem) -> Bool {
         switch item {
-        case let .reference(_, sealed): !sealed || replacing.contains(index)
+        case let .reference(_, sealed, _): !sealed || replacing.contains(index)
         case .describe: true
         }
     }
@@ -520,5 +620,47 @@ struct RequestView: View {
 
     private func secondsLeft(at date: Date) -> Int {
         max(0, Int((Double(read.expiresAtMs) / 1000 - date.timeIntervalSince1970).rounded(.down)))
+    }
+}
+
+extension ProgramItem {
+    /// The login field the item goes into, for a sign-in
+    var field: LoginField? {
+        switch self {
+        case let .reference(_, _, field), let .describe(_, field): field
+        }
+    }
+}
+
+/// A value field whose keyboard and AutoFill match the login field it is
+/// for: a username, a password, or a one-time code on the number pad; any
+/// other value is a password field
+struct ValueField: View {
+    let field: LoginField?
+    @Binding var text: String
+
+    var body: some View {
+        Group {
+            switch field {
+            case .username:
+                TextField("Username", text: $text)
+                    .textContentType(.username)
+                    .keyboardType(.emailAddress)
+            case .code:
+                TextField("Code", text: $text)
+                    .textContentType(.oneTimeCode)
+                    .keyboardType(.numberPad)
+            case .password:
+                SecureField("Password", text: $text)
+                    .textContentType(.password)
+            case nil:
+                SecureField("Value", text: $text)
+                    .textContentType(.password)
+            }
+        }
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        .privacySensitive()
+        .textFieldStyle(.roundedBorder)
     }
 }

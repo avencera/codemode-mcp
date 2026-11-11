@@ -1,5 +1,5 @@
-//! The app actor: the supervisor of the connection and request actors, and
-//! the only writer of [`AppState`]
+//! The app actor: the supervisor of the connection, request and takeover
+//! actors, the keeper of the handoffs, and the only writer of [`AppState`]
 //!
 //! It takes the UI's actions and its children's reports, changes the state,
 //! and sends each change to the reconciler as an [`Update`]. Anything slow
@@ -15,27 +15,32 @@ use std::{
 use companion_wire::{
     ASK_TIMEOUT,
     mobile::{
-        PhoneProgramRead, PhoneRequest, ProgramItem as WireProgramItem,
-        PushEnvironment as WirePushEnvironment, PushToken, RequestId,
+        HandoffAnswer, PhoneHandoff, PhoneProgramRead, PhoneRequest,
+        ProgramItem as WireProgramItem, PushEnvironment as WirePushEnvironment, PushToken,
+        RequestId,
     },
+    takeover::PhoneMessage,
     wire::{
         CompanionErrorCode, CompanionFault, CompanionResponse, MAX_DESCRIPTION_CHARS,
         MAX_DESTINATION_CHARS, MAX_PROGRAM_ITEMS, MAX_REASON_CHARS, PairCheck,
     },
 };
-use iroh::SecretKey;
-use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, SupervisionEvent};
+use iroh::{Endpoint, SecretKey};
+use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 use tokio::sync::oneshot;
 
 use crate::{
     connection::{ConnArgs, ConnMsg, ConnectionActor},
     ffi::{
-        AppAction, AppState, ConnectionState, PairingState, PendingRead, Platform, ProgramItem,
-        ProgramRead, PushEnvironment, ReadStatus, Reconciler, Update,
+        AppAction, AppState, ConnectionState, HandoffStatus, PairingState, PendingHandoff,
+        PendingRead, Platform, ProgramItem, ProgramRead, PushEnvironment, ReadStatus, Reconciler,
+        SignIn, TakeoverEnd, TakeoverInput, TakeoverState, TakeoverStatus, Update,
     },
+    handoff::{Handoffs, Offer},
     pairing,
     record::{GatewayRecord, load_key},
     request::{Asked, Entered, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
+    takeover::{TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg},
 };
 
 /// How long a read opened from a push may take to arrive once the link is
@@ -52,6 +57,10 @@ const RESTART_SECS: u32 = 1;
 const MAX_REFERENCE_CHARS: usize = 256;
 /// Longest summary of a program read's items a push placeholder shows
 const MAX_SUMMARY_CHARS: usize = 200;
+/// Longest site, account or session name a prompt shows
+const MAX_NAME_CHARS: usize = 128;
+/// Longest page address a handoff's card shows
+const MAX_URL_CHARS: usize = 1024;
 
 /// How a read's stream ended without an answer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +82,16 @@ pub struct Incoming {
     pub seq: u64,
     /// Where the answer goes
     pub responder: oneshot::Sender<CompanionResponse>,
+}
+
+/// A handoff as it arrives, with where its answer goes
+pub struct IncomingHandoff {
+    /// The handoff
+    pub handoff: PhoneHandoff,
+    /// Its stream's number
+    pub seq: u64,
+    /// Where the answer goes
+    pub responder: oneshot::Sender<HandoffAnswer>,
 }
 
 /// An approval that may ask Face ID, run at once or, while another read's
@@ -118,7 +137,28 @@ pub enum AppMsg {
     Connection(ConnectionState),
     /// The gateway sent a read
     Incoming(Box<Incoming>),
-    /// A read's stream ended without an answer
+    /// The gateway sent a handoff
+    Handoff(Box<IncomingHandoff>),
+    /// The gateway's deadline for a handoff passed
+    HandoffExpired {
+        /// The handoff
+        id: String,
+    },
+    /// The owner did something on the takeover
+    Takeover(TakeoverInput),
+    /// The owner typed or filled on the takeover
+    TakeoverSend(PhoneMessage),
+    /// The takeover reported
+    TakeoverEvent {
+        /// Which takeover; one replaced since is ignored
+        generation: u64,
+        /// What happened
+        event: TakeoverEvent,
+    },
+    /// Lends the connection's endpoint to a takeover; `None` while there is
+    /// no connection actor
+    Endpoint(RpcReplyPort<Option<Endpoint>>),
+    /// A read's or handoff's stream ended without an answer
     StreamEnded {
         /// The read
         id: RequestId,
@@ -162,6 +202,8 @@ impl Shared {
                 connection: ConnectionState::Offline,
                 reads: Vec::new(),
                 pairing: PairingState::Idle,
+                handoffs: Vec::new(),
+                takeover: None,
             }),
             updates: Mutex::new(None),
         }
@@ -246,6 +288,34 @@ impl Shared {
         self.change(|state| change(&mut state.reads).then(|| Update::Reads(state.reads.clone())));
     }
 
+    fn change_handoffs(&self, change: impl FnOnce(&mut Vec<PendingHandoff>) -> bool) {
+        self.change(|state| {
+            change(&mut state.handoffs).then(|| Update::Handoffs(state.handoffs.clone()))
+        });
+    }
+
+    /// Sets handoff `id`'s status, if it shows
+    fn set_handoff(&self, id: &str, status: HandoffStatus) {
+        self.change_handoffs(|handoffs| {
+            handoffs
+                .iter_mut()
+                .find(|handoff| handoff.id == id)
+                .map(|handoff| handoff.status = status)
+                .is_some()
+        });
+    }
+
+    fn change_takeover(&self, change: impl FnOnce(&mut Option<TakeoverState>) -> bool) {
+        self.change(|state| {
+            change(&mut state.takeover).then(|| Update::Takeover(state.takeover.clone()))
+        });
+    }
+
+    /// Hands an update to the app that changes nothing the state keeps
+    fn send(&self, update: Update) {
+        self.change(|_| Some(update));
+    }
+
     fn read_status(&self, id: &str) -> Option<ReadStatus> {
         self.state
             .read()
@@ -261,7 +331,7 @@ impl Shared {
 /// control, invisible and direction-changing characters as `?`, cut with `…`,
 /// so text a program chose stays on one line and reads in the order it is
 /// stored; the gateway's prompts clean text the same way
-fn one_line(text: &str, limit: usize) -> String {
+pub(crate) fn one_line(text: &str, limit: usize) -> String {
     let mut shown: String = text
         .chars()
         .take(limit)
@@ -292,25 +362,44 @@ fn program_prompt(program: &PhoneProgramRead) -> (String, ProgramRead) {
         .items
         .iter()
         .map(|item| match item {
-            WireProgramItem::Reference { reference, sealed } => ProgramItem::Reference {
+            WireProgramItem::Reference {
+                reference,
+                sealed,
+                field,
+            } => ProgramItem::Reference {
                 reference: one_line(reference, MAX_REFERENCE_CHARS),
                 sealed: sealed.is_some(),
+                field: field.map(Into::into),
             },
-            WireProgramItem::Describe { description } => ProgramItem::Describe {
+            WireProgramItem::Describe { description, field } => ProgramItem::Describe {
                 description: one_line(description, MAX_DESCRIPTION_CHARS),
+                field: field.map(Into::into),
             },
         })
         .collect();
+    let sign_in = program.sign_in.as_ref().map(|sign_in| SignIn {
+        title: one_line(&sign_in.title(), 2 * MAX_NAME_CHARS),
+        site: one_line(&sign_in.site, MAX_NAME_CHARS),
+        account: sign_in
+            .account
+            .as_deref()
+            .map(|account| one_line(account, MAX_NAME_CHARS)),
+        session: sign_in
+            .session
+            .as_deref()
+            .map(|session| one_line(session, MAX_NAME_CHARS)),
+    });
     let named: Vec<&str> = items
         .iter()
         .map(|item| match item {
             ProgramItem::Reference { reference, .. } => reference.as_str(),
-            ProgramItem::Describe { description } => description.as_str(),
+            ProgramItem::Describe { description, .. } => description.as_str(),
         })
         .collect();
-    let summary = match named.as_slice() {
-        [one] => (*one).to_owned(),
-        many => format!("{} values: {}", many.len(), many.join(", ")),
+    let summary = match (&sign_in, named.as_slice()) {
+        (Some(sign_in), _) => sign_in.title.clone(),
+        (None, [one]) => (*one).to_owned(),
+        (None, many) => format!("{} values: {}", many.len(), many.join(", ")),
     };
     let reason = program
         .reason
@@ -329,6 +418,7 @@ fn program_prompt(program: &PhoneProgramRead) -> (String, ProgramRead) {
         destination,
         keep_secs: keep_secs(program),
         items,
+        sign_in,
     };
 
     (summary, prompt)
@@ -347,6 +437,42 @@ fn malformed(program: &PhoneProgramRead) -> Option<String> {
     }
 
     None
+}
+
+/// A handoff as its card shows it
+fn handoff_card(handoff: &PhoneHandoff, gateway_name: &str) -> PendingHandoff {
+    let reason = handoff
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| one_line(reason, MAX_REASON_CHARS));
+
+    PendingHandoff {
+        id: handoff.id.to_string(),
+        session: one_line(&handoff.session, MAX_NAME_CHARS),
+        reason,
+        url: handoff
+            .url
+            .as_deref()
+            .map(|url| one_line(url, MAX_URL_CHARS)),
+        gateway_name: gateway_name.to_owned(),
+        expires_at_ms: now_ms() + i64::try_from(handoff.expires_in_ms).unwrap_or(i64::MAX),
+        status: HandoffStatus::Waiting,
+    }
+}
+
+/// The browser session a takeover link names, if it is one the gateway
+/// could have: one line of at most [`MAX_NAME_CHARS`], without spaces
+fn session_name(session: &str) -> Option<String> {
+    let session = session.trim();
+    let plain = !session.is_empty()
+        && session.chars().count() <= MAX_NAME_CHARS
+        && !session
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace());
+
+    plain.then(|| session.to_owned())
 }
 
 fn now_ms() -> i64 {
@@ -391,6 +517,12 @@ pub struct AppActorState {
     /// Counts changes to the link, so a wait meant for one link is not
     /// ended by its timer after that link dropped
     link: u64,
+    /// The handoffs whose streams are open
+    handoffs: Handoffs,
+    /// The open takeover, if any
+    takeover: Option<ActorRef<TakeoverMsg>>,
+    /// Counts takeovers, so the reports of one replaced are ignored
+    takeover_generation: u64,
 }
 
 pub struct App;
@@ -515,12 +647,29 @@ impl App {
                     });
                 }
             },
-            AppAction::Dismiss { id } => state.shared.change_reads(|reads| {
-                let before = reads.len();
-                reads.retain(|read| read.id != id || !read.status.is_finished());
+            AppAction::Dismiss { id } => {
+                state.shared.change_reads(|reads| {
+                    let before = reads.len();
+                    reads.retain(|read| read.id != id || !read.status.is_finished());
 
-                reads.len() != before
-            }),
+                    reads.len() != before
+                });
+                state.shared.change_handoffs(|handoffs| {
+                    let before = handoffs.len();
+                    handoffs.retain(|handoff| handoff.id != id || !handoff.status.is_finished());
+
+                    handoffs.len() != before
+                });
+            }
+            AppAction::CancelHandoff { id } => {
+                if let Some(status) = state.handoffs.cancel(&id) {
+                    state.shared.set_handoff(&id, status);
+                }
+            }
+            AppAction::OpenTakeover { session, handoff } => {
+                Self::open_takeover(myself, state, &session, handoff.as_deref()).await;
+            }
+            AppAction::CloseTakeover => Self::close_takeover(state),
             AppAction::Unpair => {
                 if state.record.is_none() {
                     return;
@@ -552,11 +701,17 @@ impl App {
                 if let Some(connection) = &state.connection {
                     let _ = connection.cast(ConnMsg::Connect);
                 }
+                if let Some(takeover) = &state.takeover {
+                    let _ = takeover.cast(TakeoverMsg::Foreground);
+                }
             }
             AppAction::Background => {
                 state.foreground = false;
                 if let Some(connection) = &state.connection {
                     let _ = connection.cast(ConnMsg::Disconnect);
+                }
+                if let Some(takeover) = &state.takeover {
+                    let _ = takeover.cast(TakeoverMsg::Background);
                 }
             }
             AppAction::OpenedFromPush {
@@ -594,6 +749,7 @@ impl App {
                         destination: None,
                         keep_secs: None,
                         items: Vec::new(),
+                        sign_in: None,
                     }),
                 };
                 Self::opened_from_push(myself, state, pushed, expires_at_ms);
@@ -613,6 +769,195 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Opens a takeover of `session`, for `handoff` if set, replacing any
+    /// open one; a session or handoff id a link made up is refused
+    async fn open_takeover(
+        myself: &ActorRef<AppMsg>,
+        state: &mut AppActorState,
+        session: &str,
+        handoff: Option<&str>,
+    ) {
+        let Some(record) = state.record.clone() else {
+            return;
+        };
+        let Some(session) = session_name(session) else {
+            tracing::warn!("a takeover was asked for a session name no gateway uses");
+
+            return;
+        };
+        let handoff = handoff.and_then(|id| RequestId::try_from(id.to_owned()).ok());
+
+        // the same takeover asked for again, such as a push tapped twice,
+        // keeps its link
+        let open = state.shared.state().takeover.is_some_and(|shown| {
+            shown.session == session
+                && shown.handoff == handoff.as_ref().map(ToString::to_string)
+                && !matches!(shown.status, TakeoverStatus::Ended { .. })
+        });
+        if open && state.takeover.is_some() {
+            return;
+        }
+
+        Self::close_takeover(state);
+        state.takeover_generation = state.takeover_generation.wrapping_add(1);
+        let shown = TakeoverState {
+            session: session.clone(),
+            handoff: handoff.as_ref().map(ToString::to_string),
+            status: TakeoverStatus::Connecting,
+            page: None,
+            notice: None,
+        };
+        state.shared.change_takeover(|takeover| {
+            *takeover = Some(shown);
+
+            true
+        });
+
+        // a push or link opens the app, which is in the foreground from here
+        state.foreground = true;
+        if let Some(connection) = &state.connection {
+            let _ = connection.cast(ConnMsg::Connect);
+        }
+
+        let args = TakeoverArgs {
+            session,
+            handoff,
+            generation: state.takeover_generation,
+            record,
+            platform: Arc::clone(&state.platform),
+            app: myself.clone(),
+            foreground: state.foreground,
+        };
+        match Actor::spawn_linked(None, TakeoverActor, args, myself.get_cell()).await {
+            Ok((takeover, _)) => state.takeover = Some(takeover),
+            Err(error) => {
+                tracing::error!(%error, "cannot start a takeover");
+                Self::takeover_ended(state, TakeoverEnd::Failed, Some(error.to_string()));
+            }
+        }
+    }
+
+    /// Leaves the takeover, if one is open, without ending it on the gateway
+    fn close_takeover(state: &mut AppActorState) {
+        if let Some(takeover) = state.takeover.take() {
+            takeover.stop(None);
+        }
+        state
+            .shared
+            .change_takeover(|takeover| takeover.take().is_some());
+    }
+
+    /// Shows why the takeover ended; one the owner ended with Done or Cancel
+    /// closes at once, and ends its handoff here too
+    fn takeover_ended(state: &mut AppActorState, reason: TakeoverEnd, message: Option<String>) {
+        state.takeover = None;
+        let handoff = state
+            .shared
+            .state()
+            .takeover
+            .and_then(|takeover| takeover.handoff);
+        if let Some(id) = &handoff {
+            match reason {
+                TakeoverEnd::Done | TakeoverEnd::Cancelled => {
+                    state.handoffs.finish(id);
+                    state.shared.change_handoffs(|handoffs| {
+                        let before = handoffs.len();
+                        handoffs.retain(|handoff| handoff.id != *id);
+
+                        handoffs.len() != before
+                    });
+                }
+                TakeoverEnd::HandoffOver => {
+                    state.handoffs.finish(id);
+                    state.shared.set_handoff(id, HandoffStatus::Over);
+                }
+                _ => {}
+            }
+        }
+
+        let closes = matches!(reason, TakeoverEnd::Done | TakeoverEnd::Cancelled);
+        state.shared.change_takeover(|takeover| {
+            if closes {
+                return takeover.take().is_some();
+            }
+            let Some(takeover) = takeover else {
+                return false;
+            };
+            takeover.status = TakeoverStatus::Ended { reason, message };
+
+            true
+        });
+    }
+
+    /// Applies what the takeover reported
+    fn takeover_event(state: &mut AppActorState, event: TakeoverEvent) {
+        match event {
+            TakeoverEvent::Status(TakeoverStatus::Ended { reason, message }) => {
+                Self::takeover_ended(state, reason, message);
+            }
+            TakeoverEvent::Status(status) => state.shared.change_takeover(|takeover| {
+                let Some(takeover) = takeover else {
+                    return false;
+                };
+                let changed = takeover.status != status;
+                takeover.status = status;
+
+                changed
+            }),
+            TakeoverEvent::Page(page) => state.shared.change_takeover(|takeover| {
+                let Some(takeover) = takeover else {
+                    return false;
+                };
+                // a notice is about the page it was made on
+                if takeover.page.as_ref().map(|shown| &shown.url) != Some(&page.url) {
+                    takeover.notice = None;
+                }
+                takeover.page = Some(page);
+
+                true
+            }),
+            TakeoverEvent::Notice(notice) => state.shared.change_takeover(|takeover| {
+                let Some(takeover) = takeover else {
+                    return false;
+                };
+                takeover.notice = Some(notice);
+
+                true
+            }),
+            TakeoverEvent::Screen(image) => state.shared.send(Update::Screen(image)),
+        }
+    }
+
+    /// Shows a new handoff and starts its deadline, or hands one offered
+    /// again after a reconnect its new stream
+    fn handoff(myself: &ActorRef<AppMsg>, state: &mut AppActorState, incoming: IncomingHandoff) {
+        let IncomingHandoff {
+            handoff,
+            seq,
+            responder,
+        } = incoming;
+        let Some(record) = &state.record else {
+            return;
+        };
+        let id = handoff.id.to_string();
+        if state.handoffs.offer(&id, seq, responder) == Offer::Again {
+            return;
+        }
+
+        let card = handoff_card(&handoff, &record.name);
+        state.shared.change_handoffs(|handoffs| {
+            match handoffs.iter_mut().find(|shown| shown.id == id) {
+                Some(shown) => *shown = card,
+                None => handoffs.push(card),
+            }
+
+            true
+        });
+        myself.send_after(Duration::from_millis(handoff.expires_in_ms), move || {
+            AppMsg::HandoffExpired { id }
+        });
     }
 
     /// Runs `approval`, or queues it while another read's Face ID prompt is
@@ -841,6 +1186,9 @@ impl Actor for App {
             denied: HashMap::new(),
             pairing: false,
             link: 0,
+            handoffs: Handoffs::default(),
+            takeover: None,
+            takeover_generation: 0,
         })
     }
 
@@ -891,6 +1239,14 @@ impl Actor for App {
                 for (_, request) in state.requests.drain() {
                     request.stop(None);
                 }
+                Self::close_takeover(state);
+                state.handoffs.clear();
+                state.shared.change_handoffs(|handoffs| {
+                    let had = !handoffs.is_empty();
+                    handoffs.clear();
+
+                    had
+                });
                 state.queued.clear();
                 state.shared.set_gateway(None);
                 state.shared.set_connection(ConnectionState::Offline);
@@ -925,6 +1281,39 @@ impl Actor for App {
                 }
             }
             AppMsg::Incoming(incoming) => Self::incoming(&myself, state, *incoming).await,
+            AppMsg::Handoff(incoming) => Self::handoff(&myself, state, *incoming),
+            AppMsg::HandoffExpired { id } => {
+                let waiting =
+                    state.shared.state().handoffs.iter().any(|handoff| {
+                        handoff.id == id && handoff.status == HandoffStatus::Waiting
+                    });
+                if state.handoffs.expire(&id) && waiting {
+                    state.shared.set_handoff(&id, HandoffStatus::Expired);
+                }
+            }
+            AppMsg::Takeover(input) => {
+                if let Some(takeover) = &state.takeover {
+                    let _ = takeover.cast(TakeoverMsg::Input(input));
+                }
+            }
+            AppMsg::TakeoverSend(message) => {
+                if let Some(takeover) = &state.takeover {
+                    let _ = takeover.cast(TakeoverMsg::Send(message));
+                }
+            }
+            AppMsg::TakeoverEvent { generation, event } => {
+                if generation == state.takeover_generation {
+                    Self::takeover_event(state, event);
+                }
+            }
+            AppMsg::Endpoint(reply) => match &state.connection {
+                Some(connection) => {
+                    let _ = connection.cast(ConnMsg::Endpoint(reply));
+                }
+                None => {
+                    let _ = reply.send(None);
+                }
+            },
             AppMsg::Answer { id, value } => {
                 if let Some(request) = state.requests.get(&id) {
                     let _ = request.cast(RequestMsg::Answer(value));
@@ -936,6 +1325,9 @@ impl Actor for App {
             AppMsg::StreamEnded { id, seq, end } => {
                 if let Some(request) = state.requests.get(id.as_str()) {
                     let _ = request.cast(RequestMsg::StreamEnded { seq, end });
+                }
+                if let Some(status) = state.handoffs.stream_ended(id.as_str(), seq, end) {
+                    state.shared.set_handoff(id.as_str(), status);
                 }
             }
             AppMsg::ReadChanged { id, status } => {
@@ -985,11 +1377,15 @@ impl Actor for App {
     ) -> Result<(), ActorProcessingErr> {
         let (cell, error) = match event {
             SupervisionEvent::ActorFailed(cell, error) => (cell, error),
-            // a request that stopped is done with its read
+            // a request that stopped is done with its read, and a takeover
+            // that stopped has reported why
             SupervisionEvent::ActorTerminated(cell, ..) => {
                 state
                     .requests
                     .retain(|_, request| request.get_id() != cell.get_id());
+                if is(&cell, state.takeover.as_ref()) {
+                    state.takeover = None;
+                }
 
                 return Ok(());
             }
@@ -999,6 +1395,11 @@ impl Actor for App {
 
         if is(&cell, state.connection.as_ref()) {
             Self::restart_connection(&myself, state, &error.to_string());
+
+            return Ok(());
+        }
+        if is(&cell, state.takeover.as_ref()) {
+            Self::takeover_ended(state, TakeoverEnd::Failed, Some(error.to_string()));
 
             return Ok(());
         }
@@ -1028,6 +1429,6 @@ impl Actor for App {
     }
 }
 
-fn is(cell: &ActorCell, actor: Option<&ActorRef<ConnMsg>>) -> bool {
+fn is<M: ractor::Message>(cell: &ActorCell, actor: Option<&ActorRef<M>>) -> bool {
     actor.is_some_and(|actor| actor.get_id() == cell.get_id())
 }

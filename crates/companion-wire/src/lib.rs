@@ -8,6 +8,7 @@
 pub mod mobile;
 #[cfg(feature = "seal")]
 pub mod seal;
+pub mod takeover;
 pub mod ticket;
 pub mod wire;
 

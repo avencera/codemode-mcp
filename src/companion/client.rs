@@ -101,6 +101,9 @@ pub enum CompanionFailure {
     /// A device could not be trusted
     #[error("{0}")]
     Trust(String),
+    /// No phone could be offered a handoff
+    #[error("{0}")]
+    Handoff(String),
 }
 
 /// What a companion said to `companion check`; never the value itself
@@ -150,6 +153,9 @@ pub struct Companions {
     pub(super) registering: Mutex<()>,
     /// Accepts the pairing protocol; started by the first invite
     pub(super) accepting: OnceLock<JoinHandle<()>>,
+    /// Runs the takeovers phones open; held weakly, since it reads values
+    /// through the reader that holds these companions
+    pub(super) takeovers: std::sync::RwLock<Option<std::sync::Weak<dyn super::TakeoverHost>>>,
 }
 
 impl Companions {
@@ -212,6 +218,7 @@ impl Companions {
             config_path,
             secret_key: Mutex::new(None),
             endpoint: OnceCell::new(),
+            takeovers: std::sync::RwLock::new(None),
             invites: Invites::default(),
             registering: Mutex::new(()),
             accepting: OnceLock::new(),

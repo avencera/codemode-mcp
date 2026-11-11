@@ -447,7 +447,8 @@ return type is `Any`.
   tools are served, so a renamed tool cannot run without its `per_call` grant or policy
 - Server-level helpers (`[servers.<s>]`): `arguments` is a table the gateway passes to every tool that declares
   one of its keys, and those parameters are dropped from the stubs, so a script cannot guess them (1Password's
-  `accountId`). `setup` lists calls made once per connection, lazily, before the first other call on it, inside
+  `accountId`); a value a script passes anyway is replaced, so a server can be pinned, such as to one
+  agent-browser session. `setup` lists calls made once per connection, lazily, before the first other call on it, inside
   that call's approval; a server that grants scopes per connection, such as 1Password's `authenticate`, needs
   this, and running it lazily keeps the 1Password app from prompting at boot. A failed setup call fails the call
   that needed it with a message naming only the setup tool. `aliases` are extra search terms for the server's
@@ -1104,6 +1105,41 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
 - Accessibility (`AXIsProcessTrustedWithOptions`, which asks macOS to show its prompt) and event posting
   (`CGPreflightPostEventAccess`) are checked on every call, and the error names the System Settings switch. The
   grant is the daemon's own, keyed to its signature
+
+### Browser (`src/browser.rs`, `src/browser/`, `src/companion/takeover.rs`)
+
+The `browser` builtin fills logins into agent-browser sessions and hands sessions to the owner's phone. It
+talks to the session's Chromium over CDP itself (`browser/cdp.rs`, a small client over `tokio-tungstenite`
+rather than a generated crate), so no secret passes through an agent-browser command.
+
+- Finding the page: `agent-browser --session S get cdp-url` (must be `ws://127.0.0.1` or `localhost`; it never
+  launches a browser) and `--json tab list` for the active tab's target, then `Target.attachToTarget` with
+  `flatten`. The focused element is read in an isolated world (`Page.createIsolatedWorld`), so page script
+  cannot shadow the functions used; the walk follows `activeElement` through same-origin frames, takes a
+  cross-origin frame's address from `Page.getFrameTree`, and treats an out-of-process frame missing from the
+  tree as another site. The top-level address is `location.href` read in the same world as the focus walk, so
+  a navigation between the reads fails them instead of pairing one page's address with another's field. The
+  check (`PageState::check`) is the same for an agent's fill and a phone's. `replace_text` focuses and selects
+  the checked node itself and confirms it holds focus through its same-origin frames before
+  `Input.insertText`, then confirms again after; a phone's fill from an offer carries the offer's site and is
+  refused once the page is elsewhere.
+- Approval: `Browsers::prepare` runs before the gate, like `FillCheck::prepare`, and records what it found
+  under `checked` (host, site, and the source: a 1Password reference, or the phone). `fill` refuses a call
+  without it and reads the page again after approval.
+- Values: read by reference at the Mac (TOTP computed from the seed at fill time), or from one phone program
+  read for the whole sign-in (`ProgramAsk.sign_in`, shown as `site · account`; items carry `LoginField` so the
+  phone sets the AutoFill type). Unused values sit in `SignIns`, keyed by session and site, for 5 minutes as
+  `Zeroizing` strings. The `site_logins` table (schema 8) keeps each site's item, account and field
+  references, learned from fills at the Mac, so a fill while away can send references with sealed copies.
+- Takeover: `TAKEOVER_ALPN`, a separate iroh connection per takeover from a listed, trusted phone, framed as
+  in `companion_wire::takeover`. The gateway lays the page out with `Emulation.setDeviceMetricsOverride`
+  (mobile), screencasts JPEG with the phone's `Ack` gating `Page.screencastFrameAck`, polls the page state
+  every 800 ms (150 ms after input), and restores with `clearDeviceMetricsOverride` and `stopScreencast`.
+- Handoff: `Handoffs` holds open handoffs by request id; the offer goes to every phone as a gateway-opened
+  stream, like a read, with a push (`kind=handoff`). Done or Cancel from a takeover naming the id, or Cancel on
+  the offer stream, answers it. The call is marked `waits_on_owner`, so the executor pauses the script's
+  budget, and the upstream timeout covers the 120-minute maximum.
+- Not exported to spokes: a spoke's call is gated on the hub without `prepare`.
 
 ### Xcode
 

@@ -1,7 +1,8 @@
 # Companion core
 
 The Rust core of the iPhone companion app (`companion-core`). It pairs with a codemode-mcp gateway, holds the
-connection to it, and runs each read the gateway sends from arrival to answer. The SwiftUI app in `ios/` draws
+connection to it, runs each read the gateway sends from arrival to answer, shows the handoffs agents ask for, and
+runs the live takeover of a browser session on the gateway Mac. The SwiftUI app in `ios/` draws
 the state and does what only iOS can: the Keychain, the Secure Enclave, Face ID and push. How to use the app is
 in [docs/operations.md](../docs/operations.md#approve-from-an-iphone).
 
@@ -13,6 +14,8 @@ in [docs/operations.md](../docs/operations.md#approve-from-an-iphone).
 | `app.rs` | The app actor: supervisor of the others and the only writer of `AppState` |
 | `connection.rs` | The connection actor: owns the iroh endpoint and the link to the gateway |
 | `request.rs` | One request actor per read |
+| `handoff.rs` | The app actor's table of open handoffs and their streams |
+| `takeover.rs` | The takeover actor: one live browser session |
 | `pairing.rs` | Scan-to-pair, as one spawned task |
 | `record.rs` | The pairing record and iroh key, kept in the Keychain through `Platform` |
 | `net.rs` | Binding the endpoint, and one JSON request and answer per stream |
@@ -24,10 +27,12 @@ The wire types are in `crates/companion-wire`, shared with the gateway, so the t
 Swift creates one `FfiApp` with its `Platform`, then calls `listen_for_updates` with a `Reconciler`. From then on:
 
 1. The UI calls `dispatch(AppAction)`. The action becomes a message to the app actor; `dispatch` never blocks.
-2. The app actor changes `AppState` and sends each change as an `Update` (gateway, connection, reads or
-   pairing). Updates go through a channel to one thread that calls `reconcile`, so Swift sees them in order and
-   never on a tokio thread.
-3. Swift's `AppManager` applies the update to its `@Observable` copy on the main thread. It holds the reconciler
+2. The app actor changes `AppState` and sends each change as an `Update` (gateway, connection, reads, pairing,
+   handoffs or takeover). A takeover's images go the same way as `Update::Screen` but are not kept in `AppState`.
+   Updates go through a channel to one thread that calls `reconcile`, so Swift sees them in order and never on a
+   tokio thread.
+3. Swift's `AppManager` applies the update to its `@Observable` copy on the main thread; it decodes an image on
+   the reconcile thread first, and reports it drawn once it is shown. It holds the reconciler
    through a `WeakReconciler`, so the core does not keep the manager alive. `state()` reads the whole state, for
    start-up.
 
@@ -36,7 +41,8 @@ Swift creates one `FfiApp` with its `Platform`, then calls `listen_for_updates` 
 ```
 App (supervisor)
 ├── Connection          one while paired
-└── Request × n         one per read the gateway has sent
+├── Request × n         one per read the gateway has sent
+└── Takeover            one while the owner has a browser session open
 ```
 
 - **App** takes UI actions and its children's reports. Slow work (pairing, unpairing, Keychain writes) runs in a
@@ -68,10 +74,36 @@ App (supervisor)
   shared from 1Password through the app's share extension, at most `max_file_bytes()`. The answer is
   `CompanionResponse::Values` in item order, a file's bytes going as `{"base64": ...}` unless they are UTF-8. The prompt
   shows the program's destination, cleaned to one line, and its keep (at most an hour), which Face ID's reason
-  names too.
+  names too. A program read with `sign_in` fills a login in the gateway's browser: the prompt is titled with the
+  site and account (`github.com · praveenperera`) and the browser session, and each item carries its `LoginField`,
+  so the app gives each entered value the matching AutoFill (username, password, or a one-time code on the number
+  pad) and lays the entered fields out together, letting AutoFill fill a username and password at once.
+- **Handoffs** are offered on a gateway-opened stream like reads, as `{"handoff": {...}}`, when an agent needs the
+  owner for a browser step it cannot do (a passkey, a captcha). They need no actor: the app keeps them in
+  `handoff.rs`, keyed by id, so one offered again after a reconnect replaces its stream and stays one card. Cancel
+  answers `HandoffAnswer::Cancelled` on the stream, kept until it is delivered as a read's answer is. Take over
+  opens a takeover with the handoff's id; its Done or Cancel ends the handoff on the takeover's connection, after
+  which the gateway stops the handoff's stream. A stopped stream marks a handoff the owner did not answer here as
+  over, and its deadline (at most two hours) as expired.
+- **Takeover** dials the gateway on `TAKEOVER_ALPN` from the connection actor's endpoint (the app lends it through
+  `AppMsg::Endpoint`), so the gateway sees the paired phone's key. It waits for the app's first `Resize`, which
+  gives the image area in points and its scale (at most 2), then opens one stream and sends `Open { session,
+  handoff, viewport }`. Frames are read and written in spawned tasks that report back as messages. Each `Page`
+  updates `AppState.takeover` (address, focus, fill offers without their sealed bytes); each `Screen` goes to
+  Swift as `Update::Screen`, outside `AppState`, and is acknowledged with `Ack` only when Swift reports it drawn
+  (`TakeoverInput::Drawn`), so the gateway sends images no faster than the phone shows them. Taps, long presses
+  and scrolls name the image they were made on and give points as fractions of it. Typed text and fills go through
+  `FfiApp::takeover_text` and `FfiApp::takeover_fill`, apart from `TakeoverInput`, as `companion_wire::takeover::
+  Secret`, which never shows in `Debug`; text longer than the wire's limit goes in pieces. Fill from an offer
+  opens its sealed copy with `Platform::open_sealed`, the seal's `info` binding the gateway and the offer's
+  reference, and sends the value as `Fill`. A link that drops while the app is in the foreground is dialed again
+  with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while
+  the link is down goes right after the next `Open`. `Ended` stops the actor: Done and Cancel close the screen and
+  remove their handoff's card, any other reason stays on screen until the owner closes it. Leaving
+  (`CloseTakeover`) hangs up without ending anything, so the handoff can be taken over again.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
-second, and a failed request marks its read failed. A connection actor that cannot start, say because its endpoint
+second, a failed request marks its read failed, and a failed takeover shows as ended. A connection actor that cannot start, say because its endpoint
 does not bind or the Keychain is still locked after a restart, is tried again after a second the same way. A link
 that drops within ten seconds of opening counts as a failed dial, so a gateway that refuses the phone is redialed
 with the same backoff.

@@ -32,8 +32,9 @@ use codemode_mcp::{
         self, CompanionErrorCode, CompanionFault, CompanionResponse, InviteTicket, MOBILE_ALPN,
         PAIR_ALPN, PairCheck, PairRequest, PairResponse, ProgramValue, Registration, Role,
         mobile::{
-            PhoneProgramRead, PhoneProgramRequest, PhoneRead, PhoneRegistration, PhoneRequest,
-            PhoneResponse, ProgramItem, PushEnvironment, PushToken,
+            PhoneHandoffRequest, PhoneProgramRead, PhoneProgramRequest, PhoneRead,
+            PhoneRegistration, PhoneRequest, PhoneResponse, ProgramItem, PushEnvironment,
+            PushToken,
         },
     },
     config::Config,
@@ -41,7 +42,14 @@ use codemode_mcp::{
     mac::TouchId,
     secrets::PHONE_GRACE,
 };
-use companion_wire::seal::SoftwareKey;
+use companion_wire::{
+    mobile::{LoginField, RequestId},
+    seal::SoftwareKey,
+    takeover::{
+        EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, Point, Secret,
+        TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
+    },
+};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, TransportAddr,
     endpoint::{Connection, presets},
@@ -51,7 +59,10 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::{
-    harness::{FakeMac, Harness, Setup, Stop, TestResult, approval_id, temp_state_dir, text_of},
+    fake_cdp::{FakeCdp, Field},
+    harness::{
+        FakeMac, Harness, Setup, Stop, TestResult, approval_id, execute, temp_state_dir, text_of,
+    },
     secrets::{VALUE, fake_op, reads},
 };
 
@@ -310,6 +321,22 @@ impl FakePhone {
             let Ok(body) = receive.read_to_end(64 * 1024).await else {
                 return;
             };
+            if let Ok(request) = serde_json::from_slice::<PhoneHandoffRequest>(&body) {
+                // answered through the takeover, as the app does
+                if let Ok(mut seen) = self.seen.lock() {
+                    seen.push(Seen {
+                        id: request.handoff.id.to_string(),
+                        reference: format!("handoff {}", request.handoff.session),
+                        expires_in_ms: request.handoff.expires_in_ms,
+                        sealed: false,
+                        withdrawn: false,
+                        items: Vec::new(),
+                        reason: request.handoff.reason,
+                    });
+                }
+                let _ = send.stopped().await;
+                continue;
+            }
             let Ok(read) = serde_json::from_slice::<PhoneRead>(&body) else {
                 let Ok(program) = serde_json::from_slice::<PhoneProgramRequest>(&body) else {
                     return;
@@ -398,13 +425,15 @@ impl FakePhone {
             .items
             .iter()
             .map(|item| match item {
-                ProgramItem::Reference { reference, sealed } => {
+                ProgramItem::Reference {
+                    reference, sealed, ..
+                } => {
                     format!(
                         "{reference}{}",
                         if sealed.is_some() { " (sealed)" } else { "" }
                     )
                 }
-                ProgramItem::Describe { description } => format!("\"{description}\""),
+                ProgramItem::Describe { description, .. } => format!("\"{description}\""),
             })
             .collect();
         if let Ok(mut seen) = self.seen.lock() {
@@ -437,6 +466,7 @@ impl FakePhone {
                     ProgramItem::Reference {
                         reference,
                         sealed: Some(sealed),
+                        ..
                     },
                     _,
                 ) => self
@@ -548,6 +578,8 @@ struct Options {
     /// Also serve `logins`, with a notifier so its fills can be approved
     /// on the passkey page while the owner is away
     logins: bool,
+    /// Also serve `browser`, on the sessions of this `agent-browser`
+    browser: Option<PathBuf>,
 }
 
 impl Rig {
@@ -604,6 +636,11 @@ impl Rig {
         // runs and its value is sealed to the phone
         let gateway_mac = Arc::new(FakeMac::default());
         gateway_mac.set_present(true);
+        let top = options
+            .browser
+            .as_ref()
+            .map(|path| format!("agent_browser_path = \"{}\"", path.display()))
+            .unwrap_or_default();
         let extra = format!(
             "[secrets]\n\
              op = \"{op}\"\n\
@@ -618,7 +655,17 @@ impl Rig {
              [servers.twin]\n\
              command = \"{fixture}\"\n\
              env = {{ FIXTURE_SECRET = \"{{{{ {REFERENCE} }}}}\" }}\n\n\
-             {logins}",
+             {logins}\n\
+             {browser}",
+            browser = if options.browser.is_some() {
+                "[servers.browser]\n\
+                 builtin = \"browser\"\n\
+                 policy = \"ask\"\n\
+                 tools.fill.grant = \"per_call\"\n\
+                 tools.handoff.policy = \"allow\"\n"
+            } else {
+                ""
+            },
             op = local_op.display(),
             key = gateway_key.display(),
             phone = phone.id(),
@@ -637,7 +684,8 @@ impl Rig {
         );
         let Some(harness) = Harness::with(Setup {
             extra: &extra,
-            notify: options.logins,
+            top: &top,
+            notify: options.logins || options.browser.is_some(),
             mac: Some(Arc::clone(&gateway_mac)),
             ..Setup::default()
         })
@@ -1726,6 +1774,7 @@ async fn with_the_owner_away_the_login_for_a_page_is_picked_on_the_phone() -> Te
     let Some(rig) = Rig::start(Options {
         with_mac_companion: true,
         logins: true,
+        ..Options::default()
     })
     .await?
     else {
@@ -1813,4 +1862,337 @@ async fn restart_fresh(
     assert_eq!(status, 200, "{body}");
 
     harness.restart_with(Stop::Drain, change).await
+}
+
+/// A takeover link the test drives as the app would
+struct Takeover {
+    send: iroh::endpoint::SendStream,
+    receive: iroh::endpoint::RecvStream,
+}
+
+impl Takeover {
+    async fn open(
+        phone: &FakePhone,
+        session: &str,
+        handoff: Option<&str>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let connection = phone.dial(TAKEOVER_ALPN).await?;
+        let (send, receive) = connection.open_bi().await?;
+        let mut takeover = Self { send, receive };
+        takeover
+            .send(&PhoneMessage::Open {
+                session: session.to_owned(),
+                handoff: handoff
+                    .map(|id| RequestId::try_from(id.to_owned()))
+                    .transpose()?,
+                viewport: Viewport {
+                    width: 390,
+                    height: 844,
+                    scale: 3.0,
+                },
+            })
+            .await?;
+
+        Ok(takeover)
+    }
+
+    async fn send(&mut self, message: &PhoneMessage) -> Result<(), Box<dyn Error>> {
+        self.send.write_all(&encode_message(message)?).await?;
+
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<GatewayFrame, Box<dyn Error>> {
+        let mut header = [0; HEADER_BYTES];
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.receive.read_exact(&mut header),
+        )
+        .await??;
+        let (kind, length) = read_header(header)?;
+        let mut body = vec![0; length];
+        self.receive.read_exact(&mut body).await?;
+
+        Ok(decode_gateway(kind, &body)?)
+    }
+
+    /// Frames until one `pick` takes, acknowledging each image
+    async fn until<T>(
+        &mut self,
+        mut pick: impl FnMut(&GatewayFrame) -> Option<T>,
+    ) -> Result<T, Box<dyn Error>> {
+        loop {
+            let frame = self.next().await?;
+            if let Some(picked) = pick(&frame) {
+                return Ok(picked);
+            }
+            if let GatewayFrame::Screen(screen) = &frame {
+                self.send(&PhoneMessage::Ack {
+                    seq: screen.header.seq,
+                })
+                .await?;
+            }
+        }
+    }
+}
+
+async fn eventually<T>(mut probe: impl FnMut() -> Option<T>) -> Result<T, Box<dyn Error>> {
+    for _ in 0..500 {
+        if let Some(found) = probe() {
+            return Ok(found);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    Err("timed out".into())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_is_taken_over_on_the_phone_and_ends_when_the_owner_is_done() -> TestResult {
+    let cdp = FakeCdp::start("https://github.com/login").await?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(cdp.program.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let pending = rig
+        .harness
+        .execute_body(r#"await browser_handoff(session="test", reason="approve the passkey")"#)
+        .await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    // the push wakes the phone, which is offered the handoff
+    let handoff = eventually(|| {
+        rig.phone
+            .seen()
+            .into_iter()
+            .find(|seen| seen.reference == "handoff test")
+    })
+    .await?;
+    assert_eq!(handoff.reason.as_deref(), Some("approve the passkey"));
+    let push = rig
+        .apns
+        .pushes()
+        .into_iter()
+        .find(|push| push.body["kind"] == "handoff")
+        .ok_or("no handoff push")?;
+    assert_eq!(push.body["session"], "test", "{}", push.body);
+    assert_eq!(push.body["request"], handoff.id.as_str(), "{}", push.body);
+
+    let mut takeover = Takeover::open(&rig.phone, "test", Some(&handoff.id)).await?;
+    // the page and its images, each image drawn and acknowledged before the
+    // next comes
+    let mut url = None;
+    let mut last = None;
+    let seq = takeover
+        .until(|frame| {
+            match frame {
+                GatewayFrame::Message(GatewayMessage::Page { url: page, .. }) => {
+                    url = Some(page.clone());
+                }
+                GatewayFrame::Screen(screen) => last = Some(screen.header.seq),
+                GatewayFrame::Message(_) => {}
+            }
+
+            last.filter(|seq| *seq == 2 && url.is_some())
+        })
+        .await?;
+    assert_eq!(url.as_deref(), Some("https://github.com/login"));
+    takeover
+        .send(&PhoneMessage::Tap {
+            at: Point { x: 0.5, y: 0.25 },
+            seq,
+        })
+        .await?;
+    // a value chosen for another site, as when the page moved while Face
+    // ID was up, is refused rather than filled
+    cdp.focus(Some(Field::PASSWORD));
+    takeover
+        .send(&PhoneMessage::Fill {
+            field: LoginField::Password,
+            value: Secret::new("chosen-for-gitlab".to_owned()),
+            submit: false,
+            site: Some("gitlab.com".to_owned()),
+        })
+        .await?;
+    let refused = takeover
+        .until(|frame| match frame {
+            GatewayFrame::Message(GatewayMessage::Refused { message }) => Some(message.clone()),
+            _ => None,
+        })
+        .await?;
+    assert!(refused.contains("chosen for gitlab.com"), "{refused}");
+    assert_eq!(cdp.typed(), "");
+
+    takeover.send(&PhoneMessage::Done).await?;
+    let ended = takeover
+        .until(|frame| match frame {
+            GatewayFrame::Message(GatewayMessage::Ended { reason, .. }) => Some(*reason),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(ended, EndReason::Done);
+
+    let execution = pending["execution_id"].as_str().unwrap_or_default();
+    let done: Value = serde_json::from_str(&text_of(&rig.harness.wait_done(execution).await?))?;
+    assert_eq!(
+        done["result"],
+        json!({ "outcome": "done", "url": "https://github.com/login" }),
+        "{done}"
+    );
+
+    let log = cdp.log();
+    // laid out as the phone at its size, the tap at the image's point in
+    // page pixels, then the agent's layout back
+    assert!(
+        log.iter().any(
+            |line| line.starts_with("Emulation.setDeviceMetricsOverride")
+                && line.contains("\"mobile\":true")
+                && line.contains("\"width\":390")
+        ),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().any(|line| line.contains("mousePressed")
+            && line.contains("\"x\":195.0")
+            && line.contains("\"y\":211.0")),
+        "{log:#?}"
+    );
+    let cleared = log
+        .iter()
+        .position(|line| line == "Emulation.clearDeviceMetricsOverride");
+    let pressed = log.iter().position(|line| line.contains("mousePressed"));
+    assert!(cleared > pressed, "{log:#?}");
+    assert!(log.contains(&"Page.stopScreencast".to_owned()), "{log:#?}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_owner_away_one_phone_request_signs_in_and_each_field_is_filled_once() -> TestResult
+{
+    const ENTERED: &str = "entered-on-the-phone";
+    let cdp = FakeCdp::start("https://github.com/login").await?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(cdp.program.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut passkey = rig.harness.enroll_passkey().await?;
+    rig.gateway_mac.set_present(false);
+    rig.phone.set_answer(Answer::Enter(ENTERED));
+
+    // the page is checked before anyone is asked
+    cdp.focus(Some(Field::USERNAME));
+    let refused = text_of(
+        &execute(
+            &rig.harness.client,
+            r#"await browser_fill(session="test", kind="password", site="github.com")"#,
+        )
+        .await?,
+    );
+    assert!(refused.contains("not a password field"), "{refused}");
+    let refused = text_of(
+        &execute(
+            &rig.harness.client,
+            r#"await browser_fill(session="test", kind="username", site="gitlab.com")"#,
+        )
+        .await?,
+    );
+    assert!(refused.contains("gitlab.com"), "{refused}");
+    assert!(rig.phone.seen().iter().all(|seen| seen.items.is_empty()));
+
+    let mut fill = async |kind: &str| -> Result<Value, Box<dyn Error>> {
+        let pending = rig
+            .harness
+            .execute_body(&format!(
+                r#"await browser_fill(session="test", kind="{kind}", site="github.com", submit={})"#,
+                if kind == "password" { "True" } else { "False" }
+            ))
+            .await?;
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let id = approval_id(&pending)?;
+        let page = rig
+            .harness
+            .http
+            .get(format!("{}/approve/{id}", rig.harness.base()))
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(
+            page.contains(&format!(
+                "{kind} into github.com (browser session test), from the user&#39;s phone"
+            )),
+            "{page}"
+        );
+        let (status, body) = rig
+            .harness
+            .approve_with_passkey(&mut passkey, &id, "once")
+            .await?;
+        assert_eq!(status, 200, "{body}");
+        let execution = pending["execution_id"].as_str().unwrap_or_default();
+
+        Ok(serde_json::from_str(&text_of(
+            &rig.harness.wait_done(execution).await?,
+        ))?)
+    };
+
+    let done = fill("username").await?;
+    assert_eq!(
+        done["result"],
+        json!({ "filled": true, "url": "https://github.com/login" }),
+        "{done}"
+    );
+    assert!(!done.to_string().contains(ENTERED), "{done}");
+    assert_eq!(cdp.typed(), ENTERED);
+
+    // one request for the whole sign-in
+    let asked: Vec<Seen> = rig
+        .phone
+        .seen()
+        .into_iter()
+        .filter(|seen| !seen.items.is_empty())
+        .collect();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        asked[0].items,
+        [
+            "\"username for github.com\"".to_owned(),
+            "\"password for github.com\"".to_owned()
+        ]
+    );
+    assert_eq!(
+        asked[0].reason.as_deref(),
+        Some("sign in to github.com in browser session test")
+    );
+
+    // the password comes from that request, not a second one
+    cdp.focus(Some(Field::PASSWORD));
+    let done = fill("password").await?;
+    assert_eq!(done["result"]["filled"], true, "{done}");
+    assert_eq!(cdp.typed(), format!("{ENTERED}{ENTERED}"));
+    assert_eq!(
+        rig.phone
+            .seen()
+            .iter()
+            .filter(|seen| !seen.items.is_empty())
+            .count(),
+        1
+    );
+    let log = cdp.log();
+    assert!(
+        log.iter()
+            .any(|line| line.starts_with("Input.dispatchKeyEvent") && line.contains("Enter")),
+        "{log:#?}"
+    );
+    assert!(!log.iter().any(|line| line.contains(ENTERED)), "{log:#?}");
+
+    rig.stop().await
 }

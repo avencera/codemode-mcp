@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use companion_wire::takeover::TAKEOVER_ALPN;
 use iroh::{Endpoint, EndpointId, endpoint::Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -259,6 +260,7 @@ impl Invites {
         }
         if phones {
             alpns.push(MOBILE_ALPN.to_vec());
+            alpns.push(TAKEOVER_ALPN.to_vec());
         }
         endpoint.set_alpns(alpns);
     }
@@ -369,6 +371,10 @@ impl Companions {
                             Ok(Ok(connection)) if connection.alpn() == MOBILE_ALPN => {
                                 drop(slot);
                                 companions.phone_connection(connection).await;
+                            }
+                            Ok(Ok(connection)) if connection.alpn() == TAKEOVER_ALPN => {
+                                drop(slot);
+                                companions.takeover_connection(connection).await;
                             }
                             Ok(Ok(connection)) => {
                                 connection.close(1_u32.into(), b"unexpected protocol");

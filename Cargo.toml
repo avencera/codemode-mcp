@@ -20,6 +20,8 @@ color-eyre = "0.6"
 # turso's futures finish on the calling thread, so the store blocks on them
 # without a runtime
 futures-executor = "0.3.34"
+# splits the CDP WebSocket into its reader and writer
+futures-util = { version = "0.3.32", default-features = false, features = ["sink"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 http = "1.5.0"
@@ -73,6 +75,11 @@ sha2 = "0.11.0"
 thiserror = "2.0.21"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "net", "signal", "sync", "io-util", "io-std"] }
 tokio-util = "0.7.20"
+# the CDP client of the `browser` builtin, over plain ws:// to a local Chrome; in
+# the tree already through monty-pool
+tokio-tungstenite = { version = "0.27.0", default-features = false, features = ["connect"] }
+# wipes the login values the `browser` builtin holds; in the tree already
+zeroize = "1.8.2"
 toml = "1.1.8"
 toml_edit = "0.25.17"
 # no mimalloc (it installs a global allocator) and no full-text search

@@ -519,6 +519,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -642,6 +658,25 @@ public protocol FfiAppProtocol: AnyObject, Sendable {
      * What the app shows now
      */
     func state()  -> AppState
+    
+    /**
+     * Sends what the owner does on the takeover
+     */
+    func takeover(input: TakeoverInput) 
+    
+    /**
+     * Fills `value`, typed or from AutoFill, into the taken-over page's
+     * focused `field`, replacing what it holds, and presses Return after
+     * it with `submit`
+     */
+    func takeoverFill(field: LoginField, value: String, submit: Bool) 
+    
+    /**
+     * Types `text` into the taken-over page's focused element; its own
+     * call, as [`FfiApp::answer`] is, so the text never sits in a type
+     * that derives `Debug`
+     */
+    func takeoverText(text: String) 
     
 }
 /**
@@ -781,6 +816,48 @@ open func state() -> AppState  {
 })
 }
     
+    /**
+     * Sends what the owner does on the takeover
+     */
+open func takeover(input: TakeoverInput)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_companion_core_fn_method_ffiapp_takeover(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeTakeoverInput_lower(input),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Fills `value`, typed or from AutoFill, into the taken-over page's
+     * focused `field`, replacing what it holds, and presses Return after
+     * it with `submit`
+     */
+open func takeoverFill(field: LoginField, value: String, submit: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_companion_core_fn_method_ffiapp_takeover_fill(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeLoginField_lower(field),
+        FfiConverterString.lower(value),
+        FfiConverterBool.lower(submit),uniffiCallStatus
+    )
+}
+}
+    
+    /**
+     * Types `text` into the taken-over page's focused element; its own
+     * call, as [`FfiApp::answer`] is, so the text never sits in a type
+     * that derives `Debug`
+     */
+open func takeoverText(text: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_companion_core_fn_method_ffiapp_takeover_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),uniffiCallStatus
+    )
+}
+}
+    
 
     
 }
@@ -850,6 +927,16 @@ public struct AppState: Equatable, Hashable {
      * Where a pairing stands
      */
     public var pairing: PairingState
+    /**
+     * Handoffs asked of this phone, newest last, including finished ones
+     * until they are dismissed
+     */
+    public var handoffs: [PendingHandoff]
+    /**
+     * The browser session the owner has taken over, if any; its images
+     * arrive as [`Update::Screen`] and are not kept here
+     */
+    public var takeover: TakeoverState?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -866,11 +953,21 @@ public struct AppState: Equatable, Hashable {
          */reads: [PendingRead], 
         /**
          * Where a pairing stands
-         */pairing: PairingState) {
+         */pairing: PairingState, 
+        /**
+         * Handoffs asked of this phone, newest last, including finished ones
+         * until they are dismissed
+         */handoffs: [PendingHandoff], 
+        /**
+         * The browser session the owner has taken over, if any; its images
+         * arrive as [`Update::Screen`] and are not kept here
+         */takeover: TakeoverState?) {
         self.gateway = gateway
         self.connection = connection
         self.reads = reads
         self.pairing = pairing
+        self.handoffs = handoffs
+        self.takeover = takeover
     }
 
     
@@ -892,7 +989,9 @@ public struct FfiConverterTypeAppState: FfiConverterRustBuffer {
                 gateway: FfiConverterOptionTypeGatewayInfo.read(from: &buf), 
                 connection: FfiConverterTypeConnectionState.read(from: &buf), 
                 reads: FfiConverterSequenceTypePendingRead.read(from: &buf), 
-                pairing: FfiConverterTypePairingState.read(from: &buf)
+                pairing: FfiConverterTypePairingState.read(from: &buf), 
+                handoffs: FfiConverterSequenceTypePendingHandoff.read(from: &buf), 
+                takeover: FfiConverterOptionTypeTakeoverState.read(from: &buf)
         )
     }
 
@@ -901,6 +1000,8 @@ public struct FfiConverterTypeAppState: FfiConverterRustBuffer {
         FfiConverterTypeConnectionState.write(value.connection, into: &buf)
         FfiConverterSequenceTypePendingRead.write(value.reads, into: &buf)
         FfiConverterTypePairingState.write(value.pairing, into: &buf)
+        FfiConverterSequenceTypePendingHandoff.write(value.handoffs, into: &buf)
+        FfiConverterOptionTypeTakeoverState.write(value.takeover, into: &buf)
     }
 }
 
@@ -917,6 +1018,96 @@ public func FfiConverterTypeAppState_lift(_ buf: RustBuffer) throws -> AppState 
 #endif
 public func FfiConverterTypeAppState_lower(_ value: AppState) -> RustBuffer {
     return FfiConverterTypeAppState.lower(value)
+}
+
+
+/**
+ * A login value the gateway sent a sealed copy of for a taken-over page;
+ * [`TakeoverInput::FillOffer`] opens it with Face ID and fills it
+ */
+public struct FillOffer: Equatable, Hashable {
+    /**
+     * The field it fills
+     */
+    public var field: LoginField
+    /**
+     * The `op://` reference
+     */
+    public var reference: String
+    /**
+     * The 1Password item
+     */
+    public var item: String
+    /**
+     * The account, such as the login's username
+     */
+    public var account: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The field it fills
+         */field: LoginField, 
+        /**
+         * The `op://` reference
+         */reference: String, 
+        /**
+         * The 1Password item
+         */item: String, 
+        /**
+         * The account, such as the login's username
+         */account: String?) {
+        self.field = field
+        self.reference = reference
+        self.item = item
+        self.account = account
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FillOffer: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFillOffer: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FillOffer {
+        return
+            try FillOffer(
+                field: FfiConverterTypeLoginField.read(from: &buf), 
+                reference: FfiConverterString.read(from: &buf), 
+                item: FfiConverterString.read(from: &buf), 
+                account: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FillOffer, into buf: inout [UInt8]) {
+        FfiConverterTypeLoginField.write(value.field, into: &buf)
+        FfiConverterString.write(value.reference, into: &buf)
+        FfiConverterString.write(value.item, into: &buf)
+        FfiConverterOptionString.write(value.account, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFillOffer_lift(_ buf: RustBuffer) throws -> FillOffer {
+    return try FfiConverterTypeFillOffer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFillOffer_lower(_ value: FillOffer) -> RustBuffer {
+    return FfiConverterTypeFillOffer.lower(value)
 }
 
 
@@ -1214,6 +1405,128 @@ public func FfiConverterTypeOpenRequest_lower(_ value: OpenRequest) -> RustBuffe
 
 
 /**
+ * A handoff the gateway asked this phone for: an agent wants the owner to
+ * do a step in a browser session, such as a passkey or a captcha
+ *
+ * Every text here is cleaned to one line, as a [`ProgramRead`]'s is
+ */
+public struct PendingHandoff: Equatable, Hashable {
+    /**
+     * The id the push named, which a takeover opens with
+     */
+    public var id: String
+    /**
+     * The browser session, such as `github`
+     */
+    public var session: String
+    /**
+     * What the agent needs done, in its own words; a claim to show quoted
+     */
+    public var reason: String?
+    /**
+     * The page the session shows, when the gateway could read it
+     */
+    public var url: String?
+    /**
+     * The gateway Mac's short name
+     */
+    public var gatewayName: String
+    /**
+     * When the gateway gives up, in ms since the epoch on this phone's clock
+     */
+    public var expiresAtMs: Int64
+    /**
+     * Where it stands
+     */
+    public var status: HandoffStatus
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The id the push named, which a takeover opens with
+         */id: String, 
+        /**
+         * The browser session, such as `github`
+         */session: String, 
+        /**
+         * What the agent needs done, in its own words; a claim to show quoted
+         */reason: String?, 
+        /**
+         * The page the session shows, when the gateway could read it
+         */url: String?, 
+        /**
+         * The gateway Mac's short name
+         */gatewayName: String, 
+        /**
+         * When the gateway gives up, in ms since the epoch on this phone's clock
+         */expiresAtMs: Int64, 
+        /**
+         * Where it stands
+         */status: HandoffStatus) {
+        self.id = id
+        self.session = session
+        self.reason = reason
+        self.url = url
+        self.gatewayName = gatewayName
+        self.expiresAtMs = expiresAtMs
+        self.status = status
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension PendingHandoff: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingHandoff: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingHandoff {
+        return
+            try PendingHandoff(
+                id: FfiConverterString.read(from: &buf), 
+                session: FfiConverterString.read(from: &buf), 
+                reason: FfiConverterOptionString.read(from: &buf), 
+                url: FfiConverterOptionString.read(from: &buf), 
+                gatewayName: FfiConverterString.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                status: FfiConverterTypeHandoffStatus.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingHandoff, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.session, into: &buf)
+        FfiConverterOptionString.write(value.reason, into: &buf)
+        FfiConverterOptionString.write(value.url, into: &buf)
+        FfiConverterString.write(value.gatewayName, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterTypeHandoffStatus.write(value.status, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingHandoff_lift(_ buf: RustBuffer) throws -> PendingHandoff {
+    return try FfiConverterTypePendingHandoff.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingHandoff_lower(_ value: PendingHandoff) -> RustBuffer {
+    return FfiConverterTypePendingHandoff.lower(value)
+}
+
+
+/**
  * One read the gateway asked this phone to approve
  */
 public struct PendingRead: Equatable, Hashable {
@@ -1365,6 +1678,10 @@ public struct ProgramRead: Equatable, Hashable {
      * opened from a push has not arrived
      */
     public var items: [ProgramItem]
+    /**
+     * Set when the values sign in to a website in the gateway's browser
+     */
+    public var signIn: SignIn?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1384,11 +1701,15 @@ public struct ProgramRead: Equatable, Hashable {
         /**
          * The values asked for, in the order they are sent; empty while a read
          * opened from a push has not arrived
-         */items: [ProgramItem]) {
+         */items: [ProgramItem], 
+        /**
+         * Set when the values sign in to a website in the gateway's browser
+         */signIn: SignIn?) {
         self.reason = reason
         self.destination = destination
         self.keepSecs = keepSecs
         self.items = items
+        self.signIn = signIn
     }
 
     
@@ -1410,7 +1731,8 @@ public struct FfiConverterTypeProgramRead: FfiConverterRustBuffer {
                 reason: FfiConverterOptionString.read(from: &buf), 
                 destination: FfiConverterOptionString.read(from: &buf), 
                 keepSecs: FfiConverterOptionUInt64.read(from: &buf), 
-                items: FfiConverterSequenceTypeProgramItem.read(from: &buf)
+                items: FfiConverterSequenceTypeProgramItem.read(from: &buf), 
+                signIn: FfiConverterOptionTypeSignIn.read(from: &buf)
         )
     }
 
@@ -1419,6 +1741,7 @@ public struct FfiConverterTypeProgramRead: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.destination, into: &buf)
         FfiConverterOptionUInt64.write(value.keepSecs, into: &buf)
         FfiConverterSequenceTypeProgramItem.write(value.items, into: &buf)
+        FfiConverterOptionTypeSignIn.write(value.signIn, into: &buf)
     }
 }
 
@@ -1435,6 +1758,95 @@ public func FfiConverterTypeProgramRead_lift(_ buf: RustBuffer) throws -> Progra
 #endif
 public func FfiConverterTypeProgramRead_lower(_ value: ProgramRead) -> RustBuffer {
     return FfiConverterTypeProgramRead.lower(value)
+}
+
+
+/**
+ * One image of a taken-over page
+ */
+public struct ScreenImage: Equatable, Hashable {
+    /**
+     * Counts up within one link; [`TakeoverInput::Drawn`] and taps name it
+     */
+    public var seq: UInt32
+    /**
+     * Width in pixels
+     */
+    public var width: UInt32
+    /**
+     * Height in pixels
+     */
+    public var height: UInt32
+    /**
+     * The JPEG image
+     */
+    public var jpeg: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Counts up within one link; [`TakeoverInput::Drawn`] and taps name it
+         */seq: UInt32, 
+        /**
+         * Width in pixels
+         */width: UInt32, 
+        /**
+         * Height in pixels
+         */height: UInt32, 
+        /**
+         * The JPEG image
+         */jpeg: Data) {
+        self.seq = seq
+        self.width = width
+        self.height = height
+        self.jpeg = jpeg
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ScreenImage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeScreenImage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ScreenImage {
+        return
+            try ScreenImage(
+                seq: FfiConverterUInt32.read(from: &buf), 
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf), 
+                jpeg: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ScreenImage, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.seq, into: &buf)
+        FfiConverterUInt32.write(value.width, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+        FfiConverterData.write(value.jpeg, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScreenImage_lift(_ buf: RustBuffer) throws -> ScreenImage {
+    return try FfiConverterTypeScreenImage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScreenImage_lower(_ value: ScreenImage) -> RustBuffer {
+    return FfiConverterTypeScreenImage.lower(value)
 }
 
 
@@ -1528,6 +1940,395 @@ public func FfiConverterTypeSealedItem_lower(_ value: SealedItem) -> RustBuffer 
 
 
 /**
+ * The website a program read signs in to, cleaned to one line like the
+ * rest of the prompt
+ */
+public struct SignIn: Equatable, Hashable {
+    /**
+     * The site and account as the prompt names them, such as
+     * `github.com · praveenperera`
+     */
+    public var title: String
+    /**
+     * The site, such as `github.com`
+     */
+    public var site: String
+    /**
+     * The account, when the gateway knows it
+     */
+    public var account: String?
+    /**
+     * The browser session the values go to, such as `github`
+     */
+    public var session: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The site and account as the prompt names them, such as
+         * `github.com · praveenperera`
+         */title: String, 
+        /**
+         * The site, such as `github.com`
+         */site: String, 
+        /**
+         * The account, when the gateway knows it
+         */account: String?, 
+        /**
+         * The browser session the values go to, such as `github`
+         */session: String?) {
+        self.title = title
+        self.site = site
+        self.account = account
+        self.session = session
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SignIn: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignIn: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignIn {
+        return
+            try SignIn(
+                title: FfiConverterString.read(from: &buf), 
+                site: FfiConverterString.read(from: &buf), 
+                account: FfiConverterOptionString.read(from: &buf), 
+                session: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SignIn, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.site, into: &buf)
+        FfiConverterOptionString.write(value.account, into: &buf)
+        FfiConverterOptionString.write(value.session, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignIn_lift(_ buf: RustBuffer) throws -> SignIn {
+    return try FfiConverterTypeSignIn.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignIn_lower(_ value: SignIn) -> RustBuffer {
+    return FfiConverterTypeSignIn.lower(value)
+}
+
+
+/**
+ * The element with keyboard focus on a taken-over page
+ */
+public struct TakeoverFocus: Equatable, Hashable {
+    /**
+     * The login field it looks like, if any
+     */
+    public var field: LoginField?
+    /**
+     * Whether it takes text, so the app raises the keyboard
+     */
+    public var editable: Bool
+    /**
+     * Whether it hides its text, as a password field does
+     */
+    public var secure: Bool
+    /**
+     * Whether it asks for digits, so the app shows the number pad
+     */
+    public var numeric: Bool
+    /**
+     * Origin of the frame holding it
+     */
+    public var origin: String
+    /**
+     * Whether that frame is on another site than the page
+     */
+    public var crossSite: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The login field it looks like, if any
+         */field: LoginField?, 
+        /**
+         * Whether it takes text, so the app raises the keyboard
+         */editable: Bool, 
+        /**
+         * Whether it hides its text, as a password field does
+         */secure: Bool, 
+        /**
+         * Whether it asks for digits, so the app shows the number pad
+         */numeric: Bool, 
+        /**
+         * Origin of the frame holding it
+         */origin: String, 
+        /**
+         * Whether that frame is on another site than the page
+         */crossSite: Bool) {
+        self.field = field
+        self.editable = editable
+        self.secure = secure
+        self.numeric = numeric
+        self.origin = origin
+        self.crossSite = crossSite
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TakeoverFocus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverFocus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverFocus {
+        return
+            try TakeoverFocus(
+                field: FfiConverterOptionTypeLoginField.read(from: &buf), 
+                editable: FfiConverterBool.read(from: &buf), 
+                secure: FfiConverterBool.read(from: &buf), 
+                numeric: FfiConverterBool.read(from: &buf), 
+                origin: FfiConverterString.read(from: &buf), 
+                crossSite: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TakeoverFocus, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeLoginField.write(value.field, into: &buf)
+        FfiConverterBool.write(value.editable, into: &buf)
+        FfiConverterBool.write(value.secure, into: &buf)
+        FfiConverterBool.write(value.numeric, into: &buf)
+        FfiConverterString.write(value.origin, into: &buf)
+        FfiConverterBool.write(value.crossSite, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverFocus_lift(_ buf: RustBuffer) throws -> TakeoverFocus {
+    return try FfiConverterTypeTakeoverFocus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverFocus_lower(_ value: TakeoverFocus) -> RustBuffer {
+    return FfiConverterTypeTakeoverFocus.lower(value)
+}
+
+
+/**
+ * The page of a takeover
+ */
+public struct TakeoverPage: Equatable, Hashable {
+    /**
+     * The address of the top-level page
+     */
+    public var url: String
+    /**
+     * The page's title
+     */
+    public var title: String
+    /**
+     * The element with keyboard focus, when it takes text
+     */
+    public var focus: TakeoverFocus?
+    /**
+     * Login values this phone can fill from sealed copies
+     */
+    public var offers: [FillOffer]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The address of the top-level page
+         */url: String, 
+        /**
+         * The page's title
+         */title: String, 
+        /**
+         * The element with keyboard focus, when it takes text
+         */focus: TakeoverFocus?, 
+        /**
+         * Login values this phone can fill from sealed copies
+         */offers: [FillOffer]) {
+        self.url = url
+        self.title = title
+        self.focus = focus
+        self.offers = offers
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TakeoverPage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverPage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverPage {
+        return
+            try TakeoverPage(
+                url: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                focus: FfiConverterOptionTypeTakeoverFocus.read(from: &buf), 
+                offers: FfiConverterSequenceTypeFillOffer.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TakeoverPage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterOptionTypeTakeoverFocus.write(value.focus, into: &buf)
+        FfiConverterSequenceTypeFillOffer.write(value.offers, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverPage_lift(_ buf: RustBuffer) throws -> TakeoverPage {
+    return try FfiConverterTypeTakeoverPage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverPage_lower(_ value: TakeoverPage) -> RustBuffer {
+    return FfiConverterTypeTakeoverPage.lower(value)
+}
+
+
+/**
+ * The browser session the owner has taken over
+ */
+public struct TakeoverState: Equatable, Hashable {
+    /**
+     * The browser session, such as `github`
+     */
+    public var session: String
+    /**
+     * The handoff it answers, if it was opened for one
+     */
+    public var handoff: String?
+    /**
+     * The link to the session
+     */
+    public var status: TakeoverStatus
+    /**
+     * The page and its focused element, once the gateway has said
+     */
+    public var page: TakeoverPage?
+    /**
+     * The last thing the gateway refused or filled, until the page changes
+     */
+    public var notice: TakeoverNotice?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The browser session, such as `github`
+         */session: String, 
+        /**
+         * The handoff it answers, if it was opened for one
+         */handoff: String?, 
+        /**
+         * The link to the session
+         */status: TakeoverStatus, 
+        /**
+         * The page and its focused element, once the gateway has said
+         */page: TakeoverPage?, 
+        /**
+         * The last thing the gateway refused or filled, until the page changes
+         */notice: TakeoverNotice?) {
+        self.session = session
+        self.handoff = handoff
+        self.status = status
+        self.page = page
+        self.notice = notice
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TakeoverState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverState {
+        return
+            try TakeoverState(
+                session: FfiConverterString.read(from: &buf), 
+                handoff: FfiConverterOptionString.read(from: &buf), 
+                status: FfiConverterTypeTakeoverStatus.read(from: &buf), 
+                page: FfiConverterOptionTypeTakeoverPage.read(from: &buf), 
+                notice: FfiConverterOptionTypeTakeoverNotice.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TakeoverState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.session, into: &buf)
+        FfiConverterOptionString.write(value.handoff, into: &buf)
+        FfiConverterTypeTakeoverStatus.write(value.status, into: &buf)
+        FfiConverterOptionTypeTakeoverPage.write(value.page, into: &buf)
+        FfiConverterOptionTypeTakeoverNotice.write(value.notice, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverState_lift(_ buf: RustBuffer) throws -> TakeoverState {
+    return try FfiConverterTypeTakeoverState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverState_lower(_ value: TakeoverState) -> RustBuffer {
+    return FfiConverterTypeTakeoverState.lower(value)
+}
+
+
+/**
  * What the UI asks for
  */
 
@@ -1617,6 +2418,32 @@ public enum AppAction: Equatable, Hashable {
          */expiresAtMs: Int64?
     )
     /**
+     * Refuse the handoff `id`
+     */
+    case cancelHandoff(
+        /**
+         * The handoff
+         */id: String
+    )
+    /**
+     * Take over browser `session`, for handoff `handoff` if set: from the
+     * handoff's Take over, its push, or a `codemode-companion://takeover`
+     * link. Replaces any takeover already open
+     */
+    case openTakeover(
+        /**
+         * The browser session
+         */session: String, 
+        /**
+         * The handoff it answers
+         */handoff: String?
+    )
+    /**
+     * Leave the takeover without ending it or its handoff, which may be
+     * taken over again later; also closes one the gateway ended
+     */
+    case closeTakeover
+    /**
      * APNs gave this token, or `None` when notifications are off
      */
     case pushToken(
@@ -1672,7 +2499,15 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 9: return .openedFromProgramPush(id: try FfiConverterString.read(from: &buf), summary: try FfiConverterString.read(from: &buf), gateway: try FfiConverterString.read(from: &buf), expiresAtMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
-        case 10: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
+        case 10: return .cancelHandoff(id: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 11: return .openTakeover(session: try FfiConverterString.read(from: &buf), handoff: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 12: return .closeTakeover
+        
+        case 13: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1731,8 +2566,23 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterOptionInt64.write(expiresAtMs, into: &buf)
             
         
-        case let .pushToken(token,environment):
+        case let .cancelHandoff(id):
             writeInt(&buf, Int32(10))
+            FfiConverterString.write(id, into: &buf)
+            
+        
+        case let .openTakeover(session,handoff):
+            writeInt(&buf, Int32(11))
+            FfiConverterString.write(session, into: &buf)
+            FfiConverterOptionString.write(handoff, into: &buf)
+            
+        
+        case .closeTakeover:
+            writeInt(&buf, Int32(12))
+        
+        
+        case let .pushToken(token,environment):
+            writeInt(&buf, Int32(13))
             FfiConverterOptionString.write(token, into: &buf)
             FfiConverterTypePushEnvironment.write(environment, into: &buf)
             
@@ -1947,6 +2797,188 @@ public func FfiConverterTypeEnteredValue_lift(_ buf: RustBuffer) throws -> Enter
 #endif
 public func FfiConverterTypeEnteredValue_lower(_ value: EnteredValue) -> RustBuffer {
     return FfiConverterTypeEnteredValue.lower(value)
+}
+
+
+
+/**
+ * Where one handoff stands
+ */
+
+public enum HandoffStatus: Equatable, Hashable {
+    
+    /**
+     * Waiting for the owner to take over or cancel
+     */
+    case waiting
+    /**
+     * The owner cancelled it here
+     */
+    case cancelled
+    /**
+     * The gateway gave up waiting
+     */
+    case expired
+    /**
+     * It ended elsewhere: a takeover finished it, another phone answered,
+     * or the agent stopped waiting
+     */
+    case over
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HandoffStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHandoffStatus: FfiConverterRustBuffer {
+    typealias SwiftType = HandoffStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HandoffStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .waiting
+        
+        case 2: return .cancelled
+        
+        case 3: return .expired
+        
+        case 4: return .over
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: HandoffStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .waiting:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .expired:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .over:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHandoffStatus_lift(_ buf: RustBuffer) throws -> HandoffStatus {
+    return try FfiConverterTypeHandoffStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHandoffStatus_lower(_ value: HandoffStatus) -> RustBuffer {
+    return FfiConverterTypeHandoffStatus.lower(value)
+}
+
+
+
+/**
+ * Which login field a value goes into, so the app offers the matching
+ * AutoFill
+ */
+
+public enum LoginField: Equatable, Hashable {
+    
+    /**
+     * A username or email address
+     */
+    case username
+    /**
+     * A password
+     */
+    case password
+    /**
+     * A one-time code
+     */
+    case code
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension LoginField: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLoginField: FfiConverterRustBuffer {
+    typealias SwiftType = LoginField
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LoginField {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .username
+        
+        case 2: return .password
+        
+        case 3: return .code
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LoginField, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .username:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .password:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .code:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginField_lift(_ buf: RustBuffer) throws -> LoginField {
+    return try FfiConverterTypeLoginField.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLoginField_lower(_ value: LoginField) -> RustBuffer {
+    return FfiConverterTypeLoginField.lower(value)
 }
 
 
@@ -2264,7 +3296,10 @@ public enum ProgramItem: Equatable, Hashable {
         /**
          * Whether the gateway sent a copy Face ID can open; without one the
          * owner enters the value
-         */sealed: Bool
+         */sealed: Bool, 
+        /**
+         * The login field it goes into, for a sign-in
+         */field: LoginField?
     )
     /**
      * Only the program's description of the item; the owner picks it in
@@ -2273,7 +3308,10 @@ public enum ProgramItem: Equatable, Hashable {
     case describe(
         /**
          * The description
-         */description: String
+         */description: String, 
+        /**
+         * The login field it goes into, for a sign-in
+         */field: LoginField?
     )
 
 
@@ -2296,10 +3334,10 @@ public struct FfiConverterTypeProgramItem: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .reference(reference: try FfiConverterString.read(from: &buf), sealed: try FfiConverterBool.read(from: &buf)
+        case 1: return .reference(reference: try FfiConverterString.read(from: &buf), sealed: try FfiConverterBool.read(from: &buf), field: try FfiConverterOptionTypeLoginField.read(from: &buf)
         )
         
-        case 2: return .describe(description: try FfiConverterString.read(from: &buf)
+        case 2: return .describe(description: try FfiConverterString.read(from: &buf), field: try FfiConverterOptionTypeLoginField.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2310,15 +3348,17 @@ public struct FfiConverterTypeProgramItem: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .reference(reference,sealed):
+        case let .reference(reference,sealed,field):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(reference, into: &buf)
             FfiConverterBool.write(sealed, into: &buf)
+            FfiConverterOptionTypeLoginField.write(field, into: &buf)
             
         
-        case let .describe(description):
+        case let .describe(description,field):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(description, into: &buf)
+            FfiConverterOptionTypeLoginField.write(field, into: &buf)
             
         }
     }
@@ -2558,6 +3598,680 @@ public func FfiConverterTypeReadStatus_lower(_ value: ReadStatus) -> RustBuffer 
 
 
 /**
+ * Why a takeover ended
+ */
+
+public enum TakeoverEnd: Equatable, Hashable {
+    
+    /**
+     * The owner tapped Done
+     */
+    case done
+    /**
+     * The owner tapped Cancel
+     */
+    case cancelled
+    /**
+     * Its handoff ended elsewhere: another phone answered, the agent
+     * stopped waiting, or it expired
+     */
+    case handoffOver
+    /**
+     * The browser session closed or could not be reached
+     */
+    case browserGone
+    /**
+     * The gateway is stopping
+     */
+    case shutdown
+    /**
+     * The phone could not keep it going
+     */
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TakeoverEnd: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverEnd: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverEnd
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverEnd {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .done
+        
+        case 2: return .cancelled
+        
+        case 3: return .handoffOver
+        
+        case 4: return .browserGone
+        
+        case 5: return .shutdown
+        
+        case 6: return .failed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TakeoverEnd, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .done:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .handoffOver:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .browserGone:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .shutdown:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverEnd_lift(_ buf: RustBuffer) throws -> TakeoverEnd {
+    return try FfiConverterTypeTakeoverEnd.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverEnd_lower(_ value: TakeoverEnd) -> RustBuffer {
+    return FfiConverterTypeTakeoverEnd.lower(value)
+}
+
+
+
+/**
+ * What the owner does on a takeover, besides typing and filling (see
+ * [`FfiApp::takeover_text`] and [`FfiApp::takeover_fill`]); points are
+ * fractions of the image, from 0 at the top left to 1 at the bottom right
+ */
+
+public enum TakeoverInput: Equatable, Hashable {
+    
+    /**
+     * The image area's size changed, or it first appeared; the takeover
+     * dials once it knows it
+     */
+    case resize(
+        /**
+         * Width in points
+         */width: UInt32, 
+        /**
+         * Height in points
+         */height: UInt32, 
+        /**
+         * Pixels per point
+         */scale: Double
+    )
+    /**
+     * Image `seq` is on screen, so the gateway may send the next
+     */
+    case drawn(
+        /**
+         * The image
+         */seq: UInt32
+    )
+    /**
+     * A tap on image `seq`
+     */
+    case tap(
+        /**
+         * From the left
+         */x: Double, 
+        /**
+         * From the top
+         */y: Double, 
+        /**
+         * The image
+         */seq: UInt32
+    )
+    /**
+     * A long press on image `seq`
+     */
+    case longPress(
+        /**
+         * From the left
+         */x: Double, 
+        /**
+         * From the top
+         */y: Double, 
+        /**
+         * The image
+         */seq: UInt32
+    )
+    /**
+     * Scroll the page under the point by `dx` and `dy`, as fractions of
+     * the image; positive scrolls right and down
+     */
+    case scroll(
+        /**
+         * From the left
+         */x: Double, 
+        /**
+         * From the top
+         */y: Double, 
+        /**
+         * Horizontal distance
+         */dx: Double, 
+        /**
+         * Vertical distance
+         */dy: Double, 
+        /**
+         * The image
+         */seq: UInt32
+    )
+    /**
+     * A key from the key bar
+     */
+    case key(
+        /**
+         * Which
+         */key: TakeoverKey
+    )
+    /**
+     * Back in the session's history
+     */
+    case back
+    /**
+     * Open the offer for `reference` with Face ID and fill it
+     */
+    case fillOffer(
+        /**
+         * The offer's reference
+         */reference: String
+    )
+    /**
+     * The owner finished: ends the takeover and its handoff as done
+     */
+    case done
+    /**
+     * The owner gave up: ends the takeover and its handoff as cancelled
+     */
+    case cancel
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TakeoverInput: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverInput: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverInput
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverInput {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .resize(width: try FfiConverterUInt32.read(from: &buf), height: try FfiConverterUInt32.read(from: &buf), scale: try FfiConverterDouble.read(from: &buf)
+        )
+        
+        case 2: return .drawn(seq: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 3: return .tap(x: try FfiConverterDouble.read(from: &buf), y: try FfiConverterDouble.read(from: &buf), seq: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 4: return .longPress(x: try FfiConverterDouble.read(from: &buf), y: try FfiConverterDouble.read(from: &buf), seq: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 5: return .scroll(x: try FfiConverterDouble.read(from: &buf), y: try FfiConverterDouble.read(from: &buf), dx: try FfiConverterDouble.read(from: &buf), dy: try FfiConverterDouble.read(from: &buf), seq: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 6: return .key(key: try FfiConverterTypeTakeoverKey.read(from: &buf)
+        )
+        
+        case 7: return .back
+        
+        case 8: return .fillOffer(reference: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 9: return .done
+        
+        case 10: return .cancel
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TakeoverInput, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .resize(width,height,scale):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt32.write(width, into: &buf)
+            FfiConverterUInt32.write(height, into: &buf)
+            FfiConverterDouble.write(scale, into: &buf)
+            
+        
+        case let .drawn(seq):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt32.write(seq, into: &buf)
+            
+        
+        case let .tap(x,y,seq):
+            writeInt(&buf, Int32(3))
+            FfiConverterDouble.write(x, into: &buf)
+            FfiConverterDouble.write(y, into: &buf)
+            FfiConverterUInt32.write(seq, into: &buf)
+            
+        
+        case let .longPress(x,y,seq):
+            writeInt(&buf, Int32(4))
+            FfiConverterDouble.write(x, into: &buf)
+            FfiConverterDouble.write(y, into: &buf)
+            FfiConverterUInt32.write(seq, into: &buf)
+            
+        
+        case let .scroll(x,y,dx,dy,seq):
+            writeInt(&buf, Int32(5))
+            FfiConverterDouble.write(x, into: &buf)
+            FfiConverterDouble.write(y, into: &buf)
+            FfiConverterDouble.write(dx, into: &buf)
+            FfiConverterDouble.write(dy, into: &buf)
+            FfiConverterUInt32.write(seq, into: &buf)
+            
+        
+        case let .key(key):
+            writeInt(&buf, Int32(6))
+            FfiConverterTypeTakeoverKey.write(key, into: &buf)
+            
+        
+        case .back:
+            writeInt(&buf, Int32(7))
+        
+        
+        case let .fillOffer(reference):
+            writeInt(&buf, Int32(8))
+            FfiConverterString.write(reference, into: &buf)
+            
+        
+        case .done:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .cancel:
+            writeInt(&buf, Int32(10))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverInput_lift(_ buf: RustBuffer) throws -> TakeoverInput {
+    return try FfiConverterTypeTakeoverInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverInput_lower(_ value: TakeoverInput) -> RustBuffer {
+    return FfiConverterTypeTakeoverInput.lower(value)
+}
+
+
+
+/**
+ * A key on the takeover's key bar
+ */
+
+public enum TakeoverKey: Equatable, Hashable {
+    
+    /**
+     * Return
+     */
+    case enter
+    /**
+     * Tab
+     */
+    case tab
+    /**
+     * Shift-Tab
+     */
+    case shiftTab
+    /**
+     * Delete the character before the caret
+     */
+    case backspace
+    /**
+     * Escape
+     */
+    case escape
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TakeoverKey: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverKey: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverKey
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverKey {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .enter
+        
+        case 2: return .tab
+        
+        case 3: return .shiftTab
+        
+        case 4: return .backspace
+        
+        case 5: return .escape
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TakeoverKey, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .enter:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .tab:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .shiftTab:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .backspace:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .escape:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverKey_lift(_ buf: RustBuffer) throws -> TakeoverKey {
+    return try FfiConverterTypeTakeoverKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverKey_lower(_ value: TakeoverKey) -> RustBuffer {
+    return FfiConverterTypeTakeoverKey.lower(value)
+}
+
+
+
+/**
+ * What the gateway last said about the owner's input
+ */
+
+public enum TakeoverNotice: Equatable, Hashable {
+    
+    /**
+     * Something was not done; the takeover goes on
+     */
+    case refused(
+        /**
+         * Why, never holding a value
+         */message: String
+    )
+    /**
+     * A value went into this field
+     */
+    case filled(
+        /**
+         * The field
+         */field: LoginField
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TakeoverNotice: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverNotice: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverNotice
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverNotice {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .refused(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .filled(field: try FfiConverterTypeLoginField.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TakeoverNotice, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .refused(message):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .filled(field):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeLoginField.write(field, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverNotice_lift(_ buf: RustBuffer) throws -> TakeoverNotice {
+    return try FfiConverterTypeTakeoverNotice.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverNotice_lower(_ value: TakeoverNotice) -> RustBuffer {
+    return FfiConverterTypeTakeoverNotice.lower(value)
+}
+
+
+
+/**
+ * The link of a takeover
+ */
+
+public enum TakeoverStatus: Equatable, Hashable {
+    
+    /**
+     * Waiting for the screen's size, or dialing
+     */
+    case connecting
+    /**
+     * The page is live
+     */
+    case live
+    /**
+     * The link dropped or a dial failed; the next starts after `in_secs`
+     */
+    case retrying(
+        /**
+         * Seconds to the next dial
+         */inSecs: UInt32, 
+        /**
+         * Why
+         */error: String
+    )
+    /**
+     * The app is in the background; it dials again in the foreground
+     */
+    case paused
+    /**
+     * The gateway ended it
+     */
+    case ended(
+        /**
+         * Why
+         */reason: TakeoverEnd, 
+        /**
+         * More detail, such as why the browser could not be reached
+         */message: String?
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TakeoverStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTakeoverStatus: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TakeoverStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .connecting
+        
+        case 2: return .live
+        
+        case 3: return .retrying(inSecs: try FfiConverterUInt32.read(from: &buf), error: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .paused
+        
+        case 5: return .ended(reason: try FfiConverterTypeTakeoverEnd.read(from: &buf), message: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TakeoverStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .connecting:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .live:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .retrying(inSecs,error):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt32.write(inSecs, into: &buf)
+            FfiConverterString.write(error, into: &buf)
+            
+        
+        case .paused:
+            writeInt(&buf, Int32(4))
+        
+        
+        case let .ended(reason,message):
+            writeInt(&buf, Int32(5))
+            FfiConverterTypeTakeoverEnd.write(reason, into: &buf)
+            FfiConverterOptionString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverStatus_lift(_ buf: RustBuffer) throws -> TakeoverStatus {
+    return try FfiConverterTypeTakeoverStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTakeoverStatus_lower(_ value: TakeoverStatus) -> RustBuffer {
+    return FfiConverterTypeTakeoverStatus.lower(value)
+}
+
+
+
+/**
  * One change to [`AppState`], sent to the [`Reconciler`]
  */
 
@@ -2582,6 +4296,22 @@ public enum Update: Equatable, Hashable {
      * The pairing moved on
      */
     case pairing(PairingState
+    )
+    /**
+     * The handoffs changed
+     */
+    case handoffs([PendingHandoff]
+    )
+    /**
+     * The takeover changed, or ended with `None`
+     */
+    case takeover(TakeoverState?
+    )
+    /**
+     * A new image of the taken-over page; the app reports it drawn with
+     * [`TakeoverInput::Drawn`]
+     */
+    case screen(ScreenImage
     )
 
 
@@ -2616,6 +4346,15 @@ public struct FfiConverterTypeUpdate: FfiConverterRustBuffer {
         case 4: return .pairing(try FfiConverterTypePairingState.read(from: &buf)
         )
         
+        case 5: return .handoffs(try FfiConverterSequenceTypePendingHandoff.read(from: &buf)
+        )
+        
+        case 6: return .takeover(try FfiConverterOptionTypeTakeoverState.read(from: &buf)
+        )
+        
+        case 7: return .screen(try FfiConverterTypeScreenImage.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -2642,6 +4381,21 @@ public struct FfiConverterTypeUpdate: FfiConverterRustBuffer {
         case let .pairing(v1):
             writeInt(&buf, Int32(4))
             FfiConverterTypePairingState.write(v1, into: &buf)
+            
+        
+        case let .handoffs(v1):
+            writeInt(&buf, Int32(5))
+            FfiConverterSequenceTypePendingHandoff.write(v1, into: &buf)
+            
+        
+        case let .takeover(v1):
+            writeInt(&buf, Int32(6))
+            FfiConverterOptionTypeTakeoverState.write(v1, into: &buf)
+            
+        
+        case let .screen(v1):
+            writeInt(&buf, Int32(7))
+            FfiConverterTypeScreenImage.write(v1, into: &buf)
             
         }
     }
@@ -3324,6 +5078,150 @@ fileprivate struct FfiConverterOptionTypeProgramRead: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSignIn: FfiConverterRustBuffer {
+    typealias SwiftType = SignIn?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSignIn.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSignIn.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTakeoverFocus: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverFocus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTakeoverFocus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTakeoverFocus.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTakeoverPage: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverPage?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTakeoverPage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTakeoverPage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTakeoverState: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTakeoverState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTakeoverState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeLoginField: FfiConverterRustBuffer {
+    typealias SwiftType = LoginField?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeLoginField.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeLoginField.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeTakeoverNotice: FfiConverterRustBuffer {
+    typealias SwiftType = TakeoverNotice?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTakeoverNotice.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTakeoverNotice.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -3341,6 +5239,56 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFillOffer: FfiConverterRustBuffer {
+    typealias SwiftType = [FillOffer]
+
+    public static func write(_ value: [FillOffer], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFillOffer.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FillOffer] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FillOffer]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFillOffer.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePendingHandoff: FfiConverterRustBuffer {
+    typealias SwiftType = [PendingHandoff]
+
+    public static func write(_ value: [PendingHandoff], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePendingHandoff.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PendingHandoff] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PendingHandoff]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePendingHandoff.read(from: &buf))
         }
         return seq
     }
@@ -3488,6 +5436,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_companion_core_checksum_method_ffiapp_state() != 12133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_companion_core_checksum_method_ffiapp_takeover() != 10152) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_companion_core_checksum_method_ffiapp_takeover_fill() != 8231) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_companion_core_checksum_method_ffiapp_takeover_text() != 47243) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_companion_core_checksum_constructor_ffiapp_new() != 57398) {

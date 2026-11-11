@@ -51,6 +51,12 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSCameraUsageDescription: Companion scans the QR code `codemode-mcp companion invite` shows, to pair with the gateway.
         NSFaceIDUsageDescription: Face ID approves each 1Password read the gateway asks this iPhone for.
+        # `codemode-companion://takeover?session=<name>&request=<id>` opens a
+        # browser session's takeover, as a handoff push does
+        CFBundleURLTypes:
+          - CFBundleURLName: com.avencera.codemode-mcp.companion
+            CFBundleURLSchemes:
+              - codemode-companion
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

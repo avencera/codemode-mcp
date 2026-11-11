@@ -1156,7 +1156,10 @@ impl Driver<'_> {
                 }
                 let gateway = Arc::clone(&self.gateway);
                 let context = self.context.clone();
+                // the owner's time on their phone is not the script's
+                let paused = call.waits_on_owner.then(|| self.context.budget.pause());
                 self.running.spawn(async move {
+                    let _paused = paused;
                     let label = call.function.clone();
                     let sensitive = call.sensitive;
                     let answer = match gateway.invoke(&context, call, Some(approval_id)).await {
@@ -1359,8 +1362,11 @@ impl Driver<'_> {
                 }
                 let gateway = Arc::clone(&self.gateway);
                 let context = self.context.clone();
+                // the owner's time on their phone is not the script's
+                let paused = call.waits_on_owner.then(|| self.context.budget.pause());
 
                 Step::Ready(Box::pin(async move {
+                    let _paused = paused;
                     let sensitive = call.sensitive;
                     match gateway.invoke(&context, call, approval_id).await {
                         Ok(value) => Answer::value(value),

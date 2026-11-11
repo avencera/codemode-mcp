@@ -53,7 +53,9 @@ before the script sees them.
   full-device alarms, and server-side scheduled alerts, served as MCP tools
 - **Website sign-in.** An agent driving the Mac's screen can sign in to any website with the 1Password login
   saved for it, or one you pick on your phone, typed into the page in a code-signed browser without the
-  value reaching the agent
+  value reaching the agent. In an [agent-browser](https://github.com/vercel-labs/agent-browser) session, the
+  value goes straight into the page over CDP, and a step only you can do, such as a passkey, is handed to the
+  Companion app, where you drive the session live
 - **Hub and spokes.** Your other machines, Linux included, run codemode-mcp as spokes of the Mac: their agents
   see the Mac's servers next to the machine's own, and every approval and 1Password value is decided on the
   Mac, over Tailscale. Tokens and sign-ins never leave it

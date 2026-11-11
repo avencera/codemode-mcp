@@ -537,13 +537,108 @@ fn first_set<'a>(first: &'a str, second: &'a str) -> &'a str {
 }
 
 /// `login` as the owner is shown it, such as `GitHub (Personal)`
-fn item_name(login: &SavedLogin) -> String {
+pub fn item_name(login: &SavedLogin) -> String {
     let title = prompt::one_line(&login.title, 80);
     if login.vault.is_empty() {
         title
     } else {
         format!("{title} ({})", prompt::one_line(&login.vault, 40))
     }
+}
+
+/// The 1Password Login item for pages on `hosts`, innermost first: the one
+/// `item` names (`op://vault/item`), or else the one saved for every
+/// page's site. Also the sites the pages must stay on while it is typed,
+/// and what the owner must be warned of, such as that a named item is not
+/// saved for the page. Lists this Mac's logins, so the caller makes sure
+/// the owner is here
+pub async fn find_login(
+    onepassword: &OnePassword,
+    item: Option<&str>,
+    hosts: &[String],
+) -> Result<(SavedLogin, Sites, Option<String>), FillError> {
+    let logins = onepassword.saved_logins().await.map_err(|error| {
+        FillError::Failed(format!("could not list the logins in 1Password: {error}"))
+    })?;
+    // every page around the field is on one of the item's sites, so a
+    // site's sign-in frame inside another site's page finds nothing
+    let saved_for_page = |login: &SavedLogin| {
+        let sites = sites_of(login);
+        hosts
+            .iter()
+            .all(|host| sites.contains(&site_of(host)))
+            .then_some(sites)
+    };
+    let site = sites_named(hosts);
+    let (login, sites, warning) = match item {
+        Some(text) => {
+            let (vault, title) = item_ref(text)?;
+            let login = match named(&logins, vault, title).as_slice() {
+                [login] => *login,
+                [] => {
+                    return Err(FillError::Refused(format!(
+                        "1Password on this Mac has no Login item {}",
+                        prompt::one_line(text, 80)
+                    )));
+                }
+                several => {
+                    let names: Vec<String> = several
+                        .iter()
+                        .map(|login| item_text(login, &logins))
+                        .collect();
+                    return Err(FillError::Refused(format!(
+                        "several Login items match {}; pass one by its ID: {}",
+                        prompt::one_line(text, 80),
+                        names.join(", ")
+                    )));
+                }
+            };
+            match saved_for_page(login) {
+                Some(sites) => (login, Sites::Domains(sites), None),
+                // the owner's call, so the prompt says so
+                None => (
+                    login,
+                    Sites::Any,
+                    Some(format!("this item is NOT saved for {site}")),
+                ),
+            }
+        }
+        None => {
+            let matched: Vec<(&SavedLogin, Vec<String>)> = logins
+                .iter()
+                .filter_map(|login| saved_for_page(login).map(|sites| (login, sites)))
+                .collect();
+            match matched.as_slice() {
+                [(login, sites)] => (*login, Sites::Domains(sites.clone()), None),
+                [] => {
+                    return Err(FillError::Refused(format!(
+                        "no 1Password login is saved for {site}; pass the one to use as \
+                         `item` (op://vault/item), and the user will be warned that it is \
+                         not saved for this site"
+                    )));
+                }
+                several => {
+                    let among: Vec<&SavedLogin> = several.iter().map(|(login, _)| *login).collect();
+                    let mut names: Vec<String> = among
+                        .iter()
+                        .take(MAX_NAMED_LOGINS)
+                        .map(|login| item_text(login, &logins))
+                        .collect();
+                    if among.len() > MAX_NAMED_LOGINS {
+                        names.push(format!("{} more", among.len() - MAX_NAMED_LOGINS));
+                    }
+                    return Err(FillError::Refused(format!(
+                        "{} 1Password logins are saved for {site}; pass the one to use as \
+                         `item`: {}",
+                        among.len(),
+                        names.join(", ")
+                    )));
+                }
+            }
+        }
+    };
+
+    Ok((login.clone(), sites, warning))
 }
 
 /// The check the gateway runs on a `logins` server's `fill` call before
@@ -582,10 +677,11 @@ impl FillCheck {
             return Ok(None);
         }
         arguments.remove(CHECKED);
-        // the server's fixed arguments, such as an `item`, are what the call
-        // runs with, so the check and the owner see them too
+        // the server's fixed arguments, such as an `item`, replace the
+        // script's when the call runs, so the check and the owner see them
+        // too rather than the item the script named
         for (name, value) in &server.arguments {
-            if name != CHECKED && !arguments.contains_key(name) {
+            if name != CHECKED {
                 arguments.insert(name.clone(), value.clone());
             }
         }
@@ -665,88 +761,8 @@ impl FillCheck {
             return self.source_away(field, item);
         }
 
-        let logins = self.onepassword.saved_logins().await.map_err(|error| {
-            FillError::Failed(format!("could not list the logins in 1Password: {error}"))
-        })?;
-        // every page around the field is on one of the item's sites, so a
-        // site's sign-in frame inside another site's page finds nothing
-        let saved_for_page = |login: &SavedLogin| {
-            let sites = sites_of(login);
-            hosts
-                .iter()
-                .all(|host| sites.contains(&site_of(host)))
-                .then_some(sites)
-        };
-        let site = sites_named(hosts);
-        let (login, sites, warning) = match item {
-            Some(text) => {
-                let (vault, title) = item_ref(text)?;
-                let login = match named(&logins, vault, title).as_slice() {
-                    [login] => *login,
-                    [] => {
-                        return Err(FillError::Refused(format!(
-                            "1Password on this Mac has no Login item {}",
-                            prompt::one_line(text, 80)
-                        )));
-                    }
-                    several => {
-                        let names: Vec<String> = several
-                            .iter()
-                            .map(|login| item_text(login, &logins))
-                            .collect();
-                        return Err(FillError::Refused(format!(
-                            "several Login items match {}; pass one by its ID: {}",
-                            prompt::one_line(text, 80),
-                            names.join(", ")
-                        )));
-                    }
-                };
-                match saved_for_page(login) {
-                    Some(sites) => (login, Sites::Domains(sites), None),
-                    // the owner's call, so the prompt says so
-                    None => (
-                        login,
-                        Sites::Any,
-                        Some(format!("this item is NOT saved for {site}")),
-                    ),
-                }
-            }
-            None => {
-                let matched: Vec<(&SavedLogin, Vec<String>)> = logins
-                    .iter()
-                    .filter_map(|login| saved_for_page(login).map(|sites| (login, sites)))
-                    .collect();
-                match matched.as_slice() {
-                    [(login, sites)] => (*login, Sites::Domains(sites.clone()), None),
-                    [] => {
-                        return Err(FillError::Refused(format!(
-                            "no 1Password login is saved for {site}; pass the one to use as \
-                             `item` (op://vault/item), and the user will be warned that it is \
-                             not saved for this site"
-                        )));
-                    }
-                    several => {
-                        let among: Vec<&SavedLogin> =
-                            several.iter().map(|(login, _)| *login).collect();
-                        let mut names: Vec<String> = among
-                            .iter()
-                            .take(MAX_NAMED_LOGINS)
-                            .map(|login| item_text(login, &logins))
-                            .collect();
-                        if among.len() > MAX_NAMED_LOGINS {
-                            names.push(format!("{} more", among.len() - MAX_NAMED_LOGINS));
-                        }
-                        return Err(FillError::Refused(format!(
-                            "{} 1Password logins are saved for {site}; pass the one to use as \
-                             `item`: {}",
-                            among.len(),
-                            names.join(", ")
-                        )));
-                    }
-                }
-            }
-        };
-
+        let (login, sites, warning) = find_login(&self.onepassword, item, hosts).await?;
+        let login = &login;
         let name = item_name(login);
         let reference = self
             .onepassword
@@ -822,7 +838,7 @@ impl FillCheck {
 
 /// Whether `value` is a one-time code itself, as the owner enters one on
 /// the phone, rather than the seed 1Password holds
-fn is_code(value: &str) -> bool {
+pub fn is_code(value: &str) -> bool {
     (6..=8).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
@@ -913,6 +929,7 @@ impl LoginsServer {
             keep: None,
             phones_only: true,
             keep_scope: None,
+            sign_in: None,
         };
 
         match self.0.onepassword.read_for_program(&ask).await {
@@ -1135,6 +1152,7 @@ mod tests {
             vault_id: format!("{}id", vault.to_lowercase().replace('/', "")),
             vault: vault.to_owned(),
             hosts: Vec::new(),
+            account: None,
         };
         let logins = [
             login("a1", "GitLab", "Personal"),

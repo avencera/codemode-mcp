@@ -1103,6 +1103,7 @@ dependencies = [
  "companion-wire",
  "core-foundation",
  "futures-executor",
+ "futures-util",
  "hex",
  "hmac 0.13.0",
  "http",
@@ -1138,6 +1139,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
  "toml_edit",
@@ -1148,6 +1150,7 @@ dependencies = [
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "zeroize",
 ]
 
 [[package]]
@@ -1226,6 +1229,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
@@ -1240,6 +1244,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]

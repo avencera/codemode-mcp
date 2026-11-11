@@ -1,6 +1,7 @@
 import CompanionCore
 import Foundation
 import Observation
+import UIKit
 
 /// The UI's copy of the core's state, kept current by the core's updates
 @Observable
@@ -8,6 +9,10 @@ final class AppManager: Reconciler, @unchecked Sendable {
     static let shared = AppManager()
 
     private(set) var state: AppState
+
+    /// The newest image of the taken-over page, decoded; the core's state
+    /// never holds images
+    private(set) var screen: TakeoverScreen?
 
     @ObservationIgnored private let rust: FfiApp
 
@@ -33,14 +38,55 @@ final class AppManager: Reconciler, @unchecked Sendable {
         rust.answerProgram(id: id, entered: entered)
     }
 
-    /// The read the request screen shows: the first one still waiting on
-    /// the owner, else the newest finished one until it is dismissed
-    var shownRead: PendingRead? {
-        state.reads.first { !$0.status.isFinished } ?? state.reads.last
+    /// Sends what the owner did on the takeover
+    func takeover(_ input: TakeoverInput) {
+        rust.takeover(input: input)
+    }
+
+    /// Types `text` into the taken-over page's focused element
+    func takeoverText(_ text: String) {
+        rust.takeoverText(text: text)
+    }
+
+    /// Fills `value` into the taken-over page's focused `field`
+    func takeoverFill(field: LoginField, value: String, submit: Bool) {
+        rust.takeoverFill(field: field, value: value, submit: submit)
+    }
+
+    /// What the app shows: the takeover while one is open, then a read still
+    /// waiting, a handoff still waiting, and the newest finished read or
+    /// handoff until it is dismissed
+    var shown: Shown {
+        if let takeover = state.takeover { return .takeover(takeover) }
+        if let read = state.reads.first(where: { !$0.status.isFinished }) { return .read(read) }
+        if let handoff = state.handoffs.first(where: { !$0.status.isFinished }) { return .handoff(handoff) }
+        if let read = state.reads.last { return .read(read) }
+        if let handoff = state.handoffs.last { return .handoff(handoff) }
+        return .gateway
     }
 
     func reconcile(update: Update) {
+        // decoded here, off the main thread, so a large image never holds
+        // the UI
+        if case let .screen(image) = update {
+            guard let decoded = UIImage(data: image.jpeg)?.preparingForDisplay() else { return }
+            let screen = TakeoverScreen(seq: image.seq, image: decoded)
+            DispatchQueue.main.async { [weak self] in self?.show(screen) }
+            return
+        }
         DispatchQueue.main.async { [weak self] in self?.apply(update) }
+    }
+
+    /// Shows a new image, then tells the core it is drawn once SwiftUI has
+    /// had its turn, so the gateway sends the next no faster than this
+    /// phone shows them
+    @MainActor
+    private func show(_ screen: TakeoverScreen) {
+        guard state.takeover != nil else { return }
+        self.screen = screen
+        DispatchQueue.main.async { [weak self] in
+            self?.rust.takeover(input: .drawn(seq: screen.seq))
+        }
     }
 
     @MainActor
@@ -54,6 +100,48 @@ final class AppManager: Reconciler, @unchecked Sendable {
             state.reads = reads
         case let .pairing(pairing):
             state.pairing = pairing
+        case let .handoffs(handoffs):
+            state.handoffs = handoffs
+        case let .takeover(takeover):
+            // a new takeover, or none, starts without the last one's image
+            if takeover?.session != state.takeover?.session || takeover?.handoff != state.takeover?.handoff {
+                screen = nil
+            }
+            state.takeover = takeover
+        case .screen:
+            break
+        }
+    }
+}
+
+/// One decoded image of the taken-over page
+struct TakeoverScreen {
+    /// The image's number, which taps and scrolls name
+    let seq: UInt32
+    let image: UIImage
+}
+
+/// What the app shows, in order of what needs the owner most
+enum Shown {
+    case takeover(TakeoverState)
+    case read(PendingRead)
+    case handoff(PendingHandoff)
+    case gateway
+}
+
+extension HandoffStatus {
+    var isFinished: Bool {
+        self != .waiting
+    }
+}
+
+extension LoginField {
+    /// The field as prompts name it
+    var label: String {
+        switch self {
+        case .username: "Username"
+        case .password: "Password"
+        case .code: "One-time code"
         }
     }
 }

@@ -17,6 +17,7 @@ mod pair;
 mod phone;
 mod program;
 mod server;
+mod takeover;
 mod trust;
 
 /// The wire types, shared with the phone's core
@@ -32,9 +33,11 @@ pub use invite::{InviteStatus, MAX_INVITE_LIFETIME, OpenedInvite};
 pub use join::{JoinError, Joined, Joining, join};
 pub use pair::{PairError, Paired, Pairing, companion_id, pair};
 pub use program::{
-    ProgramAsk, ProgramRead, ProgramReadError, ProgramTarget, ProgramValues, checked_query,
+    ProgramAsk, ProgramRead, ProgramReadError, ProgramTarget, ProgramValues, SignInAsk,
+    checked_query,
 };
 pub use server::{CompanionHandle, ServeError, serve};
+pub use takeover::{HandoffOffer, TakeoverHost, TakeoverOpen};
 pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
 };

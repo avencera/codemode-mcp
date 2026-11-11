@@ -1035,6 +1035,7 @@ async fn op_read(
             keep: request.keep_secs.map(Duration::from_secs),
             phones_only: read.phones_only,
             keep_scope: Some(spoke.id.clone()),
+            sign_in: None,
         })
         .await;
 

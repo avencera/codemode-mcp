@@ -17,7 +17,7 @@
 use std::{sync::Arc, time::Duration};
 
 use companion_wire::{
-    mobile::{PhoneProgramRead, PhoneProgramRequest, ProgramItem, RequestId},
+    mobile::{LoginField, PhoneProgramRead, PhoneProgramRequest, ProgramItem, RequestId, SignIn},
     wire::{
         MAX_DESCRIPTION_CHARS, MAX_DESTINATION_CHARS, MAX_FIND_QUERY_CHARS, MAX_KEEP_SECS,
         MAX_PROGRAM_ITEMS, MAX_REASON_CHARS,
@@ -219,6 +219,19 @@ pub struct ProgramAsk {
     /// so spokes that share a name never share kept values; `None` for
     /// this machine
     pub keep_scope: Option<String>,
+    /// Set when the values sign in to a website, so a phone names the site
+    /// and offers each field's AutoFill
+    pub sign_in: Option<SignInAsk>,
+}
+
+/// The website a program read signs in to, and the login field each target
+/// goes into, in the order of [`ProgramAsk::targets`]
+#[derive(Debug, Clone)]
+pub struct SignInAsk {
+    /// The site, account and session the phone shows
+    pub sign_in: SignIn,
+    /// One field per target
+    pub fields: Vec<LoginField>,
 }
 
 /// What every prompt of one program read shows besides the items, cleaned
@@ -227,6 +240,7 @@ struct Context {
     reason: Option<String>,
     destination: Option<String>,
     keep_secs: Option<u64>,
+    sign_in: Option<SignInAsk>,
     /// What kept values are filed under: the destination, after the keep
     /// scope when there is one
     kept_for: Option<String>,
@@ -384,6 +398,10 @@ impl OnePassword {
             reason: clean_reason(ask.reason.as_deref()),
             destination,
             keep_secs: clean_keep(ask.keep.map(|keep| keep.as_secs())),
+            sign_in: ask
+                .sign_in
+                .clone()
+                .filter(|sign_in| sign_in.fields.len() == targets.len()),
             kept_for,
         };
         let references = all_references(&targets);
@@ -561,10 +579,26 @@ impl OnePassword {
         let outcome = ProgramValues { source, values };
 
         if let Some(companions) = &companions {
-            for (target, value) in targets.iter().zip(&outcome.values) {
+            for (index, (target, value)) in targets.iter().zip(&outcome.values).enumerate() {
                 let ProgramTarget::Reference(reference) = target else {
                     continue;
                 };
+                // a code entered for a one-time password's field expires in
+                // seconds; sealed under the seed's reference it would be
+                // opened as a seed for every later sign-in. Trimmed as the
+                // fill trims it, so a pasted code with a stray space is still
+                // taken as a code
+                let code_field = context
+                    .sign_in
+                    .as_ref()
+                    .and_then(|sign_in| sign_in.fields.get(index))
+                    .is_some_and(|field| *field == LoginField::Code);
+                let entered_code = value
+                    .as_text()
+                    .is_some_and(|text| crate::logins::is_code(text.trim()));
+                if code_field && entered_code {
+                    continue;
+                }
                 // a phone hands back what it opens as text, so a file such as
                 // a `.p12` is never sealed to it; any copy a phone holds, such
                 // as text once entered for the file by mistake, is dropped
@@ -695,18 +729,27 @@ impl Companions {
         deadline: Instant,
     ) -> Result<Vec<ProgramValue>, CompanionFailure> {
         let key = phone.id.to_string();
+        let field = |index: usize| {
+            context
+                .sign_in
+                .as_ref()
+                .and_then(|sign_in| sign_in.fields.get(index).copied())
+        };
         let items: Vec<ProgramItem> = targets
             .iter()
-            .map(|target| match target {
+            .enumerate()
+            .map(|(index, target)| match target {
                 ProgramTarget::Reference(reference) => ProgramItem::Reference {
                     reference: reference.clone(),
                     sealed: self
                         .store
                         .as_ref()
                         .and_then(|store| store.seal(&key, reference).ok().flatten()),
+                    field: field(index),
                 },
                 ProgramTarget::Describe(description) => ProgramItem::Describe {
                     description: description.clone(),
+                    field: field(index),
                 },
             })
             .collect();
@@ -718,6 +761,10 @@ impl Companions {
                 reason: context.reason.clone(),
                 destination: context.destination.clone(),
                 keep_secs: context.keep_secs,
+                sign_in: context
+                    .sign_in
+                    .as_ref()
+                    .map(|sign_in| sign_in.sign_in.clone()),
                 expires_in_ms,
             };
             let mut request = serde_json::to_vec(&PhoneProgramRequest {
@@ -754,7 +801,11 @@ impl Companions {
         };
         let summary = summary(targets, context);
 
-        let asked = self.ask_until(phone, &id, Subject::Program(summary), deadline, encode);
+        let subject = match &context.sign_in {
+            Some(sign_in) => Subject::SignIn(sign_in.sign_in.title()),
+            None => Subject::Program(summary),
+        };
+        let asked = self.ask_until::<CompanionResponse>(phone, &id, subject, deadline, encode);
         let answer = tokio::time::timeout_at(deadline, asked)
             .await
             .unwrap_or_else(|_| {

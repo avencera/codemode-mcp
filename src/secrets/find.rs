@@ -58,6 +58,9 @@ struct Listed {
     vault: Named,
     #[serde(default)]
     urls: Vec<ListedUrl>,
+    /// What 1Password lists under the title; a Login's username
+    #[serde(default)]
+    additional_information: Option<String>,
 }
 
 /// One website an item is saved for
@@ -131,6 +134,8 @@ pub struct SavedLogin {
     pub vault: String,
     /// Lowercase hosts of its saved websites, such as `github.com`
     pub hosts: Vec<String>,
+    /// The username 1Password lists for it, such as `praveenperera`
+    pub account: Option<String>,
 }
 
 /// Which field of a Login item to read
@@ -172,6 +177,10 @@ impl OnePassword {
                 title: item.title,
                 vault_id: item.vault.id,
                 vault: item.vault.name,
+                account: item
+                    .additional_information
+                    .map(|account| account.trim().to_owned())
+                    .filter(|account| !account.is_empty()),
             })
             .collect())
     }
@@ -184,6 +193,18 @@ impl OnePassword {
         login: &SavedLogin,
         part: LoginPart,
     ) -> Result<Option<String>, FindError> {
+        let [reference] = self.login_references(login, [part]).await?;
+
+        Ok(reference)
+    }
+
+    /// The references of `login`'s `parts`, in order, from one read of the
+    /// item, by IDs as [`OnePassword::login_reference`] builds them
+    pub async fn login_references<const N: usize>(
+        &self,
+        login: &SavedLogin,
+        parts: [LoginPart; N],
+    ) -> Result<[Option<String>; N], FindError> {
         let vault = first_set(&login.vault_id, &login.vault);
         let json = self
             .op(
@@ -198,16 +219,18 @@ impl OnePassword {
             reason: "the answer was not a JSON item".to_owned(),
         })?;
 
-        Ok(login_field(&opened, part).map(|(section, field)| {
-            let mut reference = format!("op://{vault}/{}", login.id);
-            if let Some(section) = section {
+        Ok(parts.map(|part| {
+            login_field(&opened, part).map(|(section, field)| {
+                let mut reference = format!("op://{vault}/{}", login.id);
+                if let Some(section) = section {
+                    reference.push('/');
+                    reference.push_str(section);
+                }
                 reference.push('/');
-                reference.push_str(section);
-            }
-            reference.push('/');
-            reference.push_str(field);
+                reference.push_str(field);
 
-            reference
+                reference
+            })
         }))
     }
 

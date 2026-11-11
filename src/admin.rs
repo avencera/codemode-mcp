@@ -1356,6 +1356,7 @@ async fn op_read(
             keep: request.keep_secs.map(std::time::Duration::from_secs),
             phones_only: false,
             keep_scope: None,
+            sign_in: None,
         })
         .await;
 

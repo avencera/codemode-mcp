@@ -10,7 +10,11 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use companion_wire::wire::ProgramValue;
+use companion_wire::{
+    mobile::LoginField as WireLoginField,
+    takeover::{PhoneMessage, Secret as WireSecret},
+    wire::ProgramValue,
+};
 use ractor::{Actor, ActorRef};
 
 use crate::{
@@ -31,6 +35,12 @@ pub struct AppState {
     pub reads: Vec<PendingRead>,
     /// Where a pairing stands
     pub pairing: PairingState,
+    /// Handoffs asked of this phone, newest last, including finished ones
+    /// until they are dismissed
+    pub handoffs: Vec<PendingHandoff>,
+    /// The browser session the owner has taken over, if any; its images
+    /// arrive as [`Update::Screen`] and are not kept here
+    pub takeover: Option<TakeoverState>,
 }
 
 /// The paired gateway
@@ -129,6 +139,55 @@ pub struct ProgramRead {
     /// The values asked for, in the order they are sent; empty while a read
     /// opened from a push has not arrived
     pub items: Vec<ProgramItem>,
+    /// Set when the values sign in to a website in the gateway's browser
+    pub sign_in: Option<SignIn>,
+}
+
+/// The website a program read signs in to, cleaned to one line like the
+/// rest of the prompt
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SignIn {
+    /// The site and account as the prompt names them, such as
+    /// `github.com · praveenperera`
+    pub title: String,
+    /// The site, such as `github.com`
+    pub site: String,
+    /// The account, when the gateway knows it
+    pub account: Option<String>,
+    /// The browser session the values go to, such as `github`
+    pub session: Option<String>,
+}
+
+/// Which login field a value goes into, so the app offers the matching
+/// AutoFill
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum LoginField {
+    /// A username or email address
+    Username,
+    /// A password
+    Password,
+    /// A one-time code
+    Code,
+}
+
+impl From<WireLoginField> for LoginField {
+    fn from(field: WireLoginField) -> Self {
+        match field {
+            WireLoginField::Username => Self::Username,
+            WireLoginField::Password => Self::Password,
+            WireLoginField::Code => Self::Code,
+        }
+    }
+}
+
+impl From<LoginField> for WireLoginField {
+    fn from(field: LoginField) -> Self {
+        match field {
+            LoginField::Username => Self::Username,
+            LoginField::Password => Self::Password,
+            LoginField::Code => Self::Code,
+        }
+    }
 }
 
 /// One value of a [`ProgramRead`]
@@ -141,12 +200,16 @@ pub enum ProgramItem {
         /// Whether the gateway sent a copy Face ID can open; without one the
         /// owner enters the value
         sealed: bool,
+        /// The login field it goes into, for a sign-in
+        field: Option<LoginField>,
     },
     /// Only the program's description of the item; the owner picks it in
     /// 1Password and enters the value
     Describe {
         /// The description
         description: String,
+        /// The login field it goes into, for a sign-in
+        field: Option<LoginField>,
     },
 }
 
@@ -186,6 +249,276 @@ impl ReadStatus {
     pub fn is_finished(&self) -> bool {
         !matches!(self, Self::Connecting | Self::Waiting | Self::Approving)
     }
+}
+
+/// A handoff the gateway asked this phone for: an agent wants the owner to
+/// do a step in a browser session, such as a passkey or a captcha
+///
+/// Every text here is cleaned to one line, as a [`ProgramRead`]'s is
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PendingHandoff {
+    /// The id the push named, which a takeover opens with
+    pub id: String,
+    /// The browser session, such as `github`
+    pub session: String,
+    /// What the agent needs done, in its own words; a claim to show quoted
+    pub reason: Option<String>,
+    /// The page the session shows, when the gateway could read it
+    pub url: Option<String>,
+    /// The gateway Mac's short name
+    pub gateway_name: String,
+    /// When the gateway gives up, in ms since the epoch on this phone's clock
+    pub expires_at_ms: i64,
+    /// Where it stands
+    pub status: HandoffStatus,
+}
+
+/// Where one handoff stands
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum HandoffStatus {
+    /// Waiting for the owner to take over or cancel
+    Waiting,
+    /// The owner cancelled it here
+    Cancelled,
+    /// The gateway gave up waiting
+    Expired,
+    /// It ended elsewhere: a takeover finished it, another phone answered,
+    /// or the agent stopped waiting
+    Over,
+}
+
+impl HandoffStatus {
+    /// Whether nothing more happens to the handoff
+    pub fn is_finished(&self) -> bool {
+        !matches!(self, Self::Waiting)
+    }
+}
+
+/// The browser session the owner has taken over
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TakeoverState {
+    /// The browser session, such as `github`
+    pub session: String,
+    /// The handoff it answers, if it was opened for one
+    pub handoff: Option<String>,
+    /// The link to the session
+    pub status: TakeoverStatus,
+    /// The page and its focused element, once the gateway has said
+    pub page: Option<TakeoverPage>,
+    /// The last thing the gateway refused or filled, until the page changes
+    pub notice: Option<TakeoverNotice>,
+}
+
+/// The link of a takeover
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum TakeoverStatus {
+    /// Waiting for the screen's size, or dialing
+    Connecting,
+    /// The page is live
+    Live,
+    /// The link dropped or a dial failed; the next starts after `in_secs`
+    Retrying {
+        /// Seconds to the next dial
+        in_secs: u32,
+        /// Why
+        error: String,
+    },
+    /// The app is in the background; it dials again in the foreground
+    Paused,
+    /// The gateway ended it
+    Ended {
+        /// Why
+        reason: TakeoverEnd,
+        /// More detail, such as why the browser could not be reached
+        message: Option<String>,
+    },
+}
+
+/// Why a takeover ended
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TakeoverEnd {
+    /// The owner tapped Done
+    Done,
+    /// The owner tapped Cancel
+    Cancelled,
+    /// Its handoff ended elsewhere: another phone answered, the agent
+    /// stopped waiting, or it expired
+    HandoffOver,
+    /// The browser session closed or could not be reached
+    BrowserGone,
+    /// The gateway is stopping
+    Shutdown,
+    /// The phone could not keep it going
+    Failed,
+}
+
+/// The page of a takeover
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TakeoverPage {
+    /// The address of the top-level page
+    pub url: String,
+    /// The page's title
+    pub title: String,
+    /// The element with keyboard focus, when it takes text
+    pub focus: Option<TakeoverFocus>,
+    /// Login values this phone can fill from sealed copies
+    pub offers: Vec<FillOffer>,
+}
+
+/// The element with keyboard focus on a taken-over page
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TakeoverFocus {
+    /// The login field it looks like, if any
+    pub field: Option<LoginField>,
+    /// Whether it takes text, so the app raises the keyboard
+    pub editable: bool,
+    /// Whether it hides its text, as a password field does
+    pub secure: bool,
+    /// Whether it asks for digits, so the app shows the number pad
+    pub numeric: bool,
+    /// Origin of the frame holding it
+    pub origin: String,
+    /// Whether that frame is on another site than the page
+    pub cross_site: bool,
+}
+
+/// A login value the gateway sent a sealed copy of for a taken-over page;
+/// [`TakeoverInput::FillOffer`] opens it with Face ID and fills it
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FillOffer {
+    /// The field it fills
+    pub field: LoginField,
+    /// The `op://` reference
+    pub reference: String,
+    /// The 1Password item
+    pub item: String,
+    /// The account, such as the login's username
+    pub account: Option<String>,
+}
+
+/// What the gateway last said about the owner's input
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum TakeoverNotice {
+    /// Something was not done; the takeover goes on
+    Refused {
+        /// Why, never holding a value
+        message: String,
+    },
+    /// A value went into this field
+    Filled {
+        /// The field
+        field: LoginField,
+    },
+}
+
+/// One image of a taken-over page
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ScreenImage {
+    /// Counts up within one link; [`TakeoverInput::Drawn`] and taps name it
+    pub seq: u32,
+    /// Width in pixels
+    pub width: u32,
+    /// Height in pixels
+    pub height: u32,
+    /// The JPEG image
+    pub jpeg: Vec<u8>,
+}
+
+impl std::fmt::Debug for ScreenImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScreenImage")
+            .field("seq", &self.seq)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("jpeg", &self.jpeg.len())
+            .finish()
+    }
+}
+
+/// A key on the takeover's key bar
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TakeoverKey {
+    /// Return
+    Enter,
+    /// Tab
+    Tab,
+    /// Shift-Tab
+    ShiftTab,
+    /// Delete the character before the caret
+    Backspace,
+    /// Escape
+    Escape,
+}
+
+/// What the owner does on a takeover, besides typing and filling (see
+/// [`FfiApp::takeover_text`] and [`FfiApp::takeover_fill`]); points are
+/// fractions of the image, from 0 at the top left to 1 at the bottom right
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum TakeoverInput {
+    /// The image area's size changed, or it first appeared; the takeover
+    /// dials once it knows it
+    Resize {
+        /// Width in points
+        width: u32,
+        /// Height in points
+        height: u32,
+        /// Pixels per point
+        scale: f64,
+    },
+    /// Image `seq` is on screen, so the gateway may send the next
+    Drawn {
+        /// The image
+        seq: u32,
+    },
+    /// A tap on image `seq`
+    Tap {
+        /// From the left
+        x: f64,
+        /// From the top
+        y: f64,
+        /// The image
+        seq: u32,
+    },
+    /// A long press on image `seq`
+    LongPress {
+        /// From the left
+        x: f64,
+        /// From the top
+        y: f64,
+        /// The image
+        seq: u32,
+    },
+    /// Scroll the page under the point by `dx` and `dy`, as fractions of
+    /// the image; positive scrolls right and down
+    Scroll {
+        /// From the left
+        x: f64,
+        /// From the top
+        y: f64,
+        /// Horizontal distance
+        dx: f64,
+        /// Vertical distance
+        dy: f64,
+        /// The image
+        seq: u32,
+    },
+    /// A key from the key bar
+    Key {
+        /// Which
+        key: TakeoverKey,
+    },
+    /// Back in the session's history
+    Back,
+    /// Open the offer for `reference` with Face ID and fill it
+    FillOffer {
+        /// The offer's reference
+        reference: String,
+    },
+    /// The owner finished: ends the takeover and its handoff as done
+    Done,
+    /// The owner gave up: ends the takeover and its handoff as cancelled
+    Cancel,
 }
 
 /// Where a pairing stands
@@ -274,6 +607,23 @@ pub enum AppAction {
         /// push says
         expires_at_ms: Option<i64>,
     },
+    /// Refuse the handoff `id`
+    CancelHandoff {
+        /// The handoff
+        id: String,
+    },
+    /// Take over browser `session`, for handoff `handoff` if set: from the
+    /// handoff's Take over, its push, or a `codemode-companion://takeover`
+    /// link. Replaces any takeover already open
+    OpenTakeover {
+        /// The browser session
+        session: String,
+        /// The handoff it answers
+        handoff: Option<String>,
+    },
+    /// Leave the takeover without ending it or its handoff, which may be
+    /// taken over again later; also closes one the gateway ended
+    CloseTakeover,
     /// APNs gave this token, or `None` when notifications are off
     PushToken {
         /// The device token as lowercase hex
@@ -294,6 +644,13 @@ pub enum Update {
     Reads(Vec<PendingRead>),
     /// The pairing moved on
     Pairing(PairingState),
+    /// The handoffs changed
+    Handoffs(Vec<PendingHandoff>),
+    /// The takeover changed, or ended with `None`
+    Takeover(Option<TakeoverState>),
+    /// A new image of the taken-over page; the app reports it drawn with
+    /// [`TakeoverInput::Drawn`]
+    Screen(ScreenImage),
 }
 
 /// Receives each [`Update`]; Swift applies it on the main actor
@@ -549,6 +906,41 @@ impl FfiApp {
             })
             .collect();
         if let Err(error) = self.actor.cast(AppMsg::AnswerProgram { id, entered }) {
+            tracing::error!(%error, "the app actor is gone");
+        }
+    }
+
+    /// Sends what the owner does on the takeover
+    pub fn takeover(&self, input: TakeoverInput) {
+        if let Err(error) = self.actor.cast(AppMsg::Takeover(input)) {
+            tracing::error!(%error, "the app actor is gone");
+        }
+    }
+
+    /// Types `text` into the taken-over page's focused element; its own
+    /// call, as [`FfiApp::answer`] is, so the text never sits in a type
+    /// that derives `Debug`
+    pub fn takeover_text(&self, text: String) {
+        let message = PhoneMessage::Text {
+            text: WireSecret::new(text),
+        };
+        if let Err(error) = self.actor.cast(AppMsg::TakeoverSend(message)) {
+            tracing::error!(%error, "the app actor is gone");
+        }
+    }
+
+    /// Fills `value`, typed or from AutoFill, into the taken-over page's
+    /// focused `field`, replacing what it holds, and presses Return after
+    /// it with `submit`
+    pub fn takeover_fill(&self, field: LoginField, value: String, submit: bool) {
+        let message = PhoneMessage::Fill {
+            field: field.into(),
+            value: WireSecret::new(value),
+            submit,
+            // typed or picked by the owner while they watch the page
+            site: None,
+        };
+        if let Err(error) = self.actor.cast(AppMsg::TakeoverSend(message)) {
             tracing::error!(%error, "the app actor is gone");
         }
     }

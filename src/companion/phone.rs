@@ -19,6 +19,7 @@ use companion_wire::{
     seal,
 };
 use iroh::{EndpointId, endpoint::Connection};
+use serde::de::DeserializeOwned;
 use tokio::{sync::watch, time::Instant};
 
 use super::{
@@ -247,7 +248,7 @@ impl Companions {
         let subject = Subject::Reference(reference.to_owned());
 
         match self
-            .ask_until(phone, &id, subject, deadline, encode)
+            .ask_until::<CompanionResponse>(phone, &id, subject, deadline, encode)
             .await?
         {
             CompanionResponse::Value(value) => Ok(value),
@@ -265,14 +266,14 @@ impl Companions {
     /// Wakes `phone` for request `id` and offers it the request `encode`
     /// makes, given the milliseconds left, on each connection it dials in
     /// with until one answers or `deadline` passes
-    pub(super) async fn ask_until(
+    pub(super) async fn ask_until<R: DeserializeOwned>(
         self: &Arc<Self>,
         phone: &PhonePeer,
         id: &RequestId,
         subject: Subject,
         deadline: Instant,
         encode: impl Fn(u64) -> Result<Vec<u8>, String>,
-    ) -> Result<CompanionResponse, CompanionFailure> {
+    ) -> Result<R, CompanionFailure> {
         let endpoint = self.endpoint().await?;
         self.start_accepting(endpoint);
         self.refresh_alpns();
@@ -501,7 +502,7 @@ fn encode_read(read: &PhoneRead) -> Result<Vec<u8>, String> {
 /// Opens a stream on `connection`, sends `request` and waits for the
 /// answer; dropping the future stops the stream, which takes the phone's
 /// prompt down
-async fn offer(connection: &Connection, request: &[u8]) -> Result<CompanionResponse, Offer> {
+async fn offer<R: DeserializeOwned>(connection: &Connection, request: &[u8]) -> Result<R, Offer> {
     let lost = |connection: &Connection, detail: String| {
         if connection.close_reason().is_some() {
             Offer::Lost

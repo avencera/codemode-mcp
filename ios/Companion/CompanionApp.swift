@@ -12,6 +12,10 @@ struct CompanionApp: App {
         WindowGroup {
             ContentView()
                 .environment(AppManager.shared)
+                .onOpenURL { url in
+                    guard let takeover = TakeoverLink(url) else { return }
+                    AppManager.shared.dispatch(.openTakeover(session: takeover.session, handoff: takeover.request))
+                }
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
             switch phase {
@@ -85,15 +89,24 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     // above clears it
     func application(_: UIApplication, didFailToRegisterForRemoteNotificationsWithError _: Error) {}
 
-    /// The owner tapped the push: show that read once the gateway sends it
+    /// The owner tapped the push: show that read once the gateway sends it,
+    /// or open a handoff's session straight away
     func userNotificationCenter(
         _: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
         let info = response.notification.request.content.userInfo
-        guard let id = info["request"] as? String,
-              let gateway = info["gateway"] as? String
-        else { return }
+        guard let id = info["request"] as? String else { return }
+
+        // the handoff's card arrives on the link behind the takeover, and the
+        // takeover's Done or Cancel answers it
+        if info["kind"] as? String == "handoff" {
+            guard let session = info["session"] as? String else { return }
+            AppManager.shared.dispatch(.openTakeover(session: session, handoff: id))
+            return
+        }
+
+        guard let gateway = info["gateway"] as? String else { return }
         // JSON numbers arrive as NSNumber; a push from an older gateway has
         // no deadline
         let expires = (info["expires"] as? NSNumber)?.int64Value
@@ -124,5 +137,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         willPresent _: UNNotification
     ) async -> UNNotificationPresentationOptions {
         []
+    }
+}
+
+/// A `codemode-companion://takeover?session=<name>&request=<id>` link, which
+/// opens that browser session's takeover, for the handoff `request` if set
+struct TakeoverLink {
+    static let scheme = "codemode-companion"
+
+    let session: String
+    let request: String?
+
+    init?(_ url: URL) {
+        guard url.scheme == Self.scheme, url.host() == "takeover",
+              let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+              let session = items.first(where: { $0.name == "session" })?.value, !session.isEmpty
+        else { return nil }
+        self.session = session
+        request = items.first(where: { $0.name == "request" })?.value
     }
 }

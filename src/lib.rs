@@ -6,6 +6,7 @@ pub mod admin;
 pub mod app;
 pub mod approvals;
 pub mod bans;
+pub mod browser;
 pub mod budget;
 pub mod catalog;
 pub mod companion;
