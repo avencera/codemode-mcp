@@ -184,6 +184,8 @@ pub enum PhoneMessage {
     },
     /// Go back in the session's history
     Back,
+    /// Load the page again
+    Reload,
     /// Text the owner typed, inserted at the caret of the focused element
     Text {
         /// The text, at most [`MAX_TEXT_CHARS`]

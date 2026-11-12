@@ -510,6 +510,8 @@ pub enum TakeoverInput {
     },
     /// Back in the session's history
     Back,
+    /// Load the page again
+    Reload,
     /// Open the offer for `reference` with Face ID and fill it
     FillOffer {
         /// The offer's reference

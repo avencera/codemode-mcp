@@ -424,6 +424,9 @@ impl Takeover<'_> {
             }
             PhoneMessage::Key { key } => self.page.press(key).await?,
             PhoneMessage::Back => self.back().await?,
+            PhoneMessage::Reload => {
+                self.page.session().call("Page.reload", json!({})).await?;
+            }
             PhoneMessage::Text { text } => {
                 let text = Zeroizing::new(text.into_inner());
                 if text.chars().count() > MAX_TEXT_CHARS {

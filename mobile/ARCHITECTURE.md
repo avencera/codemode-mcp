@@ -94,7 +94,9 @@ App (supervisor)
   (`TakeoverInput::Drawn`), so the gateway sends images no faster than the phone shows them. Taps, long presses
   and scrolls name the image they were made on and give points as fractions of it. Typed text and fills go through
   `FfiApp::takeover_text` and `FfiApp::takeover_fill`, apart from `TakeoverInput`, as `companion_wire::takeover::
-  Secret`, which never shows in `Debug`; text longer than the wire's limit goes in pieces. Fill from an offer
+  Secret`, which never shows in `Debug`; text longer than the wire's limit goes in pieces. A long press in a
+  focused text field offers Paste, which sends the clipboard as text; a whole value AutoFill sets is a fill of the
+  field the keyboard was set up for, not of the page's focus as last heard, which may lag. Fill from an offer
   opens its sealed copy with `Platform::open_sealed`, the seal's `info` binding the gateway and the offer's
   reference, and sends the value as `Fill`. A link that drops while the app is in the foreground is dialed again
   with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while

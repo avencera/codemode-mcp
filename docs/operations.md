@@ -789,9 +789,11 @@ the session live in the Companion app:
   when you finish. You see it as live images, each sent only after the last was drawn.
 - The Mac's display is turned on and kept on while you have the page, since the browser draws nothing while
   the display sleeps; it may sleep again once you finish.
-- Tap to click, drag to scroll, long-press for a right click, and pinch to zoom the picture on the phone. A
-  focused text field brings up the keyboard, with AutoFill for usernames, passwords and one-time codes; the key
-  bar adds Enter, Tab, Shift-Tab, Backspace, Esc and Back.
+- Tap to click, drag to scroll, long-press for a right click, and pinch to zoom the picture on the phone. In a
+  focused text field, long-press offers Paste, which types what is on the phone's clipboard. A focused text
+  field brings up the keyboard, with AutoFill for usernames, passwords and one-time codes; a value AutoFill gives
+  goes only into the kind of field it was offered for, so if the page's focus moved on meanwhile it is refused
+  and you pick it again. The key bar adds the page's Back and Reload, Esc, Tab, Shift-Tab, Backspace and Enter.
 - **Fill from 1Password** fills the focused field from a copy sealed to the phone, after Face ID, checked as an
   agent's fill is, and only while the page is still on the site the copy is saved for; if the page moved while
   Face ID was up, nothing is filled.

@@ -46,6 +46,10 @@ struct TakeoverView: View {
                     TakeoverSurface(
                         onTap: { tap($0) },
                         onLongPress: { longPress($0) },
+                        // in a text field a long press offers Paste, as it
+                        // would on the phone, instead of a right click
+                        pastes: { takeover.page?.focus?.editable == true },
+                        onPaste: { manager.takeoverText($0) },
                         onScroll: { scroll(at: $0, by: $1) },
                         onZoom: { zoom(by: $0, moving: $1) }
                     )
@@ -199,7 +203,8 @@ struct TakeoverView: View {
                 .disabled(!live)
             }
             HStack(spacing: 6) {
-                keyButton("arrow.uturn.backward", "Back") { manager.takeover(.back) }
+                keyButton("chevron.backward", "Back") { manager.takeover(.back) }
+                keyButton("arrow.clockwise", "Reload") { manager.takeover(.reload) }
                 keyButton("escape", "Escape") { manager.takeover(.key(key: .escape)) }
                 keyButton("arrow.left.to.line", "Shift-Tab") { manager.takeover(.key(key: .shiftTab)) }
                 keyButton("arrow.right.to.line", "Tab") { manager.takeover(.key(key: .tab)) }
@@ -354,6 +359,10 @@ struct TakeoverView: View {
 struct TakeoverSurface: UIViewRepresentable {
     let onTap: (CGPoint) -> Void
     let onLongPress: (CGPoint) -> Void
+    /// Whether a long press offers Paste rather than pressing the page
+    let pastes: () -> Bool
+    /// Text from the clipboard, for the page's focused field
+    let onPaste: (String) -> Void
     /// Where the drag started, and how far it moved since the last call
     let onScroll: (CGPoint, CGSize) -> Void
     /// How much the pinch scaled and the two fingers moved since the last
@@ -381,6 +390,9 @@ struct TakeoverSurface: UIViewRepresentable {
             view.addGestureRecognizer(recognizer)
         }
         coordinator.zooming = [pinch, twoFingers]
+        let menu = UIEditMenuInteraction(delegate: coordinator)
+        view.addInteraction(menu)
+        coordinator.menu = menu
 
         return view
     }
@@ -389,9 +401,10 @@ struct TakeoverSurface: UIViewRepresentable {
         context.coordinator.parent = self
     }
 
-    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
         var parent: TakeoverSurface
         var zooming: [UIGestureRecognizer] = []
+        var menu: UIEditMenuInteraction?
         /// Where the current drag started
         private var start: CGPoint = .zero
         /// Drag not yet sent; drags go at most this often, so a fast swipe
@@ -410,7 +423,25 @@ struct TakeoverSurface: UIViewRepresentable {
 
         @objc func pressed(_ recognizer: UILongPressGestureRecognizer) {
             guard recognizer.state == .began else { return }
-            parent.onLongPress(recognizer.location(in: recognizer.view))
+            let point = recognizer.location(in: recognizer.view)
+            if parent.pastes(), let menu {
+                menu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+                return
+            }
+            parent.onLongPress(point)
+        }
+
+        func editMenuInteraction(
+            _: UIEditMenuInteraction,
+            menuFor _: UIEditMenuConfiguration,
+            suggestedActions _: [UIMenuElement]
+        ) -> UIMenu? {
+            let paste = UIAction(title: "Paste", image: UIImage(systemName: "doc.on.clipboard")) { [weak self] _ in
+                // read only when chosen, so iOS asks to allow it then
+                guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+                self?.parent.onPaste(text)
+            }
+            return UIMenu(children: [paste])
         }
 
         @objc func dragged(_ recognizer: UIPanGestureRecognizer) {
@@ -461,7 +492,8 @@ struct TakeoverSurface: UIViewRepresentable {
 /// An invisible text field that raises the keyboard for the page's focused
 /// element and sends what is typed at once, keeping none of it: each
 /// character goes as text, a whole value AutoFill puts in at once as a fill
-/// of the focused login field, and delete and return as keys
+/// of the login field the keyboard was set up for, and delete and return as
+/// keys
 struct KeyCatcher: UIViewRepresentable {
     let focus: TakeoverFocus?
     let active: Bool
@@ -525,13 +557,13 @@ struct KeyCatcher: UIViewRepresentable {
         }
 
         func textField(
-            _: UITextField,
+            _ field: UITextField,
             shouldChangeCharactersIn _: NSRange,
             replacementString string: String
         ) -> Bool {
             // the field is always empty, so deleting comes through
             // `deleteBackward` and return through `textFieldShouldReturn`
-            if !string.isEmpty, string != "\n" { send(string) }
+            if !string.isEmpty, string != "\n" { send(string, from: field) }
             return false
         }
 
@@ -544,14 +576,28 @@ struct KeyCatcher: UIViewRepresentable {
         @objc func changed(_ field: UITextField) {
             guard let text = field.text, !text.isEmpty else { return }
             field.text = ""
-            send(text)
+            send(text, from: field)
         }
 
-        private func send(_ text: String) {
-            if text.count > 1, let field = parent.focus?.field {
-                parent.onFill(field, text)
+        /// A whole value goes as a fill of the field the keyboard was set up
+        /// for, which is what AutoFill picked it for. The page's focus can
+        /// have moved on before the phone hears of it, and labelled by that
+        /// a username could go into a password field; labelled this way,
+        /// the gateway refuses it unless that field is still focused
+        private func send(_ text: String, from field: UITextField) {
+            if text.count > 1, let login = Self.login(field.textContentType) {
+                parent.onFill(login, text)
             } else {
                 parent.onText(text)
+            }
+        }
+
+        private static func login(_ contentType: UITextContentType?) -> LoginField? {
+            switch contentType {
+            case .username?: .username
+            case .password?: .password
+            case .oneTimeCode?: .code
+            default: nil
             }
         }
     }

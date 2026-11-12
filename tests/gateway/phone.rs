@@ -2026,6 +2026,14 @@ async fn a_handoff_is_taken_over_on_the_phone_and_ends_when_the_owner_is_done() 
         .await?;
     assert!(refused.contains("chosen for gitlab.com"), "{refused}");
     assert_eq!(cdp.typed(), "");
+    takeover.send(&PhoneMessage::Reload).await?;
+    eventually(|| {
+        cdp.log()
+            .iter()
+            .any(|line| line == "Page.reload")
+            .then_some(())
+    })
+    .await?;
 
     takeover.send(&PhoneMessage::Done).await?;
     let ended = takeover
