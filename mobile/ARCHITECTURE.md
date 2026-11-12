@@ -105,6 +105,11 @@ App (supervisor)
   the link is down goes right after the next `Open`. `Ended` stops the actor: Done and Cancel close the screen and
   remove their handoff's card, any other reason stays on screen until the owner closes it. Leaving
   (`CloseTakeover`) hangs up without ending anything, so the handoff can be taken over again.
+- **Sessions** are listed on a takeover link of their own: `RefreshSessions` dials `TAKEOVER_ALPN` in a spawned
+  task, sends `PhoneMessage::Sessions` and reads the one answer into `AppState.sessions` (running sessions
+  and saved profiles), which keeps the last listing while the next loads. `StartSession` opens a takeover whose
+  `Open` carries `start`, the `https` address the gateway starts the session at; the takeover actor drops it
+  once a link gets through, so a redial takes the session over as it is.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
 second, a failed request marks its read failed, and a failed takeover shows as ended. A connection actor that cannot start, say because its endpoint

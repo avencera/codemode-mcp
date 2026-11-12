@@ -53,6 +53,18 @@ struct HandoffView: View {
         }
         .navigationTitle("Browser handoff")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                // puts the card aside for the session list, which still
+                // lists this handoff
+                Button {
+                    manager.browse()
+                } label: {
+                    Label("Sessions", systemImage: "chevron.backward")
+                        .labelStyle(.titleAndIcon)
+                }
+            }
+        }
     }
 
     @ViewBuilder

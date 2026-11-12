@@ -2,10 +2,12 @@
 //! a browser session of the gateway Mac, on [`TAKEOVER_ALPN`]
 //!
 //! The phone dials one connection per takeover and opens one bidirectional
-//! stream on it. Its first message is [`PhoneMessage::Open`]; from then on
-//! the gateway sends the live page as [`Screen`] images and what changed on
-//! it as [`GatewayMessage`]s, and the phone sends the owner's taps, scrolls,
-//! keys and text. The gateway sends the next image only once the phone has
+//! stream on it. Its first message is [`PhoneMessage::Open`], or
+//! [`PhoneMessage::Sessions`] to list the browser sessions instead, which the
+//! gateway answers with [`GatewayMessage::Sessions`] before closing the
+//! stream. After an Open the gateway sends the live page as [`Screen`]
+//! images and what changed on it as [`GatewayMessage`]s, and the phone sends
+//! the owner's taps, scrolls, keys and text. The gateway sends the next image only once the phone has
 //! acknowledged the last, so a slow link gets fewer images rather than a
 //! growing queue
 //!
@@ -140,7 +142,16 @@ pub enum PhoneMessage {
         handoff: Option<RequestId>,
         /// The phone's screen area for the page
         viewport: Viewport,
+        /// An `https` address to start the session at, from the phone's New
+        /// session: the gateway launches the session with its saved profile
+        /// when it is not running, or loads the address in it when it is.
+        /// Sent only with the first Open, so a redial keeps the page
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<String>,
     },
+    /// Instead of an Open: list the browser sessions, answered with
+    /// [`GatewayMessage::Sessions`]
+    Sessions,
     /// The phone drew the image `seq`, so the gateway may send the next
     Ack {
         /// The image's [`ScreenHeader::seq`]
@@ -272,6 +283,19 @@ pub struct FillOffer {
     pub site: String,
 }
 
+/// A browser session that is running on the gateway Mac
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningSession {
+    /// The session's name, such as `github`
+    pub name: String,
+    /// The address of its active tab, when it could be read
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The title of its active tab, when it could be read
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// What the gateway sends on a takeover besides the images
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -301,6 +325,15 @@ pub enum GatewayMessage {
     Refused {
         /// Why, never holding a value
         message: String,
+    },
+    /// The answer to [`PhoneMessage::Sessions`]; the gateway closes the
+    /// stream next
+    Sessions {
+        /// The sessions running now, by name
+        running: Vec<RunningSession>,
+        /// The saved profiles of sessions not running, by name, which a
+        /// [`PhoneMessage::Open`] with `start` launches signed in as before
+        saved: Vec<String>,
     },
     /// The takeover is over, and the gateway closes the stream next
     Ended {

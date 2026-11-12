@@ -15,11 +15,11 @@ use async_trait::async_trait;
 use companion_wire::{
     mobile::{HandoffAnswer, PhoneHandoff, PhoneHandoffRequest, RequestId, Sealed},
     takeover::{
-        GatewayFrame, HEADER_BYTES, PhoneMessage, Viewport, decode_phone, encode_message,
-        encode_screen, read_header,
+        EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, RunningSession,
+        Viewport, decode_phone, encode_message, encode_screen, read_header,
     },
 };
-use iroh::endpoint::{Connection, RecvStream};
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::{sync::mpsc, task::JoinSet, time::Instant};
 use zeroize::Zeroizing;
 
@@ -45,6 +45,17 @@ pub struct TakeoverOpen {
     pub handoff: Option<RequestId>,
     /// Its screen area for the page
     pub viewport: Viewport,
+    /// The `https` address to start the session at, unchecked
+    pub start: Option<String>,
+}
+
+/// The browser sessions a phone may take over or start
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionList {
+    /// The sessions running now
+    pub running: Vec<RunningSession>,
+    /// The saved profiles of sessions not running
+    pub saved: Vec<String>,
 }
 
 /// Runs the takeovers phones open
@@ -59,6 +70,9 @@ pub trait TakeoverHost: Send + Sync {
         input: mpsc::Receiver<PhoneMessage>,
         output: mpsc::Sender<GatewayFrame>,
     );
+
+    /// The browser sessions, for a phone's list
+    async fn sessions(&self) -> Result<SessionList, String>;
 }
 
 /// What a handoff offered to the phones shows
@@ -91,6 +105,28 @@ async fn read_frame(receive: &mut RecvStream) -> Result<(u8, Zeroizing<Vec<u8>>)
         .map_err(|error| error.to_string())?;
 
     Ok((kind, body))
+}
+
+/// Answers a phone's [`PhoneMessage::Sessions`] with the list, or with
+/// [`GatewayMessage::Ended`] saying why there is none
+async fn answer_sessions(host: &dyn TakeoverHost, send: &mut SendStream) {
+    let message = match host.sessions().await {
+        Ok(list) => GatewayMessage::Sessions {
+            running: list.running,
+            saved: list.saved,
+        },
+        Err(message) => GatewayMessage::Ended {
+            reason: EndReason::BrowserGone,
+            message: Some(message),
+        },
+    };
+    let Ok(bytes) = encode_message(&message) else {
+        return;
+    };
+    if send.write_all(&bytes).await.is_ok() {
+        let _ = send.finish();
+        let _ = tokio::time::timeout(OPEN_WINDOW, send.stopped()).await;
+    }
 }
 
 impl Companions {
@@ -144,11 +180,19 @@ impl Companions {
                     session,
                     handoff,
                     viewport,
+                    start,
                 }) => TakeoverOpen {
                     session,
                     handoff,
                     viewport,
+                    start,
                 },
+                Ok(PhoneMessage::Sessions) => {
+                    answer_sessions(host.as_ref(), &mut send).await;
+                    connection.close(0_u32.into(), b"listed");
+
+                    return;
+                }
                 _ => {
                     connection.close(1_u32.into(), b"expected open");
 

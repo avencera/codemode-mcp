@@ -937,6 +937,10 @@ public struct AppState: Equatable, Hashable {
      * arrive as [`Update::Screen`] and are not kept here
      */
     public var takeover: TakeoverState?
+    /**
+     * The gateway's browser sessions, as last listed
+     */
+    public var sessions: BrowserSessions
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -961,13 +965,17 @@ public struct AppState: Equatable, Hashable {
         /**
          * The browser session the owner has taken over, if any; its images
          * arrive as [`Update::Screen`] and are not kept here
-         */takeover: TakeoverState?) {
+         */takeover: TakeoverState?, 
+        /**
+         * The gateway's browser sessions, as last listed
+         */sessions: BrowserSessions) {
         self.gateway = gateway
         self.connection = connection
         self.reads = reads
         self.pairing = pairing
         self.handoffs = handoffs
         self.takeover = takeover
+        self.sessions = sessions
     }
 
     
@@ -991,7 +999,8 @@ public struct FfiConverterTypeAppState: FfiConverterRustBuffer {
                 reads: FfiConverterSequenceTypePendingRead.read(from: &buf), 
                 pairing: FfiConverterTypePairingState.read(from: &buf), 
                 handoffs: FfiConverterSequenceTypePendingHandoff.read(from: &buf), 
-                takeover: FfiConverterOptionTypeTakeoverState.read(from: &buf)
+                takeover: FfiConverterOptionTypeTakeoverState.read(from: &buf), 
+                sessions: FfiConverterTypeBrowserSessions.read(from: &buf)
         )
     }
 
@@ -1002,6 +1011,7 @@ public struct FfiConverterTypeAppState: FfiConverterRustBuffer {
         FfiConverterTypePairingState.write(value.pairing, into: &buf)
         FfiConverterSequenceTypePendingHandoff.write(value.handoffs, into: &buf)
         FfiConverterOptionTypeTakeoverState.write(value.takeover, into: &buf)
+        FfiConverterTypeBrowserSessions.write(value.sessions, into: &buf)
     }
 }
 
@@ -1018,6 +1028,166 @@ public func FfiConverterTypeAppState_lift(_ buf: RustBuffer) throws -> AppState 
 #endif
 public func FfiConverterTypeAppState_lower(_ value: AppState) -> RustBuffer {
     return FfiConverterTypeAppState.lower(value)
+}
+
+
+/**
+ * A browser session running on the gateway Mac
+ */
+public struct BrowserSession: Equatable, Hashable {
+    /**
+     * Its name, such as `github`
+     */
+    public var name: String
+    /**
+     * The address of its active tab, when the gateway could read it
+     */
+    public var url: String?
+    /**
+     * The title of its active tab, when the gateway could read it
+     */
+    public var title: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Its name, such as `github`
+         */name: String, 
+        /**
+         * The address of its active tab, when the gateway could read it
+         */url: String?, 
+        /**
+         * The title of its active tab, when the gateway could read it
+         */title: String?) {
+        self.name = name
+        self.url = url
+        self.title = title
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BrowserSession: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBrowserSession: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BrowserSession {
+        return
+            try BrowserSession(
+                name: FfiConverterString.read(from: &buf), 
+                url: FfiConverterOptionString.read(from: &buf), 
+                title: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BrowserSession, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.url, into: &buf)
+        FfiConverterOptionString.write(value.title, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBrowserSession_lift(_ buf: RustBuffer) throws -> BrowserSession {
+    return try FfiConverterTypeBrowserSession.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBrowserSession_lower(_ value: BrowserSession) -> RustBuffer {
+    return FfiConverterTypeBrowserSession.lower(value)
+}
+
+
+/**
+ * The gateway's browser sessions, which the owner takes over or starts
+ */
+public struct BrowserSessions: Equatable, Hashable {
+    /**
+     * Where the listing stands
+     */
+    public var status: SessionsStatus
+    /**
+     * The sessions running, by name, from the last listing
+     */
+    public var running: [BrowserSession]
+    /**
+     * The sessions with a saved profile that are not running, by name,
+     * which [`AppAction::StartSession`] launches signed in as before
+     */
+    public var saved: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Where the listing stands
+         */status: SessionsStatus, 
+        /**
+         * The sessions running, by name, from the last listing
+         */running: [BrowserSession], 
+        /**
+         * The sessions with a saved profile that are not running, by name,
+         * which [`AppAction::StartSession`] launches signed in as before
+         */saved: [String]) {
+        self.status = status
+        self.running = running
+        self.saved = saved
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BrowserSessions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBrowserSessions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BrowserSessions {
+        return
+            try BrowserSessions(
+                status: FfiConverterTypeSessionsStatus.read(from: &buf), 
+                running: FfiConverterSequenceTypeBrowserSession.read(from: &buf), 
+                saved: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BrowserSessions, into buf: inout [UInt8]) {
+        FfiConverterTypeSessionsStatus.write(value.status, into: &buf)
+        FfiConverterSequenceTypeBrowserSession.write(value.running, into: &buf)
+        FfiConverterSequenceString.write(value.saved, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBrowserSessions_lift(_ buf: RustBuffer) throws -> BrowserSessions {
+    return try FfiConverterTypeBrowserSessions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBrowserSessions_lower(_ value: BrowserSessions) -> RustBuffer {
+    return FfiConverterTypeBrowserSessions.lower(value)
 }
 
 
@@ -2439,10 +2609,28 @@ public enum AppAction: Equatable, Hashable {
          */handoff: String?
     )
     /**
+     * Start browser `session` at `url`, an `https` address, and take it
+     * over: the gateway launches the session with its saved profile when it
+     * is not running, or loads `url` in it when it is. Replaces any
+     * takeover already open
+     */
+    case startSession(
+        /**
+         * The browser session, new or saved
+         */session: String, 
+        /**
+         * Where to start it
+         */url: String
+    )
+    /**
      * Leave the takeover without ending it or its handoff, which may be
      * taken over again later; also closes one the gateway ended
      */
     case closeTakeover
+    /**
+     * Ask the gateway for its browser sessions
+     */
+    case refreshSessions
     /**
      * APNs gave this token, or `None` when notifications are off
      */
@@ -2505,9 +2693,14 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 11: return .openTakeover(session: try FfiConverterString.read(from: &buf), handoff: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 12: return .closeTakeover
+        case 12: return .startSession(session: try FfiConverterString.read(from: &buf), url: try FfiConverterString.read(from: &buf)
+        )
         
-        case 13: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
+        case 13: return .closeTakeover
+        
+        case 14: return .refreshSessions
+        
+        case 15: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2577,12 +2770,22 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterOptionString.write(handoff, into: &buf)
             
         
-        case .closeTakeover:
+        case let .startSession(session,url):
             writeInt(&buf, Int32(12))
+            FfiConverterString.write(session, into: &buf)
+            FfiConverterString.write(url, into: &buf)
+            
+        
+        case .closeTakeover:
+            writeInt(&buf, Int32(13))
+        
+        
+        case .refreshSessions:
+            writeInt(&buf, Int32(14))
         
         
         case let .pushToken(token,environment):
-            writeInt(&buf, Int32(13))
+            writeInt(&buf, Int32(15))
             FfiConverterOptionString.write(token, into: &buf)
             FfiConverterTypePushEnvironment.write(environment, into: &buf)
             
@@ -3598,6 +3801,107 @@ public func FfiConverterTypeReadStatus_lower(_ value: ReadStatus) -> RustBuffer 
 
 
 /**
+ * Where a listing of the browser sessions stands
+ */
+
+public enum SessionsStatus: Equatable, Hashable {
+    
+    /**
+     * Never listed
+     */
+    case idle
+    /**
+     * Asking the gateway; the last listing still shows
+     */
+    case loading
+    /**
+     * Listed
+     */
+    case listed
+    /**
+     * The gateway could not be asked or could not list them
+     */
+    case failed(
+        /**
+         * Why, one line
+         */message: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SessionsStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionsStatus: FfiConverterRustBuffer {
+    typealias SwiftType = SessionsStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionsStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .idle
+        
+        case 2: return .loading
+        
+        case 3: return .listed
+        
+        case 4: return .failed(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SessionsStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .idle:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .loading:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .listed:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .failed(message):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionsStatus_lift(_ buf: RustBuffer) throws -> SessionsStatus {
+    return try FfiConverterTypeSessionsStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionsStatus_lower(_ value: SessionsStatus) -> RustBuffer {
+    return FfiConverterTypeSessionsStatus.lower(value)
+}
+
+
+
+/**
  * Why a takeover ended
  */
 
@@ -4318,6 +4622,11 @@ public enum Update: Equatable, Hashable {
     case takeover(TakeoverState?
     )
     /**
+     * The browser sessions changed
+     */
+    case sessions(BrowserSessions
+    )
+    /**
      * A new image of the taken-over page; the app reports it drawn with
      * [`TakeoverInput::Drawn`]
      */
@@ -4362,7 +4671,10 @@ public struct FfiConverterTypeUpdate: FfiConverterRustBuffer {
         case 6: return .takeover(try FfiConverterOptionTypeTakeoverState.read(from: &buf)
         )
         
-        case 7: return .screen(try FfiConverterTypeScreenImage.read(from: &buf)
+        case 7: return .sessions(try FfiConverterTypeBrowserSessions.read(from: &buf)
+        )
+        
+        case 8: return .screen(try FfiConverterTypeScreenImage.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -4403,8 +4715,13 @@ public struct FfiConverterTypeUpdate: FfiConverterRustBuffer {
             FfiConverterOptionTypeTakeoverState.write(v1, into: &buf)
             
         
-        case let .screen(v1):
+        case let .sessions(v1):
             writeInt(&buf, Int32(7))
+            FfiConverterTypeBrowserSessions.write(v1, into: &buf)
+            
+        
+        case let .screen(v1):
+            writeInt(&buf, Int32(8))
             FfiConverterTypeScreenImage.write(v1, into: &buf)
             
         }
@@ -5249,6 +5566,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeBrowserSession: FfiConverterRustBuffer {
+    typealias SwiftType = [BrowserSession]
+
+    public static func write(_ value: [BrowserSession], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeBrowserSession.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BrowserSession] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [BrowserSession]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeBrowserSession.read(from: &buf))
         }
         return seq
     }

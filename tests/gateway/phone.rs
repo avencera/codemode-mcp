@@ -46,8 +46,8 @@ use companion_wire::{
     mobile::{LoginField, RequestId},
     seal::SoftwareKey,
     takeover::{
-        EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, Point, Secret,
-        TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
+        EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, Point, RunningSession,
+        Secret, TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
     },
 };
 use iroh::{
@@ -580,6 +580,8 @@ struct Options {
     logins: bool,
     /// Also serve `browser`, on the sessions of this `agent-browser`
     browser: Option<PathBuf>,
+    /// The sessions' profiles, for `browser_profiles`
+    browser_profiles: Option<PathBuf>,
 }
 
 impl Rig {
@@ -636,11 +638,14 @@ impl Rig {
         // runs and its value is sealed to the phone
         let gateway_mac = Arc::new(FakeMac::default());
         gateway_mac.set_present(true);
-        let top = options
+        let mut top = options
             .browser
             .as_ref()
-            .map(|path| format!("agent_browser_path = \"{}\"", path.display()))
+            .map(|path| format!("agent_browser_path = \"{}\"\n", path.display()))
             .unwrap_or_default();
+        if let Some(profiles) = &options.browser_profiles {
+            top.push_str(&format!("browser_profiles = \"{}\"\n", profiles.display()));
+        }
         let extra = format!(
             "[secrets]\n\
              op = \"{op}\"\n\
@@ -1871,25 +1876,47 @@ struct Takeover {
 }
 
 impl Takeover {
+    /// A link with nothing sent on it yet
+    async fn dial(phone: &FakePhone) -> Result<Self, Box<dyn Error>> {
+        let connection = phone.dial(TAKEOVER_ALPN).await?;
+        let (send, receive) = connection.open_bi().await?;
+
+        Ok(Self { send, receive })
+    }
+
     async fn open(
         phone: &FakePhone,
         session: &str,
         handoff: Option<&str>,
     ) -> Result<Self, Box<dyn Error>> {
-        let connection = phone.dial(TAKEOVER_ALPN).await?;
-        let (send, receive) = connection.open_bi().await?;
-        let mut takeover = Self { send, receive };
+        let handoff = handoff
+            .map(|id| RequestId::try_from(id.to_owned()))
+            .transpose()?;
+        Self::opened(phone, session, handoff, None).await
+    }
+
+    /// A takeover of `session` that starts it at `url`, as New session does
+    async fn start(phone: &FakePhone, session: &str, url: &str) -> Result<Self, Box<dyn Error>> {
+        Self::opened(phone, session, None, Some(url.to_owned())).await
+    }
+
+    async fn opened(
+        phone: &FakePhone,
+        session: &str,
+        handoff: Option<RequestId>,
+        start: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut takeover = Self::dial(phone).await?;
         takeover
             .send(&PhoneMessage::Open {
                 session: session.to_owned(),
-                handoff: handoff
-                    .map(|id| RequestId::try_from(id.to_owned()))
-                    .transpose()?,
+                handoff,
                 viewport: Viewport {
                     width: 390,
                     height: 844,
                     scale: 3.0,
                 },
+                start,
             })
             .await?;
 
@@ -2223,6 +2250,99 @@ async fn with_the_owner_away_one_phone_request_signs_in_and_each_field_is_filled
         "{log:#?}"
     );
     assert!(!log.iter().any(|line| line.contains(ENTERED)), "{log:#?}");
+
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_phone_lists_the_browser_sessions_and_starts_one_with_its_saved_profile() -> TestResult
+{
+    let cdp = FakeCdp::start("https://github.com/login").await?;
+    // saved sessions' profiles, and a directory of agent-browser's that is
+    // not one
+    for saved in ["discord", "broken"] {
+        std::fs::create_dir_all(cdp.profiles.join(saved))?;
+        std::fs::write(cdp.profiles.join(saved).join("Local State"), "{}")?;
+    }
+    std::fs::create_dir_all(cdp.profiles.join("screenshots"))?;
+    std::fs::write(cdp.profiles.join("screenshots").join("github.png"), "")?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(cdp.program.clone()),
+        browser_profiles: Some(cdp.profiles.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // `gone` is listed by agent-browser but has no browser and no profile;
+    // `broken` has a profile, but agent-browser does not say whether its
+    // browser runs, so it is not offered to start, which could relaunch it
+    let mut listing = Takeover::dial(&rig.phone).await?;
+    listing.send(&PhoneMessage::Sessions).await?;
+    let GatewayFrame::Message(GatewayMessage::Sessions { running, saved }) = listing.next().await?
+    else {
+        return Err("no session list".into());
+    };
+    assert_eq!(
+        running,
+        [RunningSession {
+            name: "test".to_owned(),
+            url: Some("https://github.com/login".to_owned()),
+            title: Some("Sign in".to_owned()),
+        }]
+    );
+    assert_eq!(saved, ["discord"]);
+
+    // only an https address starts a session, a session agent-browser says
+    // nothing clear about is not started, and a directory that is not a
+    // profile is not made one
+    for (session, url, why) in [
+        ("discord", "file:///etc/hosts", "https"),
+        ("broken", "https://example.com/", "did not say"),
+        (
+            "screenshots",
+            "https://example.com/",
+            "not a browser profile",
+        ),
+    ] {
+        let mut refused = Takeover::start(&rig.phone, session, url).await?;
+        let (reason, message) = refused
+            .until(|frame| match frame {
+                GatewayFrame::Message(GatewayMessage::Ended { reason, message }) => {
+                    Some((*reason, message.clone().unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .await?;
+        assert_eq!(reason, EndReason::BrowserGone);
+        assert!(message.contains(why), "{session}: {message}");
+    }
+    assert!(cdp.opens().is_empty(), "{:?}", cdp.opens());
+
+    // the saved session launches with its profile and is taken over
+    let mut started = Takeover::start(&rig.phone, "discord", "https://discord.com/login").await?;
+    started
+        .until(|frame| matches!(frame, GatewayFrame::Screen(_)).then_some(()))
+        .await?;
+    drop(started);
+    // a running session only loads the address: launch options would make
+    // agent-browser relaunch its browser and lose the page
+    let mut again = Takeover::start(&rig.phone, "test", "https://github.com/").await?;
+    again
+        .until(|frame| matches!(frame, GatewayFrame::Screen(_)).then_some(()))
+        .await?;
+    assert_eq!(
+        cdp.opens(),
+        [
+            format!(
+                "--session discord --profile {} --engine chrome open https://discord.com/login",
+                cdp.profiles.join("discord").display()
+            ),
+            "--session test open https://github.com/".to_owned(),
+        ]
+    );
 
     rig.stop().await
 }

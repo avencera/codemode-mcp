@@ -1,12 +1,15 @@
 //! A stand-in for an agent-browser session: a DevTools endpoint that answers
 //! the commands the `browser` builtin sends with a page the test sets, and
-//! an `agent-browser` script that points at it
+//! an `agent-browser` script that points at it. The script knows the session
+//! `test`, lists `gone` as a session with no browser and `broken` as one it
+//! cannot say anything about, and records each `open`, after which that
+//! session runs on the same page
 
 use std::{
     error::Error,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -70,6 +73,10 @@ pub struct FakeCdp {
     state: Arc<Mutex<State>>,
     /// The `agent-browser` script for the gateway's `agent_browser_path`
     pub program: PathBuf,
+    /// An empty directory for the gateway's `browser_profiles`
+    pub profiles: PathBuf,
+    /// Where the script records what it was asked to open
+    opens: PathBuf,
 }
 
 impl FakeCdp {
@@ -97,10 +104,25 @@ impl FakeCdp {
             }
         });
 
+        let directory = temp_state_dir();
+        let profiles = directory.join("profiles");
+        std::fs::create_dir_all(&profiles)?;
+
         Ok(Self {
             state,
-            program: agent_browser(address)?,
+            program: agent_browser(&directory, address, url)?,
+            profiles,
+            opens: directory.join("opens"),
         })
+    }
+
+    /// The arguments of each `open` the script ran, in order
+    pub fn opens(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.opens)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn with<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
@@ -125,27 +147,50 @@ impl FakeCdp {
     }
 }
 
-/// An `agent-browser` that knows one session, `test`, at `address`
-fn agent_browser(address: SocketAddr) -> Result<PathBuf, Box<dyn Error>> {
-    let directory = temp_state_dir();
-    std::fs::create_dir_all(&directory)?;
+/// An `agent-browser` in `directory` whose sessions' browser is at
+/// `address`, showing `url`
+fn agent_browser(
+    directory: &Path,
+    address: SocketAddr,
+    url: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    std::fs::create_dir_all(directory)?;
     let program = directory.join("agent-browser");
     let tabs = json!({
         "success": true,
-        "data": { "tabs": [{ "active": true, "targetId": TARGET, "title": "Sign in" }] },
+        "data": { "tabs": [{ "active": true, "targetId": TARGET, "title": "Sign in", "url": url }] },
         "error": null,
     });
+    let sessions = json!({
+        "success": true,
+        "data": { "sessions": ["test", "gone", "broken"] },
+        "error": null,
+    });
+    let cdp_url = json!({
+        "success": true,
+        "data": { "cdpUrl": format!("ws://127.0.0.1:{}/devtools/browser/fake", address.port()) },
+        "error": null,
+    });
+    let not_launched = json!({ "success": false, "data": null, "error": "Browser not launched" });
     std::fs::write(
         &program,
         format!(
             "#!/bin/sh\n\
-             [ \"$2\" = test ] || {{ echo 'no such session' >&2; exit 1; }}\n\
+             [ \"$*\" = '--json session list' ] && {{ echo '{sessions}'; exit 0; }}\n\
+             [ \"$1\" = --session ] || exit 2\n\
              case \"$*\" in\n\
-             *cdp-url*) echo 'ws://127.0.0.1:{port}/devtools/browser/fake' ;;\n\
-             *'tab list'*) echo '{tabs}' ;;\n\
+             *' open '*) echo \"$*\" >> '{directory}/opens'; touch '{directory}/started-'\"$2\"; exit 0 ;;\n\
+             esac\n\
+             [ \"$2\" = broken ] && {{ echo 'the daemon is stuck' >&2; exit 3; }}\n\
+             running=no\n\
+             {{ [ \"$2\" = test ] || [ -f '{directory}/started-'\"$2\" ]; }} && running=yes\n\
+             case \"$*\" in\n\
+             *cdp-url*) [ $running = yes ] || {{ echo '{not_launched}'; exit 1; }}\n\
+             echo '{cdp_url}' ;;\n\
+             *'tab list'*) [ $running = yes ] || exit 1; echo '{tabs}' ;;\n\
              *) exit 2 ;;\n\
              esac\n",
-            port = address.port(),
+            directory = directory.display(),
         ),
     )?;
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;

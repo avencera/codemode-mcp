@@ -14,6 +14,10 @@ final class AppManager: Reconciler, @unchecked Sendable {
     /// never holds images
     private(set) var screen: TakeoverScreen?
 
+    /// Whether the owner put the handoff cards aside for the session list;
+    /// a new handoff or read brings them back
+    private(set) var browsing = false
+
     @ObservationIgnored private let rust: FfiApp
 
     private init() {
@@ -53,12 +57,19 @@ final class AppManager: Reconciler, @unchecked Sendable {
         rust.takeoverFill(field: field, value: value, submit: submit)
     }
 
+    /// Shows the gateway's session list until a new handoff or read comes
+    func browse() {
+        browsing = true
+    }
+
     /// What the app shows: the takeover while one is open, then a read still
     /// waiting, a handoff still waiting, and the newest finished read or
-    /// handoff until it is dismissed
+    /// handoff until it is dismissed; while the owner browses, the session
+    /// list in place of the handoffs and finished reads
     var shown: Shown {
         if let takeover = state.takeover { return .takeover(takeover) }
         if let read = state.reads.first(where: { !$0.status.isFinished }) { return .read(read) }
+        if browsing { return .gateway }
         if let handoff = state.handoffs.first(where: { !$0.status.isFinished }) { return .handoff(handoff) }
         if let read = state.reads.last { return .read(read) }
         if let handoff = state.handoffs.last { return .handoff(handoff) }
@@ -97,11 +108,19 @@ final class AppManager: Reconciler, @unchecked Sendable {
         case let .connection(connection):
             state.connection = connection
         case let .reads(reads):
+            if reads.contains(where: { read in !state.reads.contains { $0.id == read.id } }) {
+                browsing = false
+            }
             state.reads = reads
         case let .pairing(pairing):
             state.pairing = pairing
         case let .handoffs(handoffs):
+            if handoffs.contains(where: { handoff in !state.handoffs.contains { $0.id == handoff.id } }) {
+                browsing = false
+            }
             state.handoffs = handoffs
+        case let .sessions(sessions):
+            state.sessions = sessions
         case let .takeover(takeover):
             // a new takeover, or none, starts without the last one's image
             if takeover?.session != state.takeover?.session || takeover?.handoff != state.takeover?.handoff {

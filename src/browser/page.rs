@@ -2,26 +2,50 @@
 //! fills it over CDP
 //!
 //! agent-browser is asked only where a session's browser is (`get cdp-url`,
-//! which never launches one) and which tab is active (`tab list`); every
+//! which never launches one), which tab is active (`tab list`), which
+//! sessions it has (`session list`), and, for the owner's New session on the
+//! phone, to start one (`open`); every
 //! value goes straight to the page over CDP, so none passes through an
 //! agent-browser command, its argv or the activity it streams to its
 //! dashboard. The focused element is read in an isolated world, where the
 //! page's own scripts cannot replace the DOM getters the check relies on
 
 use std::{
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
-use companion_wire::{mobile::LoginField, takeover::Key};
+use companion_wire::{
+    mobile::LoginField,
+    takeover::{Key, RunningSession},
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::cdp::{Browser, CdpError, Session};
-use crate::logins::site_of;
+use crate::{companion::SessionList, logins::site_of};
 
 /// How long an agent-browser lookup may take
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long starting a session may take, launching its browser included
+const START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long listing the sessions may wait on agent-browser for the list,
+/// then for each session; a session that takes longer is left out, so the
+/// phone, which waits 30 seconds, still gets the rest
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_SESSION_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// agent-browser's answer to `get cdp-url` for a session without a browser,
+/// one never launched or one that closed
+const NOT_LAUNCHED: &str = "Browser not launched";
+
+/// A file every Chrome profile directory holds, which tells a saved session
+/// from agent-browser's other directories beside it
+const PROFILE_MARKER: &str = "Local State";
 
 /// Most frames a focused element may sit in, nested
 const MAX_FRAME_DEPTH: usize = 8;
@@ -90,6 +114,58 @@ impl std::fmt::Display for SessionName {
 #[derive(Debug, Clone)]
 pub struct AgentBrowser {
     program: PathBuf,
+    /// Where sessions keep their Chrome profiles, one directory per session
+    /// named after it, such as `~/.agent-browser/github`
+    profiles: Option<PathBuf>,
+    /// One start at a time, so a second start of a session sees the browser
+    /// the first launched instead of launching over it
+    starts: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// What agent-browser says of a session's browser
+enum Launch {
+    /// It runs, taking CDP at this loopback address
+    Running(String),
+    /// It is not running: never launched, or closed since
+    NotLaunched,
+}
+
+/// What a listing found of one session
+enum Listed {
+    Running(RunningSession),
+    NotLaunched,
+    /// agent-browser did not say in time or said something else, so the
+    /// session is neither listed nor offered to start, which could relaunch
+    /// a browser that runs
+    Unknown(String),
+}
+
+#[derive(Deserialize)]
+struct CdpUrlReply {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    data: Option<CdpUrlData>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CdpUrlData {
+    #[serde(rename = "cdpUrl")]
+    cdp_url: String,
+}
+
+#[derive(Deserialize)]
+struct SessionsReply {
+    #[serde(default)]
+    data: Option<SessionsData>,
+}
+
+#[derive(Deserialize)]
+struct SessionsData {
+    #[serde(default)]
+    sessions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -112,10 +188,16 @@ struct Tab {
     active: bool,
     #[serde(rename = "targetId")]
     target_id: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 impl AgentBrowser {
-    /// agent-browser from the daemon's `PATH`, or where Homebrew or npm put it
+    /// agent-browser from the daemon's `PATH`, or where Homebrew or npm put
+    /// it; its sessions keep no profiles until [`AgentBrowser::with_profiles`]
+    /// says where
     pub fn find(home: Option<&Path>) -> Self {
         let on_path = std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)
@@ -137,20 +219,35 @@ impl AgentBrowser {
             program: on_path
                 .or_else(installed)
                 .unwrap_or_else(|| PathBuf::from("agent-browser")),
+            profiles: None,
+            starts: Arc::default(),
         }
     }
 
-    /// A specific agent-browser binary, for tests
+    /// A specific agent-browser binary
     pub fn at(program: PathBuf) -> Self {
-        Self { program }
+        Self {
+            program,
+            profiles: None,
+            starts: Arc::default(),
+        }
     }
 
-    async fn run(&self, session: &SessionName, args: &[&str]) -> Result<Vec<u8>, PageError> {
-        let output = tokio::time::timeout(
-            LOOKUP_TIMEOUT,
+    /// Keeps each session's profile in `profiles`, one directory per session
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: PathBuf) -> Self {
+        self.profiles = Some(profiles);
+        self
+    }
+
+    async fn output(
+        &self,
+        args: &[&OsStr],
+        timeout: Duration,
+    ) -> Result<std::process::Output, PageError> {
+        tokio::time::timeout(
+            timeout,
             tokio::process::Command::new(&self.program)
-                .arg("--session")
-                .arg(session.as_str())
                 .args(args)
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true)
@@ -160,7 +257,13 @@ impl AgentBrowser {
         .map_err(|_| PageError::NoBrowser("agent-browser did not answer in time".to_owned()))?
         .map_err(|error| {
             PageError::NoBrowser(format!("could not run {}: {error}", self.program.display()))
-        })?;
+        })
+    }
+
+    async fn run(&self, session: &SessionName, args: &[&str]) -> Result<Vec<u8>, PageError> {
+        let mut all = vec![OsStr::new("--session"), OsStr::new(session.as_str())];
+        all.extend(args.iter().map(OsStr::new));
+        let output = self.output(&all, LOOKUP_TIMEOUT).await?;
         if !output.status.success() {
             let detail = String::from_utf8_lossy(&output.stderr);
             let detail = crate::prompt::one_line(detail.trim(), 200);
@@ -177,16 +280,205 @@ impl AgentBrowser {
     /// Connects to `session`'s browser and attaches to its active tab;
     /// never starts a browser
     pub async fn open(&self, session: &SessionName) -> Result<Page, PageError> {
-        let url = self.run(session, &["get", "cdp-url"]).await?;
-        let url = String::from_utf8_lossy(&url).trim().to_owned();
-        // only a browser on this Mac; agent-browser can also point at a
-        // remote one, whose page this daemon has no business filling
-        if !is_loopback_devtools(&url) {
+        let url = self.devtools(session).await?;
+        let target = self.active_tab(session).await?.target_id;
+
+        let browser = Browser::connect(&url).await?;
+        let session = browser.attach(&target).await?;
+
+        Ok(Page { session })
+    }
+
+    /// Where `session`'s browser takes CDP; an error when it has none
+    /// running
+    async fn devtools(&self, session: &SessionName) -> Result<String, PageError> {
+        match self.launch(session, LOOKUP_TIMEOUT).await? {
+            Launch::Running(url) => Ok(url),
+            Launch::NotLaunched => Err(PageError::NoBrowser(format!(
+                "agent-browser session `{session}` has no running browser; start it with \
+                 `agent-browser --session {session} open <url>` first"
+            ))),
+        }
+    }
+
+    /// Whether `session`'s browser runs, from `get cdp-url`, which never
+    /// launches one. Anything but a plain answer is an error, so a caller
+    /// never takes a slow or odd answer for a browser that is not running
+    async fn launch(&self, session: &SessionName, timeout: Duration) -> Result<Launch, PageError> {
+        let args = ["--session", session.as_str(), "--json", "get", "cdp-url"].map(OsStr::new);
+        let output = self.output(&args, timeout).await?;
+        let reply: CdpUrlReply = serde_json::from_slice(&output.stdout).map_err(|_| {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            PageError::NoBrowser(format!(
+                "agent-browser did not say whether `{session}` runs ({})",
+                crate::prompt::one_line(detail.trim(), 200)
+            ))
+        })?;
+
+        match (reply.success, reply.data, reply.error) {
+            (true, Some(data), _) => {
+                // only a browser on this Mac; agent-browser can also point at
+                // a remote one, whose page this daemon has no business filling
+                if !is_loopback_devtools(&data.cdp_url) {
+                    return Err(PageError::NoBrowser(format!(
+                        "agent-browser session `{session}` is not a browser on this Mac"
+                    )));
+                }
+
+                Ok(Launch::Running(data.cdp_url))
+            }
+            (false, _, Some(error)) if error == NOT_LAUNCHED => Ok(Launch::NotLaunched),
+            (_, _, error) => Err(PageError::NoBrowser(format!(
+                "agent-browser did not say whether `{session}` runs ({})",
+                crate::prompt::one_line(error.as_deref().unwrap_or("no answer"), 200)
+            ))),
+        }
+    }
+
+    /// The sessions with a browser running and the saved profiles of the
+    /// others, each by name
+    pub async fn sessions(&self) -> Result<SessionList, PageError> {
+        let listed = self
+            .output(
+                &[
+                    OsStr::new("--json"),
+                    OsStr::new("session"),
+                    OsStr::new("list"),
+                ],
+                LIST_TIMEOUT,
+            )
+            .await?;
+        if !listed.status.success() {
+            return Err(PageError::NoBrowser(
+                "agent-browser could not list its sessions".to_owned(),
+            ));
+        }
+        let listed: SessionsReply = serde_json::from_slice(&listed.stdout).map_err(|_| {
+            PageError::NoBrowser("agent-browser's session list could not be read".to_owned())
+        })?;
+        let names = listed
+            .data
+            .map(|data| data.sessions)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| SessionName::parse(name).ok())
+            .collect::<Vec<_>>();
+
+        // a listed session may have no browser, such as one whose browser
+        // closed; it shows as saved when it has a profile
+        let listed = futures_util::future::join_all(names.iter().map(|session| async move {
+            tokio::time::timeout(LIST_SESSION_TIMEOUT, self.listed(session))
+                .await
+                .unwrap_or_else(|_| Listed::Unknown(session.to_string()))
+        }))
+        .await;
+        let mut running = Vec::new();
+        let mut unknown = Vec::new();
+        for session in listed {
+            match session {
+                Listed::Running(session) => running.push(session),
+                Listed::NotLaunched => {}
+                Listed::Unknown(name) => unknown.push(name),
+            }
+        }
+        running.sort_by(|left, right| left.name.cmp(&right.name));
+        let saved = self
+            .saved()
+            .await
+            .into_iter()
+            .filter(|name| running.iter().all(|session| session.name != *name))
+            .filter(|name| !unknown.contains(name))
+            .collect();
+
+        Ok(SessionList { running, saved })
+    }
+
+    /// Whether `session`'s browser runs, and its active tab when it does
+    async fn listed(&self, session: &SessionName) -> Listed {
+        let name = session.to_string();
+        match self.launch(session, LIST_TIMEOUT).await {
+            Ok(Launch::Running(_)) => {}
+            Ok(Launch::NotLaunched) => return Listed::NotLaunched,
+            Err(_) => return Listed::Unknown(name),
+        }
+        // the browser runs, so listing its tabs launches nothing
+        let tab = self.active_tab(session).await.ok();
+        let (url, title) = tab.map(|tab| (tab.url, tab.title)).unwrap_or_default();
+
+        Listed::Running(RunningSession {
+            name,
+            url: url.filter(|url| !url.is_empty()),
+            title: title.filter(|title| !title.is_empty()),
+        })
+    }
+
+    /// The names of the sessions with a saved profile, sorted
+    async fn saved(&self) -> Vec<String> {
+        let Some(profiles) = &self.profiles else {
+            return Vec::new();
+        };
+        let Ok(mut entries) = tokio::fs::read_dir(profiles).await else {
+            return Vec::new();
+        };
+        let mut saved = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let profile = tokio::fs::try_exists(entry.path().join(PROFILE_MARKER)).await;
+            if profile.unwrap_or(false) && SessionName::parse(&name).is_ok() {
+                saved.push(name);
+            }
+        }
+        saved.sort();
+
+        saved
+    }
+
+    /// Starts `session` at `url`, an `https` address: loads it in the
+    /// session's browser when one runs, or launches the session's browser
+    /// with its saved profile, so a site it signed in to before still is
+    pub async fn start(&self, session: &SessionName, url: &str) -> Result<(), PageError> {
+        let address = reqwest::Url::parse(url)
+            .ok()
+            .filter(|address| address.scheme() == "https" && address.host_str().is_some())
+            .ok_or_else(|| {
+                PageError::Refused("a session starts only at an https address".to_owned())
+            })?;
+        let _turn = self.starts.lock().await;
+        // an error here refuses the start: a browser that did not answer may
+        // be running, and launch options would relaunch it
+        let launch = self.launch(session, LOOKUP_TIMEOUT).await?;
+
+        let mut args: Vec<OsString> = vec!["--session".into(), session.as_str().into()];
+        // launch options only for a browser that is not running: given them,
+        // agent-browser relaunches a running one, and its page is lost
+        if matches!(launch, Launch::NotLaunched) {
+            if let Some(profiles) = &self.profiles {
+                let profile = profiles.join(session.as_str());
+                usable_profile(&profile).await?;
+                args.push("--profile".into());
+                args.push(profile.into());
+            }
+            args.extend(["--engine".into(), "chrome".into()]);
+        }
+        args.extend(["open".into(), address.as_str().into()]);
+        let args = args.iter().map(OsString::as_os_str).collect::<Vec<_>>();
+        let output = self.output(&args, START_TIMEOUT).await?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+
             return Err(PageError::NoBrowser(format!(
-                "agent-browser session `{session}` is not a browser on this Mac"
+                "agent-browser could not start `{session}` ({})",
+                crate::prompt::one_line(detail.trim(), 200)
             )));
         }
 
+        Ok(())
+    }
+
+    /// `session`'s active tab
+    async fn active_tab(&self, session: &SessionName) -> Result<Tab, PageError> {
         let tabs = self.run(session, &["--json", "tab", "list"]).await?;
         let tabs: TabList = serde_json::from_slice(&tabs).map_err(|_| {
             PageError::NoBrowser("agent-browser's tab list could not be read".to_owned())
@@ -197,24 +489,38 @@ impl AgentBrowser {
                 crate::prompt::one_line(&error.to_string(), 200)
             )));
         }
-        let target = tabs
-            .data
+        tabs.data
             .map(|data| data.tabs)
             .unwrap_or_default()
             .into_iter()
             .find(|tab| tab.active)
-            .map(|tab| tab.target_id)
             .ok_or_else(|| {
                 PageError::NoBrowser(format!(
                     "agent-browser session `{session}` has no active tab"
                 ))
-            })?;
-
-        let browser = Browser::connect(&url).await?;
-        let session = browser.attach(&target).await?;
-
-        Ok(Page { session })
+            })
     }
+}
+
+/// Refuses `profile` when it is a directory with files that is not a
+/// Chrome profile, such as agent-browser's own `sessions` or `tmp` beside
+/// the profiles, which Chrome would otherwise fill in
+async fn usable_profile(profile: &Path) -> Result<(), PageError> {
+    let Ok(mut entries) = tokio::fs::read_dir(profile).await else {
+        return Ok(());
+    };
+    let empty = matches!(entries.next_entry().await, Ok(None));
+    let marked = tokio::fs::try_exists(profile.join(PROFILE_MARKER))
+        .await
+        .unwrap_or(false);
+    if empty || marked {
+        return Ok(());
+    }
+
+    Err(PageError::Refused(format!(
+        "{} holds files that are not a browser profile; pick another name",
+        profile.display()
+    )))
 }
 
 /// Whether `url` is a DevTools endpoint on this Mac: `ws` to a loopback

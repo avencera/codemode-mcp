@@ -19,11 +19,11 @@ use companion_wire::{
     mobile::{LoginField as WireLoginField, RequestId, seal_info},
     takeover::{
         EndReason, FillOffer as WireFillOffer, Focus, GatewayFrame, GatewayMessage, HEADER_BYTES,
-        Key, MAX_TEXT_CHARS, PhoneMessage, Point, Secret as WireSecret, TAKEOVER_ALPN, Viewport,
-        decode_gateway, encode_message, read_header,
+        Key, MAX_TEXT_CHARS, PhoneMessage, Point, RunningSession, Secret as WireSecret,
+        TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
     },
 };
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::mpsc;
 
@@ -111,6 +111,8 @@ pub struct TakeoverArgs {
     pub session: String,
     /// The handoff it answers
     pub handoff: Option<RequestId>,
+    /// The `https` address to start the session at, for New session
+    pub start: Option<String>,
     /// Tells this takeover's reports apart from those of one it replaced
     pub generation: u64,
     /// The gateway to dial
@@ -137,6 +139,9 @@ struct Live {
 pub struct TakeoverState {
     session: String,
     handoff: Option<RequestId>,
+    /// The address to start the session at, until a link gets through: a
+    /// redial takes the session over as it is, keeping its page
+    start: Option<String>,
     generation: u64,
     record: GatewayRecord,
     platform: Arc<dyn Platform>,
@@ -228,6 +233,7 @@ impl TakeoverActor {
             session: state.session.clone(),
             handoff: state.handoff.clone(),
             viewport,
+            start: state.start.clone(),
         };
         // kept until a dial gets through, so a failed one loses nothing
         let mut first = vec![open];
@@ -259,8 +265,10 @@ impl TakeoverActor {
 
             return;
         }
-        // the Open and any Done or Cancel waiting on it went with the dial
+        // the Open and any Done or Cancel waiting on it went with the dial;
+        // the session is started, so a redial takes it over as it is
         state.ending = None;
+        state.start = None;
         state.links = state.links.wrapping_add(1);
         let id = state.links;
         let (writer, frames) = mpsc::unbounded_channel();
@@ -322,6 +330,8 @@ impl TakeoverActor {
                     message: one_line(&message, MAX_PAGE_TEXT_CHARS),
                 }));
             }
+            // the answer to a listing, which goes on a link of its own
+            GatewayMessage::Sessions { .. } => {}
             GatewayMessage::Ended { reason, message } => {
                 state.hang_up(b"ended");
                 state.report(TakeoverEvent::Status(TakeoverStatus::Ended {
@@ -486,6 +496,7 @@ impl Actor for TakeoverActor {
         Ok(TakeoverState {
             session: args.session,
             handoff: args.handoff,
+            start: args.start,
             generation: args.generation,
             record: args.record,
             platform: args.platform,
@@ -622,6 +633,61 @@ async fn connect(
         send,
         receive,
     })
+}
+
+/// How long the gateway may take to list its sessions, which it caps at
+/// about 13 seconds
+const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a link whose stream ended may take to say why it closed
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The gateway's browser sessions: dials as a takeover does, asks with
+/// [`PhoneMessage::Sessions`], and reads the one answer
+pub async fn list_sessions(
+    app: ActorRef<AppMsg>,
+    address: iroh::EndpointAddr,
+) -> Result<(Vec<RunningSession>, Vec<String>), String> {
+    let mut link = connect(app, address, vec![PhoneMessage::Sessions]).await?;
+    let _ = link.send.finish();
+    let answer = tokio::time::timeout(LIST_TIMEOUT, read_frame(&mut link.receive))
+        .await
+        .map_err(|_| "the gateway did not list its sessions in time".to_owned())?;
+    let answer = match answer {
+        Ok(frame) => frame,
+        // a gateway that cannot list closes the link, its reason the close's
+        Err(error) => return Err(refusal(&link.connection).await.unwrap_or(error)),
+    };
+    link.connection.close(0_u32.into(), b"listed");
+
+    match answer {
+        GatewayFrame::Message(GatewayMessage::Sessions { running, saved }) => Ok((running, saved)),
+        GatewayFrame::Message(GatewayMessage::Ended {
+            message: Some(message),
+            ..
+        }) => Err(message),
+        _ => Err("the gateway answered something else; update codemode-mcp on it".to_owned()),
+    }
+}
+
+/// Why the gateway closed `connection`, in the owner's words, when it closed
+/// it for a reason a listing can meet: an older gateway, which takes only an
+/// Open, or one without the `browser` server
+async fn refusal(connection: &Connection) -> Option<String> {
+    let closed = tokio::time::timeout(CLOSE_WAIT, connection.closed())
+        .await
+        .ok()?;
+    let ConnectionError::ApplicationClosed(close) = closed else {
+        return None;
+    };
+
+    match close.reason.as_ref() {
+        b"expected open" => {
+            Some("The gateway's codemode-mcp is too old to list sessions; update it".to_owned())
+        }
+        b"no browser" => Some("The gateway has no `browser` server configured".to_owned()),
+        _ => None,
+    }
 }
 
 /// Writes each frame the actor queues, until the actor drops the link

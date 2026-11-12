@@ -97,9 +97,15 @@ struct TakeoverView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
-                // leaves without ending anything; the handoff's card can take
-                // the session over again
-                Button("Leave") { manager.dispatch(.closeTakeover) }
+                // leaves without ending anything, for the session list, where
+                // this session or its handoff can be taken over again
+                Button {
+                    manager.dispatch(.closeTakeover)
+                    manager.browse()
+                } label: {
+                    Label("Sessions", systemImage: "chevron.backward")
+                        .labelStyle(.titleAndIcon)
+                }
             }
         }
     }

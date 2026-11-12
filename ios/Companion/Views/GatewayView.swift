@@ -1,9 +1,12 @@
 import CompanionCore
 import SwiftUI
 
-/// The paired gateway: its name, the link, and unpairing
+/// The paired gateway: its name, the link, its browser sessions, and
+/// unpairing
 struct GatewayView: View {
     @Environment(AppManager.self) private var manager
+    /// The session New session starts, while its sheet is up
+    @State private var starting: NewSession?
 
     var body: some View {
         if let gateway = manager.state.gateway {
@@ -12,18 +15,31 @@ struct GatewayView: View {
                 connection: manager.state.connection,
                 pairing: manager.state.pairing,
                 unpair: { manager.dispatch(.unpair) }
-            )
+            ) {
+                BrowserSessionsSection(gatewayName: gateway.name, starting: $starting)
+            }
+            .sheet(item: $starting) { session in
+                NewSessionSheet(name: session.name, gatewayName: gateway.name) { name, url in
+                    manager.dispatch(.startSession(session: name, url: url))
+                }
+            }
+            // listed when the screen shows and each time the link comes back
+            .task(id: manager.state.connection == .connected) {
+                guard manager.state.connection == .connected else { return }
+                manager.dispatch(.refreshSessions)
+            }
         }
     }
 }
 
 /// The gateway screen drawn from plain values, so previews can show each
-/// connection state without a core
-struct GatewayDetails: View {
+/// connection state without a core; `sessions` is the browser's section
+struct GatewayDetails<Sessions: View>: View {
     let gateway: GatewayInfo
     let connection: ConnectionState
     let pairing: PairingState
     let unpair: () -> Void
+    @ViewBuilder let sessions: Sessions
     @State private var confirmingUnpair = false
 
     var body: some View {
@@ -32,6 +48,8 @@ struct GatewayDetails: View {
             // section: a section that comes and goes left the card above it
             // drawn at its old height
             Section { header }
+
+            sessions
 
             Section {
                 LabeledContent("Listed on the Mac as", value: gateway.phoneName)
@@ -150,7 +168,9 @@ struct GatewayDetails: View {
             connection: .connected,
             pairing: .idle,
             unpair: {}
-        )
+        ) {
+            EmptyView()
+        }
     }
 }
 
@@ -161,6 +181,8 @@ struct GatewayDetails: View {
             connection: .retrying(inSecs: 8, error: "the gateway did not answer"),
             pairing: .failed(message: "The check read failed"),
             unpair: {}
-        )
+        ) {
+            EmptyView()
+        }
     }
 }

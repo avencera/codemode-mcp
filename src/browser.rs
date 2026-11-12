@@ -53,8 +53,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     companion::{
-        Companions, HandoffOffer, ProgramAsk, ProgramRead, ProgramTarget, SignInAsk, TakeoverHost,
-        TakeoverOpen,
+        Companions, HandoffOffer, ProgramAsk, ProgramRead, ProgramTarget, SessionList, SignInAsk,
+        TakeoverHost, TakeoverOpen,
     },
     config::{Builtin, PhonePeer, ServerConfig},
     logins::{find_login, is_code, item_name, site_of, totp::Totp},
@@ -633,9 +633,19 @@ impl TakeoverHost for Browsers {
             },
             None => None,
         };
+        if let Some(url) = &open.start {
+            tracing::info!(phone = %phone.name, %session, "starting a session for a phone");
+            if let Err(error) = self.agent_browser.start(&session, url).await {
+                tracing::warn!(phone = %phone.name, %session, %error, "the session did not start");
+                return end(EndReason::BrowserGone, error.to_string()).await;
+            }
+        }
         let page = match self.agent_browser.open(&session).await {
             Ok(page) => page,
-            Err(error) => return end(EndReason::BrowserGone, error.to_string()).await,
+            Err(error) => {
+                tracing::warn!(phone = %phone.name, %session, %error, "no browser to take over");
+                return end(EndReason::BrowserGone, error.to_string()).await;
+            }
         };
 
         let offers = self.offers();
@@ -650,6 +660,13 @@ impl TakeoverHost for Browsers {
         if let (Some(answer), Some(handoff)) = (outcome.answer(), handoff) {
             handoff.finish(answer);
         }
+    }
+
+    async fn sessions(&self) -> Result<SessionList, String> {
+        self.agent_browser
+            .sessions()
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 

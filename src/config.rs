@@ -103,6 +103,11 @@ pub struct Config {
     /// `~/.local/bin`
     #[serde(default)]
     pub agent_browser_path: Option<PathBuf>,
+    /// Directory of the agent-browser sessions' Chrome profiles, one per
+    /// session named after it, which a session the phone starts launches
+    /// with and lists as saved; when unset, `~/.agent-browser`
+    #[serde(default)]
+    pub browser_profiles: Option<PathBuf>,
     /// How long one upstream tool call may run before it is cancelled
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
@@ -165,6 +170,7 @@ impl Default for Config {
             extra_allowed_hosts: Vec::new(),
             worker_path: None,
             agent_browser_path: None,
+            browser_profiles: None,
             tool_timeout_secs: default_tool_timeout_secs(),
             admin_listen: default_admin_listen(),
             state_dir: None,

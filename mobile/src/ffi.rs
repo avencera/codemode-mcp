@@ -41,6 +41,48 @@ pub struct AppState {
     /// The browser session the owner has taken over, if any; its images
     /// arrive as [`Update::Screen`] and are not kept here
     pub takeover: Option<TakeoverState>,
+    /// The gateway's browser sessions, as last listed
+    pub sessions: BrowserSessions,
+}
+
+/// The gateway's browser sessions, which the owner takes over or starts
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct BrowserSessions {
+    /// Where the listing stands
+    pub status: SessionsStatus,
+    /// The sessions running, by name, from the last listing
+    pub running: Vec<BrowserSession>,
+    /// The sessions with a saved profile that are not running, by name,
+    /// which [`AppAction::StartSession`] launches signed in as before
+    pub saved: Vec<String>,
+}
+
+/// Where a listing of the browser sessions stands
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Enum)]
+pub enum SessionsStatus {
+    /// Never listed
+    #[default]
+    Idle,
+    /// Asking the gateway; the last listing still shows
+    Loading,
+    /// Listed
+    Listed,
+    /// The gateway could not be asked or could not list them
+    Failed {
+        /// Why, one line
+        message: String,
+    },
+}
+
+/// A browser session running on the gateway Mac
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BrowserSession {
+    /// Its name, such as `github`
+    pub name: String,
+    /// The address of its active tab, when the gateway could read it
+    pub url: Option<String>,
+    /// The title of its active tab, when the gateway could read it
+    pub title: Option<String>,
 }
 
 /// The paired gateway
@@ -623,9 +665,21 @@ pub enum AppAction {
         /// The handoff it answers
         handoff: Option<String>,
     },
+    /// Start browser `session` at `url`, an `https` address, and take it
+    /// over: the gateway launches the session with its saved profile when it
+    /// is not running, or loads `url` in it when it is. Replaces any
+    /// takeover already open
+    StartSession {
+        /// The browser session, new or saved
+        session: String,
+        /// Where to start it
+        url: String,
+    },
     /// Leave the takeover without ending it or its handoff, which may be
     /// taken over again later; also closes one the gateway ended
     CloseTakeover,
+    /// Ask the gateway for its browser sessions
+    RefreshSessions,
     /// APNs gave this token, or `None` when notifications are off
     PushToken {
         /// The device token as lowercase hex
@@ -650,6 +704,8 @@ pub enum Update {
     Handoffs(Vec<PendingHandoff>),
     /// The takeover changed, or ended with `None`
     Takeover(Option<TakeoverState>),
+    /// The browser sessions changed
+    Sessions(BrowserSessions),
     /// A new image of the taken-over page; the app reports it drawn with
     /// [`TakeoverInput::Drawn`]
     Screen(ScreenImage),

@@ -19,7 +19,7 @@ use companion_wire::{
         ProgramItem as WireProgramItem, PushEnvironment as WirePushEnvironment, PushToken,
         RequestId,
     },
-    takeover::PhoneMessage,
+    takeover::{PhoneMessage, RunningSession},
     wire::{
         CompanionErrorCode, CompanionFault, CompanionResponse, MAX_DESCRIPTION_CHARS,
         MAX_DESTINATION_CHARS, MAX_PROGRAM_ITEMS, MAX_REASON_CHARS, PairCheck,
@@ -32,15 +32,16 @@ use tokio::sync::oneshot;
 use crate::{
     connection::{ConnArgs, ConnMsg, ConnectionActor},
     ffi::{
-        AppAction, AppState, ConnectionState, HandoffStatus, PairingState, PendingHandoff,
-        PendingRead, Platform, ProgramItem, ProgramRead, PushEnvironment, ReadStatus, Reconciler,
-        SignIn, TakeoverEnd, TakeoverInput, TakeoverState, TakeoverStatus, Update,
+        AppAction, AppState, BrowserSession, BrowserSessions, ConnectionState, HandoffStatus,
+        PairingState, PendingHandoff, PendingRead, Platform, ProgramItem, ProgramRead,
+        PushEnvironment, ReadStatus, Reconciler, SessionsStatus, SignIn, TakeoverEnd,
+        TakeoverInput, TakeoverState, TakeoverStatus, Update,
     },
     handoff::{Handoffs, Offer},
     pairing,
     record::{GatewayRecord, load_key},
     request::{Asked, Entered, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
-    takeover::{TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg},
+    takeover::{TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg, list_sessions},
 };
 
 /// How long a read opened from a push may take to arrive once the link is
@@ -158,6 +159,8 @@ pub enum AppMsg {
     /// Lends the connection's endpoint to a takeover; `None` while there is
     /// no connection actor
     Endpoint(RpcReplyPort<Option<Endpoint>>),
+    /// A listing of the browser sessions finished
+    Sessions(Result<(Vec<RunningSession>, Vec<String>), String>),
     /// A read's or handoff's stream ended without an answer
     StreamEnded {
         /// The read
@@ -204,6 +207,7 @@ impl Shared {
                 pairing: PairingState::Idle,
                 handoffs: Vec::new(),
                 takeover: None,
+                sessions: BrowserSessions::default(),
             }),
             updates: Mutex::new(None),
         }
@@ -302,6 +306,14 @@ impl Shared {
                 .find(|handoff| handoff.id == id)
                 .map(|handoff| handoff.status = status)
                 .is_some()
+        });
+    }
+
+    fn change_sessions(&self, change: impl FnOnce(&mut BrowserSessions)) {
+        self.change(|state| {
+            let before = state.sessions.clone();
+            change(&mut state.sessions);
+            (state.sessions != before).then(|| Update::Sessions(state.sessions.clone()))
         });
     }
 
@@ -667,9 +679,13 @@ impl App {
                 }
             }
             AppAction::OpenTakeover { session, handoff } => {
-                Self::open_takeover(myself, state, &session, handoff.as_deref()).await;
+                Self::open_takeover(myself, state, &session, handoff.as_deref(), None).await;
+            }
+            AppAction::StartSession { session, url } => {
+                Self::open_takeover(myself, state, &session, None, Some(url)).await;
             }
             AppAction::CloseTakeover => Self::close_takeover(state),
+            AppAction::RefreshSessions => Self::refresh_sessions(myself, state),
             AppAction::Unpair => {
                 if state.record.is_none() {
                     return;
@@ -771,13 +787,35 @@ impl App {
         }
     }
 
-    /// Opens a takeover of `session`, for `handoff` if set, replacing any
-    /// open one; a session or handoff id a link made up is refused
+    /// Asks the gateway for its browser sessions, in a spawned task that
+    /// reports back as [`AppMsg::Sessions`]; the last listing shows meanwhile
+    fn refresh_sessions(myself: &ActorRef<AppMsg>, state: &mut AppActorState) {
+        let Some(record) = &state.record else {
+            return;
+        };
+        if state.shared.state().sessions.status == SessionsStatus::Loading {
+            return;
+        }
+        state
+            .shared
+            .change_sessions(|sessions| sessions.status = SessionsStatus::Loading);
+        let address = record.endpoint_addr();
+        let myself = myself.clone();
+        tokio::spawn(async move {
+            let listed = list_sessions(myself.clone(), address).await;
+            let _ = myself.cast(AppMsg::Sessions(listed));
+        });
+    }
+
+    /// Opens a takeover of `session`, for `handoff` if set and starting it at
+    /// `start` if set, replacing any open one; a session or handoff id a link
+    /// made up is refused
     async fn open_takeover(
         myself: &ActorRef<AppMsg>,
         state: &mut AppActorState,
         session: &str,
         handoff: Option<&str>,
+        start: Option<String>,
     ) {
         let Some(record) = state.record.clone() else {
             return;
@@ -791,11 +829,12 @@ impl App {
 
         // the same takeover asked for again, such as a push tapped twice,
         // keeps its link
-        let open = state.shared.state().takeover.is_some_and(|shown| {
-            shown.session == session
-                && shown.handoff == handoff.as_ref().map(ToString::to_string)
-                && !matches!(shown.status, TakeoverStatus::Ended { .. })
-        });
+        let open = start.is_none()
+            && state.shared.state().takeover.is_some_and(|shown| {
+                shown.session == session
+                    && shown.handoff == handoff.as_ref().map(ToString::to_string)
+                    && !matches!(shown.status, TakeoverStatus::Ended { .. })
+            });
         if open && state.takeover.is_some() {
             return;
         }
@@ -824,6 +863,7 @@ impl App {
         let args = TakeoverArgs {
             session,
             handoff,
+            start,
             generation: state.takeover_generation,
             record,
             platform: Arc::clone(&state.platform),
@@ -1257,6 +1297,10 @@ impl Actor for App {
                     had
                 });
                 state.shared.set_pairing(PairingState::Idle);
+                // the sessions were the old gateway's
+                state
+                    .shared
+                    .change_sessions(|sessions| *sessions = BrowserSessions::default());
             }
             AppMsg::Connection(connection) => {
                 let connected = connection == ConnectionState::Connected;
@@ -1306,6 +1350,29 @@ impl Actor for App {
                     Self::takeover_event(state, event);
                 }
             }
+            // a listing that finishes after an unpair was of the old gateway
+            AppMsg::Sessions(_) if state.record.is_none() => {}
+            AppMsg::Sessions(listed) => state.shared.change_sessions(|sessions| match listed {
+                Ok((running, saved)) => {
+                    *sessions = BrowserSessions {
+                        status: SessionsStatus::Listed,
+                        running: running
+                            .into_iter()
+                            .map(|session| BrowserSession {
+                                name: session.name,
+                                url: session.url,
+                                title: session.title,
+                            })
+                            .collect(),
+                        saved,
+                    };
+                }
+                Err(message) => {
+                    sessions.status = SessionsStatus::Failed {
+                        message: one_line(&message, MAX_REASON_CHARS),
+                    };
+                }
+            }),
             AppMsg::Endpoint(reply) => match &state.connection {
                 Some(connection) => {
                     let _ = connection.cast(ConnMsg::Endpoint(reply));

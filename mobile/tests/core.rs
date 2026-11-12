@@ -13,10 +13,10 @@ use std::{
 };
 
 use companion_core::ffi::{
-    AppAction, AppState, ConnectionState, EnteredValue, FfiApp, HandoffStatus, LoginField,
-    OpenBatch, OpenError, OpenRequest, PairingState, PendingRead, Platform, PlatformError,
-    ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, ScreenImage, TakeoverInput,
-    TakeoverNotice, TakeoverStatus, Update,
+    AppAction, AppState, BrowserSession, ConnectionState, EnteredValue, FfiApp, HandoffStatus,
+    LoginField, OpenBatch, OpenError, OpenRequest, PairingState, PendingRead, Platform,
+    PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, ScreenImage,
+    SessionsStatus, TakeoverInput, TakeoverNotice, TakeoverStatus, Update,
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
@@ -27,9 +27,9 @@ use companion_wire::{
     },
     seal::{SoftwareKey, seal},
     takeover::{
-        EndReason, FillOffer, Focus, GatewayMessage, HEADER_BYTES, PhoneMessage, Point, Screen,
-        ScreenHeader, Secret as WireSecret, TAKEOVER_ALPN, Viewport, decode_phone, encode_message,
-        encode_screen, read_header,
+        EndReason, FillOffer, Focus, GatewayMessage, HEADER_BYTES, PhoneMessage, Point,
+        RunningSession, Screen, ScreenHeader, Secret as WireSecret, TAKEOVER_ALPN, Viewport,
+        decode_phone, encode_message, encode_screen, read_header,
     },
     ticket::{InviteSecret, InviteTicket},
     wire::{
@@ -1691,6 +1691,7 @@ async fn a_takeover_shows_the_page_paces_its_images_and_sends_the_owners_input()
             height: 664,
             scale: 2.0,
         },
+        start: None,
     };
     let (connection, _, mut receive) = gateway.next_takeover().await?;
     assert_eq!(read_phone(&mut receive).await?, open);
@@ -2014,6 +2015,88 @@ async fn a_sign_in_names_its_site_and_each_items_login_field() -> TestResult {
     // one Send answers both, as AutoFill filled them
     app.answer_program(id.to_string(), typed(&[(0, "praveenperera"), (1, TYPED)]));
     assert_eq!(reading.await??, texts(&["praveenperera", TYPED]));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sessions_are_listed_and_a_started_session_redials_as_it_is() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _platform, _recorder) = paired(&gateway).await?;
+
+    // a gateway from before listings closes the link, as it does any link
+    // that does not start with an Open
+    app.dispatch(AppAction::RefreshSessions);
+    let (old, _, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    old.close(1_u32.into(), b"expected open");
+    let state = until(&app, |state| {
+        matches!(state.sessions.status, SessionsStatus::Failed { .. })
+    })
+    .await?;
+    assert_eq!(
+        state.sessions.status,
+        SessionsStatus::Failed {
+            message: "The gateway's codemode-mcp is too old to list sessions; update it".to_owned()
+        }
+    );
+
+    app.dispatch(AppAction::RefreshSessions);
+    let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    let listed = GatewayMessage::Sessions {
+        running: vec![RunningSession {
+            name: "github".to_owned(),
+            url: Some("https://github.com/".to_owned()),
+            title: Some("GitHub".to_owned()),
+        }],
+        saved: vec!["discord".to_owned()],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+    let state = until(&app, |state| {
+        state.sessions.status == SessionsStatus::Listed
+    })
+    .await?;
+    assert_eq!(
+        state.sessions.running,
+        [BrowserSession {
+            name: "github".to_owned(),
+            url: Some("https://github.com/".to_owned()),
+            title: Some("GitHub".to_owned()),
+        }]
+    );
+    assert_eq!(state.sessions.saved, ["discord"]);
+
+    app.dispatch(AppAction::StartSession {
+        session: "discord".to_owned(),
+        url: "https://discord.com/login".to_owned(),
+    });
+    app.takeover(TakeoverInput::Resize {
+        width: 390,
+        height: 664,
+        scale: 3.0,
+    });
+    let open = |start: Option<&str>| PhoneMessage::Open {
+        session: "discord".to_owned(),
+        handoff: None,
+        viewport: Viewport {
+            width: 390,
+            height: 664,
+            scale: 3.0,
+        },
+        start: start.map(str::to_owned),
+    };
+    let (connection, _, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        open(Some("https://discord.com/login"))
+    );
+
+    // a redial takes the session over as it is: starting it again would
+    // load the address over whatever the owner had done on the page
+    connection.close(0_u32.into(), b"restart");
+    let (_connection, _, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, open(None));
 
     Ok(())
 }

@@ -331,9 +331,26 @@ impl HubView {
     }
 }
 
-/// A config for the hub's server that the catalog reads as the hub does:
-/// each tool's policy, grant and output, the server's aliases and
-/// sensitivity
+/// The agent-browser the `browser` builtin drives: the configured binary or
+/// the one found, its sessions' profiles in the configured directory or
+/// `~/.agent-browser`
+fn agent_browser(config: &Config) -> AgentBrowser {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let program = match &config.agent_browser_path {
+        Some(path) => AgentBrowser::at(path.clone()),
+        None => AgentBrowser::find(home.as_deref()),
+    };
+    let profiles = config
+        .browser_profiles
+        .clone()
+        .or_else(|| home.map(|home| home.join(".agent-browser")));
+
+    match profiles {
+        Some(profiles) => program.with_profiles(profiles),
+        None => program,
+    }
+}
+
 /// A failed exchange with the hub as a script sees it: a timeout keeps its
 /// kind, so `except TimeoutError` catches it as it would a local one
 fn hub_unreachable(error: &HubClientError) -> HubError {
@@ -346,6 +363,9 @@ fn hub_unreachable(error: &HubClientError) -> HubError {
     }
 }
 
+/// A config for the hub's server that the catalog reads as the hub does:
+/// each tool's policy, grant and output, the server's aliases and
+/// sensitivity
 fn hub_server_config(server: &HubServer) -> Result<ServerConfig, String> {
     let mut tools = toml::Table::new();
     for exported in &server.tools {
@@ -432,14 +452,7 @@ impl Gateway {
                     secrets.onepassword.clone(),
                     Arc::clone(&redactor),
                     Some(store.clone()),
-                    match &config.agent_browser_path {
-                        Some(path) => AgentBrowser::at(path.clone()),
-                        None => AgentBrowser::find(
-                            std::env::var_os("HOME")
-                                .map(std::path::PathBuf::from)
-                                .as_deref(),
-                        ),
-                    },
+                    agent_browser(&config),
                 )
             });
         let builtins = Builtins {

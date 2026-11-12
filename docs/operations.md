@@ -747,7 +747,9 @@ agent hands the session to your phone instead.
    `fill` must ask on every call; the config is refused unless it is `ask` with `grant = "per_call"`. A
    handoff asks you on your phone anyway, so it can be `allow`. agent-browser is found on the daemon's `PATH`,
    then in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`; set `agent_browser_path` at the top of
-   the config for another place.
+   the config for another place. A session started from the phone keeps its Chrome profile, and so its
+   sign-ins, in `~/.agent-browser/<session>`; set `browser_profiles` at the top of the config for another
+   directory.
 2. Restart the daemon. The agent opens the page in its session, clicks the field, and calls
    `browser_fill(session="github", kind="password", site="github.com", submit=True)`.
 
@@ -800,8 +802,19 @@ the session live in the Companion app:
   it opens a sheet with one field of that kind: pick the login from the AutoFill bar (or its key icon) and tap
   Fill, and the value is filled into the page's focused field if it is still that kind.
 - The page is drawn at the phone's own scale (3x on most iPhones), so text stays sharp.
-- **Done** or **Cancel** ends the handoff and the agent's call returns `done` or `cancelled`. **Leave** closes
-  the screen without answering, so you can take over again from the card.
+- **Done** or **Cancel** ends the handoff and the agent's call returns `done` or `cancelled`. **Sessions**
+  leaves without answering, for the session list, where you can take it over again.
+
+The app's home screen lists the browser sessions on the gateway Mac under **Browser sessions**: handoffs waiting
+on you first, with the agent's reason, then each running session with its page, then the saved sessions that
+are not running. Tap one to take it over; a takeover without a handoff has no Done or Cancel to answer, and
+the agent keeps the session after you leave. **Sessions** on a handoff's card puts it aside for this list,
+until a new handoff or request comes.
+
+**New session** asks for a name and an address, which must be `https` (`github.com/login` is read as
+`https://github.com/login`). A session that is not running launches with its saved profile, so a site it was
+signed in to still is; tapping a saved session fills in its name. A running session loads the address
+instead. Agents use a session you start like any other, by its name.
 
 A takeover runs over its own iroh connection from a paired, trusted phone, and only while the app is open. A
 phone can also open one with a `codemode-companion://takeover?session=NAME` link, without a handoff.
@@ -814,7 +827,6 @@ Limits:
 - The daemon and the app wipe their own copies of a value after use, including the frames that carry it and
   values a sign-in did not use once its 5 minutes are up, but not the copies inside the WebSocket, QUIC and
   JSON libraries' buffers on the way to the browser.
-- Spokes do not get the `browser` server: a spoke's call is gated on the hub without the page check.
 
 ## OAuth sign-in
 

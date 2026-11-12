@@ -37,7 +37,7 @@ pub use program::{
     checked_query,
 };
 pub use server::{CompanionHandle, ServeError, serve};
-pub use takeover::{HandoffOffer, TakeoverHost, TakeoverOpen};
+pub use takeover::{HandoffOffer, SessionList, TakeoverHost, TakeoverOpen};
 pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
 };
