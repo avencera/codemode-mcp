@@ -750,7 +750,23 @@ agent hands the session to your phone instead.
    the config for another place. A session started from the phone keeps its Chrome profile, and so its
    sign-ins, in `~/.agent-browser/<session>`; set `browser_profiles` at the top of the config for another
    directory.
-2. Restart the daemon. The agent opens the page in its session, clicks the field, and calls
+2. If the Mac's screen may be locked while you take a session over from your phone, as on a Mac mini left
+   alone, tell agent-browser's Chrome to keep drawing pages then. Headless Chrome on macOS paces its frames by
+   the display, which stops while the screen is locked, so the takeover screen, screenshots and agents'
+   `agent-browser screenshot` all hang. Put this in `~/.agent-browser/config.json`:
+
+   ```json
+   {
+     "args": "--disable-features=Translate,CADisplayLinkInBrowser,CADisplayLinkinGpu"
+   }
+   ```
+
+   Chrome then falls back to a 60 frames-a-second timer that runs while the screen is locked, at a few
+   percent of a core on an animated page. `--disable-frame-rate-limit` also works but has no cap, and costs
+   two to three cores. `Translate` stays listed because Chrome keeps only the last `--disable-features` it is
+   given, and agent-browser passes `--disable-features=Translate` before these args. A browser already running
+   keeps its old flags until it is started again.
+3. Restart the daemon. The agent opens the page in its session, clicks the field, and calls
    `browser_fill(session="github", kind="password", site="github.com", submit=True)`.
 
 What a fill checks before you are asked, from the page itself:
