@@ -421,7 +421,9 @@ impl Takeover<'_> {
     async fn handle(&mut self, message: PhoneMessage) -> Result<Option<Outcome>, PageError> {
         match message {
             // only a link's first message, which the companion read
-            PhoneMessage::Open { .. } | PhoneMessage::Sessions => {}
+            PhoneMessage::Open { .. }
+            | PhoneMessage::Sessions
+            | PhoneMessage::CloseSession { .. } => {}
             PhoneMessage::Ack { seq } => {
                 if let Some((unacked, browser_id)) = self.unacked
                     && unacked == seq

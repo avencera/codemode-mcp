@@ -73,6 +73,10 @@ pub trait TakeoverHost: Send + Sync {
 
     /// The browser sessions, for a phone's list
     async fn sessions(&self) -> Result<SessionList, String>;
+
+    /// Quits `session`'s browser, as named by the phone, keeping its saved
+    /// profile
+    async fn close_session(&self, session: &str) -> Result<(), String>;
 }
 
 /// What a handoff offered to the phones shows
@@ -107,10 +111,19 @@ async fn read_frame(receive: &mut RecvStream) -> Result<(u8, Zeroizing<Vec<u8>>)
     Ok((kind, body))
 }
 
-/// Answers a phone's [`PhoneMessage::Sessions`] with the list, or with
-/// [`GatewayMessage::Ended`] saying why there is none
-async fn answer_sessions(host: &dyn TakeoverHost, send: &mut SendStream) {
-    let message = match host.sessions().await {
+/// Answers a phone's [`PhoneMessage::Sessions`], or its
+/// [`PhoneMessage::CloseSession`] once `close` is closed, with the list, or
+/// with [`GatewayMessage::Ended`] saying why there is none
+async fn answer_sessions(host: &dyn TakeoverHost, close: Option<&str>, send: &mut SendStream) {
+    let closed = match close {
+        Some(session) => host.close_session(session).await,
+        None => Ok(()),
+    };
+    let listed = match closed {
+        Ok(()) => host.sessions().await,
+        Err(message) => Err(message),
+    };
+    let message = match listed {
         Ok(list) => GatewayMessage::Sessions {
             running: list.running,
             saved: list.saved,
@@ -188,7 +201,14 @@ impl Companions {
                     start,
                 },
                 Ok(PhoneMessage::Sessions) => {
-                    answer_sessions(host.as_ref(), &mut send).await;
+                    answer_sessions(host.as_ref(), None, &mut send).await;
+                    connection.close(0_u32.into(), b"listed");
+
+                    return;
+                }
+                Ok(PhoneMessage::CloseSession { session }) => {
+                    tracing::info!(phone = %phone.name, %session, "closing a session for a phone");
+                    answer_sessions(host.as_ref(), Some(&session), &mut send).await;
                     connection.close(0_u32.into(), b"listed");
 
                     return;

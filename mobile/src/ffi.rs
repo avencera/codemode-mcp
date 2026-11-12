@@ -680,6 +680,12 @@ pub enum AppAction {
     CloseTakeover,
     /// Ask the gateway for its browser sessions
     RefreshSessions,
+    /// Quit browser `session` on the gateway, keeping its saved profile, then
+    /// list the sessions again; a takeover of it is left
+    CloseSession {
+        /// The browser session
+        session: String,
+    },
     /// APNs gave this token, or `None` when notifications are off
     PushToken {
         /// The device token as lowercase hex

@@ -826,7 +826,9 @@ The app's home screen lists the browser sessions on the gateway Mac under **Brow
 on you first, with the agent's reason, then each running session with its page, then the saved sessions that
 are not running. Tap one to take it over; a takeover without a handoff has no Done or Cancel to answer, and
 the agent keeps the session after you leave. **Sessions** on a handoff's card puts it aside for this list,
-until a new handoff or request comes.
+until a new handoff or request comes. Swipe a running session left, or long-press it, to **Close** it: its
+browser quits, after you confirm, and an agent using it loses the page, but its saved profile stays, so it
+lists as saved and starts again signed in.
 
 **New session** asks for a name and an address, which must be `https` (`github.com/login` is read as
 `https://github.com/login`). A session that is not running launches with its saved profile, so a site it was

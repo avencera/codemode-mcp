@@ -2020,7 +2020,7 @@ async fn a_sign_in_names_its_site_and_each_items_login_field() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_sessions_are_listed_and_a_started_session_redials_as_it_is() -> TestResult {
+async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     let gateway = FakeGateway::start().await?;
     let (app, _platform, _recorder) = paired(&gateway).await?;
 
@@ -2097,6 +2097,30 @@ async fn the_sessions_are_listed_and_a_started_session_redials_as_it_is() -> Tes
     connection.close(0_u32.into(), b"restart");
     let (_connection, _, mut receive) = gateway.next_takeover().await?;
     assert_eq!(read_phone(&mut receive).await?, open(None));
+
+    // closing the session leaves its takeover, which would only end with
+    // the browser, and lists the sessions as they are after
+    app.dispatch(AppAction::CloseSession {
+        session: "discord".to_owned(),
+    });
+    let (_closing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        PhoneMessage::CloseSession {
+            session: "discord".to_owned()
+        }
+    );
+    let listed = GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: vec!["discord".to_owned(), "github".to_owned()],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+    let state = until(&app, |state| {
+        state.sessions.status == SessionsStatus::Listed && state.sessions.running.is_empty()
+    })
+    .await?;
+    assert_eq!(state.takeover, None);
+    assert_eq!(state.sessions.saved, ["discord", "github"]);
 
     Ok(())
 }

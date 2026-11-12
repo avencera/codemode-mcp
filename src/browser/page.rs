@@ -33,6 +33,11 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long starting a session may take, launching its browser included
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long closing a session may take: agent-browser asks the browser to
+/// close, which takes up to 30 seconds to fail when its link to the browser
+/// is gone, then waits 5 more before killing it
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// How long listing the sessions may wait on agent-browser for the list,
 /// then for each session; a session that takes longer is left out, so the
 /// phone, which waits 30 seconds, still gets the rest
@@ -470,6 +475,26 @@ impl AgentBrowser {
 
             return Err(PageError::NoBrowser(format!(
                 "agent-browser could not start `{session}` ({})",
+                crate::prompt::one_line(detail.trim(), 200)
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Quits `session`'s browser; its saved profile stays, so starting the
+    /// session again finds its sign-ins
+    pub async fn close(&self, session: &SessionName) -> Result<(), PageError> {
+        // after any start under way, so a close cannot land between its check
+        // and its launch
+        let _turn = self.starts.lock().await;
+        let args = ["--session", session.as_str(), "--json", "close"].map(OsStr::new);
+        let output = self.output(&args, CLOSE_TIMEOUT).await?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+
+            return Err(PageError::NoBrowser(format!(
+                "agent-browser could not close `{session}` ({})",
                 crate::prompt::one_line(detail.trim(), 200)
             )));
         }

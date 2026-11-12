@@ -639,24 +639,38 @@ async fn connect(
 /// about 13 seconds
 const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long the gateway may take to close a session, which it caps at 45
+/// seconds, before it lists them
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// How long a link whose stream ended may take to say why it closed
 const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The gateway's browser sessions: dials as a takeover does, asks with
-/// [`PhoneMessage::Sessions`], and reads the one answer
+/// The gateway's browser sessions, after closing `close` if set: dials as a
+/// takeover does, asks with [`PhoneMessage::Sessions`] or
+/// [`PhoneMessage::CloseSession`], and reads the one answer
 pub async fn list_sessions(
     app: ActorRef<AppMsg>,
     address: iroh::EndpointAddr,
+    close: Option<String>,
 ) -> Result<(Vec<RunningSession>, Vec<String>), String> {
-    let mut link = connect(app, address, vec![PhoneMessage::Sessions]).await?;
+    let (first, timeout, asked) = match close {
+        Some(session) => (
+            PhoneMessage::CloseSession { session },
+            CLOSE_TIMEOUT + LIST_TIMEOUT,
+            "close sessions",
+        ),
+        None => (PhoneMessage::Sessions, LIST_TIMEOUT, "list sessions"),
+    };
+    let mut link = connect(app, address, vec![first]).await?;
     let _ = link.send.finish();
-    let answer = tokio::time::timeout(LIST_TIMEOUT, read_frame(&mut link.receive))
+    let answer = tokio::time::timeout(timeout, read_frame(&mut link.receive))
         .await
-        .map_err(|_| "the gateway did not list its sessions in time".to_owned())?;
+        .map_err(|_| format!("the gateway did not {asked} in time"))?;
     let answer = match answer {
         Ok(frame) => frame,
-        // a gateway that cannot list closes the link, its reason the close's
-        Err(error) => return Err(refusal(&link.connection).await.unwrap_or(error)),
+        // a gateway that cannot answer closes the link, its reason the close's
+        Err(error) => return Err(refusal(&link.connection, asked).await.unwrap_or(error)),
     };
     link.connection.close(0_u32.into(), b"listed");
 
@@ -672,8 +686,9 @@ pub async fn list_sessions(
 
 /// Why the gateway closed `connection`, in the owner's words, when it closed
 /// it for a reason a listing can meet: an older gateway, which takes only an
-/// Open, or one without the `browser` server
-async fn refusal(connection: &Connection) -> Option<String> {
+/// Open and could not do what was `asked`, or one without the `browser`
+/// server
+async fn refusal(connection: &Connection, asked: &str) -> Option<String> {
     let closed = tokio::time::timeout(CLOSE_WAIT, connection.closed())
         .await
         .ok()?;
@@ -682,9 +697,9 @@ async fn refusal(connection: &Connection) -> Option<String> {
     };
 
     match close.reason.as_ref() {
-        b"expected open" => {
-            Some("The gateway's codemode-mcp is too old to list sessions; update it".to_owned())
-        }
+        b"expected open" => Some(format!(
+            "The gateway's codemode-mcp is too old to {asked}; update it"
+        )),
         b"no browser" => Some("The gateway has no `browser` server configured".to_owned()),
         _ => None,
     }

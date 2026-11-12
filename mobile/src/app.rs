@@ -685,7 +685,21 @@ impl App {
                 Self::open_takeover(myself, state, &session, None, Some(url)).await;
             }
             AppAction::CloseTakeover => Self::close_takeover(state),
-            AppAction::RefreshSessions => Self::refresh_sessions(myself, state),
+            AppAction::RefreshSessions => Self::refresh_sessions(myself, state, None),
+            AppAction::CloseSession { session } => {
+                let Some(session) = session_name(&session) else {
+                    tracing::warn!("a close was asked for a session name no gateway uses");
+
+                    return;
+                };
+                // a takeover of it, put aside for the list, would only end
+                // with its browser
+                let shown = state.shared.state().takeover;
+                if shown.is_some_and(|takeover| takeover.session == session) {
+                    Self::close_takeover(state);
+                }
+                Self::refresh_sessions(myself, state, Some(session));
+            }
             AppAction::Unpair => {
                 if state.record.is_none() {
                     return;
@@ -787,13 +801,19 @@ impl App {
         }
     }
 
-    /// Asks the gateway for its browser sessions, in a spawned task that
-    /// reports back as [`AppMsg::Sessions`]; the last listing shows meanwhile
-    fn refresh_sessions(myself: &ActorRef<AppMsg>, state: &mut AppActorState) {
+    /// Asks the gateway for its browser sessions, after closing `close` if
+    /// set, in a spawned task that reports back as [`AppMsg::Sessions`]; the
+    /// last listing shows meanwhile
+    fn refresh_sessions(
+        myself: &ActorRef<AppMsg>,
+        state: &mut AppActorState,
+        close: Option<String>,
+    ) {
         let Some(record) = &state.record else {
             return;
         };
-        if state.shared.state().sessions.status == SessionsStatus::Loading {
+        // a close goes ahead of a listing under way, whose answer it follows
+        if close.is_none() && state.shared.state().sessions.status == SessionsStatus::Loading {
             return;
         }
         state
@@ -802,7 +822,7 @@ impl App {
         let address = record.endpoint_addr();
         let myself = myself.clone();
         tokio::spawn(async move {
-            let listed = list_sessions(myself.clone(), address).await;
+            let listed = list_sessions(myself.clone(), address, close).await;
             let _ = myself.cast(AppMsg::Sessions(listed));
         });
     }

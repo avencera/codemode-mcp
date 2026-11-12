@@ -109,7 +109,9 @@ App (supervisor)
   task, sends `PhoneMessage::Sessions` and reads the one answer into `AppState.sessions` (running sessions
   and saved profiles), which keeps the last listing while the next loads. `StartSession` opens a takeover whose
   `Open` carries `start`, the `https` address the gateway starts the session at; the takeover actor drops it
-  once a link gets through, so a redial takes the session over as it is.
+  once a link gets through, so a redial takes the session over as it is. `CloseSession` sends
+  `PhoneMessage::CloseSession` on a listing link instead, leaving any takeover of that session first, and
+  reads the list the gateway answers after the close.
 
 A child that fails is reported to the app through supervision: a failed connection actor is restarted after a
 second, a failed request marks its read failed, and a failed takeover shows as ended. A connection actor that cannot start, say because its endpoint

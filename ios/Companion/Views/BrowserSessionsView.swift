@@ -2,14 +2,16 @@ import CompanionCore
 import SwiftUI
 
 /// The gateway's browser sessions: the handoffs waiting on the owner, the
-/// sessions running, which any can take over, the saved ones to start again,
-/// and New session
+/// sessions running, which any can take over or close, the saved ones to
+/// start again, and New session
 struct BrowserSessionsSection: View {
     @Environment(AppManager.self) private var manager
     let gatewayName: String
     /// The session New session starts, while its sheet is up; the list
     /// holds the sheet, since a section's own modifiers do not reliably run
     @Binding var starting: NewSession?
+    /// The running session whose Close waits on the owner's confirmation
+    @State private var closing: String?
 
     var body: some View {
         let sessions = manager.state.sessions
@@ -34,6 +36,29 @@ struct BrowserSessionsSection: View {
                     manager.dispatch(.openTakeover(session: session.name, handoff: nil))
                 } label: {
                     SessionRow(name: session.name, detail: session.detail, icon: "safari", tint: .accentColor)
+                }
+                .swipeActions {
+                    Button("Close", systemImage: "xmark.circle") { closing = session.name }
+                        .tint(.red)
+                }
+                .contextMenu {
+                    Button("Close Session", systemImage: "xmark.circle", role: .destructive) { closing = session.name }
+                }
+                // on the row, since a section's own modifiers do not reliably
+                // run
+                .confirmationDialog(
+                    "Close \(session.name)?",
+                    isPresented: Binding(
+                        get: { closing == session.name },
+                        set: { if !$0 { closing = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("Close Session", role: .destructive) {
+                        manager.dispatch(.closeSession(session: session.name))
+                    }
+                } message: {
+                    Text("Its browser on \(gatewayName) quits, and an agent using it loses the page. Its saved sign-ins stay, so it starts again signed in.")
                 }
             }
             ForEach(sessions.saved, id: \.self) { name in
@@ -67,7 +92,7 @@ struct BrowserSessionsSection: View {
             if case let .failed(message) = sessions.status {
                 Text(message).foregroundStyle(.red)
             } else {
-                Text("Sessions of the browser on \(gatewayName). Take one over to use it here; agents keep using it after you leave.")
+                Text("Sessions of the browser on \(gatewayName). Take one over to use it here; agents keep using it after you leave. Swipe one to close it.")
             }
         }
     }

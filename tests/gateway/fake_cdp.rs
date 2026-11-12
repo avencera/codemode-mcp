@@ -3,7 +3,7 @@
 //! an `agent-browser` script that points at it. The script knows the session
 //! `test`, lists `gone` as a session with no browser and `broken` as one it
 //! cannot say anything about, and records each `open`, after which that
-//! session runs on the same page
+//! session runs on the same page, and each `close`, after which it does not
 
 use std::{
     error::Error,
@@ -77,6 +77,8 @@ pub struct FakeCdp {
     pub profiles: PathBuf,
     /// Where the script records what it was asked to open
     opens: PathBuf,
+    /// Where the script records the sessions it was asked to close
+    closes: PathBuf,
 }
 
 impl FakeCdp {
@@ -113,12 +115,22 @@ impl FakeCdp {
             program: agent_browser(&directory, address, url)?,
             profiles,
             opens: directory.join("opens"),
+            closes: directory.join("closes"),
         })
     }
 
     /// The arguments of each `open` the script ran, in order
     pub fn opens(&self) -> Vec<String> {
         std::fs::read_to_string(&self.opens)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The sessions the script closed, in order
+    pub fn closes(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.closes)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
@@ -179,11 +191,12 @@ fn agent_browser(
              [ \"$*\" = '--json session list' ] && {{ echo '{sessions}'; exit 0; }}\n\
              [ \"$1\" = --session ] || exit 2\n\
              case \"$*\" in\n\
-             *' open '*) echo \"$*\" >> '{directory}/opens'; touch '{directory}/started-'\"$2\"; exit 0 ;;\n\
+             *' open '*) echo \"$*\" >> '{directory}/opens'; rm -f '{directory}/closed-'\"$2\"; touch '{directory}/started-'\"$2\"; exit 0 ;;\n\
+             *' close') echo \"$2\" >> '{directory}/closes'; rm -f '{directory}/started-'\"$2\"; touch '{directory}/closed-'\"$2\"; echo '{{\"success\":true,\"data\":{{\"closed\":true}},\"error\":null}}'; exit 0 ;;\n\
              esac\n\
              [ \"$2\" = broken ] && {{ echo 'the daemon is stuck' >&2; exit 3; }}\n\
              running=no\n\
-             {{ [ \"$2\" = test ] || [ -f '{directory}/started-'\"$2\" ]; }} && running=yes\n\
+             {{ {{ [ \"$2\" = test ] && [ ! -f '{directory}/closed-test' ]; }} || [ -f '{directory}/started-'\"$2\" ]; }} && running=yes\n\
              case \"$*\" in\n\
              *cdp-url*) [ $running = yes ] || {{ echo '{not_launched}'; exit 1; }}\n\
              echo '{cdp_url}' ;;\n\

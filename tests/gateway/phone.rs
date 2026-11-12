@@ -2255,8 +2255,7 @@ async fn with_the_owner_away_one_phone_request_signs_in_and_each_field_is_filled
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_phone_lists_the_browser_sessions_and_starts_one_with_its_saved_profile() -> TestResult
-{
+async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
     let cdp = FakeCdp::start("https://github.com/login").await?;
     // saved sessions' profiles, and a directory of agent-browser's that is
     // not one
@@ -2343,6 +2342,39 @@ async fn the_phone_lists_the_browser_sessions_and_starts_one_with_its_saved_prof
             "--session test open https://github.com/".to_owned(),
         ]
     );
+    drop(again);
+
+    // closing a session quits its browser and answers the list after it; a
+    // name agent-browser would not take is refused before it is asked
+    let mut refused = Takeover::dial(&rig.phone).await?;
+    refused
+        .send(&PhoneMessage::CloseSession {
+            session: "../test".to_owned(),
+        })
+        .await?;
+    assert!(
+        matches!(
+            refused.next().await?,
+            GatewayFrame::Message(GatewayMessage::Ended {
+                reason: EndReason::BrowserGone,
+                ..
+            })
+        ),
+        "a bad name was not refused"
+    );
+    let mut closing = Takeover::dial(&rig.phone).await?;
+    closing
+        .send(&PhoneMessage::CloseSession {
+            session: "test".to_owned(),
+        })
+        .await?;
+    let GatewayFrame::Message(GatewayMessage::Sessions { running, saved }) = closing.next().await?
+    else {
+        return Err("no session list after the close".into());
+    };
+    assert_eq!(cdp.closes(), ["test"]);
+    assert!(running.is_empty(), "{running:?}");
+    assert_eq!(saved, ["discord"]);
 
     rig.stop().await
 }

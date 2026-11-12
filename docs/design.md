@@ -1138,7 +1138,9 @@ rather than a generated crate), so no secret passes through an agent-browser com
   in `companion_wire::takeover`. A link whose first message is `Sessions` instead of `Open` is answered with the
   session list and closed: `agent-browser session list`, each one's `get cdp-url` (which never launches a
   browser) and then its active tab, plus the profile directories under `browser_profiles` (those holding
-  `Local State`) that are not running. An `Open` with `start` first runs `agent-browser open` at that `https`
+  `Local State`) that are not running. A first message `CloseSession` runs `agent-browser --session <name>
+  close` first, which quits the browser and kills it if it does not exit, but leaves its profile, then answers
+  the list the same way; it waits for any start under way. An `Open` with `start` first runs `agent-browser open` at that `https`
   address: with `--profile <browser_profiles>/<session> --engine chrome` when the session has no browser, and
   without them when it has one, since agent-browser relaunches a running browser it is given launch options
   for, losing its page. The phone sends `start` only until a link gets through, so a redial keeps the page. The gateway lays the page out with `Emulation.setDeviceMetricsOverride`

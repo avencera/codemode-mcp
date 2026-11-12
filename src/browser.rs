@@ -668,6 +668,15 @@ impl TakeoverHost for Browsers {
             .await
             .map_err(|error| error.to_string())
     }
+
+    async fn close_session(&self, session: &str) -> Result<(), String> {
+        let session = SessionName::parse(session).map_err(|error| error.to_string())?;
+
+        self.agent_browser.close(&session).await.map_err(|error| {
+            tracing::warn!(%session, %error, "the session did not close");
+            error.to_string()
+        })
+    }
 }
 
 /// The answer to `fill`

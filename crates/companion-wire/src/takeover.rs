@@ -3,9 +3,9 @@
 //!
 //! The phone dials one connection per takeover and opens one bidirectional
 //! stream on it. Its first message is [`PhoneMessage::Open`], or
-//! [`PhoneMessage::Sessions`] to list the browser sessions instead, which the
-//! gateway answers with [`GatewayMessage::Sessions`] before closing the
-//! stream. After an Open the gateway sends the live page as [`Screen`]
+//! [`PhoneMessage::Sessions`] to list the browser sessions instead, or
+//! [`PhoneMessage::CloseSession`] to close one, which the gateway answers
+//! with [`GatewayMessage::Sessions`] before closing the stream. After an Open the gateway sends the live page as [`Screen`]
 //! images and what changed on it as [`GatewayMessage`]s, and the phone sends
 //! the owner's taps, scrolls, keys and text. The gateway sends the next image only once the phone has
 //! acknowledged the last, so a slow link gets fewer images rather than a
@@ -152,6 +152,12 @@ pub enum PhoneMessage {
     /// Instead of an Open: list the browser sessions, answered with
     /// [`GatewayMessage::Sessions`]
     Sessions,
+    /// Instead of an Open: quit `session`'s browser, keeping its saved
+    /// profile, answered with [`GatewayMessage::Sessions`] as listed after
+    CloseSession {
+        /// The browser session, such as `github`
+        session: String,
+    },
     /// The phone drew the image `seq`, so the gateway may send the next
     Ack {
         /// The image's [`ScreenHeader::seq`]
@@ -326,8 +332,8 @@ pub enum GatewayMessage {
         /// Why, never holding a value
         message: String,
     },
-    /// The answer to [`PhoneMessage::Sessions`]; the gateway closes the
-    /// stream next
+    /// The answer to [`PhoneMessage::Sessions`] and
+    /// [`PhoneMessage::CloseSession`]; the gateway closes the stream next
     Sessions {
         /// The sessions running now, by name
         running: Vec<RunningSession>,
