@@ -261,8 +261,8 @@ struct TakeoverView: View {
         }
     }
 
-    /// Keys the phone's keyboard lacks, the page's history, Fill from
-    /// 1Password, and the keyboard itself
+    /// Keys the phone's keyboard lacks, Paste into the focused field, the
+    /// page's history, Fill from 1Password, and the keyboard itself
     private var keyBar: some View {
         let live = takeover.status == .live
         return VStack(spacing: 8) {
@@ -278,8 +278,13 @@ struct TakeoverView: View {
                 keyButton("chevron.backward", "Back") { manager.takeover(.back) }
                 keyButton("arrow.clockwise", "Reload") { manager.takeover(.reload) }
                 keyButton("escape", "Escape") { manager.takeover(.key(key: .escape)) }
-                keyButton("arrow.left.to.line", "Shift-Tab") { manager.takeover(.key(key: .shiftTab)) }
                 keyButton("arrow.right.to.line", "Tab") { manager.takeover(.key(key: .tab)) }
+                keyButton("doc.on.clipboard", "Paste") {
+                    // read only when tapped, so iOS asks to allow it then
+                    guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+                    manager.takeoverText(text)
+                }
+                .disabled(takeover.page?.focus?.editable != true)
                 keyButton("delete.left", "Backspace") { manager.takeover(.key(key: .backspace)) }
                 keyButton("return", "Enter") { manager.takeover(.key(key: .enter)) }
                 keyButton(keyboardUp ? "keyboard.chevron.compact.down" : "keyboard", keyboardUp ? "Hide keyboard" : "Show keyboard") {

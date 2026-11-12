@@ -4405,10 +4405,6 @@ public enum TakeoverKey: Equatable, Hashable {
      */
     case tab
     /**
-     * Shift-Tab
-     */
-    case shiftTab
-    /**
      * Delete the character before the caret
      */
     case backspace
@@ -4441,11 +4437,9 @@ public struct FfiConverterTypeTakeoverKey: FfiConverterRustBuffer {
         
         case 2: return .tab
         
-        case 3: return .shiftTab
+        case 3: return .backspace
         
-        case 4: return .backspace
-        
-        case 5: return .escape
+        case 4: return .escape
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4463,16 +4457,12 @@ public struct FfiConverterTypeTakeoverKey: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         
         
-        case .shiftTab:
+        case .backspace:
             writeInt(&buf, Int32(3))
         
         
-        case .backspace:
-            writeInt(&buf, Int32(4))
-        
-        
         case .escape:
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(4))
         
         }
     }

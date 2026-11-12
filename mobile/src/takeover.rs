@@ -809,7 +809,6 @@ fn wire_key(key: TakeoverKey) -> Key {
     match key {
         TakeoverKey::Enter => Key::Enter,
         TakeoverKey::Tab => Key::Tab,
-        TakeoverKey::ShiftTab => Key::ShiftTab,
         TakeoverKey::Backspace => Key::Backspace,
         TakeoverKey::Escape => Key::Escape,
     }

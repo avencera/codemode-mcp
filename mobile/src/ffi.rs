@@ -496,8 +496,6 @@ pub enum TakeoverKey {
     Enter,
     /// Tab
     Tab,
-    /// Shift-Tab
-    ShiftTab,
     /// Delete the character before the caret
     Backspace,
     /// Escape

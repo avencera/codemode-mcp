@@ -812,7 +812,7 @@ the session live in the Companion app:
   focused text field, long-press offers Paste, which types what is on the phone's clipboard. A focused text
   field brings up the keyboard, with AutoFill for usernames, passwords and one-time codes; a value AutoFill gives
   goes only into the kind of field it was offered for, so if the page's focus moved on meanwhile it is refused
-  and you pick it again. The key bar adds the page's Back and Reload, Esc, Tab, Shift-Tab, Backspace and Enter.
+  and you pick it again. The key bar adds the page's Back and Reload, Esc, Tab, Paste into the focused field, Backspace and Enter.
 - Tap the address at the top to go somewhere else: type an address, such as `github.com/settings`, and tap Go.
   Only `https` addresses open; if the site does not load, the reason shows under the page.
 - **Fill from 1Password** shows for a focused username, password or code field. It fills the field from a copy
