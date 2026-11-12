@@ -30,7 +30,7 @@ use super::{
     awake::DisplayAwake,
     cdp::CdpError,
     login_value,
-    page::{Page, PageError, PageState},
+    page::{Page, PageError, PageState, https_address},
 };
 use crate::{logins::site_of, secrets::Redactor};
 
@@ -482,6 +482,7 @@ impl Takeover<'_> {
             PhoneMessage::Reload => {
                 self.page.session().call("Page.reload", json!({})).await?;
             }
+            PhoneMessage::Go { url } => self.go(&url).await?,
             PhoneMessage::Text { text } => {
                 let text = Zeroizing::new(text.into_inner());
                 if text.chars().count() > MAX_TEXT_CHARS {
@@ -547,6 +548,31 @@ impl Takeover<'_> {
         };
         self.page.replace_text(focused, &typed, submit).await?;
         self.state = Some(state);
+
+        Ok(())
+    }
+
+    /// Loads the address the owner typed; a page Chrome could not load is
+    /// refused with its reason, as the page then shows only Chrome's error
+    async fn go(&self, url: &str) -> Result<(), PageError> {
+        let Some(address) = https_address(url) else {
+            self.refuse("only an https address opens here".to_owned())
+                .await;
+
+            return Ok(());
+        };
+        let loaded = self
+            .page
+            .session()
+            .call("Page.navigate", json!({ "url": address.as_str() }))
+            .await?;
+        if let Some(error) = loaded["errorText"]
+            .as_str()
+            .filter(|error| !error.is_empty())
+        {
+            let host = address.host_str().unwrap_or_default();
+            self.refuse(format!("{host} did not load ({error})")).await;
+        }
 
         Ok(())
     }

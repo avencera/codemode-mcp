@@ -395,6 +395,7 @@ impl TakeoverActor {
             TakeoverInput::Key { key } => PhoneMessage::Key { key: wire_key(key) },
             TakeoverInput::Back => PhoneMessage::Back,
             TakeoverInput::Reload => PhoneMessage::Reload,
+            TakeoverInput::Go { url } => PhoneMessage::Go { url },
             TakeoverInput::FillOffer { reference } => {
                 Self::open_offer(myself, state, &reference);
 

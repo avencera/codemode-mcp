@@ -565,6 +565,11 @@ pub enum TakeoverInput {
     Back,
     /// Load the page again
     Reload,
+    /// Load `url`, an `https` address, in the page
+    Go {
+        /// The address
+        url: String,
+    },
     /// Open the offer for `reference` with Face ID and fill it
     FillOffer {
         /// The offer's reference

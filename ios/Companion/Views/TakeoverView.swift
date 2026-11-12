@@ -26,6 +26,13 @@ struct TakeoverView: View {
     /// The area's size waits a moment before it goes, so a keyboard sliding
     /// in lays the page out once
     @State private var resizing: Task<Void, Never>?
+    /// The address bar's text while the owner edits it; nil shows the
+    /// page's address
+    @State private var typing: String?
+    /// What of the address bar's text is selected: all of it on a tap, so
+    /// typing replaces it
+    @State private var typingSelection: TextSelection?
+    @FocusState private var addressFocused: Bool
 
     /// Most the picture zooms
     private static let maxZoom: CGFloat = 5
@@ -77,7 +84,7 @@ struct TakeoverView: View {
             // the page's keyboard: invisible, it only takes what is typed
             KeyCatcher(
                 focus: takeover.page?.focus,
-                active: keyboardUp && takeover.status == .live,
+                active: keyboardUp && takeover.status == .live && typing == nil,
                 onText: { manager.takeoverText($0) },
                 onFill: { manager.takeoverFill(field: $0, value: $1, submit: false) },
                 onKey: { manager.takeover(.key(key: $0)) }
@@ -117,12 +124,24 @@ struct TakeoverView: View {
 
     private var header: some View {
         VStack(spacing: 2) {
-            if let page = takeover.page {
-                Text(page.url)
-                    .font(.system(.footnote, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
+            if typing != nil {
+                addressBar
+            } else if let page = takeover.page {
+                // a tap edits the address, as in Safari
+                Button {
+                    typingSelection = TextSelection(range: page.url.startIndex ..< page.url.endIndex)
+                    typing = page.url
+                    addressFocused = true
+                } label: {
+                    Text(page.url)
+                        .font(.system(.footnote, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.plain)
+                .disabled(takeover.status != .live)
+                .accessibilityHint("Enter another address")
                 if let focus = page.focus, focus.crossSite {
                     Label("The focused field is in a frame from \(focus.origin)", systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
@@ -137,6 +156,42 @@ struct TakeoverView: View {
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
+    }
+
+    /// The page's address, editable: Go loads what was typed, as `https`
+    private var addressBar: some View {
+        let text = Binding { typing ?? "" } set: { typing = $0 }
+        let bad = typing.map { !$0.isEmpty && httpsAddress($0) == nil } ?? false
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                TextField("Address", text: text, selection: $typingSelection)
+                    .focused($addressFocused)
+                    .font(.system(.footnote, design: .monospaced))
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .onSubmit(go)
+                    .textFieldStyle(.roundedBorder)
+                Button("Cancel") { typing = nil }
+                    .font(.footnote)
+            }
+            if bad {
+                Text("Only an https address opens here.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func go() {
+        guard let url = typing.flatMap(httpsAddress) else {
+            // Return put the keyboard away; keep editing
+            addressFocused = true
+            return
+        }
+        typing = nil
+        manager.takeover(.go(url: url))
     }
 
     /// What the link is doing, over the picture, while it is not live

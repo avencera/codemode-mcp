@@ -490,12 +490,9 @@ impl AgentBrowser {
     /// session's browser when one runs, or launches the session's browser
     /// with its saved profile, so a site it signed in to before still is
     pub async fn start(&self, session: &SessionName, url: &str) -> Result<(), PageError> {
-        let address = reqwest::Url::parse(url)
-            .ok()
-            .filter(|address| address.scheme() == "https" && address.host_str().is_some())
-            .ok_or_else(|| {
-                PageError::Refused("a session starts only at an https address".to_owned())
-            })?;
+        let address = https_address(url).ok_or_else(|| {
+            PageError::Refused("a session starts only at an https address".to_owned())
+        })?;
         let _turn = self.starts.lock().await;
         // an error here refuses the start: a browser that did not answer may
         // be running, and launch options would relaunch it
@@ -1201,6 +1198,14 @@ fn key_event(key: Key) -> (&'static str, i64, &'static str, i64) {
         Key::Backspace => ("Backspace", 8, "", 0),
         Key::Escape => ("Escape", 27, "", 0),
     }
+}
+
+/// `url` when it is an `https` address with a host, the only kind the owner
+/// may send a session to
+pub fn https_address(url: &str) -> Option<reqwest::Url> {
+    reqwest::Url::parse(url)
+        .ok()
+        .filter(|address| address.scheme() == "https" && address.host_str().is_some())
 }
 
 #[cfg(test)]

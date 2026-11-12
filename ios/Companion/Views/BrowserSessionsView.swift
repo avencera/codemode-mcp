@@ -245,10 +245,7 @@ struct NewSessionSheet: View {
 
     /// The address as `https`, which is all a session starts at
     private var url: String? {
-        let typed = address.trimmingCharacters(in: .whitespaces)
-        let full = typed.contains("://") ? typed : "https://\(typed)"
-        guard let url = URL(string: full), url.scheme == "https", url.host() != nil else { return nil }
-        return url.absoluteString
+        httpsAddress(address)
     }
 
     /// Matches the gateway's session names, so it never refuses one here
@@ -262,4 +259,14 @@ struct NewSessionSheet: View {
         onStart(name, url)
         dismiss()
     }
+}
+
+/// An address the owner typed as `https`, with the scheme added when they
+/// left it out, such as `github.com/login`; nil for any other scheme or no
+/// host, which the gateway would refuse
+func httpsAddress(_ typed: String) -> String? {
+    let typed = typed.trimmingCharacters(in: .whitespaces)
+    let full = typed.contains("://") ? typed : "https://\(typed)"
+    guard let url = URL(string: full), url.scheme == "https", url.host() != nil else { return nil }
+    return url.absoluteString
 }

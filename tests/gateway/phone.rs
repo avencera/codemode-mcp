@@ -2086,6 +2086,31 @@ async fn a_handoff_is_taken_over_on_the_phone_and_ends_when_the_owner_is_done() 
             .then_some(())
     })
     .await?;
+    // the address bar loads only an https address
+    takeover
+        .send(&PhoneMessage::Go {
+            url: "http://github.com/settings".to_owned(),
+        })
+        .await?;
+    let refused = takeover
+        .until(|frame| match frame {
+            GatewayFrame::Message(GatewayMessage::Refused { message }) => Some(message.clone()),
+            _ => None,
+        })
+        .await?;
+    assert!(refused.contains("only an https address"), "{refused}");
+    takeover
+        .send(&PhoneMessage::Go {
+            url: "https://github.com/settings".to_owned(),
+        })
+        .await?;
+    eventually(|| {
+        cdp.log()
+            .iter()
+            .any(|line| line == r#"Page.navigate "https://github.com/settings""#)
+            .then_some(())
+    })
+    .await?;
 
     takeover.send(&PhoneMessage::Done).await?;
     let ended = takeover

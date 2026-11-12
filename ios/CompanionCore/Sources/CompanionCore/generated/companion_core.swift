@@ -4220,6 +4220,14 @@ public enum TakeoverInput: Equatable, Hashable {
      */
     case reload
     /**
+     * Load `url`, an `https` address, in the page
+     */
+    case go(
+        /**
+         * The address
+         */url: String
+    )
+    /**
      * Open the offer for `reference` with Face ID and fill it
      */
     case fillOffer(
@@ -4278,12 +4286,15 @@ public struct FfiConverterTypeTakeoverInput: FfiConverterRustBuffer {
         
         case 8: return .reload
         
-        case 9: return .fillOffer(reference: try FfiConverterString.read(from: &buf)
+        case 9: return .go(url: try FfiConverterString.read(from: &buf)
         )
         
-        case 10: return .done
+        case 10: return .fillOffer(reference: try FfiConverterString.read(from: &buf)
+        )
         
-        case 11: return .cancel
+        case 11: return .done
+        
+        case 12: return .cancel
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4341,17 +4352,22 @@ public struct FfiConverterTypeTakeoverInput: FfiConverterRustBuffer {
             writeInt(&buf, Int32(8))
         
         
-        case let .fillOffer(reference):
+        case let .go(url):
             writeInt(&buf, Int32(9))
+            FfiConverterString.write(url, into: &buf)
+            
+        
+        case let .fillOffer(reference):
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(reference, into: &buf)
             
         
         case .done:
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
         
         
         case .cancel:
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(12))
         
         }
     }

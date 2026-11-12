@@ -291,6 +291,7 @@ fn answer(state: &mut State, method: &str, params: &Value) -> (Value, Option<Vec
             state.log.push(format!("{method} {params}"));
         }
         "Input.dispatchKeyEvent" => state.log.push(format!("{method} {}", params["key"])),
+        "Page.navigate" => state.log.push(format!("{method} {}", params["url"])),
         // the text itself is kept apart, so the log can be shown in a failure
         "Input.insertText" => {
             state.log.push(method.to_owned());

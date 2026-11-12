@@ -92,7 +92,8 @@ App (supervisor)
   updates `AppState.takeover` (address, focus, fill offers without their sealed bytes); each `Screen` goes to
   Swift as `Update::Screen`, outside `AppState`, and is acknowledged with `Ack` only when Swift reports it drawn
   (`TakeoverInput::Drawn`), so the gateway sends images no faster than the phone shows them. Taps, long presses
-  and scrolls name the image they were made on and give points as fractions of it. Typed text and fills go through
+  and scrolls name the image they were made on and give points as fractions of it. The address bar sends
+  `TakeoverInput::Go` with an `https` address, which the gateway checks again and loads with `Page.navigate`. Typed text and fills go through
   `FfiApp::takeover_text` and `FfiApp::takeover_fill`, apart from `TakeoverInput`, as `companion_wire::takeover::
   Secret`, which never shows in `Debug`; text longer than the wire's limit goes in pieces. A long press in a
   focused text field offers Paste, which sends the clipboard as text; a whole value AutoFill sets is a fill of the

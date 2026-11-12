@@ -213,6 +213,12 @@ pub enum PhoneMessage {
     Back,
     /// Load the page again
     Reload,
+    /// Load `url` in the page, as typed in the phone's address bar; the
+    /// gateway refuses an address that is not `https`
+    Go {
+        /// The address
+        url: String,
+    },
     /// Text the owner typed, inserted at the caret of the focused element
     Text {
         /// The text, at most [`MAX_TEXT_CHARS`]
