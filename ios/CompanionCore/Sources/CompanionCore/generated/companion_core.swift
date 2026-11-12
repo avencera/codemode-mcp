@@ -3806,6 +3806,10 @@ public enum TakeoverInput: Equatable, Hashable {
      */
     case back
     /**
+     * Load the page again
+     */
+    case reload
+    /**
      * Open the offer for `reference` with Face ID and fill it
      */
     case fillOffer(
@@ -3862,12 +3866,14 @@ public struct FfiConverterTypeTakeoverInput: FfiConverterRustBuffer {
         
         case 7: return .back
         
-        case 8: return .fillOffer(reference: try FfiConverterString.read(from: &buf)
+        case 8: return .reload
+        
+        case 9: return .fillOffer(reference: try FfiConverterString.read(from: &buf)
         )
         
-        case 9: return .done
+        case 10: return .done
         
-        case 10: return .cancel
+        case 11: return .cancel
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -3921,17 +3927,21 @@ public struct FfiConverterTypeTakeoverInput: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
         
         
-        case let .fillOffer(reference):
+        case .reload:
             writeInt(&buf, Int32(8))
+        
+        
+        case let .fillOffer(reference):
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(reference, into: &buf)
             
         
         case .done:
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(10))
         
         
         case .cancel:
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(11))
         
         }
     }
