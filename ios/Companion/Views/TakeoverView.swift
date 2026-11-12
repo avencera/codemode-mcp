@@ -19,15 +19,18 @@ struct TakeoverView: View {
     @State private var area: CGSize = .zero
     /// Whether the keyboard is up for the page's focused field
     @State private var keyboardUp = false
+    /// The login field Fill from 1Password asks a value for, while its sheet
+    /// is up
+    @State private var filling: LoginField?
     /// The area's size waits a moment before it goes, so a keyboard sliding
     /// in lays the page out once
     @State private var resizing: Task<Void, Never>?
 
     /// Most the picture zooms
     private static let maxZoom: CGFloat = 5
-    /// Most pixels per point the gateway draws at; a 3x screen gets 2x, which
-    /// reads as sharp and costs half the bytes
-    private static let maxScale: CGFloat = 2
+    /// Most pixels per point the gateway draws at: a 3x screen's own, since
+    /// page text at 2x reads as blurry
+    private static let maxScale: CGFloat = 3
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,6 +87,11 @@ struct TakeoverView: View {
             // the keyboard follows the page's focus; the owner can still put
             // it away with the key bar
             keyboardUp = focus?.editable == true
+        }
+        .sheet(item: $filling) { field in
+            FillSheet(field: field, site: takeover.page.flatMap { URL(string: $0.url)?.host() }) { value in
+                manager.takeoverFill(field: field, value: value, submit: false)
+            }
         }
         .navigationTitle(takeover.session)
         .navigationBarTitleDisplayMode(.inline)
@@ -229,18 +237,26 @@ struct TakeoverView: View {
         .accessibilityLabel(label)
     }
 
-    /// Fill from 1Password: the gateway's sealed copy for the focused field
-    /// when it sent one, opened with Face ID; otherwise the keyboard, whose
-    /// AutoFill offers 1Password
+    /// Fill from 1Password for a focused login field: the gateway's sealed
+    /// copy when it sent one, opened with Face ID; otherwise a sheet whose
+    /// field AutoFill fills from 1Password. Only a login field shows it, as
+    /// the gateway fills no other
     private var fillAction: (title: String, action: () -> Void)? {
-        guard let page = takeover.page, let focus = page.focus, focus.editable else { return nil }
-        if let field = focus.field, let offer = page.offers.first(where: { $0.field == field }) {
+        guard let page = takeover.page, let focus = page.focus, focus.editable,
+              let field = focus.field
+        else { return nil }
+        if let offer = page.offers.first(where: { $0.field == field }) {
             let account = offer.account.map { " (\($0))" } ?? ""
             return ("Fill \(field.label.lowercased()) from \(offer.item)\(account)", {
                 manager.takeover(.fillOffer(reference: offer.reference))
             })
         }
-        return ("Fill from 1Password", { keyboardUp = true })
+        return ("Fill \(field.label.lowercased()) from 1Password", {
+            // the sheet's field takes the keyboard; the page's comes back
+            // with the next focus
+            keyboardUp = false
+            filling = field
+        })
     }
 
     private var actions: some View {
@@ -601,6 +617,58 @@ struct KeyCatcher: UIViewRepresentable {
             }
         }
     }
+}
+
+/// A visible field for one login value, which AutoFill fills from 1Password
+/// as it would a sign-in form: the key catcher is hidden, and AutoFill offers
+/// less for a field it cannot see. Fill sends the value as a fill of the
+/// page's focused field, which the gateway checks is still that kind
+struct FillSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let field: LoginField
+    let site: String?
+    let onFill: (String) -> Void
+
+    @State private var value = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    ValueField(field: field, text: $value)
+                        .focused($focused)
+                        .onSubmit(fill)
+                } footer: {
+                    Text("Pick the login\(site.map { " for \($0)" } ?? "") from the AutoFill bar above the keyboard, or its key icon")
+                }
+            }
+            .navigationTitle("Fill \(field.label.lowercased())")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Fill", action: fill)
+                        .disabled(value.isEmpty)
+                }
+            }
+            .onAppear { focused = true }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func fill() {
+        guard !value.isEmpty else { return }
+        onFill(value)
+        value = ""
+        dismiss()
+    }
+}
+
+extension LoginField: @retroactive Identifiable {
+    public var id: Self { self }
 }
 
 /// The key catcher's field, which also reports delete on an empty field

@@ -25,8 +25,10 @@ const TARGET: &str = "page-target";
 /// Screencast images sent before the browser waits for its acknowledgement;
 /// a real one sends the next only after the last is acknowledged
 const IMAGES: u32 = 3;
-/// The smallest JPEG: start and end of image
-const JPEG: [u8; 4] = [0xFF, 0xD8, 0xFF, 0xD9];
+/// The page's size in CSS pixels, as screencast images report it
+const PAGE: (u16, u16) = (390, 844);
+/// The device scale a capture is drawn at, the phone's
+const SCALE: u16 = 3;
 
 /// The focused element, as the page's `DESCRIBE` script reports it
 #[derive(Clone)]
@@ -57,6 +59,9 @@ struct State {
     /// Text inserted into the page
     typed: String,
     images: u32,
+    /// A capture drew the page again, so the next screencast image repeats
+    /// the last, as Chrome's does
+    echo: bool,
 }
 
 /// The browser; its log shows what the gateway did to the page
@@ -78,6 +83,7 @@ impl FakeCdp {
             log: Vec::new(),
             typed: String::new(),
             images: 0,
+            echo: false,
         }));
         let serving = Arc::clone(&state);
         tokio::spawn(async move {
@@ -170,29 +176,58 @@ async fn serve(socket: Socket, state: Arc<Mutex<State>>) {
         let id = command["id"].clone();
         let method = command["method"].as_str().unwrap_or_default().to_owned();
         let params = &command["params"];
-        let (result, image) = {
+        let (result, frame) = {
             let mut state = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             answer(&mut state, &method, params)
         };
         let _ = outgoing.send(json!({ "id": id, "result": result }));
-        if image {
+        if let Some(frame) = frame {
             let _ = outgoing.send(json!({
                 "method": "Page.screencastFrame",
                 "sessionId": SESSION,
                 "params": {
-                    "data": STANDARD.encode(JPEG),
+                    "data": STANDARD.encode(frame),
                     "sessionId": 1,
-                    "metadata": { "deviceWidth": 390.0, "deviceHeight": 844.0 },
+                    "metadata": { "deviceWidth": PAGE.0, "deviceHeight": PAGE.1 },
                 },
             }));
         }
     }
 }
 
-/// The answer to `method`, and whether a screencast image follows it
-fn answer(state: &mut State, method: &str, params: &Value) -> (Value, bool) {
+/// A JPEG header of `width` by `height` pixels, which `tag` tells apart from
+/// another of the same size
+fn jpeg(width: u16, height: u16, tag: u32) -> Vec<u8> {
+    let [height_high, height_low] = height.to_be_bytes();
+    let [width_high, width_low] = width.to_be_bytes();
+    let mut jpeg = vec![
+        0xFF,
+        0xD8,
+        0xFF,
+        0xC0,
+        0x00,
+        0x08,
+        0x08,
+        height_high,
+        height_low,
+        width_high,
+        width_low,
+        0x00,
+        0xFF,
+        0xFE,
+        0x00,
+        0x06,
+    ];
+    jpeg.extend(tag.to_be_bytes());
+    jpeg.extend([0xFF, 0xD9]);
+    jpeg
+}
+
+/// The answer to `method`, and the screencast image that follows it, which
+/// is drawn at one pixel per CSS pixel as headless Chrome's are
+fn answer(state: &mut State, method: &str, params: &Value) -> (Value, Option<Vec<u8>>) {
     match method {
         "Emulation.setDeviceMetricsOverride" | "Input.dispatchMouseEvent" => {
             state.log.push(format!("{method} {params}"));
@@ -230,6 +265,11 @@ fn answer(state: &mut State, method: &str, params: &Value) -> (Value, bool) {
         {
             json!({ "result": { "type": "boolean", "value": state.focus.is_some() } })
         }
+        "Page.captureScreenshot" => {
+            state.echo = true;
+            let shot = jpeg(PAGE.0 * SCALE, PAGE.1 * SCALE, state.images);
+            json!({ "data": STANDARD.encode(shot) })
+        }
         "Runtime.callFunctionOn" if params["returnByValue"] == true => {
             let origin = reqwest::Url::parse(&state.url)
                 .map(|url| url.origin().ascii_serialization())
@@ -253,14 +293,19 @@ fn answer(state: &mut State, method: &str, params: &Value) -> (Value, bool) {
     let image = match method {
         "Page.startScreencast" => {
             state.images = 1;
-            true
+            Some(state.images)
+        }
+        // the repeat a capture brings on, which is not a new image
+        "Page.screencastFrameAck" if state.echo => {
+            state.echo = false;
+            Some(state.images)
         }
         "Page.screencastFrameAck" if state.images < IMAGES => {
             state.images += 1;
-            true
+            Some(state.images)
         }
-        _ => false,
+        _ => None,
     };
 
-    (result, image)
+    (result, image.map(|tag| jpeg(PAGE.0, PAGE.1, tag)))
 }

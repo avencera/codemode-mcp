@@ -1136,10 +1136,15 @@ rather than a generated crate), so no secret passes through an agent-browser com
   references, learned from fills at the Mac, so a fill while away can send references with sealed copies.
 - Takeover: `TAKEOVER_ALPN`, a separate iroh connection per takeover from a listed, trusted phone, framed as
   in `companion_wire::takeover`. The gateway lays the page out with `Emulation.setDeviceMetricsOverride`
-  (mobile), screencasts JPEG with the phone's `Ack` gating `Page.screencastFrameAck`, polls the page state
+  (mobile) at the phone's scale (at most 3), screencasts JPEG with the phone's `Ack` gating
+  `Page.screencastFrameAck`, polls the page state
   every 800 ms (150 ms after input), and restores with `clearDeviceMetricsOverride` and `stopScreencast`.
   Headless Chrome on macOS draws nothing while the display sleeps, so a takeover holds `caffeinate -d -u`
   (`browser::awake::DisplayAwake`), which turns the display on and keeps it on until the takeover ends.
+  Headless Chrome's screencast images are one pixel per CSS pixel whatever the device scale, which is blurry
+  on a 3x phone, so each one smaller than the scale asks for is swapped for a `Page.captureScreenshot`, which
+  honours it. A capture draws the page again and brings on one repeat image; an image byte-identical to the
+  last is acknowledged and dropped, which ends that loop.
 - Handoff: `Handoffs` holds open handoffs by request id; the offer goes to every phone as a gateway-opened
   stream, like a read, with a push (`kind=handoff`). Done or Cancel from a takeover naming the id, or Cancel on
   the offer stream, answers it. The call is marked `waits_on_owner`, so the executor pauses the script's

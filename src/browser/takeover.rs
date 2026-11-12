@@ -40,8 +40,9 @@ const POLL: Duration = Duration::from_millis(800);
 /// How soon they are read again after an input
 const AFTER_INPUT: Duration = Duration::from_millis(150);
 
-/// Largest pixels per point the page is drawn at, to keep images small
-const MAX_SCALE: f64 = 2.0;
+/// Largest pixels per point the page is drawn at: an iPhone's own, so text is
+/// as sharp as the phone can show it
+const MAX_SCALE: f64 = 3.0;
 
 /// Smallest and largest side of the area the phone may ask for, in points
 const SIDE: std::ops::RangeInclusive<u32> = 200..=2000;
@@ -106,6 +107,9 @@ struct Takeover<'a> {
     next_seq: u32,
     /// The browser's id of the image the phone has not acknowledged yet
     unacked: Option<(u32, i64)>,
+    /// The browser's last screencast image, to tell a change on the page from
+    /// the echo of a sharper capture
+    last_frame: Option<Vec<u8>>,
     shown: Shown,
     /// The last state read, for fills
     state: Option<PageState>,
@@ -129,6 +133,7 @@ pub async fn run(
         sizes: VecDeque::new(),
         next_seq: 0,
         unacked: None,
+        last_frame: None,
         shown: Shown::default(),
         state: None,
     };
@@ -285,6 +290,9 @@ impl Takeover<'_> {
         let metadata = &params["metadata"];
         let page_width = metadata["deviceWidth"].as_f64().unwrap_or_default();
         let page_height = metadata["deviceHeight"].as_f64().unwrap_or_default();
+        let Some(jpeg) = self.sharpen(jpeg, page_width).await? else {
+            return self.ack_browser(browser_id).await;
+        };
         let (width, height) = jpeg_size(&jpeg).unwrap_or_default();
 
         let seq = self.next_seq;
@@ -310,6 +318,49 @@ impl Takeover<'_> {
         }
 
         Ok(())
+    }
+
+    /// The image to show for screencast image `frame`, or `None` when it only
+    /// echoes the last capture. Headless Chrome sends screencast images at one
+    /// pixel per CSS pixel whatever the device scale, which is blurry on a
+    /// phone, so the page is captured at its scale instead. Capturing draws
+    /// the page again and the browser sends the same image once more; that
+    /// echo is dropped, or each would bring on the other
+    async fn sharpen(
+        &mut self,
+        frame: Vec<u8>,
+        page_width: f64,
+    ) -> Result<Option<Vec<u8>>, PageError> {
+        let scale = self.viewport.scale.clamp(1.0, MAX_SCALE);
+        let (width, _) = jpeg_size(&frame).unwrap_or_default();
+        // a browser launched at the scale already sends sharp images
+        if f64::from(width) >= (page_width * scale).floor() {
+            return Ok(Some(frame));
+        }
+        if self.last_frame.as_deref() == Some(frame.as_slice()) {
+            return Ok(None);
+        }
+
+        let shot = self
+            .page
+            .session()
+            .call(
+                "Page.captureScreenshot",
+                json!({ "format": "jpeg", "quality": QUALITY }),
+            )
+            .await;
+        let sharp = match shot {
+            Ok(shot) => shot["data"]
+                .as_str()
+                .and_then(|data| STANDARD.decode(data).ok()),
+            // the page between documents; the blurry image still shows it
+            Err(CdpError::Command { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let shown = sharp.unwrap_or_else(|| frame.clone());
+        self.last_frame = Some(frame);
+
+        Ok(Some(shown))
     }
 
     async fn ack_browser(&self, browser_id: i64) -> Result<(), PageError> {

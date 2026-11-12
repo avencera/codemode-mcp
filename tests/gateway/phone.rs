@@ -1987,13 +1987,21 @@ async fn a_handoff_is_taken_over_on_the_phone_and_ends_when_the_owner_is_done() 
     // next comes
     let mut url = None;
     let mut last = None;
+    let mut images = Vec::new();
     let seq = takeover
         .until(|frame| {
             match frame {
                 GatewayFrame::Message(GatewayMessage::Page { url: page, .. }) => {
                     url = Some(page.clone());
                 }
-                GatewayFrame::Screen(screen) => last = Some(screen.header.seq),
+                GatewayFrame::Screen(screen) => {
+                    last = Some(screen.header.seq);
+                    images.push((
+                        screen.header.width,
+                        screen.header.height,
+                        screen.jpeg.clone(),
+                    ));
+                }
                 GatewayFrame::Message(_) => {}
             }
 
@@ -2001,6 +2009,15 @@ async fn a_handoff_is_taken_over_on_the_phone_and_ends_when_the_owner_is_done() 
         })
         .await?;
     assert_eq!(url.as_deref(), Some("https://github.com/login"));
+    // the browser's blurry screencast images are captured again at the
+    // phone's scale, and the repeat each capture brings on is not sent
+    assert!(
+        images
+            .iter()
+            .all(|(width, height, _)| (*width, *height) == (1170, 2532))
+    );
+    let distinct: std::collections::HashSet<_> = images.iter().map(|(.., jpeg)| jpeg).collect();
+    assert_eq!(distinct.len(), 3);
     takeover
         .send(&PhoneMessage::Tap {
             at: Point { x: 0.5, y: 0.25 },
@@ -2075,6 +2092,11 @@ async fn a_handoff_is_taken_over_on_the_phone_and_ends_when_the_owner_is_done() 
     let pressed = log.iter().position(|line| line.contains("mousePressed"));
     assert!(cleared > pressed, "{log:#?}");
     assert!(log.contains(&"Page.stopScreencast".to_owned()), "{log:#?}");
+    let captures = log
+        .iter()
+        .filter(|line| *line == "Page.captureScreenshot")
+        .count();
+    assert_eq!(captures, 3, "{log:#?}");
 
     rig.stop().await
 }

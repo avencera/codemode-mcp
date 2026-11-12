@@ -96,7 +96,9 @@ App (supervisor)
   `FfiApp::takeover_text` and `FfiApp::takeover_fill`, apart from `TakeoverInput`, as `companion_wire::takeover::
   Secret`, which never shows in `Debug`; text longer than the wire's limit goes in pieces. A long press in a
   focused text field offers Paste, which sends the clipboard as text; a whole value AutoFill sets is a fill of the
-  field the keyboard was set up for, not of the page's focus as last heard, which may lag. Fill from an offer
+  field the keyboard was set up for, not of the page's focus as last heard, which may lag. Fill from 1Password without an
+  offer opens a sheet with one visible field of the focused kind, for AutoFill, and sends its value as `Fill`.
+  Fill from an offer
   opens its sealed copy with `Platform::open_sealed`, the seal's `info` binding the gateway and the offer's
   reference, and sends the value as `Fill`. A link that drops while the app is in the foreground is dialed again
   with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while

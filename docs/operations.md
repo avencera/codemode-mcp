@@ -794,9 +794,12 @@ the session live in the Companion app:
   field brings up the keyboard, with AutoFill for usernames, passwords and one-time codes; a value AutoFill gives
   goes only into the kind of field it was offered for, so if the page's focus moved on meanwhile it is refused
   and you pick it again. The key bar adds the page's Back and Reload, Esc, Tab, Shift-Tab, Backspace and Enter.
-- **Fill from 1Password** fills the focused field from a copy sealed to the phone, after Face ID, checked as an
-  agent's fill is, and only while the page is still on the site the copy is saved for; if the page moved while
-  Face ID was up, nothing is filled.
+- **Fill from 1Password** shows for a focused username, password or code field. It fills the field from a copy
+  sealed to the phone, after Face ID, checked as an agent's fill is, and only while the page is still on the
+  site the copy is saved for; if the page moved while Face ID was up, nothing is filled. Without a sealed copy
+  it opens a sheet with one field of that kind: pick the login from the AutoFill bar (or its key icon) and tap
+  Fill, and the value is filled into the page's focused field if it is still that kind.
+- The page is drawn at the phone's own scale (3x on most iPhones), so text stays sharp.
 - **Done** or **Cancel** ends the handoff and the agent's call returns `done` or `cancelled`. **Leave** closes
   the screen without answering, so you can take over again from the card.
 
