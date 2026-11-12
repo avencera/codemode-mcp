@@ -750,10 +750,11 @@ agent hands the session to your phone instead.
    the config for another place. A session started from the phone keeps its Chrome profile, and so its
    sign-ins, in `~/.agent-browser/<session>`; set `browser_profiles` at the top of the config for another
    directory.
-2. If the Mac's screen may be locked while you take a session over from your phone, as on a Mac mini left
-   alone, tell agent-browser's Chrome to keep drawing pages then. Headless Chrome on macOS paces its frames by
-   the display, which stops while the screen is locked, so the takeover screen, screenshots and agents'
-   `agent-browser screenshot` all hang. Put this in `~/.agent-browser/config.json`:
+2. If the Mac's display may be asleep while agents use the browser, as on a Mac mini left alone, tell
+   agent-browser's Chrome to keep drawing pages then. Headless Chrome on macOS paces its frames by the display,
+   so while it sleeps (about 30 seconds after the screen locks) `agent-browser screenshot` and anything else
+   that waits for the page to be drawn hang. A takeover from your phone turns the display on while it lasts,
+   so it works without this. Put this in `~/.agent-browser/config.json`:
 
    ```json
    {
@@ -761,7 +762,7 @@ agent hands the session to your phone instead.
    }
    ```
 
-   Chrome then falls back to a 60 frames-a-second timer that runs while the screen is locked, at a few
+   Chrome then falls back to a 60 frames-a-second timer that runs while the display sleeps, at a few
    percent of a core on an animated page. `--disable-frame-rate-limit` also works but has no cap, and costs
    two to three cores. `Translate` stays listed because Chrome keeps only the last `--disable-features` it is
    given, and agent-browser passes `--disable-features=Translate` before these args. A browser already running
