@@ -319,6 +319,16 @@ impl HubView {
     fn server(&self, name: &str) -> Option<&HubServer> {
         self.servers.iter().find(|server| server.name == name)
     }
+
+    /// Whether the hub marks its server's `tool` as waiting on the owner
+    fn waits_on_owner(&self, server: &str, tool: &str) -> bool {
+        self.server(server).is_some_and(|server| {
+            server
+                .tools
+                .iter()
+                .any(|exported| exported.tool.name == tool && exported.waits_on_owner)
+        })
+    }
 }
 
 /// A config for the hub's server that the catalog reads as the hub does:
@@ -774,9 +784,8 @@ impl Gateway {
             server: entry.server.clone(),
             tool: entry.tool.clone(),
             sensitive: server_config.is_some_and(|server| server.is_sensitive()),
-            waits_on_owner: server_config
-                .is_some_and(|server| server.builtin == Some(Builtin::Browser))
-                && entry.tool == "handoff",
+            waits_on_owner: server_config.is_some_and(|server| server.waits_on_owner(&entry.tool))
+                || hub.waits_on_owner(&entry.server, &entry.tool),
             arguments: omit_none_arguments(entry, arguments),
             output: entry.output.clone(),
             hub_request: None,
@@ -1242,17 +1251,15 @@ impl Gateway {
     /// when stub validation could not run and the previous catalog was kept
     /// Keeps what this hub's spokes get of `snapshots`: every server but
     /// the `secrets` builtin, which writes on the machine that runs it, so
-    /// each spoke has its own, and the `browser` builtin, whose fills are
-    /// checked against the page before the owner is asked, which a spoke's
-    /// call through the hub's gate would skip
+    /// each spoke has its own. A spoke's call of the `browser` builtin is
+    /// prepared here, through the hub's gate, so its fill is checked
+    /// against the page before the owner is asked, as a call made here is
     fn export(&self, snapshots: &[ServerSnapshot]) {
         let servers: Vec<HubServer> = snapshots
             .iter()
             .filter_map(|snapshot| {
                 let server = self.config.servers.get(&snapshot.name);
-                if server.is_some_and(|server| {
-                    matches!(server.builtin, Some(Builtin::Secrets | Builtin::Browser))
-                }) {
+                if server.is_some_and(|server| server.builtin == Some(Builtin::Secrets)) {
                     return None;
                 }
 

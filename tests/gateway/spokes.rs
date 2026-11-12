@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use super::{
-    harness::{FakeMac, Harness, ORIGIN, Setup, TestResult, approval_id, temp_state_dir, text_of},
+    fake_cdp::{FakeCdp, Field},
+    harness::{
+        FakeMac, Harness, ORIGIN, Setup, TestResult, approval_id, execute, temp_state_dir, text_of,
+    },
     oauth::{Client, begin_login, start_mock, wait_for_state},
     secrets::{VALUE, fake_op},
 };
@@ -539,6 +542,94 @@ async fn a_spoke_execution_parked_on_the_hub_survives_restarts_of_both() -> Test
         matches!(&overridden, CallAnswer::Error(error) if error.kind == HubErrorKind::Denied),
         "{overridden:?}"
     );
+
+    spoke.stop().await?;
+    hub.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spoke_fills_and_hands_off_through_the_hubs_browser() -> TestResult {
+    let cdp = FakeCdp::start("https://github.com/login").await?;
+    // no phone is paired to the hub
+    let hub_mac = Arc::new(FakeMac::default());
+    hub_mac.set_present(true);
+    hub_mac.set_answer(Some(TouchId::Approved));
+    let hub_top = format!("agent_browser_path = \"{}\"", cdp.program.display());
+    let Some(hub) = Harness::with(Setup {
+        notify: true,
+        mac: Some(Arc::clone(&hub_mac)),
+        top: &hub_top,
+        extra: "[servers.browser]\nbuiltin = \"browser\"\npolicy = \"ask\"\n\
+                tools.fill.grant = \"per_call\"\ntools.handoff.policy = \"allow\"\n",
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let hub_port = hub.server.local_addr().port();
+    let spoke_extra = format!("[hub]\nhost = \"127.0.0.1:{hub_port}\"\nexclude = [\"fixture\"]\n");
+    let Some(spoke) = Harness::with(Setup {
+        extra: &spoke_extra,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    // the owner trusts the spoke at the hub Mac, then leaves it
+    spoke.app.connect_hub(Duration::from_secs(5)).await?;
+    wait_for_tool(&spoke, "browser_fill").await?;
+    hub_mac.set_present(false);
+
+    // a handoff waits on the owner, so the spoke pauses the script's budget
+    // while the hub holds it, as the hub does for its own
+    let handoff = hub
+        .app
+        .gateway()
+        .hub_catalog()
+        .servers
+        .iter()
+        .find(|server| server.name == "browser")
+        .and_then(|server| {
+            server
+                .tools
+                .iter()
+                .find(|exported| exported.tool.name == "handoff")
+                .map(|exported| exported.waits_on_owner)
+        });
+    assert_eq!(handoff, Some(true));
+
+    // the hub reads the page before anyone is asked, as it does for its own
+    // fills: the wrong field is refused, and with the right one, the owner
+    // being away with no phone to pick the login on
+    cdp.focus(Some(Field::USERNAME));
+    let refused = text_of(
+        &execute(
+            &spoke.client,
+            r#"await browser_fill(session="test", kind="password", site="github.com")"#,
+        )
+        .await?,
+    );
+    assert!(refused.contains("not a password field"), "{refused}");
+    cdp.focus(Some(Field::PASSWORD));
+    let refused = text_of(
+        &execute(
+            &spoke.client,
+            r#"await browser_fill(session="test", kind="password", site="github.com")"#,
+        )
+        .await?,
+    );
+    assert!(refused.contains("no phone is paired"), "{refused}");
+    assert!(
+        hub_mac
+            .shown()
+            .iter()
+            .all(|prompt| prompt.contains("Trust")),
+        "{:?}",
+        hub_mac.shown()
+    );
+    assert!(cdp.typed().is_empty());
 
     spoke.stop().await?;
     hub.stop().await

@@ -23,6 +23,7 @@
 //! the value never enters the agent's context, transcript, or a command
 //! line, file or log on the way in
 
+mod awake;
 pub mod cdp;
 mod handoff;
 pub mod page;

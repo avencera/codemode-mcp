@@ -860,7 +860,10 @@ spokes as hub tools.
   asks every 5 s; a refused one stops asking until it restarts, so the owner is not asked again and again
 - Catalog: the hub exports its servers with a version (`catalog::export_tools`): tools whose policy is `deny`
   are left out, inputs are the shapes scripts see, and output schemas stay on the hub, which checks results
-  before they leave. The `secrets` builtin is not exported, since a spoke has its own. A spoke keeps the
+  before they leave. The `secrets` builtin is not exported, since a spoke has its own. The `browser` builtin is:
+  the hub's gate prepares a spoke's call as it does its own (`Gateway::prepare_with`), so a fill is checked
+  against the page before the owner is asked, and a tool that waits on the owner (`handoff`) is marked
+  `waits_on_owner`, so the spoke pauses the script's budget as the hub would. A spoke keeps the
   servers `[hub] servers` or `exclude` let through, merges them with its own and type-checks scripts against
   both. A spoke server with a hub server's name is a startup error naming it; a clash that appears later is
   logged and the hub server left out. A spoke holds `GET catalog?after=<version>` open on the hub, which answers
@@ -1135,6 +1138,8 @@ rather than a generated crate), so no secret passes through an agent-browser com
   in `companion_wire::takeover`. The gateway lays the page out with `Emulation.setDeviceMetricsOverride`
   (mobile), screencasts JPEG with the phone's `Ack` gating `Page.screencastFrameAck`, polls the page state
   every 800 ms (150 ms after input), and restores with `clearDeviceMetricsOverride` and `stopScreencast`.
+  Headless Chrome on macOS draws nothing while the display sleeps, so a takeover holds `caffeinate -d -u`
+  (`browser::awake::DisplayAwake`), which turns the display on and keeps it on until the takeover ends.
 - Handoff: `Handoffs` holds open handoffs by request id; the offer goes to every phone as a gateway-opened
   stream, like a read, with a push (`kind=handoff`). Done or Cancel from a takeover naming the id, or Cancel on
   the offer stream, answers it. The call is marked `waits_on_owner`, so the executor pauses the script's

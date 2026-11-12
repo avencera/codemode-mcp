@@ -1523,6 +1523,13 @@ impl ServerConfig {
             .unwrap_or_default()
     }
 
+    /// Whether a call of `tool` waits on the owner rather than working, so
+    /// the script's budget pauses while it runs: the `browser` builtin's
+    /// `handoff`, which returns once the owner is done on their phone
+    pub fn waits_on_owner(&self, tool: &str) -> bool {
+        self.builtin == Some(Builtin::Browser) && tool == "handoff"
+    }
+
     /// Whether logs must leave out this server's arguments, results and
     /// error text; unless set explicitly, true when the server or any of its
     /// tools asks for approval

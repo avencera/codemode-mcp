@@ -48,6 +48,10 @@ pub struct ExportedTool {
     pub grant: GrantMode,
     /// What scripts get back
     pub output: OutputSpec,
+    /// Whether a call waits on the owner, so the spoke pauses the script's
+    /// budget while it runs; absent from older hubs
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waits_on_owner: bool,
 }
 
 impl PartialEq for OutputSpec {
@@ -90,6 +94,7 @@ pub fn export_tools(config: &Config, snapshot: &ServerSnapshot) -> Vec<ExportedT
                 grant: server
                     .map_or_else(GrantMode::default, |server| server.grant_for(&tool.name)),
                 output: effective_output(&snapshot.name, tool, tool_override),
+                waits_on_owner: server.is_some_and(|server| server.waits_on_owner(&tool.name)),
                 tool: exported,
             })
         })

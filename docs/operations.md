@@ -787,6 +787,8 @@ the session live in the Companion app:
 
 - The page is laid out as a phone at your screen's size while you have it, and put back as the agent had it
   when you finish. You see it as live images, each sent only after the last was drawn.
+- The Mac's display is turned on and kept on while you have the page, since the browser draws nothing while
+  the display sleeps; it may sleep again once you finish.
 - Tap to click, drag to scroll, long-press for a right click, and pinch to zoom the picture on the phone. A
   focused text field brings up the keyboard, with AutoFill for usernames, passwords and one-time codes; the key
   bar adds Enter, Tab, Shift-Tab, Backspace, Esc and Back.
@@ -986,8 +988,9 @@ What runs where:
 - `{{ op://... }}` in a spoke server's own `env`, `headers` or `url` is approved once on the hub per server,
   and asked again when the server's command or destination changes. A server that starts before the spoke is
   trusted waits for the trust.
-- Calendar, Reminders, Xcode and website sign-in stay on the hub Mac and reach spokes as hub tools. The
-  `browser` server is the exception and stays off spokes, since its fill checks run before the hub's gate.
+- Calendar, Reminders, Xcode and website sign-in stay on the hub Mac and reach spokes as hub tools, the
+  `browser` server's `fill` and `handoff` included: a spoke's fill is checked against the hub's page and
+  approved there like one made on the hub, and its script's time stops counting while a handoff waits on you.
 - A browser session on the hub reaches spokes through agent-browser's own MCP server, one server per logged-in
   session, so an agent there drives only that profile:
 

@@ -6,7 +6,8 @@
 //! browser is acknowledged only once the phone has drawn the last image,
 //! so a slow link gets fewer images instead of a queue. The page's address
 //! and focused element are read every [`POLL`] and after each input, and
-//! sent when they change. Ending restores the page's size
+//! sent when they change. Ending restores the page's size. The display
+//! is kept on throughout, since the browser draws nothing while it sleeps
 //!
 //! This module knows nothing of the link to the phone: the caller hands it
 //! the phone's messages and sends what it answers
@@ -26,6 +27,7 @@ use tokio::sync::{broadcast::error::RecvError, mpsc, watch};
 use zeroize::Zeroizing;
 
 use super::{
+    awake::DisplayAwake,
     cdp::CdpError,
     login_value,
     page::{Page, PageError, PageState},
@@ -118,6 +120,7 @@ pub async fn run(
     output: mpsc::Sender<GatewayFrame>,
     context: Context,
 ) -> Outcome {
+    let _awake = DisplayAwake::hold();
     let mut takeover = Takeover {
         page: &page,
         output: &output,
