@@ -15,8 +15,8 @@ use std::{
 use companion_core::ffi::{
     AppAction, AppState, BrowserSession, ConnectionState, EnteredValue, FfiApp, HandoffStatus,
     LoginField, OpenBatch, OpenError, OpenRequest, PairingState, PendingRead, Platform,
-    PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, ScreenImage,
-    SessionsStatus, TakeoverInput, TakeoverNotice, TakeoverStatus, Update,
+    PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, SavedSession,
+    ScreenImage, SessionsStatus, TakeoverInput, TakeoverNotice, TakeoverStatus, Update,
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
@@ -2051,6 +2051,11 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
             title: Some("GitHub".to_owned()),
         }],
         saved: vec!["discord".to_owned()],
+        last_pages: [(
+            "discord".to_owned(),
+            "https://discord.com/channels/@me".to_owned(),
+        )]
+        .into(),
     };
     send.write_all(&encode_message(&listed)?).await?;
     let state = until(&app, |state| {
@@ -2065,7 +2070,13 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
             title: Some("GitHub".to_owned()),
         }]
     );
-    assert_eq!(state.sessions.saved, ["discord"]);
+    assert_eq!(
+        state.sessions.saved,
+        [SavedSession {
+            name: "discord".to_owned(),
+            last_page: Some("https://discord.com/channels/@me".to_owned()),
+        }]
+    );
 
     app.dispatch(AppAction::StartSession {
         session: "discord".to_owned(),
@@ -2113,6 +2124,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     let listed = GatewayMessage::Sessions {
         running: Vec::new(),
         saved: vec!["discord".to_owned(), "github".to_owned()],
+        last_pages: Default::default(),
     };
     send.write_all(&encode_message(&listed)?).await?;
     let state = until(&app, |state| {
@@ -2120,7 +2132,15 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     })
     .await?;
     assert_eq!(state.takeover, None);
-    assert_eq!(state.sessions.saved, ["discord", "github"]);
+    let names = |state: &AppState| {
+        state
+            .sessions
+            .saved
+            .iter()
+            .map(|saved| saved.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&state), ["discord", "github"]);
 
     // removing a saved one is asked on a link of its own too
     app.dispatch(AppAction::RemoveSession {
@@ -2136,9 +2156,10 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     let listed = GatewayMessage::Sessions {
         running: Vec::new(),
         saved: vec!["github".to_owned()],
+        last_pages: Default::default(),
     };
     send.write_all(&encode_message(&listed)?).await?;
-    let state = until(&app, |state| state.sessions.saved == ["github"]).await?;
+    let state = until(&app, |state| names(state) == ["github"]).await?;
     assert_eq!(state.sessions.status, SessionsStatus::Listed);
 
     Ok(())

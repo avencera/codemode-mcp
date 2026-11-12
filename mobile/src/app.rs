@@ -19,7 +19,7 @@ use companion_wire::{
         ProgramItem as WireProgramItem, PushEnvironment as WirePushEnvironment, PushToken,
         RequestId,
     },
-    takeover::{PhoneMessage, RunningSession},
+    takeover::PhoneMessage,
     wire::{
         CompanionErrorCode, CompanionFault, CompanionResponse, MAX_DESCRIPTION_CHARS,
         MAX_DESTINATION_CHARS, MAX_PROGRAM_ITEMS, MAX_REASON_CHARS, PairCheck,
@@ -34,7 +34,7 @@ use crate::{
     ffi::{
         AppAction, AppState, BrowserSession, BrowserSessions, ConnectionState, HandoffStatus,
         PairingState, PendingHandoff, PendingRead, Platform, ProgramItem, ProgramRead,
-        PushEnvironment, ReadStatus, Reconciler, SessionsStatus, SignIn, TakeoverEnd,
+        PushEnvironment, ReadStatus, Reconciler, SavedSession, SessionsStatus, SignIn, TakeoverEnd,
         TakeoverInput, TakeoverState, TakeoverStatus, Update,
     },
     handoff::{Handoffs, Offer},
@@ -42,7 +42,8 @@ use crate::{
     record::{GatewayRecord, load_key},
     request::{Asked, Entered, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
     takeover::{
-        SessionChange, TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg, list_sessions,
+        Listing, SessionChange, TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg,
+        list_sessions,
     },
 };
 
@@ -162,7 +163,7 @@ pub enum AppMsg {
     /// no connection actor
     Endpoint(RpcReplyPort<Option<Endpoint>>),
     /// A listing of the browser sessions finished
-    Sessions(Result<(Vec<RunningSession>, Vec<String>), String>),
+    Sessions(Result<Listing, String>),
     /// A read's or handoff's stream ended without an answer
     StreamEnded {
         /// The read
@@ -1383,7 +1384,11 @@ impl Actor for App {
             // a listing that finishes after an unpair was of the old gateway
             AppMsg::Sessions(_) if state.record.is_none() => {}
             AppMsg::Sessions(listed) => state.shared.change_sessions(|sessions| match listed {
-                Ok((running, saved)) => {
+                Ok(Listing {
+                    running,
+                    saved,
+                    mut last_pages,
+                }) => {
                     *sessions = BrowserSessions {
                         status: SessionsStatus::Listed,
                         running: running
@@ -1394,7 +1399,13 @@ impl Actor for App {
                                 title: session.title,
                             })
                             .collect(),
-                        saved,
+                        saved: saved
+                            .into_iter()
+                            .map(|name| SavedSession {
+                                last_page: last_pages.remove(&name),
+                                name,
+                            })
+                            .collect(),
                     };
                 }
                 Err(message) => {

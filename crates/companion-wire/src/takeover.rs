@@ -27,6 +27,8 @@
 //! `Debug` never shows them; the gateway inserts them into the page and
 //! keeps nothing
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::mobile::{LoginField, RequestId, Sealed};
@@ -349,6 +351,11 @@ pub enum GatewayMessage {
         /// The saved profiles of sessions not running, by name, which a
         /// [`PhoneMessage::Open`] with `start` launches signed in as before
         saved: Vec<String>,
+        /// The `https` page each saved session was last on, by name, where
+        /// the phone starts it again; a session missing here is asked for
+        /// an address
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        last_pages: BTreeMap<String, String>,
     },
     /// The takeover is over, and the gateway closes the stream next
     Ended {

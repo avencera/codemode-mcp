@@ -1138,7 +1138,8 @@ rather than a generated crate), so no secret passes through an agent-browser com
   in `companion_wire::takeover`. A link whose first message is `Sessions` instead of `Open` is answered with the
   session list and closed: `agent-browser session list`, each one's `get cdp-url` (which never launches a
   browser) and then its active tab, plus the profile directories under `browser_profiles` (those holding
-  `Local State`) that are not running. A first message `CloseSession` runs `agent-browser --session <name>
+  `Local State`) that are not running, each with the `https` page its agent-browser `<session>.target` names
+  as `last_pages`, which the phone starts it at. A first message `CloseSession` runs `agent-browser --session <name>
   close` first, which quits the browser and kills it if it does not exit, but leaves its profile, then answers
   the list the same way; it waits for any start under way. `RemoveSession` moves a saved profile that is
   not running to `browser_trash` (default `~/.Trash`) as `agent-browser <session> <unix time>`, refused while

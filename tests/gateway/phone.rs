@@ -647,6 +647,12 @@ impl Rig {
             top.push_str(&format!("browser_profiles = \"{}\"\n", profiles.display()));
             let trash = profiles.with_file_name("trash");
             top.push_str(&format!("browser_trash = \"{}\"\n", trash.display()));
+            // agent-browser's own files sit beside the profiles, as they do in
+            // `~/.agent-browser`
+            top.push_str(&format!(
+                "agent_browser_state = \"{}\"\n",
+                profiles.display()
+            ));
         }
         let extra = format!(
             "[secrets]\n\
@@ -2267,6 +2273,16 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
     }
     std::fs::create_dir_all(cdp.profiles.join("screenshots"))?;
     std::fs::write(cdp.profiles.join("screenshots").join("github.png"), "")?;
+    // the page agent-browser last had `discord` on, and one `broken` had,
+    // which is not offered since `broken` is not
+    std::fs::write(
+        cdp.profiles.join("discord.target"),
+        r#"{"targetId":"T","url":"https://discord.com/channels/@me","pinned":false}"#,
+    )?;
+    std::fs::write(
+        cdp.profiles.join("broken.target"),
+        r#"{"targetId":"T","url":"https://example.com/","pinned":false}"#,
+    )?;
     let Some(rig) = Rig::start(Options {
         browser: Some(cdp.program.clone()),
         browser_profiles: Some(cdp.profiles.clone()),
@@ -2282,10 +2298,21 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
     // browser runs, so it is not offered to start, which could relaunch it
     let mut listing = Takeover::dial(&rig.phone).await?;
     listing.send(&PhoneMessage::Sessions).await?;
-    let GatewayFrame::Message(GatewayMessage::Sessions { running, saved }) = listing.next().await?
+    let GatewayFrame::Message(GatewayMessage::Sessions {
+        running,
+        saved,
+        last_pages,
+    }) = listing.next().await?
     else {
         return Err("no session list".into());
     };
+    assert_eq!(
+        last_pages.into_iter().collect::<Vec<_>>(),
+        [(
+            "discord".to_owned(),
+            "https://discord.com/channels/@me".to_owned()
+        )]
+    );
     assert_eq!(
         running,
         [RunningSession {
@@ -2370,7 +2397,8 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
             session: "test".to_owned(),
         })
         .await?;
-    let GatewayFrame::Message(GatewayMessage::Sessions { running, saved }) = closing.next().await?
+    let GatewayFrame::Message(GatewayMessage::Sessions { running, saved, .. }) =
+        closing.next().await?
     else {
         return Err("no session list after the close".into());
     };

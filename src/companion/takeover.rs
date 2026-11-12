@@ -7,6 +7,7 @@
 //! browser is up to the [`TakeoverHost`] the daemon registers
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, OnceLock, PoisonError, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -59,6 +60,8 @@ pub struct SessionList {
     pub running: Vec<RunningSession>,
     /// The saved profiles of sessions not running
     pub saved: Vec<String>,
+    /// The `https` page each saved session was last on, by name
+    pub last_pages: BTreeMap<String, String>,
 }
 
 /// The images a takeover sent the phone, for the log at its end
@@ -162,6 +165,7 @@ async fn answer_sessions(
         Ok(list) => GatewayMessage::Sessions {
             running: list.running,
             saved: list.saved,
+            last_pages: list.last_pages,
         },
         Err(message) => GatewayMessage::Ended {
             reason: EndReason::BrowserGone,

@@ -11,6 +11,7 @@
 //! page's own scripts cannot replace the DOM getters the check relies on
 
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     sync::Arc,
@@ -124,6 +125,9 @@ pub struct AgentBrowser {
     profiles: Option<PathBuf>,
     /// Where a removed session's profile goes, such as `~/.Trash`
     trash: Option<PathBuf>,
+    /// Where agent-browser keeps each session's files, such as
+    /// `<session>.target` with the page it was last on
+    state: Option<PathBuf>,
     /// One start at a time, so a second start of a session sees the browser
     /// the first launched instead of launching over it
     starts: Arc<tokio::sync::Mutex<()>>,
@@ -228,6 +232,7 @@ impl AgentBrowser {
                 .unwrap_or_else(|| PathBuf::from("agent-browser")),
             profiles: None,
             trash: None,
+            state: None,
             starts: Arc::default(),
         }
     }
@@ -238,6 +243,7 @@ impl AgentBrowser {
             program,
             profiles: None,
             trash: None,
+            state: None,
             starts: Arc::default(),
         }
     }
@@ -249,6 +255,30 @@ impl AgentBrowser {
         self.profiles = Some(profiles);
         self.trash = Some(trash);
         self
+    }
+
+    /// Reads the page each session was last on from agent-browser's files
+    /// in `state`
+    #[must_use]
+    pub fn with_state(mut self, state: PathBuf) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// The `https` page `session` was last on, from agent-browser's
+    /// `<session>.target`
+    async fn last_page(&self, session: &str) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Target {
+            url: String,
+        }
+
+        let file = self.state.as_ref()?.join(format!("{session}.target"));
+        let target = tokio::fs::read(file).await.ok()?;
+        let target: Target = serde_json::from_slice(&target).ok()?;
+        let url = reqwest::Url::parse(&target.url).ok()?;
+
+        (url.scheme() == "https" && url.host_str().is_some()).then(|| url.to_string())
     }
 
     async fn output(
@@ -399,9 +429,19 @@ impl AgentBrowser {
             .into_iter()
             .filter(|name| running.iter().all(|session| session.name != *name))
             .filter(|name| !unknown.contains(name))
-            .collect();
+            .collect::<Vec<_>>();
+        let mut last_pages = BTreeMap::new();
+        for name in &saved {
+            if let Some(page) = self.last_page(name).await {
+                last_pages.insert(name.clone(), page);
+            }
+        }
 
-        Ok(SessionList { running, saved })
+        Ok(SessionList {
+            running,
+            saved,
+            last_pages,
+        })
     }
 
     /// Whether `session`'s browser runs, and its active tab when it does

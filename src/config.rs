@@ -112,6 +112,12 @@ pub struct Config {
     /// unset, `~/.Trash`, so Finder can put it back
     #[serde(default)]
     pub browser_trash: Option<PathBuf>,
+    /// Directory where agent-browser keeps its session files, whose
+    /// `<session>.target` gives the page a saved session was last on; when
+    /// unset, where agent-browser puts them: `$AGENT_BROWSER_SOCKET_DIR`,
+    /// else `$XDG_RUNTIME_DIR/agent-browser`, else `~/.agent-browser`
+    #[serde(default)]
+    pub agent_browser_state: Option<PathBuf>,
     /// How long one upstream tool call may run before it is cancelled
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
@@ -176,6 +182,7 @@ impl Default for Config {
             agent_browser_path: None,
             browser_profiles: None,
             browser_trash: None,
+            agent_browser_state: None,
             tool_timeout_secs: default_tool_timeout_secs(),
             admin_listen: default_admin_listen(),
             state_dir: None,

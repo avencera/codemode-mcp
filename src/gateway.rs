@@ -334,7 +334,7 @@ impl HubView {
 /// The agent-browser the `browser` builtin drives: the configured binary or
 /// the one found, its sessions' profiles in the configured directory or
 /// `~/.agent-browser`, removed ones moved to the configured directory or
-/// `~/.Trash`
+/// `~/.Trash`, and the last page of each read from agent-browser's files
 fn agent_browser(config: &Config) -> AgentBrowser {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let program = match &config.agent_browser_path {
@@ -348,7 +348,23 @@ fn agent_browser(config: &Config) -> AgentBrowser {
     let trash = config
         .browser_trash
         .clone()
-        .or_else(|| home.map(|home| home.join(".Trash")));
+        .or_else(|| home.as_ref().map(|home| home.join(".Trash")));
+
+    // as agent-browser picks it, an empty variable counting as unset
+    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    let state = config
+        .agent_browser_state
+        .clone()
+        .or_else(|| set("AGENT_BROWSER_SOCKET_DIR").map(std::path::PathBuf::from))
+        .or_else(|| {
+            set("XDG_RUNTIME_DIR")
+                .map(|runtime| std::path::PathBuf::from(runtime).join("agent-browser"))
+        })
+        .or_else(|| home.as_ref().map(|home| home.join(".agent-browser")));
+    let program = match state {
+        Some(state) => program.with_state(state),
+        None => program,
+    };
 
     match (profiles, trash) {
         (Some(profiles), Some(trash)) => program.with_profiles(profiles, trash),

@@ -837,8 +837,13 @@ back (rename it to the session's name in `~/.agent-browser`). A running session 
 
 **New session** asks for a name and an address, which must be `https` (`github.com/login` is read as
 `https://github.com/login`). A session that is not running launches with its saved profile, so a site it was
-signed in to still is; tapping a saved session fills in its name. A running session loads the address
-instead. Agents use a session you start like any other, by its name.
+signed in to still is. A running session loads the address instead. Agents use a session you start like any
+other, by its name.
+
+Tapping a saved session starts it at the page it was last on, which the gateway reads from agent-browser's
+`<session>.target` (in `$AGENT_BROWSER_SOCKET_DIR`, `$XDG_RUNTIME_DIR/agent-browser` or `~/.agent-browser`, or
+`agent_browser_state` at the top of the config), when that page is `https`. Without one, or with **Start at
+Another Address** from its long-press menu, it asks for an address with the name filled in.
 
 A takeover runs over its own iroh connection from a paired, trusted phone, and only while the app is open. A
 phone can also open one with a `codemode-companion://takeover?session=NAME` link, without a handoff.

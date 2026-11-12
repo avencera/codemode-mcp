@@ -1123,10 +1123,10 @@ public struct BrowserSessions: Equatable, Hashable {
      */
     public var running: [BrowserSession]
     /**
-     * The sessions with a saved profile that are not running, by name,
-     * which [`AppAction::StartSession`] launches signed in as before
+     * The sessions with a saved profile that are not running, which
+     * [`AppAction::StartSession`] launches signed in as before
      */
-    public var saved: [String]
+    public var saved: [SavedSession]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1138,9 +1138,9 @@ public struct BrowserSessions: Equatable, Hashable {
          * The sessions running, by name, from the last listing
          */running: [BrowserSession], 
         /**
-         * The sessions with a saved profile that are not running, by name,
-         * which [`AppAction::StartSession`] launches signed in as before
-         */saved: [String]) {
+         * The sessions with a saved profile that are not running, which
+         * [`AppAction::StartSession`] launches signed in as before
+         */saved: [SavedSession]) {
         self.status = status
         self.running = running
         self.saved = saved
@@ -1164,14 +1164,14 @@ public struct FfiConverterTypeBrowserSessions: FfiConverterRustBuffer {
             try BrowserSessions(
                 status: FfiConverterTypeSessionsStatus.read(from: &buf), 
                 running: FfiConverterSequenceTypeBrowserSession.read(from: &buf), 
-                saved: FfiConverterSequenceString.read(from: &buf)
+                saved: FfiConverterSequenceTypeSavedSession.read(from: &buf)
         )
     }
 
     public static func write(_ value: BrowserSessions, into buf: inout [UInt8]) {
         FfiConverterTypeSessionsStatus.write(value.status, into: &buf)
         FfiConverterSequenceTypeBrowserSession.write(value.running, into: &buf)
-        FfiConverterSequenceString.write(value.saved, into: &buf)
+        FfiConverterSequenceTypeSavedSession.write(value.saved, into: &buf)
     }
 }
 
@@ -1928,6 +1928,78 @@ public func FfiConverterTypeProgramRead_lift(_ buf: RustBuffer) throws -> Progra
 #endif
 public func FfiConverterTypeProgramRead_lower(_ value: ProgramRead) -> RustBuffer {
     return FfiConverterTypeProgramRead.lower(value)
+}
+
+
+/**
+ * A browser session on the gateway Mac that is not running but has a saved
+ * profile
+ */
+public struct SavedSession: Equatable, Hashable {
+    /**
+     * Its name, such as `discord`
+     */
+    public var name: String
+    /**
+     * The `https` page it was last on, where tapping it starts it again;
+     * `None` when the gateway does not know, so the owner gives an address
+     */
+    public var lastPage: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Its name, such as `discord`
+         */name: String, 
+        /**
+         * The `https` page it was last on, where tapping it starts it again;
+         * `None` when the gateway does not know, so the owner gives an address
+         */lastPage: String?) {
+        self.name = name
+        self.lastPage = lastPage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SavedSession: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSavedSession: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SavedSession {
+        return
+            try SavedSession(
+                name: FfiConverterString.read(from: &buf), 
+                lastPage: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SavedSession, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.lastPage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSavedSession_lift(_ buf: RustBuffer) throws -> SavedSession {
+    return try FfiConverterTypeSavedSession.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSavedSession_lower(_ value: SavedSession) -> RustBuffer {
+    return FfiConverterTypeSavedSession.lower(value)
 }
 
 
@@ -5700,6 +5772,31 @@ fileprivate struct FfiConverterSequenceTypePendingRead: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypePendingRead.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSavedSession: FfiConverterRustBuffer {
+    typealias SwiftType = [SavedSession]
+
+    public static func write(_ value: [SavedSession], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSavedSession.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SavedSession] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SavedSession]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSavedSession.read(from: &buf))
         }
         return seq
     }

@@ -63,17 +63,27 @@ struct BrowserSessionsSection: View {
                     Text("Its browser on \(gatewayName) quits, and an agent using it loses the page. Its saved sign-ins stay, so it starts again signed in.")
                 }
             }
-            ForEach(sessions.saved, id: \.self) { name in
+            ForEach(sessions.saved, id: \.name) { saved in
+                let name = saved.name
+                // starts where it left off; only a session whose last page
+                // the gateway does not know asks for an address
                 Button {
-                    starting = NewSession(name: name)
+                    if let page = saved.lastPage {
+                        manager.dispatch(.startSession(session: name, url: page))
+                    } else {
+                        starting = NewSession(name: name)
+                    }
                 } label: {
-                    SessionRow(name: name, detail: "Not running · tap to start", icon: "moon.zzz", tint: .secondary)
+                    SessionRow(name: name, detail: saved.detail, icon: "moon.zzz", tint: .secondary)
                 }
                 .swipeActions {
                     Button("Remove", systemImage: "trash") { removing = name }
                         .tint(.red)
                 }
                 .contextMenu {
+                    Button("Start at Another Address", systemImage: "link") {
+                        starting = NewSession(name: name)
+                    }
                     Button("Remove Session", systemImage: "trash", role: .destructive) { removing = name }
                 }
                 .confirmationDialog(
@@ -148,6 +158,14 @@ private struct SessionRow: View {
                     .truncationMode(.middle)
             }
         }
+    }
+}
+
+extension SavedSession {
+    /// Where tapping it starts it
+    var detail: String {
+        guard let lastPage else { return "Not running · tap to start" }
+        return "Not running · tap to open \(lastPage.replacingOccurrences(of: "https://", with: ""))"
     }
 }
 

@@ -646,6 +646,17 @@ const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// How long a link whose stream ended may take to say why it closed
 const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The gateway's browser sessions, as it listed them
+#[derive(Debug, Clone)]
+pub struct Listing {
+    /// The sessions running
+    pub running: Vec<RunningSession>,
+    /// The saved sessions not running, by name
+    pub saved: Vec<String>,
+    /// The `https` page each saved session was last on, by name
+    pub last_pages: std::collections::BTreeMap<String, String>,
+}
+
 /// What the phone asks of the gateway's sessions before they are listed
 #[derive(Debug, Clone)]
 pub enum SessionChange {
@@ -663,7 +674,7 @@ pub async fn list_sessions(
     app: ActorRef<AppMsg>,
     address: iroh::EndpointAddr,
     change: Option<SessionChange>,
-) -> Result<(Vec<RunningSession>, Vec<String>), String> {
+) -> Result<Listing, String> {
     let (first, timeout, asked) = match change {
         Some(SessionChange::Close(session)) => (
             PhoneMessage::CloseSession { session },
@@ -690,7 +701,15 @@ pub async fn list_sessions(
     link.connection.close(0_u32.into(), b"listed");
 
     match answer {
-        GatewayFrame::Message(GatewayMessage::Sessions { running, saved }) => Ok((running, saved)),
+        GatewayFrame::Message(GatewayMessage::Sessions {
+            running,
+            saved,
+            last_pages,
+        }) => Ok(Listing {
+            running,
+            saved,
+            last_pages,
+        }),
         GatewayFrame::Message(GatewayMessage::Ended {
             message: Some(message),
             ..

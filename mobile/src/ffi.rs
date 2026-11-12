@@ -52,9 +52,9 @@ pub struct BrowserSessions {
     pub status: SessionsStatus,
     /// The sessions running, by name, from the last listing
     pub running: Vec<BrowserSession>,
-    /// The sessions with a saved profile that are not running, by name,
-    /// which [`AppAction::StartSession`] launches signed in as before
-    pub saved: Vec<String>,
+    /// The sessions with a saved profile that are not running, which
+    /// [`AppAction::StartSession`] launches signed in as before
+    pub saved: Vec<SavedSession>,
 }
 
 /// Where a listing of the browser sessions stands
@@ -83,6 +83,17 @@ pub struct BrowserSession {
     pub url: Option<String>,
     /// The title of its active tab, when the gateway could read it
     pub title: Option<String>,
+}
+
+/// A browser session on the gateway Mac that is not running but has a saved
+/// profile
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SavedSession {
+    /// Its name, such as `discord`
+    pub name: String,
+    /// The `https` page it was last on, where tapping it starts it again;
+    /// `None` when the gateway does not know, so the owner gives an address
+    pub last_page: Option<String>,
 }
 
 /// The paired gateway
