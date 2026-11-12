@@ -333,7 +333,8 @@ impl HubView {
 
 /// The agent-browser the `browser` builtin drives: the configured binary or
 /// the one found, its sessions' profiles in the configured directory or
-/// `~/.agent-browser`
+/// `~/.agent-browser`, removed ones moved to the configured directory or
+/// `~/.Trash`
 fn agent_browser(config: &Config) -> AgentBrowser {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let program = match &config.agent_browser_path {
@@ -343,11 +344,15 @@ fn agent_browser(config: &Config) -> AgentBrowser {
     let profiles = config
         .browser_profiles
         .clone()
-        .or_else(|| home.map(|home| home.join(".agent-browser")));
+        .or_else(|| home.as_ref().map(|home| home.join(".agent-browser")));
+    let trash = config
+        .browser_trash
+        .clone()
+        .or_else(|| home.map(|home| home.join(".Trash")));
 
-    match profiles {
-        Some(profiles) => program.with_profiles(profiles),
-        None => program,
+    match (profiles, trash) {
+        (Some(profiles), Some(trash)) => program.with_profiles(profiles, trash),
+        _ => program,
     }
 }
 

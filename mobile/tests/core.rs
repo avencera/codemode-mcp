@@ -2122,5 +2122,24 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     assert_eq!(state.takeover, None);
     assert_eq!(state.sessions.saved, ["discord", "github"]);
 
+    // removing a saved one is asked on a link of its own too
+    app.dispatch(AppAction::RemoveSession {
+        session: "discord".to_owned(),
+    });
+    let (_removing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(
+        read_phone(&mut receive).await?,
+        PhoneMessage::RemoveSession {
+            session: "discord".to_owned()
+        }
+    );
+    let listed = GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: vec!["github".to_owned()],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+    let state = until(&app, |state| state.sessions.saved == ["github"]).await?;
+    assert_eq!(state.sessions.status, SessionsStatus::Listed);
+
     Ok(())
 }

@@ -3,7 +3,7 @@ import SwiftUI
 
 /// The gateway's browser sessions: the handoffs waiting on the owner, the
 /// sessions running, which any can take over or close, the saved ones to
-/// start again, and New session
+/// start again or remove, and New session
 struct BrowserSessionsSection: View {
     @Environment(AppManager.self) private var manager
     let gatewayName: String
@@ -12,6 +12,8 @@ struct BrowserSessionsSection: View {
     @Binding var starting: NewSession?
     /// The running session whose Close waits on the owner's confirmation
     @State private var closing: String?
+    /// The saved session whose Remove waits on the owner's confirmation
+    @State private var removing: String?
 
     var body: some View {
         let sessions = manager.state.sessions
@@ -67,6 +69,27 @@ struct BrowserSessionsSection: View {
                 } label: {
                     SessionRow(name: name, detail: "Not running · tap to start", icon: "moon.zzz", tint: .secondary)
                 }
+                .swipeActions {
+                    Button("Remove", systemImage: "trash") { removing = name }
+                        .tint(.red)
+                }
+                .contextMenu {
+                    Button("Remove Session", systemImage: "trash", role: .destructive) { removing = name }
+                }
+                .confirmationDialog(
+                    "Remove \(name)?",
+                    isPresented: Binding(
+                        get: { removing == name },
+                        set: { if !$0 { removing = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("Remove Session", role: .destructive) {
+                        manager.dispatch(.removeSession(session: name))
+                    }
+                } message: {
+                    Text("Its saved sign-ins move to the Trash on \(gatewayName), and it leaves this list.")
+                }
             }
             Button {
                 starting = NewSession(name: "")
@@ -92,7 +115,7 @@ struct BrowserSessionsSection: View {
             if case let .failed(message) = sessions.status {
                 Text(message).foregroundStyle(.red)
             } else {
-                Text("Sessions of the browser on \(gatewayName). Take one over to use it here; agents keep using it after you leave. Swipe one to close it.")
+                Text("Sessions of the browser on \(gatewayName). Take one over to use it here; agents keep using it after you leave. Swipe one to close or remove it.")
             }
         }
     }

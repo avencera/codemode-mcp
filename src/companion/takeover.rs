@@ -7,7 +7,10 @@
 //! browser is up to the [`TakeoverHost`] the daemon registers
 
 use std::{
-    sync::{Arc, PoisonError, Weak},
+    sync::{
+        Arc, OnceLock, PoisonError, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -58,6 +61,23 @@ pub struct SessionList {
     pub saved: Vec<String>,
 }
 
+/// The images a takeover sent the phone, for the log at its end
+#[derive(Default)]
+struct Traffic {
+    images: AtomicU32,
+    bytes: AtomicU64,
+    /// When the first went out
+    first: OnceLock<Instant>,
+}
+
+impl Traffic {
+    fn image(&self, bytes: usize) {
+        self.images.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        let _ = self.first.set(Instant::now());
+    }
+}
+
 /// Runs the takeovers phones open
 #[async_trait]
 pub trait TakeoverHost: Send + Sync {
@@ -77,6 +97,16 @@ pub trait TakeoverHost: Send + Sync {
     /// Quits `session`'s browser, as named by the phone, keeping its saved
     /// profile
     async fn close_session(&self, session: &str) -> Result<(), String>;
+
+    /// Moves the saved profile of `session`, as named by the phone, to the
+    /// Trash; refused while its browser runs
+    async fn remove_session(&self, session: &str) -> Result<(), String>;
+}
+
+/// What a phone asks of the sessions before they are listed
+enum SessionChange<'a> {
+    Close(&'a str),
+    Remove(&'a str),
 }
 
 /// What a handoff offered to the phones shows
@@ -111,15 +141,20 @@ async fn read_frame(receive: &mut RecvStream) -> Result<(u8, Zeroizing<Vec<u8>>)
     Ok((kind, body))
 }
 
-/// Answers a phone's [`PhoneMessage::Sessions`], or its
-/// [`PhoneMessage::CloseSession`] once `close` is closed, with the list, or
-/// with [`GatewayMessage::Ended`] saying why there is none
-async fn answer_sessions(host: &dyn TakeoverHost, close: Option<&str>, send: &mut SendStream) {
-    let closed = match close {
-        Some(session) => host.close_session(session).await,
+/// Answers a phone's [`PhoneMessage::Sessions`], or its change to a
+/// session once it is made, with the list, or with
+/// [`GatewayMessage::Ended`] saying why there is none
+async fn answer_sessions(
+    host: &dyn TakeoverHost,
+    change: Option<SessionChange<'_>>,
+    send: &mut SendStream,
+) {
+    let changed = match change {
+        Some(SessionChange::Close(session)) => host.close_session(session).await,
+        Some(SessionChange::Remove(session)) => host.remove_session(session).await,
         None => Ok(()),
     };
-    let listed = match closed {
+    let listed = match changed {
         Ok(()) => host.sessions().await,
         Err(message) => Err(message),
     };
@@ -208,7 +243,16 @@ impl Companions {
                 }
                 Ok(PhoneMessage::CloseSession { session }) => {
                     tracing::info!(phone = %phone.name, %session, "closing a session for a phone");
-                    answer_sessions(host.as_ref(), Some(&session), &mut send).await;
+                    let change = SessionChange::Close(&session);
+                    answer_sessions(host.as_ref(), Some(change), &mut send).await;
+                    connection.close(0_u32.into(), b"listed");
+
+                    return;
+                }
+                Ok(PhoneMessage::RemoveSession { session }) => {
+                    tracing::info!(phone = %phone.name, %session, "removing a session for a phone");
+                    let change = SessionChange::Remove(&session);
+                    answer_sessions(host.as_ref(), Some(change), &mut send).await;
                     connection.close(0_u32.into(), b"listed");
 
                     return;
@@ -246,8 +290,11 @@ impl Companions {
                 }
             }
         });
+        let sent = Arc::new(Traffic::default());
+        let counting = Arc::clone(&sent);
         tasks.spawn(async move {
             while let Some(frame) = output_receiver.recv().await {
+                let image = matches!(frame, GatewayFrame::Screen(_));
                 let bytes = match &frame {
                     GatewayFrame::Message(message) => encode_message(message),
                     GatewayFrame::Screen(screen) => encode_screen(screen),
@@ -258,12 +305,16 @@ impl Companions {
                 if send.write_all(&bytes).await.is_err() {
                     return;
                 }
+                if image {
+                    counting.image(bytes.len());
+                }
             }
             let _ = send.finish();
             let _ = send.stopped().await;
         });
 
         let name = phone.name.clone();
+        let opened = Instant::now();
         host.takeover(phone, open, input_receiver, output).await;
         // the writer sends what is left, then the link closes
         let _ = tokio::time::timeout(OPEN_WINDOW, async {
@@ -274,8 +325,34 @@ impl Companions {
             }
         })
         .await;
+        // how the link carried it, to tell a slow path from a slow page
+        let path = connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| {
+                let kind = if path.is_relay() { "relay" } else { "direct" };
+                (kind, path.rtt().as_millis())
+            });
+        let (path, rtt_ms) = path.unwrap_or(("none", 0));
+        let images = sent.images.load(Ordering::Relaxed);
+        let kb = sent.bytes.load(Ordering::Relaxed) / 1024;
+        let first_ms = sent
+            .first
+            .get()
+            .map_or(0, |first| first.duration_since(opened).as_millis());
+        let secs = opened.elapsed().as_secs_f64();
         connection.close(0_u32.into(), b"ended");
-        tracing::info!(phone = %name, "takeover ended");
+        tracing::info!(
+            phone = %name,
+            images,
+            kb,
+            first_ms,
+            per_sec = format!("{:.1}", f64::from(images) / secs.max(0.001)),
+            path,
+            rtt_ms,
+            "takeover ended"
+        );
     }
 
     /// Offers `handoff` to every phone, pushing to wake them, until one

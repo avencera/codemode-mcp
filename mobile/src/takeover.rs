@@ -646,19 +646,34 @@ const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// How long a link whose stream ended may take to say why it closed
 const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The gateway's browser sessions, after closing `close` if set: dials as a
-/// takeover does, asks with [`PhoneMessage::Sessions`] or
-/// [`PhoneMessage::CloseSession`], and reads the one answer
+/// What the phone asks of the gateway's sessions before they are listed
+#[derive(Debug, Clone)]
+pub enum SessionChange {
+    /// Quit a session's browser
+    Close(String),
+    /// Move a saved session's profile to the gateway's Trash
+    Remove(String),
+}
+
+/// The gateway's browser sessions, after making `change` if set: dials as a
+/// takeover does, asks with [`PhoneMessage::Sessions`],
+/// [`PhoneMessage::CloseSession`] or [`PhoneMessage::RemoveSession`], and
+/// reads the one answer
 pub async fn list_sessions(
     app: ActorRef<AppMsg>,
     address: iroh::EndpointAddr,
-    close: Option<String>,
+    change: Option<SessionChange>,
 ) -> Result<(Vec<RunningSession>, Vec<String>), String> {
-    let (first, timeout, asked) = match close {
-        Some(session) => (
+    let (first, timeout, asked) = match change {
+        Some(SessionChange::Close(session)) => (
             PhoneMessage::CloseSession { session },
             CLOSE_TIMEOUT + LIST_TIMEOUT,
             "close sessions",
+        ),
+        Some(SessionChange::Remove(session)) => (
+            PhoneMessage::RemoveSession { session },
+            LIST_TIMEOUT + LIST_TIMEOUT,
+            "remove sessions",
         ),
         None => (PhoneMessage::Sessions, LIST_TIMEOUT, "list sessions"),
     };

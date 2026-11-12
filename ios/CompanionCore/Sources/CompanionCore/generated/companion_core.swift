@@ -2641,6 +2641,15 @@ public enum AppAction: Equatable, Hashable {
          */session: String
     )
     /**
+     * Move the saved profile of browser `session`, which is not running,
+     * to the gateway's Trash, then list the sessions again
+     */
+    case removeSession(
+        /**
+         * The browser session
+         */session: String
+    )
+    /**
      * APNs gave this token, or `None` when notifications are off
      */
     case pushToken(
@@ -2712,7 +2721,10 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 15: return .closeSession(session: try FfiConverterString.read(from: &buf)
         )
         
-        case 16: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
+        case 16: return .removeSession(session: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 17: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2801,8 +2813,13 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterString.write(session, into: &buf)
             
         
-        case let .pushToken(token,environment):
+        case let .removeSession(session):
             writeInt(&buf, Int32(16))
+            FfiConverterString.write(session, into: &buf)
+            
+        
+        case let .pushToken(token,environment):
+            writeInt(&buf, Int32(17))
             FfiConverterOptionString.write(token, into: &buf)
             FfiConverterTypePushEnvironment.write(environment, into: &buf)
             

@@ -423,7 +423,8 @@ impl Takeover<'_> {
             // only a link's first message, which the companion read
             PhoneMessage::Open { .. }
             | PhoneMessage::Sessions
-            | PhoneMessage::CloseSession { .. } => {}
+            | PhoneMessage::CloseSession { .. }
+            | PhoneMessage::RemoveSession { .. } => {}
             PhoneMessage::Ack { seq } => {
                 if let Some((unacked, browser_id)) = self.unacked
                     && unacked == seq

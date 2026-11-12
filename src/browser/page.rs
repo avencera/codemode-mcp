@@ -122,6 +122,8 @@ pub struct AgentBrowser {
     /// Where sessions keep their Chrome profiles, one directory per session
     /// named after it, such as `~/.agent-browser/github`
     profiles: Option<PathBuf>,
+    /// Where a removed session's profile goes, such as `~/.Trash`
+    trash: Option<PathBuf>,
     /// One start at a time, so a second start of a session sees the browser
     /// the first launched instead of launching over it
     starts: Arc<tokio::sync::Mutex<()>>,
@@ -225,6 +227,7 @@ impl AgentBrowser {
                 .or_else(installed)
                 .unwrap_or_else(|| PathBuf::from("agent-browser")),
             profiles: None,
+            trash: None,
             starts: Arc::default(),
         }
     }
@@ -234,14 +237,17 @@ impl AgentBrowser {
         Self {
             program,
             profiles: None,
+            trash: None,
             starts: Arc::default(),
         }
     }
 
-    /// Keeps each session's profile in `profiles`, one directory per session
+    /// Keeps each session's profile in `profiles`, one directory per
+    /// session, and moves a removed one to `trash`
     #[must_use]
-    pub fn with_profiles(mut self, profiles: PathBuf) -> Self {
+    pub fn with_profiles(mut self, profiles: PathBuf, trash: PathBuf) -> Self {
         self.profiles = Some(profiles);
+        self.trash = Some(trash);
         self
     }
 
@@ -500,6 +506,46 @@ impl AgentBrowser {
         }
 
         Ok(())
+    }
+
+    /// Moves `session`'s saved profile to the trash, under a name no other
+    /// removal there has, so its sign-ins can still be put back by hand.
+    /// Refused while its browser runs, or when agent-browser does not say
+    pub async fn remove(&self, session: &SessionName) -> Result<(), PageError> {
+        let (Some(profiles), Some(trash)) = (&self.profiles, &self.trash) else {
+            return Err(PageError::Refused(
+                "this gateway keeps no session profiles".to_owned(),
+            ));
+        };
+        // no start may launch the browser on the profile while it moves
+        let _turn = self.starts.lock().await;
+        if let Launch::Running(_) = self.launch(session, LOOKUP_TIMEOUT).await? {
+            return Err(PageError::Refused(format!(
+                "`{session}` is running; close it first"
+            )));
+        }
+        let profile = profiles.join(session.as_str());
+        let marked = tokio::fs::try_exists(profile.join(PROFILE_MARKER)).await;
+        if !marked.unwrap_or(false) {
+            return Err(PageError::Refused(format!(
+                "`{session}` has no saved browser profile"
+            )));
+        }
+
+        tokio::fs::create_dir_all(trash).await.map_err(|error| {
+            PageError::Refused(format!("could not make {}: {error}", trash.display()))
+        })?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let moved = trash.join(format!("agent-browser {session} {stamp}"));
+        tokio::fs::rename(&profile, &moved).await.map_err(|error| {
+            PageError::Refused(format!(
+                "could not move `{session}` to {}: {error}",
+                trash.display()
+            ))
+        })
     }
 
     /// `session`'s active tab

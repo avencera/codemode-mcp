@@ -645,6 +645,8 @@ impl Rig {
             .unwrap_or_default();
         if let Some(profiles) = &options.browser_profiles {
             top.push_str(&format!("browser_profiles = \"{}\"\n", profiles.display()));
+            let trash = profiles.with_file_name("trash");
+            top.push_str(&format!("browser_trash = \"{}\"\n", trash.display()));
         }
         let extra = format!(
             "[secrets]\n\
@@ -2375,6 +2377,46 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
     assert_eq!(cdp.closes(), ["test"]);
     assert!(running.is_empty(), "{running:?}");
     assert_eq!(saved, ["discord"]);
+
+    // removing a saved session moves its profile to the trash, never while
+    // its browser runs
+    let phone = &rig.phone;
+    let change = |message: PhoneMessage| async move {
+        let mut link = Takeover::dial(phone).await?;
+        link.send(&message).await?;
+        link.next().await
+    };
+    let remove = || PhoneMessage::RemoveSession {
+        session: "discord".to_owned(),
+    };
+    let GatewayFrame::Message(GatewayMessage::Ended { message, .. }) = change(remove()).await?
+    else {
+        return Err("a running session was removed".into());
+    };
+    assert!(
+        message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("close it first"),
+        "{message:?}"
+    );
+    assert!(cdp.profiles.join("discord").join("Local State").exists());
+    change(PhoneMessage::CloseSession {
+        session: "discord".to_owned(),
+    })
+    .await?;
+    let GatewayFrame::Message(GatewayMessage::Sessions { saved, .. }) = change(remove()).await?
+    else {
+        return Err("no session list after the removal".into());
+    };
+    assert!(saved.is_empty(), "{saved:?}");
+    assert!(!cdp.profiles.join("discord").exists());
+    let trashed = std::fs::read_dir(cdp.profiles.with_file_name("trash"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("Local State"))
+        .filter(|state| state.exists())
+        .count();
+    assert_eq!(trashed, 1);
 
     rig.stop().await
 }

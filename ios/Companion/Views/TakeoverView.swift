@@ -4,7 +4,8 @@ import UIKit
 
 /// A browser session on the gateway Mac, live on this phone: the page as an
 /// image the owner taps, scrolls and types into, a key bar, Fill from
-/// 1Password, and Done or Cancel to hand the session back to the agent.
+/// 1Password, and for a handoff Done or Cancel to hand the session back to
+/// the agent.
 /// Pinching zooms the picture on this phone only
 struct TakeoverView: View {
     @Environment(AppManager.self) private var manager
@@ -66,7 +67,9 @@ struct TakeoverView: View {
             }
             notice
             keyBar
-            if !keyboardUp {
+            // Done and Cancel answer a handoff; a session taken over from
+            // the list has none, and Sessions leaves it
+            if !keyboardUp, takeover.handoff != nil {
                 actions
             }
         }

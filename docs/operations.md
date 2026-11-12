@@ -749,7 +749,7 @@ agent hands the session to your phone instead.
    then in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`; set `agent_browser_path` at the top of
    the config for another place. A session started from the phone keeps its Chrome profile, and so its
    sign-ins, in `~/.agent-browser/<session>`; set `browser_profiles` at the top of the config for another
-   directory.
+   directory. A session removed from the phone moves its profile to `~/.Trash`, or to `browser_trash`.
 2. If the Mac's display may be asleep while agents use the browser, as on a Mac mini left alone, tell
    agent-browser's Chrome to keep drawing pages then. Headless Chrome on macOS paces its frames by the display,
    so while it sleeps (about 30 seconds after the screen locks) `agent-browser screenshot` and anything else
@@ -818,8 +818,11 @@ the session live in the Companion app:
   site the copy is saved for; if the page moved while Face ID was up, nothing is filled. Without a sealed copy
   it opens a sheet with one field of that kind: pick the login from the AutoFill bar (or its key icon) and tap
   Fill, and the value is filled into the page's focused field if it is still that kind.
-- The page is drawn at the phone's own scale (3x on most iPhones), so text stays sharp.
-- **Done** or **Cancel** ends the handoff and the agent's call returns `done` or `cancelled`. **Sessions**
+- The page is drawn at the phone's own scale (3x on most iPhones), so text stays sharp. When a takeover ends,
+  the gateway's log line `takeover ended` gives the images sent, their size in `kb`, `first_ms` until the
+  first, `per_sec`, and whether the link was `direct` or through a `relay` with its `rtt_ms`, which tells a
+  slow link from a slow page.
+- For a handoff, **Done** or **Cancel** ends it and the agent's call returns `done` or `cancelled`. **Sessions**
   leaves without answering, for the session list, where you can take it over again.
 
 The app's home screen lists the browser sessions on the gateway Mac under **Browser sessions**: handoffs waiting
@@ -828,7 +831,9 @@ are not running. Tap one to take it over; a takeover without a handoff has no Do
 the agent keeps the session after you leave. **Sessions** on a handoff's card puts it aside for this list,
 until a new handoff or request comes. Swipe a running session left, or long-press it, to **Close** it: its
 browser quits, after you confirm, and an agent using it loses the page, but its saved profile stays, so it
-lists as saved and starts again signed in.
+lists as saved and starts again signed in. Swipe or long-press a saved session to **Remove** it: its profile,
+with its sign-ins, moves to the gateway Mac's Trash as `agent-browser <session> <time>`, where Finder can put it
+back (rename it to the session's name in `~/.agent-browser`). A running session is closed first.
 
 **New session** asks for a name and an address, which must be `https` (`github.com/login` is read as
 `https://github.com/login`). A session that is not running launches with its saved profile, so a site it was

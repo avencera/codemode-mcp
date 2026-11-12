@@ -41,7 +41,9 @@ use crate::{
     pairing,
     record::{GatewayRecord, load_key},
     request::{Asked, Entered, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
-    takeover::{TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg, list_sessions},
+    takeover::{
+        SessionChange, TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg, list_sessions,
+    },
 };
 
 /// How long a read opened from a push may take to arrive once the link is
@@ -698,7 +700,15 @@ impl App {
                 if shown.is_some_and(|takeover| takeover.session == session) {
                     Self::close_takeover(state);
                 }
-                Self::refresh_sessions(myself, state, Some(session));
+                Self::refresh_sessions(myself, state, Some(SessionChange::Close(session)));
+            }
+            AppAction::RemoveSession { session } => {
+                let Some(session) = session_name(&session) else {
+                    tracing::warn!("a removal was asked for a session name no gateway uses");
+
+                    return;
+                };
+                Self::refresh_sessions(myself, state, Some(SessionChange::Remove(session)));
             }
             AppAction::Unpair => {
                 if state.record.is_none() {
@@ -801,19 +811,19 @@ impl App {
         }
     }
 
-    /// Asks the gateway for its browser sessions, after closing `close` if
+    /// Asks the gateway for its browser sessions, after making `change` if
     /// set, in a spawned task that reports back as [`AppMsg::Sessions`]; the
     /// last listing shows meanwhile
     fn refresh_sessions(
         myself: &ActorRef<AppMsg>,
         state: &mut AppActorState,
-        close: Option<String>,
+        change: Option<SessionChange>,
     ) {
         let Some(record) = &state.record else {
             return;
         };
-        // a close goes ahead of a listing under way, whose answer it follows
-        if close.is_none() && state.shared.state().sessions.status == SessionsStatus::Loading {
+        // a change goes ahead of a listing under way, whose answer it follows
+        if change.is_none() && state.shared.state().sessions.status == SessionsStatus::Loading {
             return;
         }
         state
@@ -822,7 +832,7 @@ impl App {
         let address = record.endpoint_addr();
         let myself = myself.clone();
         tokio::spawn(async move {
-            let listed = list_sessions(myself.clone(), address, close).await;
+            let listed = list_sessions(myself.clone(), address, change).await;
             let _ = myself.cast(AppMsg::Sessions(listed));
         });
     }

@@ -4,8 +4,9 @@
 //! The phone dials one connection per takeover and opens one bidirectional
 //! stream on it. Its first message is [`PhoneMessage::Open`], or
 //! [`PhoneMessage::Sessions`] to list the browser sessions instead, or
-//! [`PhoneMessage::CloseSession`] to close one, which the gateway answers
-//! with [`GatewayMessage::Sessions`] before closing the stream. After an Open the gateway sends the live page as [`Screen`]
+//! [`PhoneMessage::CloseSession`] or [`PhoneMessage::RemoveSession`] to
+//! close or remove one, which the gateway answers with
+//! [`GatewayMessage::Sessions`] before closing the stream. After an Open the gateway sends the live page as [`Screen`]
 //! images and what changed on it as [`GatewayMessage`]s, and the phone sends
 //! the owner's taps, scrolls, keys and text. The gateway sends the next image only once the phone has
 //! acknowledged the last, so a slow link gets fewer images rather than a
@@ -155,6 +156,13 @@ pub enum PhoneMessage {
     /// Instead of an Open: quit `session`'s browser, keeping its saved
     /// profile, answered with [`GatewayMessage::Sessions`] as listed after
     CloseSession {
+        /// The browser session, such as `github`
+        session: String,
+    },
+    /// Instead of an Open: move the saved profile of `session`, which must
+    /// not be running, to the gateway's Trash, answered with
+    /// [`GatewayMessage::Sessions`] as listed after
+    RemoveSession {
         /// The browser session, such as `github`
         session: String,
     },
@@ -332,8 +340,9 @@ pub enum GatewayMessage {
         /// Why, never holding a value
         message: String,
     },
-    /// The answer to [`PhoneMessage::Sessions`] and
-    /// [`PhoneMessage::CloseSession`]; the gateway closes the stream next
+    /// The answer to [`PhoneMessage::Sessions`],
+    /// [`PhoneMessage::CloseSession`] and [`PhoneMessage::RemoveSession`];
+    /// the gateway closes the stream next
     Sessions {
         /// The sessions running now, by name
         running: Vec<RunningSession>,

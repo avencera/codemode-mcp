@@ -677,6 +677,15 @@ impl TakeoverHost for Browsers {
             error.to_string()
         })
     }
+
+    async fn remove_session(&self, session: &str) -> Result<(), String> {
+        let session = SessionName::parse(session).map_err(|error| error.to_string())?;
+
+        self.agent_browser.remove(&session).await.map_err(|error| {
+            tracing::warn!(%session, %error, "the session was not removed");
+            error.to_string()
+        })
+    }
 }
 
 /// The answer to `fill`

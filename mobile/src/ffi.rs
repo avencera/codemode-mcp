@@ -686,6 +686,12 @@ pub enum AppAction {
         /// The browser session
         session: String,
     },
+    /// Move the saved profile of browser `session`, which is not running,
+    /// to the gateway's Trash, then list the sessions again
+    RemoveSession {
+        /// The browser session
+        session: String,
+    },
     /// APNs gave this token, or `None` when notifications are off
     PushToken {
         /// The device token as lowercase hex
