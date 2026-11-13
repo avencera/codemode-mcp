@@ -25,6 +25,9 @@ host = {{HUB}}
 # the address the phone dials this machine's browser sessions at, such as its
 # tailnet IP; any free port when unset
 # browser_listen = "100.x.y.z:7682"
+# seconds between reports of this machine's browser to the hub, 1 to 30; a
+# phone unpaired on the hub loses its takeovers here within one report
+# browser_report_secs = 30
 
 # write_env and find_references on this machine: they write 1Password values
 # into files here, approved on the hub, and the agent sees only the names

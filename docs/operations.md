@@ -1120,6 +1120,8 @@ the spoke itself to list and take over its sessions, so screen images do not go 
    host = "mac-mini"
    # optional: a fixed address for the phone to dial, such as the spoke's tailnet IP
    browser_listen = "100.x.y.z:7682"
+   # optional: seconds between reports to the hub, 1 to 30 (default 30)
+   # browser_report_secs = 10
 
    [servers.code_browser]
    builtin = "browser"
@@ -1130,8 +1132,9 @@ the spoke itself to list and take over its sessions, so screen images do not go 
 
    The top-level keys must come before `[hub]`. agent-browser is also found in `~/.local/bin` without
    `agent_browser_path`, as on the hub.
-3. Restart the spoke's daemon. Once the hub trusts it, the spoke reports its browser to the hub every 30
-   seconds, and the app shows its sessions under **Browser on <name>** on the next refresh.
+3. Restart the spoke's daemon. Once the hub trusts it, the spoke reports its browser to the hub every
+   `browser_report_secs` (30 seconds by default), and the app shows its sessions under **Browser on <name>** on
+   the next refresh.
 
 What changes for a spoke's sessions:
 
@@ -1146,8 +1149,10 @@ What changes for a spoke's sessions:
 - The phone must reach the spoke: on the tailnet, at the address `browser_listen` fixes, or through n0's
   relays when `[secrets] discovery` is on. A spoke the phone cannot dial in 8 seconds shows as unreachable
   in its section, and the other machines still list.
-- The spoke admits only the phones paired with the hub, which the hub tells it each time the spoke reports;
-  a phone paired on the hub is let in within 30 seconds.
+- The spoke admits only the phones paired with the hub, which the hub tells it each time the spoke reports.
+  A phone paired on the hub is let in within one report, and a phone unpaired there loses the takeovers it
+  has open on the spoke within one report. When three reports in a row go unanswered, such as while the hub
+  is down, the spoke ends every takeover and lets no phone in until the hub answers again.
 
 Manage spokes on the hub:
 

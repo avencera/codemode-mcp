@@ -36,11 +36,12 @@ use tokio::{sync::mpsc, task::JoinSet, time::Instant};
 use zeroize::Zeroizing;
 
 use super::{CompanionFailure, Companions, apns::Subject};
+use crate::config::MAX_BROWSER_REPORT_SECS;
 
 /// How long a spoke's report of its takeover endpoint stands; a spoke
-/// reports every [`super::spoke::REPORT_EVERY`], so one that missed two
-/// reports is taken to be gone
-const FRESH: Duration = Duration::from_secs(90);
+/// reports at least every [`MAX_BROWSER_REPORT_SECS`], so one that missed
+/// two reports is taken to be gone
+const FRESH: Duration = Duration::from_secs(3 * MAX_BROWSER_REPORT_SECS);
 
 /// How long a phone may take to open its stream and say what it takes over
 const OPEN_WINDOW: Duration = Duration::from_secs(30);

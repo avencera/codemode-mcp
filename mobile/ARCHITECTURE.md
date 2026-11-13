@@ -91,7 +91,8 @@ App (supervisor)
 - **Takeover** dials the gateway on `TAKEOVER_ALPN` from the connection actor's endpoint (the app lends it through
   `AppMsg::Endpoint`), so the gateway sees the paired phone's key. A session on a spoke (`BrowserHost::Machine`)
   is dialed the same way, at the endpoint id, relay and addresses the gateway listed for that machine; the spoke
-  admits only the phones the gateway tells it are paired. An `OpenTakeover` naming a machine the app has not
+  admits only the phones the gateway tells it are paired, and closes a takeover with `not paired` once the
+  gateway stops vouching for its phone. An `OpenTakeover` naming a machine the app has not
   listed yet, such as from a link, shows Connecting, lists the gateway's sessions again and opens once the
   machine is known (`waiting_open`, which also keeps the first `Resize`), or ends as failed if the gateway no
   longer lists it. It waits for the app's first `Resize`, which

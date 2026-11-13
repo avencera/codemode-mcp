@@ -3,6 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Weak},
+    time::Duration,
 };
 
 use crate::{
@@ -313,17 +314,24 @@ impl App {
         client: &Arc<HubClient>,
         browsers: &Arc<crate::browser::Browsers>,
     ) -> Option<Arc<SpokeTakeovers>> {
-        let listen = config.hub.as_ref().and_then(|hub| hub.browser_listen);
+        let hub = config.hub.as_ref()?;
+        let every = Duration::from_secs(hub.browser_report_secs);
         let host: Weak<dyn TakeoverHost> = Arc::downgrade(browsers) as Weak<dyn TakeoverHost>;
-        let takeovers =
-            match SpokeTakeovers::bind(state_dir, config.secrets.discovery, listen, host).await {
-                Ok(takeovers) => takeovers,
-                Err(error) => {
-                    tracing::warn!(%error, "no takeovers of this spoke's browser sessions");
+        let bound = SpokeTakeovers::bind(
+            state_dir,
+            config.secrets.discovery,
+            hub.browser_listen,
+            every,
+            host,
+        );
+        let takeovers = match bound.await {
+            Ok(takeovers) => takeovers,
+            Err(error) => {
+                tracing::warn!(%error, "no takeovers of this spoke's browser sessions");
 
-                    return None;
-                }
-            };
+                return None;
+            }
+        };
         tokio::spawn(Arc::clone(&takeovers).report_to(Arc::clone(client)));
 
         Some(takeovers)

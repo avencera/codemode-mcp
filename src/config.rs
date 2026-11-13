@@ -784,6 +784,21 @@ pub struct HubConfig {
     /// server
     #[serde(default)]
     pub browser_listen: Option<SocketAddr>,
+    /// Seconds between this spoke's reports of its browser to the hub, each
+    /// of which brings the phones the hub vouches for: a phone unpaired on
+    /// the hub loses its takeovers here within this, and once three reports
+    /// go unanswered no phone is let in. 1 to [`MAX_BROWSER_REPORT_SECS`];
+    /// used only with a `browser` server
+    #[serde(default = "default_browser_report_secs")]
+    pub browser_report_secs: u64,
+}
+
+/// Longest `hub.browser_report_secs`; the hub lists a spoke's browser for
+/// three times this after its last report
+pub const MAX_BROWSER_REPORT_SECS: u64 = 30;
+
+fn default_browser_report_secs() -> u64 {
+    MAX_BROWSER_REPORT_SECS
 }
 
 impl HubConfig {
@@ -841,6 +856,11 @@ impl HubConfig {
                  the ones to leave out"
                     .into(),
             ));
+        }
+        if !(1..=MAX_BROWSER_REPORT_SECS).contains(&self.browser_report_secs) {
+            return Err(ConfigError::Invalid(format!(
+                "hub.browser_report_secs must be 1 to {MAX_BROWSER_REPORT_SECS}"
+            )));
         }
 
         Ok(())
@@ -1798,6 +1818,32 @@ mod tests {
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
         Config::parse(text, Path::new("test.toml"))
+    }
+
+    /// The report interval is bounded by how long the hub lists a spoke's
+    /// browser after a report, so a spoke never drops off between two
+    #[test]
+    fn a_spokes_browser_report_interval_stays_inside_the_hubs_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hub = |line: &str| parse(&format!("[hub]\nhost = \"mac-mini\"\n{line}"));
+
+        let default = hub("")?.hub.ok_or("no hub section")?;
+        assert_eq!(default.browser_report_secs, MAX_BROWSER_REPORT_SECS);
+        let set = hub("browser_report_secs = 5")?
+            .hub
+            .ok_or("no hub section")?;
+        assert_eq!(set.browser_report_secs, 5);
+        for refused in ["browser_report_secs = 0", "browser_report_secs = 31"] {
+            let error = hub(refused).err().ok_or(refused)?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("hub.browser_report_secs must be 1 to 30"),
+                "{error}"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]

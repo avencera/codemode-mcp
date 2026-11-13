@@ -1901,6 +1901,7 @@ async fn restart_fresh(
 
 /// A takeover link the test drives as the app would
 struct Takeover {
+    connection: Connection,
     send: iroh::endpoint::SendStream,
     receive: iroh::endpoint::RecvStream,
 }
@@ -1911,7 +1912,11 @@ impl Takeover {
         let connection = phone.dial(TAKEOVER_ALPN).await?;
         let (send, receive) = connection.open_bi().await?;
 
-        Ok(Self { send, receive })
+        Ok(Self {
+            connection,
+            send,
+            receive,
+        })
     }
 
     /// A link to the machine at `address`, with nothing sent on it yet
@@ -1919,7 +1924,40 @@ impl Takeover {
         let connection = phone.dial_at(address, TAKEOVER_ALPN).await?;
         let (send, receive) = connection.open_bi().await?;
 
-        Ok(Self { send, receive })
+        Ok(Self {
+            connection,
+            send,
+            receive,
+        })
+    }
+
+    /// A takeover of `session` on the machine at `address`, once its page
+    /// shows
+    async fn shown_at(
+        phone: &FakePhone,
+        address: EndpointAddr,
+        session: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut takeover = Self::dial_at(phone, address).await?;
+        takeover
+            .send(&PhoneMessage::Open {
+                session: session.to_owned(),
+                handoff: None,
+                viewport: Viewport {
+                    width: 390,
+                    height: 844,
+                    scale: 3.0,
+                },
+                start: None,
+            })
+            .await?;
+        takeover
+            .until(|frame| {
+                matches!(frame, GatewayFrame::Message(GatewayMessage::Page { .. })).then_some(())
+            })
+            .await?;
+
+        Ok(takeover)
     }
 
     /// The sessions of the machine at `address`, as it listed them
@@ -2522,6 +2560,121 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
     rig.stop().await
 }
 
+/// A spoke of a rig's hub with its own browser server, which the owner
+/// trusted at the hub and whose browser the hub lists to its phone
+struct Spoke {
+    harness: Harness,
+    name: String,
+    /// Its id with the hub
+    id: String,
+    /// Its browser, as the hub lists it
+    machine: BrowserMachine,
+    /// Where the phone dials its browser
+    at: EndpointAddr,
+}
+
+impl Spoke {
+    /// Starts a spoke of `rig`'s hub, which must serve a browser of its own,
+    /// on the sessions of the `agent-browser` at `browser`, reporting its
+    /// browser every `report_secs`
+    async fn start(
+        rig: &Rig,
+        browser: &Path,
+        report_secs: u64,
+    ) -> Result<Option<Self>, Box<dyn Error>> {
+        // the owner trusts the spoke with Touch ID at the hub
+        rig.gateway_mac.set_answer(Some(TouchId::Approved));
+        let hub_port = rig.harness.server.local_addr().port();
+        let browser_listen = SocketAddr::from(([127, 0, 0, 1], free_port()?));
+        let extra = format!(
+            "[hub]\nhost = \"127.0.0.1:{hub_port}\"\nexclude = [\"fixture\"]\n\
+             browser_listen = \"{browser_listen}\"\nbrowser_report_secs = {report_secs}\n\n\
+             [secrets]\ndiscovery = false\n\n\
+             [servers.code_browser]\nbuiltin = \"browser\"\npolicy = \"ask\"\n\
+             tools.fill.grant = \"per_call\"\ntools.handoff.policy = \"allow\"\n"
+        );
+        let top = format!("agent_browser_path = \"{}\"", browser.display());
+        let Some(harness) = Harness::with(Setup {
+            extra: &extra,
+            top: &top,
+            ..Setup::default()
+        })
+        .await?
+        else {
+            return Ok(None);
+        };
+        harness.app.connect_hub(Duration::from_secs(5)).await?;
+        // the hub's own browser reaches the spoke once the hub trusts it
+        wait_for_tool(&harness, "browser_fill").await?;
+        wait_for_tool(&harness, "code_browser_fill").await?;
+        let name = harness
+            .app
+            .gateway()
+            .hub()
+            .ok_or("the spoke has no hub")?
+            .machine()
+            .name
+            .clone();
+        let id = rig
+            .harness
+            .app
+            .hub()
+            .ok_or("the hub has no spokes")?
+            .spokes()
+            .first()
+            .ok_or("no spoke is trusted")?
+            .id
+            .clone();
+
+        // the hub lists the spoke's browser to its phone, with where to dial
+        // it
+        let machines = rig.harness.app.gateway().companions().browser_machines();
+        let machine = eventually(|| machines.recent().into_iter().next()).await?;
+        assert_eq!(machine.name, name);
+        assert!(machine.addrs.contains(&browser_listen), "{machine:?}");
+        let at = EndpointAddr::from_parts(
+            machine.id,
+            machine.addrs.iter().copied().map(TransportAddr::Ip),
+        );
+
+        Ok(Some(Self {
+            harness,
+            name,
+            id,
+            machine,
+            at,
+        }))
+    }
+
+    /// The sessions of the spoke at `at` as `phone` lists them, once the
+    /// hub has vouched for it there
+    async fn admitted(
+        at: &EndpointAddr,
+        phone: &FakePhone,
+    ) -> Result<(Vec<RunningSession>, Vec<BrowserMachine>), Box<dyn Error>> {
+        for _ in 0..50 {
+            if let Ok(listed) = Takeover::list_at(phone, at.clone()).await {
+                return Ok(listed);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Err("the spoke never let the phone in".into())
+    }
+}
+
+/// Waits for `connection` to be closed as a phone's that is not let in
+async fn not_paired(connection: &Connection) -> TestResult {
+    let closed = tokio::time::timeout(Duration::from_secs(15), connection.closed()).await?;
+    assert!(
+        matches!(&closed, ConnectionError::ApplicationClosed(close)
+            if close.reason.as_ref() == b"not paired"),
+        "{closed:?}"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub() -> TestResult {
     const ENTERED: &str = "entered-on-the-phone";
@@ -2537,57 +2690,19 @@ async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub(
     };
     let mut passkey = rig.harness.enroll_passkey().await?;
 
-    // the spoke runs its own browser server beside the hub's, and the owner
-    // trusts it with Touch ID at the hub, then leaves
-    rig.gateway_mac.set_answer(Some(TouchId::Approved));
-    let hub_port = rig.harness.server.local_addr().port();
-    let browser_listen = SocketAddr::from(([127, 0, 0, 1], free_port()?));
-    let spoke_extra = format!(
-        "[hub]\nhost = \"127.0.0.1:{hub_port}\"\nexclude = [\"fixture\"]\n\
-         browser_listen = \"{browser_listen}\"\n\n\
-         [secrets]\ndiscovery = false\n\n\
-         [servers.code_browser]\nbuiltin = \"browser\"\npolicy = \"ask\"\n\
-         tools.fill.grant = \"per_call\"\ntools.handoff.policy = \"allow\"\n"
-    );
-    let spoke_top = format!("agent_browser_path = \"{}\"", spoke_cdp.program.display());
-    let Some(spoke) = Harness::with(Setup {
-        extra: &spoke_extra,
-        top: &spoke_top,
-        ..Setup::default()
-    })
-    .await?
-    else {
+    // the spoke runs its own browser server beside the hub's; the owner
+    // trusts it at the hub, then leaves
+    let Some(spoke) = Spoke::start(&rig, &spoke_cdp.program, 30).await? else {
         return Ok(());
     };
-    spoke.app.connect_hub(Duration::from_secs(5)).await?;
-    // the hub's own browser reaches the spoke once the hub trusts it
-    wait_for_tool(&spoke, "browser_fill").await?;
-    wait_for_tool(&spoke, "code_browser_fill").await?;
     rig.gateway_mac.set_present(false);
-    let name = spoke
-        .app
-        .gateway()
-        .hub()
-        .ok_or("the spoke has no hub")?
-        .machine()
-        .name
-        .clone();
-    let spoke_id = rig
-        .harness
-        .app
-        .hub()
-        .ok_or("the hub has no spokes")?
-        .spokes()
-        .first()
-        .ok_or("no spoke is trusted")?
-        .id
-        .clone();
-
-    // the hub lists the spoke's browser to its phone, with where to dial it
-    let machines = rig.harness.app.gateway().companions().browser_machines();
-    let machine = eventually(|| machines.recent().into_iter().next()).await?;
-    assert_eq!(machine.name, name);
-    assert!(machine.addrs.contains(&browser_listen), "{machine:?}");
+    let Spoke {
+        harness: spoke,
+        name,
+        id: spoke_id,
+        machine,
+        at: spoke_at,
+    } = spoke;
     let hub_at = EndpointAddr::from_parts(
         rig.phone.gateway,
         [TransportAddr::Ip(rig.phone.gateway_address)],
@@ -2597,19 +2712,7 @@ async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub(
 
     // the spoke lets in the hub's phone, once the hub has vouched for it,
     // and lists its own sessions, but no stranger
-    let spoke_at = EndpointAddr::from_parts(
-        machine.id,
-        machine.addrs.iter().copied().map(TransportAddr::Ip),
-    );
-    let mut listing = None;
-    for _ in 0..50 {
-        if let Ok(listed) = Takeover::list_at(&rig.phone, spoke_at.clone()).await {
-            listing = Some(listed);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let (running, machines_there) = listing.ok_or("the spoke never let the phone in")?;
+    let (running, machines_there) = Spoke::admitted(&spoke_at, &rig.phone).await?;
     let names: Vec<&str> = running
         .iter()
         .map(|session| session.name.as_str())
@@ -2618,12 +2721,7 @@ async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub(
     assert!(machines_there.is_empty());
     let stranger = FakePhone::start(rig.phone.gateway, rig.phone.gateway_address).await?;
     let refused = stranger.dial_at(spoke_at.clone(), TAKEOVER_ALPN).await?;
-    let closed = refused.closed().await;
-    assert!(
-        matches!(&closed, ConnectionError::ApplicationClosed(close)
-            if close.reason.as_ref() == b"not paired"),
-        "{closed:?}"
-    );
+    not_paired(&refused).await?;
 
     // a handoff of the spoke's session is offered through the hub, naming
     // the spoke, and the phone answers it on the spoke's own takeover
@@ -2828,4 +2926,69 @@ async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub(
 
     spoke.stop().await?;
     rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_phone_unpaired_on_the_hub_loses_its_takeovers_on_a_spoke() -> TestResult {
+    let hub_cdp = FakeCdp::start("https://example.com/").await?;
+    let spoke_cdp = FakeCdp::start("https://github.com/login").await?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(hub_cdp.program.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(spoke) = Spoke::start(&rig, &spoke_cdp.program, 1).await? else {
+        return Ok(());
+    };
+    Spoke::admitted(&spoke.at, &rig.phone).await?;
+    let takeover = Takeover::shown_at(&rig.phone, spoke.at.clone(), "test").await?;
+
+    // the phone unpairs itself on the hub, which stops vouching for it
+    let connection = rig.phone.connect().await?;
+    let unpaired = rig
+        .phone
+        .request(&connection, &PhoneRequest::Unpair)
+        .await?;
+    assert_eq!(unpaired, PhoneResponse::Done);
+
+    // the spoke ends the takeover it is in at its next report, and lets it
+    // in no more
+    not_paired(&takeover.connection).await?;
+    let again = rig.phone.dial_at(spoke.at.clone(), TAKEOVER_ALPN).await?;
+    not_paired(&again).await?;
+
+    spoke.harness.stop().await?;
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spoke_lets_no_phone_in_once_the_hub_stops_answering() -> TestResult {
+    let hub_cdp = FakeCdp::start("https://example.com/").await?;
+    let spoke_cdp = FakeCdp::start("https://github.com/login").await?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(hub_cdp.program.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(spoke) = Spoke::start(&rig, &spoke_cdp.program, 1).await? else {
+        return Ok(());
+    };
+    Spoke::admitted(&spoke.at, &rig.phone).await?;
+    let takeover = Takeover::shown_at(&rig.phone, spoke.at.clone(), "test").await?;
+
+    // the hub goes away; its last answer lapses after three unanswered
+    // reports, which ends the takeover and refuses the phone after it
+    let phone = rig.phone.clone();
+    rig.stop().await?;
+    not_paired(&takeover.connection).await?;
+    let again = phone.dial_at(spoke.at.clone(), TAKEOVER_ALPN).await?;
+    not_paired(&again).await?;
+
+    spoke.harness.stop().await
 }

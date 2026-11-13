@@ -1172,13 +1172,21 @@ rather than a generated crate), so no secret passes through an agent-browser com
   phone dials the spoke directly, for the list and for takeovers, and the hub vouches both ways.
   - Takeover endpoint: a second iroh endpoint on the spoke, taking `TAKEOVER_ALPN` only, with its key in
     `<state_dir>/browser.key` (0600), since a spoke has no Keychain. `[hub] browser_listen` fixes its socket;
-    without it the port is random. Relays and discovery follow `[secrets] discovery`. Every 30 s the spoke
-    posts its id, relay and direct addresses (at most 16, with any socket bound to one address, such as
-    `browser_listen`, included even before the interfaces are known) to `browser/endpoint`. The hub keeps them
-    in memory and answers with its paired phones' endpoint ids and names, the only phones the spoke admits;
-    until that first answer it admits none. A phone the hub does not list is closed with `not paired`, and a
-    spoke `spokes remove` drops is forgotten at once. Why a separate endpoint: the spoke's companion links,
-    if any, are its own, and the phone needs one id and address set per machine that the hub can vouch for
+    without it the port is random. Relays and discovery follow `[secrets] discovery`. Every
+    `[hub] browser_report_secs` (1 to 30, default 30) the spoke posts its id, relay and direct addresses (at
+    most 16, with any socket bound to one address, such as `browser_listen`, included even before the
+    interfaces are known) to `browser/endpoint`. The hub keeps them in memory and answers with its paired
+    phones' endpoint ids and names, the only phones the spoke admits; until that first answer it admits none.
+    A phone the hub does not list is closed with `not paired`, and a spoke `spokes remove` drops is forgotten
+    at once
+  - Revocation: each answer replaces the vouched list, which every takeover on the spoke watches, so a phone
+    the hub stops listing, such as one unpaired there, has its open takeovers closed with `not paired` within
+    one report, not only its next dial refused. An answer stands for three reports: once that long passes
+    without one (the hub is down, or no longer trusts the spoke), the list lapses, every takeover is closed
+    and no phone is admitted until the hub answers again. Why a lapse rather than keeping the last list: a
+    hub that cannot answer cannot revoke either, so a phone removed while the hub is down would keep its
+    access. Why a separate endpoint: the spoke's companion links, if any, are its own, and the phone needs one
+    id and address set per machine that the hub can vouch for
   - Why direct rather than through the hub: a relayed takeover would put every screencast image through the
     hub twice and tie each takeover to the hub's link and load. The phone already trusts what the hub says
     over its authenticated link, so the hub naming the spoke's endpoint id is enough to dial it
@@ -1432,8 +1440,9 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - A spoke's request for `op://` references in its config that was open when the hub restarted is withdrawn; the
   spoke asks again on its next attempt
 - A spoke's fill whose source the hub held when it restarted is refused; the agent fills again. A spoke's
-  takeover endpoint is listed only once the spoke reports it, up to 30 s after either machine starts, and a
-  phone that cannot reach the spoke's addresses or relay sees its section as unreachable
+  takeover endpoint is listed only once the spoke reports it, up to `browser_report_secs` (30 s by default)
+  after either machine starts, and a phone that cannot reach the spoke's addresses or relay sees its section
+  as unreachable. A phone unpaired on the hub keeps its takeovers on a spoke until the spoke's next report
 
 ## Open questions
 
