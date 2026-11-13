@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     app::{AppMsg, StreamEnd},
-    ffi::{OpenBatch, OpenError, OpenRequest, Platform, ReadStatus, SealedItem},
+    ffi::{OpenBatch, OpenDestination, OpenError, OpenRequest, Platform, ReadStatus, SealedItem},
     record::GatewayRecord,
 };
 
@@ -424,7 +424,9 @@ impl Actor for RequestActor {
                 let request = OpenRequest {
                     id: read.id.to_string(),
                     reference: read.reference.clone(),
-                    gateway_name: state.record.name.clone(),
+                    destination: OpenDestination::Gateway {
+                        name: state.record.name.clone(),
+                    },
                     info: seal_info(&state.record.id, &read.reference),
                     enc: sealed.enc.clone(),
                     ciphertext: sealed.ciphertext.clone(),

@@ -111,6 +111,9 @@ App (supervisor)
   Fill from an offer
   opens its sealed copy with `Platform::open_sealed`, the seal's `info` binding the gateway and the offer's
   reference (the gateway's id on a spoke's page too, since only the gateway reads 1Password and seals), and sends the value as `Fill`.
+  Its prompt names where the value goes, `OpenDestination::Page` with the session and its machine, so a fill on
+  a spoke names the spoke, not the gateway that sealed it; a read's prompt names the gateway
+  (`OpenDestination::Gateway`).
   For a code offer the core sends the current code, computed from the opened seed with `companion_wire::totp`,
   never the seed, so a spoke never holds it. A link that drops while the app is in the foreground is dialed again
   with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while

@@ -1571,8 +1571,8 @@ public func FfiConverterTypeOpenBatch_lower(_ value: OpenBatch) -> RustBuffer {
 
 /**
  * Everything Face ID needs to open one value: the reason it shows, and the
- * HPKE pieces. `info` binds the reference and gateway, so the value opens
- * only for the read the prompt names
+ * HPKE pieces. `info` binds the reference and the gateway that sealed it,
+ * so the value opens only for an offer of that gateway's
  */
 public struct OpenRequest: Equatable, Hashable {
     /**
@@ -1584,9 +1584,10 @@ public struct OpenRequest: Equatable, Hashable {
      */
     public var reference: String
     /**
-     * The gateway the prompt names
+     * Where the value goes, which the prompt names; for a page on a spoke
+     * that is the spoke, though the gateway sealed it
      */
-    public var gatewayName: String
+    public var destination: OpenDestination
     /**
      * HPKE `info`
      */
@@ -1610,8 +1611,9 @@ public struct OpenRequest: Equatable, Hashable {
          * The reference the prompt names
          */reference: String, 
         /**
-         * The gateway the prompt names
-         */gatewayName: String, 
+         * Where the value goes, which the prompt names; for a page on a spoke
+         * that is the spoke, though the gateway sealed it
+         */destination: OpenDestination, 
         /**
          * HPKE `info`
          */info: Data, 
@@ -1623,7 +1625,7 @@ public struct OpenRequest: Equatable, Hashable {
          */ciphertext: Data) {
         self.id = id
         self.reference = reference
-        self.gatewayName = gatewayName
+        self.destination = destination
         self.info = info
         self.enc = enc
         self.ciphertext = ciphertext
@@ -1647,7 +1649,7 @@ public struct FfiConverterTypeOpenRequest: FfiConverterRustBuffer {
             try OpenRequest(
                 id: FfiConverterString.read(from: &buf), 
                 reference: FfiConverterString.read(from: &buf), 
-                gatewayName: FfiConverterString.read(from: &buf), 
+                destination: FfiConverterTypeOpenDestination.read(from: &buf), 
                 info: FfiConverterData.read(from: &buf), 
                 enc: FfiConverterData.read(from: &buf), 
                 ciphertext: FfiConverterData.read(from: &buf)
@@ -1657,7 +1659,7 @@ public struct FfiConverterTypeOpenRequest: FfiConverterRustBuffer {
     public static func write(_ value: OpenRequest, into buf: inout [UInt8]) {
         FfiConverterString.write(value.id, into: &buf)
         FfiConverterString.write(value.reference, into: &buf)
-        FfiConverterString.write(value.gatewayName, into: &buf)
+        FfiConverterTypeOpenDestination.write(value.destination, into: &buf)
         FfiConverterData.write(value.info, into: &buf)
         FfiConverterData.write(value.enc, into: &buf)
         FfiConverterData.write(value.ciphertext, into: &buf)
@@ -3432,6 +3434,98 @@ public func FfiConverterTypeLoginField_lift(_ buf: RustBuffer) throws -> LoginFi
 #endif
 public func FfiConverterTypeLoginField_lower(_ value: LoginField) -> RustBuffer {
     return FfiConverterTypeLoginField.lower(value)
+}
+
+
+
+/**
+ * Where an opened value goes, which the Face ID prompt names
+ */
+
+public enum OpenDestination: Equatable, Hashable {
+    
+    /**
+     * codemode-mcp on the gateway, which asked to read it
+     */
+    case gateway(
+        /**
+         * The gateway's name
+         */name: String
+    )
+    /**
+     * The focused field of a taken-over page, on the machine the session
+     * runs on: the gateway or one it vouches for
+     */
+    case page(
+        /**
+         * The browser session
+         */session: String, 
+        /**
+         * The machine's name
+         */machine: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension OpenDestination: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOpenDestination: FfiConverterRustBuffer {
+    typealias SwiftType = OpenDestination
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OpenDestination {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .gateway(name: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .page(session: try FfiConverterString.read(from: &buf), machine: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OpenDestination, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .gateway(name):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(name, into: &buf)
+            
+        
+        case let .page(session,machine):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(session, into: &buf)
+            FfiConverterString.write(machine, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOpenDestination_lift(_ buf: RustBuffer) throws -> OpenDestination {
+    return try FfiConverterTypeOpenDestination.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOpenDestination_lower(_ value: OpenDestination) -> RustBuffer {
+    return FfiConverterTypeOpenDestination.lower(value)
 }
 
 

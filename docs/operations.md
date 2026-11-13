@@ -817,7 +817,8 @@ the session live in the Companion app:
 - Tap the address at the top to go somewhere else: type an address, such as `github.com/settings`, and tap Go.
   Only `https` addresses open; if the site does not load, the reason shows under the page.
 - **Fill from 1Password** shows for a focused username, password or code field. It fills the field from a copy
-  sealed to the phone, after Face ID, checked as an agent's fill is, and only while the page is still on the
+  sealed to the phone, after Face ID, whose prompt names the session and the machine it runs on, such as
+  `Fill op://… into github on ai5090`, checked as an agent's fill is, and only while the page is still on the
   site the copy is saved for; if the page moved while Face ID was up, nothing is filled. Without a sealed copy
   it opens a sheet with one field of that kind: pick the login from the AutoFill bar (or its key icon) and tap
   Fill, and the value is filled into the page's focused field if it is still that kind.

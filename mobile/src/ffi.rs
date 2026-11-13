@@ -838,17 +838,36 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for OpenError {
     }
 }
 
+/// Where an opened value goes, which the Face ID prompt names
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum OpenDestination {
+    /// codemode-mcp on the gateway, which asked to read it
+    Gateway {
+        /// The gateway's name
+        name: String,
+    },
+    /// The focused field of a taken-over page, on the machine the session
+    /// runs on: the gateway or one it vouches for
+    Page {
+        /// The browser session
+        session: String,
+        /// The machine's name
+        machine: String,
+    },
+}
+
 /// Everything Face ID needs to open one value: the reason it shows, and the
-/// HPKE pieces. `info` binds the reference and gateway, so the value opens
-/// only for the read the prompt names
+/// HPKE pieces. `info` binds the reference and the gateway that sealed it,
+/// so the value opens only for an offer of that gateway's
 #[derive(Clone, uniffi::Record)]
 pub struct OpenRequest {
     /// The read, so [`Platform::cancel_open`] can name it
     pub id: String,
     /// The reference the prompt names
     pub reference: String,
-    /// The gateway the prompt names
-    pub gateway_name: String,
+    /// Where the value goes, which the prompt names; for a page on a spoke
+    /// that is the spoke, though the gateway sealed it
+    pub destination: OpenDestination,
     /// HPKE `info`
     pub info: Vec<u8>,
     /// The encapsulated key

@@ -14,10 +14,10 @@ use std::{
 
 use companion_core::ffi::{
     AppAction, AppState, BrowserSession, ConnectionState, EnteredValue, FfiApp, HandoffStatus,
-    LoginField, OpenBatch, OpenError, OpenRequest, PairingState, PendingRead, Platform,
-    PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, SavedSession,
-    ScreenImage, SessionHost, SessionsStatus, TakeoverInput, TakeoverNotice, TakeoverStatus,
-    Update,
+    LoginField, OpenBatch, OpenDestination, OpenError, OpenRequest, PairingState, PendingRead,
+    Platform, PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler,
+    SavedSession, ScreenImage, SessionHost, SessionsStatus, TakeoverInput, TakeoverNotice,
+    TakeoverStatus, Update,
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
@@ -94,8 +94,8 @@ struct FakePlatform {
     secrets: Mutex<HashMap<String, Vec<u8>>>,
     seal: Mutex<Option<SoftwareKey>>,
     face_id: Mutex<FaceId>,
-    /// The reference and gateway each prompt named
-    prompts: Mutex<Vec<(String, String)>>,
+    /// The reference and destination each prompt named
+    prompts: Mutex<Vec<(String, OpenDestination)>>,
     /// The references, value count and gateway each program read's prompt
     /// named
     batch_prompts: Mutex<Vec<(Vec<String>, u32, String)>>,
@@ -123,7 +123,7 @@ impl FakePlatform {
         }
     }
 
-    fn prompts(&self) -> Vec<(String, String)> {
+    fn prompts(&self) -> Vec<(String, OpenDestination)> {
         self.prompts.lock().map(|p| p.clone()).unwrap_or_default()
     }
 
@@ -243,7 +243,7 @@ impl Platform for Shared {
 
     fn open_sealed(&self, request: OpenRequest) -> Result<String, OpenError> {
         if let Ok(mut prompts) = self.0.prompts.lock() {
-            prompts.push((request.reference.clone(), request.gateway_name.clone()));
+            prompts.push((request.reference.clone(), request.destination.clone()));
         }
         self.0.face_id(&request.id)?;
 
@@ -689,7 +689,12 @@ async fn pairing_registers_the_phone_and_its_check_is_approved_with_face_id() ->
     // Face ID named the reference and the gateway
     assert_eq!(
         platform.prompts(),
-        [(REFERENCE.to_owned(), "mini".to_owned())]
+        [(
+            REFERENCE.to_owned(),
+            OpenDestination::Gateway {
+                name: "mini".to_owned()
+            }
+        )]
     );
     // the keys stay on the phone: the gateway only got the public half
     assert_eq!(platform.keychain_keys(), ["gateway", "iroh-key"]);
@@ -1031,7 +1036,12 @@ async fn any_reference_is_answered_with_one_approval_and_old_records_still_load(
     assert_eq!(reading.await??, CompanionResponse::Value(VALUE.to_owned()));
     assert_eq!(
         platform.prompts()[prompts..],
-        [(other.to_owned(), "mini".to_owned())]
+        [(
+            other.to_owned(),
+            OpenDestination::Gateway {
+                name: "mini".to_owned()
+            }
+        )]
     );
 
     // and without a copy, with the value the owner enters
@@ -1828,9 +1838,16 @@ async fn a_takeover_shows_the_page_paces_its_images_and_sends_the_owners_input()
             site: Some("github.com".to_owned()),
         }
     );
+    // Face ID names the page the value goes into
     assert_eq!(
         platform.prompts().last(),
-        Some(&(reference.to_owned(), "mini".to_owned()))
+        Some(&(
+            reference.to_owned(),
+            OpenDestination::Page {
+                session: "github".to_owned(),
+                machine: "mini".to_owned()
+            }
+        ))
     );
     send.write_all(&encode_message(&GatewayMessage::Filled {
         field: WireField::Password,
@@ -2449,8 +2466,18 @@ async fn a_one_time_code_filled_on_a_machine_is_computed_on_the_phone() -> TestR
     assert!(current.iter().any(|code| code == value.expose()));
     assert!(!submit);
     assert_eq!(site.as_deref(), Some("github.com"));
-    let prompted = platform.prompts().pop().map(|(prompted, _)| prompted);
-    assert_eq!(prompted.as_deref(), Some(reference));
+    // Face ID names the spoke the value goes to, though the gateway sealed
+    // it
+    assert_eq!(
+        platform.prompts().pop(),
+        Some((
+            reference.to_owned(),
+            OpenDestination::Page {
+                session: "ci".to_owned(),
+                machine: "code".to_owned()
+            }
+        ))
+    );
 
     Ok(())
 }

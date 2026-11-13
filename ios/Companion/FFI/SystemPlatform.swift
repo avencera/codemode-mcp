@@ -109,7 +109,14 @@ final class SystemPlatform: Platform, @unchecked Sendable {
     // MARK: Face ID
 
     func openSealed(request: OpenRequest) throws -> String {
-        let reason = "Read \(request.reference) for codemode-mcp on \(request.gatewayName)"
+        // names where the value goes: a page on a spoke is filled there,
+        // though the gateway sealed it
+        let reason = switch request.destination {
+        case let .gateway(name):
+            "Read \(request.reference) for codemode-mcp on \(name)"
+        case let .page(session, machine):
+            "Fill \(request.reference) into \(session) on \(machine)"
+        }
 
         return try withFaceID(id: request.id, reason: reason) { key in
             try Self.open(key: key, info: request.info, enc: request.enc, ciphertext: request.ciphertext)

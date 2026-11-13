@@ -38,8 +38,8 @@ use crate::{
     app::{AppMsg, one_line},
     connection::backoff,
     ffi::{
-        FillOffer, OpenError, OpenRequest, Platform, ScreenImage, TakeoverEnd, TakeoverFocus,
-        TakeoverInput, TakeoverKey, TakeoverNotice, TakeoverPage, TakeoverStatus,
+        FillOffer, OpenDestination, OpenError, OpenRequest, Platform, ScreenImage, TakeoverEnd,
+        TakeoverFocus, TakeoverInput, TakeoverKey, TakeoverNotice, TakeoverPage, TakeoverStatus,
     },
     net,
     record::GatewayRecord,
@@ -478,10 +478,18 @@ impl TakeoverActor {
             return;
         };
 
+        let machine = match &state.host {
+            BrowserHost::Gateway => state.record.name.clone(),
+            BrowserHost::Machine(machine) => machine.name.clone(),
+        };
         let request = OpenRequest {
             id: state.open_id(),
             reference: offer.reference.clone(),
-            gateway_name: state.record.name.clone(),
+            // the prompt names where the value goes, not who sealed it
+            destination: OpenDestination::Page {
+                session: state.session.clone(),
+                machine,
+            },
             // the gateway sealed it, for a spoke's page too, since only the
             // gateway reads 1Password
             info: seal_info(&state.record.id, &offer.reference),
