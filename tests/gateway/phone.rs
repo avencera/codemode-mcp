@@ -111,7 +111,7 @@ struct Seen {
     /// A program read's reason
     reason: Option<String>,
     /// A handoff's machine, when it is a spoke's session
-    machine: Option<String>,
+    machine: Option<BrowserMachine>,
 }
 
 /// One push as the fake APNs server received it
@@ -354,7 +354,7 @@ impl FakePhone {
                         withdrawn: false,
                         items: Vec::new(),
                         reason: request.handoff.reason,
-                        machine: request.handoff.machine.map(|machine| machine.name),
+                        machine: request.handoff.machine,
                     });
                 }
                 let _ = send.stopped().await;
@@ -2739,14 +2739,25 @@ async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub(
             .find(|seen| seen.reference == "handoff test")
     })
     .await?;
-    assert_eq!(handoff.machine.as_deref(), Some(name.as_str()));
+    let named = handoff
+        .machine
+        .as_ref()
+        .ok_or("no machine on the handoff")?;
+    assert_eq!((named.id, named.name.as_str()), (machine.id, name.as_str()));
     let push = rig
         .apns
         .pushes()
         .into_iter()
         .find(|push| push.body["kind"] == "handoff")
         .ok_or("no handoff push")?;
-    assert_eq!(push.body["machine"], name.as_str(), "{}", push.body);
+    // the push names the spoke by its endpoint id, and by name for display
+    assert_eq!(
+        push.body["machine"],
+        machine.id.to_string(),
+        "{}",
+        push.body
+    );
+    assert_eq!(push.body["machine_name"], name.as_str(), "{}", push.body);
     assert_eq!(
         push.body["aps"]["alert"]["subtitle"],
         format!("Session test on {name}"),
@@ -3036,7 +3047,11 @@ async fn the_hub_gives_up_a_spokes_handoff_at_its_deadline() -> TestResult {
         .into_iter()
         .find(|seen| seen.reference == "handoff test")
         .ok_or("the phone never saw the offer")?;
-    assert_eq!(offer.machine.as_deref(), Some(spoke.name.as_str()));
+    let named = offer.machine.as_ref().ok_or("no machine on the offer")?;
+    assert_eq!(
+        (named.id, named.name.as_str()),
+        (spoke.machine.id, spoke.name.as_str())
+    );
 
     spoke.harness.stop().await?;
     rig.stop().await

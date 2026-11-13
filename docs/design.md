@@ -1195,8 +1195,10 @@ rather than a generated crate), so no secret passes through an agent-browser com
     reports) with its id, relay and addresses. A hub without a `browser` server of its own still answers the
     list, with no sessions of its own, so the machines show. The phone dials each machine on a link of its own,
     in parallel, with an 8 s dial timeout, so a spoke that is down shows as unreachable in its own section
-    while the rest list; a newer listing round drops a slower one's answer. An `Open` for a machine the phone
-    has not listed yet, such as from a link, waits for a new listing of the gateway first
+    while the rest list; a newer listing round drops a slower one's answer. The phone keys machines by
+    endpoint id, in its map, its sections, handoffs, pushes and every action, and shows names only: the hub
+    lets two spokes share a name, and a name key would send one's actions to the other. An `Open` for a
+    machine the phone has not listed yet, such as from a link, waits for a new listing of the gateway first
   - Fill: `prepare` on the spoke checks the page as on the hub, then posts the session, field, kind, host,
     site and item to `browser/source`. The hub checks the names, finds the source as for its own session
     under a `SessionAt` whose machine is `Machine::Spoke { id, name }`, so the spoke's remembered sign-ins and
@@ -1215,8 +1217,8 @@ rather than a generated crate), so no secret passes through an agent-browser com
   - Away: the phone is asked for the whole sign-in on the hub, as for the hub's own sessions, keyed by the
     spoke's `SessionAt`, and the values not yet used wait on the hub, not the spoke
   - Handoff: the spoke posts `browser/handoff` and the hub offers it to its phones as its own, with
-    `PhoneHandoff.machine` set and a push whose `machine` key names the spoke and whose subtitle reads
-    `Session S on <spoke>`. The request is held until a phone answers or the deadline (at most 120 minutes),
+    `PhoneHandoff.machine` set and a push whose `machine` key carries the spoke's endpoint id and
+    `machine_name` its name, and whose subtitle reads `Session S on <spoke>`. The request is held until a phone answers or the deadline (at most 120 minutes),
     which the hub enforces on the offer itself, since a phone that is never reached, or takes the offer and
     never answers, would otherwise hold it whatever the spoke does. The hub refuses at once when the spoke's
     endpoint is not fresh or no phone is paired, since no phone could take it over; if offering fails it

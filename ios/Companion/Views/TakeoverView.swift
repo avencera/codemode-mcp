@@ -361,7 +361,7 @@ struct TakeoverView: View {
         case .shutdown:
             switch takeover.host {
             case .gateway: "The gateway is stopping."
-            case let .machine(name): "codemode-mcp on \(name) is stopping."
+            case let .machine(_, name): "codemode-mcp on \(name) is stopping."
             }
         case .failed: "This iPhone could not keep the takeover going."
         }

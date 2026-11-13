@@ -102,8 +102,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // takeover's Done or Cancel answers it
         if info["kind"] as? String == "handoff" {
             guard let session = info["session"] as? String else { return }
-            // a session on a spoke names it; the gateway's own names none
-            let host = SessionHost(machine: info["machine"] as? String)
+            // a session on a spoke names it by endpoint id, and by name for
+            // display; the gateway's own names none
+            let host = SessionHost(
+                machineId: info["machine"] as? String,
+                name: info["machine_name"] as? String
+            )
             AppManager.shared.dispatch(.openTakeover(session: session, handoff: id, host: host))
             return
         }
@@ -142,9 +146,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     }
 }
 
-/// A `codemode-companion://takeover?session=<name>&request=<id>&machine=<name>`
+/// A `codemode-companion://takeover?session=<name>&request=<id>&machine=<id>`
 /// link, which opens that browser session's takeover, for the handoff
-/// `request` if set, on the gateway's `machine` if set
+/// `request` if set, on the machine whose endpoint id is `machine` if set
 struct TakeoverLink {
     static let scheme = "codemode-companion"
 
@@ -159,6 +163,6 @@ struct TakeoverLink {
         else { return nil }
         self.session = session
         request = items.first(where: { $0.name == "request" })?.value
-        host = SessionHost(machine: items.first(where: { $0.name == "machine" })?.value)
+        host = SessionHost(machineId: items.first(where: { $0.name == "machine" })?.value, name: nil)
     }
 }

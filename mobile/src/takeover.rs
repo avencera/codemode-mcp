@@ -478,10 +478,7 @@ impl TakeoverActor {
             return;
         };
 
-        let machine = match &state.host {
-            BrowserHost::Gateway => state.record.name.clone(),
-            BrowserHost::Machine(machine) => machine.name.clone(),
-        };
+        let machine = state.host.name(&state.record).to_owned();
         let request = OpenRequest {
             id: state.open_id(),
             reference: offer.reference.clone(),

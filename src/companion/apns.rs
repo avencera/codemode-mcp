@@ -6,7 +6,10 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use companion_wire::mobile::{PushEnvironment, PushToken, RequestId, push_keys};
+use companion_wire::{
+    mobile::{PushEnvironment, PushToken, RequestId, push_keys},
+    takeover::BrowserMachine,
+};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -75,7 +78,7 @@ pub enum Subject {
         /// The agent's reason, one line
         reason: String,
         /// The spoke the session runs on; `None` for the gateway's own
-        machine: Option<String>,
+        machine: Option<BrowserMachine>,
     },
 }
 
@@ -136,7 +139,9 @@ impl Apns {
                 "Take over the browser",
                 format!(
                     "Session {session} on {}",
-                    machine.as_deref().unwrap_or(&alert.gateway)
+                    machine
+                        .as_ref()
+                        .map_or(alert.gateway.as_str(), |machine| machine.name.as_str())
                 ),
                 reason.clone(),
             ),
@@ -173,8 +178,11 @@ impl Apns {
                 body[push_keys::KIND] = json!(push_keys::HANDOFF);
                 body[push_keys::SESSION] = json!(session);
                 body[push_keys::SUMMARY] = json!(reason);
+                // the id tells two spokes of one name apart; the name is
+                // for display
                 if let Some(machine) = machine {
-                    body[push_keys::MACHINE] = json!(machine);
+                    body[push_keys::MACHINE] = json!(machine.id.to_string());
+                    body[push_keys::MACHINE_NAME] = json!(machine.name);
                 }
             }
         }

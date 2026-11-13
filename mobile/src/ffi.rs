@@ -69,15 +69,32 @@ pub enum SessionHost {
     Gateway,
     /// A machine the gateway vouches for, such as a Linux spoke
     Machine {
-        /// The name the gateway lists it under, such as `code`
+        /// Its takeover endpoint's id, as the gateway lists it; the core
+        /// goes by this, since two machines may share a name
+        id: String,
+        /// The name the gateway lists it under, such as `code`, for display
         name: String,
     },
+}
+
+impl SessionHost {
+    /// Whether `other` is the same place, a machine by its id whatever
+    /// name each carries
+    pub(crate) fn is(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Gateway, Self::Gateway) => true,
+            (Self::Machine { id, .. }, Self::Machine { id: other, .. }) => id == other,
+            _ => false,
+        }
+    }
 }
 
 /// One machine's browser sessions, in a section of their own
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct MachineSessions {
-    /// The name the gateway lists it under, such as `code`
+    /// Its takeover endpoint's id, which [`SessionHost::Machine`] names it by
+    pub id: String,
+    /// The name the gateway lists it under, such as `code`, for display
     pub name: String,
     /// Where its listing stands; [`SessionsStatus::Unreachable`] when the
     /// phone could not dial it

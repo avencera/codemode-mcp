@@ -852,7 +852,8 @@ Another Address** from its long-press menu, it asks for an address with the name
 
 A takeover runs over its own iroh connection from a paired, trusted phone, and only while the app is open. A
 phone can also open one with a `codemode-companion://takeover?session=NAME` link, without a handoff; add
-`&machine=SPOKE` for a session on a spoke.
+`&machine=ID` for a session on a spoke, with the id the spoke logs as it starts (`Serving takeovers of this
+spoke's browser sessions id=…`), since two spokes may share a name.
 
 Limits:
 

@@ -2263,6 +2263,10 @@ async fn the_gateways_machines_are_listed_and_dialed_on_their_own() -> TestResul
     let gateway = FakeGateway::start().await?;
     let (app, _platform, _recorder) = paired(&gateway).await?;
     let (spoke, mut opened) = fake_spoke("ci").await?;
+    let on_spoke = SessionHost::Machine {
+        id: spoke.id.to_string(),
+        name: "code".to_owned(),
+    };
     // a machine that is off: its port answers nothing
     let off = BrowserMachine {
         name: "attic".to_owned(),
@@ -2276,9 +2280,7 @@ async fn the_gateways_machines_are_listed_and_dialed_on_their_own() -> TestResul
     app.dispatch(AppAction::OpenTakeover {
         session: "ci".to_owned(),
         handoff: None,
-        host: SessionHost::Machine {
-            name: "code".to_owned(),
-        },
+        host: on_spoke.clone(),
     });
     app.takeover(TakeoverInput::Resize {
         width: 390,
@@ -2314,9 +2316,7 @@ async fn the_gateways_machines_are_listed_and_dialed_on_their_own() -> TestResul
     );
     assert_eq!(
         app.state().takeover.map(|takeover| takeover.host),
-        Some(SessionHost::Machine {
-            name: "code".to_owned()
-        })
+        Some(on_spoke.clone())
     );
 
     // each machine has its own section; the one that is off shows as
@@ -2366,12 +2366,7 @@ async fn the_gateways_machines_are_listed_and_dialed_on_their_own() -> TestResul
         async move { gateway.offer_handoff(handoff).await }
     });
     let state = until(&app, |state| !state.handoffs.is_empty()).await?;
-    assert_eq!(
-        state.handoffs[0].host,
-        SessionHost::Machine {
-            name: "code".to_owned()
-        }
-    );
+    assert_eq!(state.handoffs[0].host, on_spoke);
     app.dispatch(AppAction::CancelHandoff { id: id.to_string() });
     assert_eq!(answered.await??, HandoffAnswer::Cancelled);
 
@@ -2391,6 +2386,7 @@ async fn a_one_time_code_filled_on_a_machine_is_computed_on_the_phone() -> TestR
         session: "ci".to_owned(),
         handoff: None,
         host: SessionHost::Machine {
+            id: spoke.id.to_string(),
             name: "code".to_owned(),
         },
     });
@@ -2404,7 +2400,7 @@ async fn a_one_time_code_filled_on_a_machine_is_computed_on_the_phone() -> TestR
         running: Vec::new(),
         saved: Vec::new(),
         last_pages: Default::default(),
-        machines: vec![spoke],
+        machines: vec![spoke.clone()],
     };
     send.write_all(&encode_message(&listed)?).await?;
     let (_open, _link, mut send, mut receive) =
@@ -2478,6 +2474,108 @@ async fn a_one_time_code_filled_on_a_machine_is_computed_on_the_phone() -> TestR
             }
         ))
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_machines_of_one_name_are_kept_apart_by_id() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _platform, _recorder) = paired(&gateway).await?;
+    let (first, mut first_opened) = fake_spoke("ci").await?;
+    let (second, mut second_opened) = fake_spoke("deploy").await?;
+    assert_eq!(first.name, second.name);
+    let host = |machine: &BrowserMachine| SessionHost::Machine {
+        id: machine.id.to_string(),
+        name: machine.name.clone(),
+    };
+
+    app.dispatch(AppAction::RefreshSessions);
+    let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    let listed = GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: Vec::new(),
+        last_pages: Default::default(),
+        machines: vec![first.clone(), second.clone()],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+
+    // each has a section of its own, with its own sessions
+    let state = until(&app, |state| {
+        state.sessions.machines.len() == 2
+            && state
+                .sessions
+                .machines
+                .iter()
+                .all(|section| section.status == SessionsStatus::Listed)
+    })
+    .await?;
+    let sections: Vec<(String, String, Vec<String>)> = state
+        .sessions
+        .machines
+        .iter()
+        .map(|section| {
+            let running = section.running.iter().map(|session| session.name.clone());
+            (section.id.clone(), section.name.clone(), running.collect())
+        })
+        .collect();
+    // two of one name show in id order
+    let mut expected = vec![
+        (
+            first.id.to_string(),
+            "code".to_owned(),
+            vec!["ci".to_owned()],
+        ),
+        (
+            second.id.to_string(),
+            "code".to_owned(),
+            vec!["deploy".to_owned()],
+        ),
+    ];
+    expected.sort();
+    assert_eq!(sections, expected);
+
+    // a handoff from the second names it, and leaves the first where it is
+    let id = RequestId::generate();
+    let handoff = PhoneHandoff {
+        id: id.clone(),
+        session: "deploy".to_owned(),
+        reason: None,
+        url: None,
+        expires_in_ms: 60_000,
+        machine: Some(second.clone()),
+    };
+    let answered = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.offer_handoff(handoff).await }
+    });
+    let state = until(&app, |state| !state.handoffs.is_empty()).await?;
+    assert_eq!(state.handoffs[0].host, host(&second));
+
+    // so a takeover on the first dials the first
+    app.dispatch(AppAction::OpenTakeover {
+        session: "ci".to_owned(),
+        handoff: None,
+        host: host(&first),
+    });
+    app.takeover(TakeoverInput::Resize {
+        width: 390,
+        height: 664,
+        scale: 3.0,
+    });
+    let (open, _link, _send, _receive) =
+        tokio::time::timeout(Duration::from_secs(10), first_opened.recv())
+            .await?
+            .ok_or("the first spoke stopped")?;
+    assert!(
+        matches!(&open, PhoneMessage::Open { session, .. } if session == "ci"),
+        "{open:?}"
+    );
+    assert!(second_opened.try_recv().is_err());
+
+    app.dispatch(AppAction::CancelHandoff { id: id.to_string() });
+    assert_eq!(answered.await??, HandoffAnswer::Cancelled);
 
     Ok(())
 }

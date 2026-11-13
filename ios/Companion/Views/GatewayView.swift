@@ -22,7 +22,7 @@ struct GatewayView: View {
                 NewSessionSheet(
                     session: session,
                     gatewayName: gateway.name,
-                    machines: manager.state.sessions.machines.map(\.name)
+                    machines: manager.state.sessions.machines
                 ) { name, url, host in
                     manager.dispatch(.startSession(session: name, url: url, host: host))
                 }

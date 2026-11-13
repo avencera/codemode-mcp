@@ -456,9 +456,13 @@ pub mod push_keys {
     pub const HANDOFF: &str = "handoff";
     /// The browser session a handoff takes over
     pub const SESSION: &str = "session";
-    /// The name of the machine a handoff's session runs on, when it is not
-    /// the gateway; absent for the gateway's own sessions
+    /// The takeover endpoint id of the machine a handoff's session runs on,
+    /// as [`BrowserMachine::id`](crate::takeover::BrowserMachine::id) in
+    /// hex, when it is not the gateway; absent for the gateway's own
+    /// sessions. The phone goes by this, since two machines may share a name
     pub const MACHINE: &str = "machine";
+    /// That machine's name, for display beside [`MACHINE`]
+    pub const MACHINE_NAME: &str = "machine_name";
 }
 
 mod base64_bytes {

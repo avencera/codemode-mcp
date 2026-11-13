@@ -25,7 +25,7 @@ use companion_wire::{
         MAX_DESTINATION_CHARS, MAX_PROGRAM_ITEMS, MAX_REASON_CHARS, PairCheck,
     },
 };
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, EndpointId, SecretKey};
 use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 use tokio::sync::oneshot;
 
@@ -169,8 +169,8 @@ pub enum AppMsg {
     Sessions(Result<Listing, ListFailure>),
     /// A listing of a machine's browser sessions finished
     MachineSessions {
-        /// The machine
-        name: String,
+        /// The machine's endpoint id
+        id: EndpointId,
         /// The round of listings it belongs to; one from an earlier round
         /// is ignored
         round: u64,
@@ -471,6 +471,7 @@ fn malformed(program: &PhoneProgramRead) -> Option<String> {
 fn handoff_card(handoff: &PhoneHandoff, gateway_name: &str) -> PendingHandoff {
     let host = match &handoff.machine {
         Some(machine) => SessionHost::Machine {
+            id: machine.id.to_string(),
             name: machine.name.clone(),
         },
         None => SessionHost::Gateway,
@@ -579,9 +580,10 @@ pub struct AppActorState {
     takeover: Option<ActorRef<TakeoverMsg>>,
     /// Counts takeovers, so the reports of one replaced are ignored
     takeover_generation: u64,
-    /// The machines with browser sessions the gateway vouched for, by name,
-    /// from its last listing or a handoff
-    machines: HashMap<String, BrowserMachine>,
+    /// The machines with browser sessions the gateway vouched for, by
+    /// endpoint id, from its last listing or a handoff; never by name,
+    /// which two machines may share
+    machines: HashMap<EndpointId, BrowserMachine>,
     /// Counts the gateway's listings, each of which lists its machines anew
     machine_round: u64,
     /// A takeover asked for on a machine not known yet, opened once a
@@ -779,7 +781,7 @@ impl App {
                 // with its browser
                 let shown = state.shared.state().takeover;
                 if shown
-                    .is_some_and(|takeover| takeover.session == session && takeover.host == host)
+                    .is_some_and(|takeover| takeover.session == session && takeover.host.is(&host))
                 {
                     Self::close_takeover(state);
                 }
@@ -934,50 +936,47 @@ impl App {
     ) {
         match host {
             SessionHost::Gateway => Self::refresh_sessions(myself, state, Some(change)),
-            SessionHost::Machine { name } => {
-                Self::list_machine(myself, state, &name, Some(change));
-            }
+            SessionHost::Machine { id, .. } => match id.parse() {
+                Ok(id) => Self::list_machine(myself, state, id, Some(change)),
+                Err(_) => tracing::warn!("a session change named a machine id no endpoint has"),
+            },
         }
     }
 
-    /// Asks machine `name` for its browser sessions, after making `change`
+    /// Asks machine `id` for its browser sessions, after making `change`
     /// if set, on a link of its own, in a spawned task that reports back as
     /// [`AppMsg::MachineSessions`]
     fn list_machine(
         myself: &ActorRef<AppMsg>,
         state: &mut AppActorState,
-        name: &str,
+        id: EndpointId,
         change: Option<SessionChange>,
     ) {
-        let (Some(record), Some(machine)) = (&state.record, state.machines.get(name)) else {
+        let (Some(record), Some(machine)) = (&state.record, state.machines.get(&id)) else {
             tracing::warn!("a listing was asked of a machine the gateway does not list");
 
             return;
         };
         let at = ListAt {
             address: BrowserHost::Machine(machine.clone()).endpoint_addr(record),
-            name: name.to_owned(),
+            name: machine.name.clone(),
             dial: MACHINE_DIAL,
         };
+        let key = id.to_string();
         state.shared.change_sessions(|sessions| {
             if let Some(section) = sessions
                 .machines
                 .iter_mut()
-                .find(|section| section.name == name)
+                .find(|section| section.id == key)
             {
                 section.status = SessionsStatus::Loading;
             }
         });
         let round = state.machine_round;
-        let name = name.to_owned();
         let myself = myself.clone();
         tokio::spawn(async move {
             let listed = list_sessions(myself.clone(), at, change).await;
-            let _ = myself.cast(AppMsg::MachineSessions {
-                name,
-                round,
-                listed,
-            });
+            let _ = myself.cast(AppMsg::MachineSessions { id, round, listed });
         });
     }
 
@@ -1013,10 +1012,16 @@ impl App {
         } = listing;
         state.machines = machines
             .into_iter()
-            .map(|machine| (machine.name.clone(), machine))
+            .map(|machine| (machine.id, machine))
             .collect();
-        let mut names: Vec<String> = state.machines.keys().cloned().collect();
-        names.sort();
+        // by name, and two of one name by id, so each keeps its place
+        let mut listed: Vec<&BrowserMachine> = state.machines.values().collect();
+        listed.sort_by(|one, other| (&one.name, one.id).cmp(&(&other.name, other.id)));
+        let ids: Vec<EndpointId> = listed.iter().map(|machine| machine.id).collect();
+        let sections: Vec<(String, String)> = listed
+            .into_iter()
+            .map(|machine| (machine.id.to_string(), machine.name.clone()))
+            .collect();
         state.shared.change_sessions(|sessions| {
             let before = std::mem::take(&mut sessions.machines);
             *sessions = BrowserSessions {
@@ -1030,12 +1035,13 @@ impl App {
                     })
                     .collect(),
                 // each keeps its last listing while it is asked again
-                machines: names
-                    .iter()
-                    .map(|name| {
-                        let kept = before.iter().find(|section| section.name == *name);
+                machines: sections
+                    .into_iter()
+                    .map(|(id, name)| {
+                        let kept = before.iter().find(|section| section.id == id);
                         MachineSessions {
-                            name: name.clone(),
+                            id,
+                            name,
                             status: SessionsStatus::Loading,
                             running: kept.map(|kept| kept.running.clone()).unwrap_or_default(),
                             saved: kept.map(|kept| kept.saved.clone()).unwrap_or_default(),
@@ -1045,15 +1051,15 @@ impl App {
             };
         });
         state.machine_round = state.machine_round.wrapping_add(1);
-        for name in &names {
-            Self::list_machine(myself, state, name, None);
+        for id in ids {
+            Self::list_machine(myself, state, id, None);
         }
 
         let Some(ask) = state.waiting_open.take() else {
             return;
         };
-        if let SessionHost::Machine { name } = &ask.host
-            && !state.machines.contains_key(name)
+        if let SessionHost::Machine { id, name } = &ask.host
+            && Self::machine(state, id).is_none()
         {
             let gateway = state
                 .record
@@ -1068,22 +1074,30 @@ impl App {
         Self::open_takeover(myself, state, ask).await;
     }
 
-    /// Shows machine `name`'s listing, unless a newer round of listings
+    /// The machine the gateway vouched for under `id`, if any
+    fn machine(state: &AppActorState, id: &str) -> Option<BrowserMachine> {
+        let id: EndpointId = id.parse().ok()?;
+
+        state.machines.get(&id).cloned()
+    }
+
+    /// Shows machine `id`'s listing, unless a newer round of listings
     /// started since it was asked
     fn machine_listed(
         state: &mut AppActorState,
-        name: &str,
+        id: EndpointId,
         round: u64,
         listed: Result<Listing, ListFailure>,
     ) {
         if round != state.machine_round {
             return;
         }
+        let key = id.to_string();
         state.shared.change_sessions(|sessions| {
             let Some(section) = sessions
                 .machines
                 .iter_mut()
-                .find(|section| section.name == name)
+                .find(|section| section.id == key)
             else {
                 return;
             };
@@ -1132,9 +1146,16 @@ impl App {
             .and_then(|id| RequestId::try_from(id.to_owned()).ok());
         let host = match &ask.host {
             SessionHost::Gateway => Some(BrowserHost::Gateway),
-            SessionHost::Machine { name } => {
-                state.machines.get(name).cloned().map(BrowserHost::Machine)
-            }
+            SessionHost::Machine { id, .. } => Self::machine(state, id).map(BrowserHost::Machine),
+        };
+        // a known machine shows under the name the gateway lists, whatever
+        // a link called it
+        let shown_host = match &host {
+            Some(BrowserHost::Machine(machine)) => SessionHost::Machine {
+                id: machine.id.to_string(),
+                name: machine.name.clone(),
+            },
+            _ => ask.host.clone(),
         };
 
         // the same takeover asked for again, such as a push tapped twice,
@@ -1142,7 +1163,7 @@ impl App {
         let open = ask.start.is_none()
             && state.shared.state().takeover.is_some_and(|shown| {
                 shown.session == session
-                    && shown.host == ask.host
+                    && shown.host.is(&shown_host)
                     && shown.handoff == handoff.as_ref().map(ToString::to_string)
                     && !matches!(shown.status, TakeoverStatus::Ended { .. })
             });
@@ -1154,7 +1175,7 @@ impl App {
         state.takeover_generation = state.takeover_generation.wrapping_add(1);
         let shown = TakeoverState {
             session: session.clone(),
-            host: ask.host.clone(),
+            host: shown_host,
             handoff: handoff.as_ref().map(ToString::to_string),
             status: TakeoverStatus::Connecting,
             page: None,
@@ -1318,7 +1339,7 @@ impl App {
         // the gateway vouches for the machine over its own link, so a
         // takeover of the handoff can dial it before any listing
         if let Some(machine) = handoff.machine.clone() {
-            state.machines.insert(machine.name.clone(), machine);
+            state.machines.insert(machine.id, machine);
         }
         if state.handoffs.offer(&id, seq, responder) == Offer::Again {
             return;
@@ -1700,11 +1721,9 @@ impl Actor for App {
             AppMsg::Sessions(_) if state.record.is_none() => {}
             AppMsg::Sessions(listed) => Self::gateway_listed(&myself, state, listed).await,
             AppMsg::MachineSessions { .. } if state.record.is_none() => {}
-            AppMsg::MachineSessions {
-                name,
-                round,
-                listed,
-            } => Self::machine_listed(state, &name, round, listed),
+            AppMsg::MachineSessions { id, round, listed } => {
+                Self::machine_listed(state, id, round, listed);
+            }
             AppMsg::Endpoint(reply) => match &state.connection {
                 Some(connection) => {
                     let _ = connection.cast(ConnMsg::Endpoint(reply));

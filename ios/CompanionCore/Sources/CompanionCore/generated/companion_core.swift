@@ -1380,7 +1380,11 @@ public func FfiConverterTypeGatewayInfo_lower(_ value: GatewayInfo) -> RustBuffe
  */
 public struct MachineSessions: Equatable, Hashable {
     /**
-     * The name the gateway lists it under, such as `code`
+     * Its takeover endpoint's id, which [`SessionHost::Machine`] names it by
+     */
+    public var id: String
+    /**
+     * The name the gateway lists it under, such as `code`, for display
      */
     public var name: String
     /**
@@ -1401,7 +1405,10 @@ public struct MachineSessions: Equatable, Hashable {
     // declare one manually.
     public init(
         /**
-         * The name the gateway lists it under, such as `code`
+         * Its takeover endpoint's id, which [`SessionHost::Machine`] names it by
+         */id: String, 
+        /**
+         * The name the gateway lists it under, such as `code`, for display
          */name: String, 
         /**
          * Where its listing stands; [`SessionsStatus::Unreachable`] when the
@@ -1413,6 +1420,7 @@ public struct MachineSessions: Equatable, Hashable {
         /**
          * Its sessions with a saved profile that are not running
          */saved: [SavedSession]) {
+        self.id = id
         self.name = name
         self.status = status
         self.running = running
@@ -1435,6 +1443,7 @@ public struct FfiConverterTypeMachineSessions: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MachineSessions {
         return
             try MachineSessions(
+                id: FfiConverterString.read(from: &buf), 
                 name: FfiConverterString.read(from: &buf), 
                 status: FfiConverterTypeSessionsStatus.read(from: &buf), 
                 running: FfiConverterSequenceTypeBrowserSession.read(from: &buf), 
@@ -1443,6 +1452,7 @@ public struct FfiConverterTypeMachineSessions: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: MachineSessions, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterTypeSessionsStatus.write(value.status, into: &buf)
         FfiConverterSequenceTypeBrowserSession.write(value.running, into: &buf)
@@ -4159,7 +4169,11 @@ public enum SessionHost: Equatable, Hashable {
      */
     case machine(
         /**
-         * The name the gateway lists it under, such as `code`
+         * Its takeover endpoint's id, as the gateway lists it; the core
+         * goes by this, since two machines may share a name
+         */id: String, 
+        /**
+         * The name the gateway lists it under, such as `code`, for display
          */name: String
     )
 
@@ -4185,7 +4199,7 @@ public struct FfiConverterTypeSessionHost: FfiConverterRustBuffer {
         
         case 1: return .gateway
         
-        case 2: return .machine(name: try FfiConverterString.read(from: &buf)
+        case 2: return .machine(id: try FfiConverterString.read(from: &buf), name: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -4200,8 +4214,9 @@ public struct FfiConverterTypeSessionHost: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case let .machine(name):
+        case let .machine(id,name):
             writeInt(&buf, Int32(2))
+            FfiConverterString.write(id, into: &buf)
             FfiConverterString.write(name, into: &buf)
             
         }

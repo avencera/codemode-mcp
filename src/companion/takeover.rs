@@ -516,7 +516,7 @@ impl Companions {
                         .reason
                         .clone()
                         .unwrap_or_else(|| "An agent needs you".to_owned()),
-                    machine: handoff.machine.as_ref().map(|machine| machine.name.clone()),
+                    machine: handoff.machine.clone(),
                 };
                 let encode = |expires_in_ms| {
                     serde_json::to_vec(&PhoneHandoffRequest {

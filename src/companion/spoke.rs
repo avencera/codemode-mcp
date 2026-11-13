@@ -92,6 +92,8 @@ impl SpokeTakeovers {
         let key = load_or_create(Role::Gateway, Some(&file)).map_err(|error| error.to_string())?;
         let endpoint = bind_endpoint(Role::Gateway, key, discovery, listen).await?;
         endpoint.set_alpns(vec![TAKEOVER_ALPN.to_vec()]);
+        // the id a `machine=` takeover link names this spoke by
+        tracing::info!(id = %endpoint.id(), "Serving takeovers of this spoke's browser sessions");
         let takeovers = Arc::new(Self {
             endpoint: endpoint.clone(),
             vouched: watch::Sender::new(Vouched::default()),

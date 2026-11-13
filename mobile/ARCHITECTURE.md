@@ -86,8 +86,9 @@ App (supervisor)
   opens a takeover with the handoff's id; its Done or Cancel ends the handoff on the takeover's connection, after
   which the gateway stops the handoff's stream. A stopped stream marks a handoff the owner did not answer here as
   over, and its deadline (at most two hours) as expired. A handoff for a spoke's session carries `machine`, the
-  spoke's name, endpoint id and addresses, which the app keeps with the other listed machines; it is trusted as
-  the gateway's word, since it arrives on the gateway's authenticated link. Its card's `host` is that machine.
+  spoke's name, endpoint id and addresses, which the app keeps with the other listed machines, by endpoint id; it
+  is trusted as the gateway's word, since it arrives on the gateway's authenticated link. Its card's `host` is that
+  machine.
 - **Takeover** dials the gateway on `TAKEOVER_ALPN` from the connection actor's endpoint (the app lends it through
   `AppMsg::Endpoint`), so the gateway sees the paired phone's key. A session on a spoke (`BrowserHost::Machine`)
   is dialed the same way, at the endpoint id, relay and addresses the gateway listed for that machine; the spoke
@@ -127,7 +128,11 @@ App (supervisor)
   of its own to that spoke, all at once, with an 8 s dial timeout, so one spoke that is down shows
   `SessionsStatus::Unreachable` while the rest list. Each gateway listing starts a new round, and a machine's
   answer from an older round is dropped. Session actions carry a `SessionHost`, the gateway or a machine by
-  name, and go to that machine. `StartSession` opens a takeover whose
+  its endpoint id, and go to that machine. Machines are kept, listed and dialed by endpoint id, never by name,
+  since the hub lets two spokes share one; the name only shows, and two sections of one name show the start
+  of their ids. A handoff's push carries the id as `machine` and the name as `machine_name`, and a
+  `codemode-companion://takeover` link names the machine by id; a takeover shows the name the gateway lists,
+  whatever its push or link said. `StartSession` opens a takeover whose
   `Open` carries `start`, the `https` address the gateway starts the session at; the takeover actor drops it
   once a link gets through, so a redial takes the session over as it is. `CloseSession` sends
   `PhoneMessage::CloseSession` on a listing link instead, leaving any takeover of that session first, and

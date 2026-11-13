@@ -21,7 +21,7 @@ struct BrowserSessionsSection: View {
             status: sessions.status,
             running: sessions.running,
             saved: sessions.saved,
-            waiting: waiting.filter { $0.host == .gateway },
+            waiting: waiting.filter { $0.host.key == SessionHost.gateway.key },
             starting: $starting
         ) {
             Button {
@@ -30,16 +30,17 @@ struct BrowserSessionsSection: View {
                 Label("New session", systemImage: "plus")
             }
         }
-        ForEach(sessions.machines, id: \.name) { machine in
-            let host = SessionHost.machine(name: machine.name)
+        ForEach(sessions.machines, id: \.id) { machine in
+            let host = SessionHost.machine(id: machine.id, name: machine.name)
+            let place = machine.label(among: sessions.machines)
             HostSessionsSection(
                 host: host,
-                place: machine.name,
-                title: "Browser on \(machine.name)",
+                place: place,
+                title: "Browser on \(place)",
                 status: machine.status,
                 running: machine.running,
                 saved: machine.saved,
-                waiting: waiting.filter { $0.host == host },
+                waiting: waiting.filter { $0.host.key == host.key },
                 starting: $starting
             ) {
                 EmptyView()
@@ -210,26 +211,38 @@ extension SessionHost {
     func place(gatewayName: String) -> String {
         switch self {
         case .gateway: gatewayName
-        case let .machine(name): name
+        case let .machine(_, name): name
         }
     }
 
-    /// The machine a link or push names; a gateway that knows no machines
-    /// names none
-    init(machine: String?) {
-        guard let machine, !machine.isEmpty else {
+    /// The machine a link or push names by its endpoint id; none names the
+    /// gateway. A link carries no name, so the id's start shows until the
+    /// gateway's listing names it
+    init(machineId: String?, name: String?) {
+        guard let machineId, !machineId.isEmpty else {
             self = .gateway
             return
         }
-        self = .machine(name: machine)
+        let name = name.flatMap { $0.isEmpty ? nil : $0 } ?? String(machineId.prefix(10))
+        self = .machine(id: machineId, name: name)
     }
 
-    /// Tells hosts apart in an identity; a machine's name never has `/`
+    /// Tells hosts apart in an identity, a machine by its endpoint id,
+    /// since two machines may share a name; an id never has `/`
     var key: String {
         switch self {
         case .gateway: ""
-        case let .machine(name): "machine:\(name)"
+        case let .machine(id, _): "machine:\(id)"
         }
+    }
+}
+
+extension MachineSessions {
+    /// The machine's name, with the start of its endpoint id when another
+    /// of `machines` shares the name, so the owner can tell them apart
+    func label(among machines: [MachineSessions]) -> String {
+        let shared = machines.contains { $0.id != id && $0.name == name }
+        return shared ? "\(name) (\(id.prefix(10)))" : name
     }
 }
 
@@ -281,7 +294,7 @@ struct NewSessionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let gatewayName: String
     /// The machines besides the gateway New session can start on
-    let machines: [String]
+    let machines: [MachineSessions]
     /// Whether the owner may pick the machine
     let movable: Bool
     let onStart: (String, String, SessionHost) -> Void
@@ -298,7 +311,7 @@ struct NewSessionSheet: View {
     init(
         session: NewSession,
         gatewayName: String,
-        machines: [String],
+        machines: [MachineSessions],
         onStart: @escaping (String, String, SessionHost) -> Void
     ) {
         _name = State(initialValue: session.name)
@@ -316,8 +329,9 @@ struct NewSessionSheet: View {
                     Section {
                         Picker("Runs on", selection: $host) {
                             Text(gatewayName).tag(SessionHost.gateway)
-                            ForEach(machines, id: \.self) { machine in
-                                Text(machine).tag(SessionHost.machine(name: machine))
+                            ForEach(machines, id: \.id) { machine in
+                                Text(machine.label(among: machines))
+                                    .tag(SessionHost.machine(id: machine.id, name: machine.name))
                             }
                         }
                     }
