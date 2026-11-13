@@ -1090,21 +1090,14 @@ the spoke itself to list and take over its sessions, so screen images do not go 
    agent-browser install            # downloads Chrome for Testing into ~/.agent-browser/browsers
    ```
 
-   On Ubuntu 23.10 and later, AppArmor keeps Chrome from making the user namespaces its sandbox needs, and it
-   stops with `No usable sandbox!`. Give agent-browser's Chrome a profile that allows them, once, as root:
+   Chrome stops with `No usable sandbox!` when it cannot make the user namespaces its sandbox needs, as in an
+   LXC container, where an AppArmor profile allowing `userns` does not help. Install Chrome's setuid sandbox
+   helper, as root, next to the Chrome it serves; do it again after `agent-browser install` brings a new
+   Chrome, since each version has its own directory:
 
    ```sh
-   sudo tee /etc/apparmor.d/agent-browser-chrome >/dev/null <<'EOF'
-   abi <abi/4.0>,
-   include <tunables/global>
-
-   profile agent-browser-chrome /home/*/.agent-browser/browsers/chrome-*/chrome flags=(unconfined) {
-     userns,
-
-     include if exists <local/agent-browser-chrome>
-   }
-   EOF
-   sudo apparmor_parser -r /etc/apparmor.d/agent-browser-chrome
+   dir=$(ls -d ~/.agent-browser/browsers/chrome-* | sort -V | tail -1)
+   sudo install -o root -g root -m 4755 "$dir/chrome_sandbox" "$dir/chrome-sandbox"
    ```
 
    Don't pass `--no-sandbox` instead, which turns Chrome's sandbox off for every page. A missing `.so` file
