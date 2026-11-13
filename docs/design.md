@@ -1230,8 +1230,10 @@ rather than a generated crate), so no secret passes through an agent-browser com
   - Fill from 1Password: a takeover on the spoke asks `browser/offers` for the phone's offers on the page's
     site, which the hub answers only for a phone it has paired. The sealed copies are the hub's, so the phone
     opens them with the hub's record whichever machine it dialed. For a one-time code the phone computes the
-    current code from the opened seed (`companion_wire::totp`, the gateway's own code) and sends only that,
-    so the seed never leaves the phone for the spoke; it does the same on the hub, which takes a code as is
+    current code from the seed, opened from an offer or typed or pasted into the code sheet
+    (`companion_wire::totp`, the gateway's own code), and sends only that, so a seed never leaves the phone
+    for the spoke. A 6 to 8 digit code goes as is and anything else is refused on the phone. It does the
+    same on the hub
   - Linux has no `~/.Trash`, so a spoke sets `browser_trash` for Remove from the phone
 
 ### Xcode

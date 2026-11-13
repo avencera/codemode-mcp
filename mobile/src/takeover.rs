@@ -517,7 +517,9 @@ impl TakeoverActor {
     }
 
     /// Sends text or a fill, within the wire's length limit; long text goes
-    /// in pieces, while a fill is one value and is refused instead
+    /// in pieces, while a fill is one value and is refused instead. Every
+    /// fill passes here, typed or opened, so a one-time code fill sends only
+    /// the current code (see [`current_code`])
     fn send_secret(state: &mut TakeoverState, message: PhoneMessage) {
         if state.live.is_none() {
             state.refuse("the page is not connected, so nothing was typed");
@@ -534,6 +536,21 @@ impl TakeoverActor {
                     });
                 }
             }
+            // a code is at most 8 digits, so it needs no length check
+            PhoneMessage::Fill {
+                field: WireLoginField::Code,
+                value,
+                submit,
+                site,
+            } => match current_code(value) {
+                Ok(value) => state.send(PhoneMessage::Fill {
+                    field: WireLoginField::Code,
+                    value,
+                    submit,
+                    site,
+                }),
+                Err(refusal) => state.refuse(refusal),
+            },
             PhoneMessage::Fill { ref value, .. }
                 if value.expose().chars().count() > MAX_TEXT_CHARS =>
             {
@@ -628,18 +645,16 @@ impl Actor for TakeoverActor {
                 opened,
             } => {
                 state.opening = false;
-                let filled = opened.map(|Secret(value)| fill_value(field, value));
-                match filled {
-                    Ok(Ok(value)) => Self::send_secret(
+                match opened {
+                    Ok(Secret(value)) => Self::send_secret(
                         state,
                         PhoneMessage::Fill {
                             field,
-                            value,
+                            value: WireSecret::new(value),
                             submit: false,
                             site: Some(site),
                         },
                     ),
-                    Ok(Err(message)) => state.refuse(&message),
                     // the owner said no; nothing to explain
                     Err(OpenError::Denied) => {}
                     Err(OpenError::Failed { message }) => state.refuse(&message),
@@ -664,21 +679,24 @@ impl Actor for TakeoverActor {
     }
 }
 
-/// What an opened offer for `field` fills: for a one-time code, the
-/// current code, computed here from the seed 1Password holds, so the seed
-/// never leaves the phone for the machine the page is on; anything else
-/// as it was opened
-fn fill_value(field: WireLoginField, opened: String) -> Result<WireSecret, String> {
-    if field != WireLoginField::Code {
-        return Ok(WireSecret::new(opened));
+/// The current one-time code for a code fill: a 6 to 8 digit code as it
+/// is, or the code an `otpauth://` address or base32 seed gives now, so a
+/// seed never leaves the phone for the machine the page is on, whether Face
+/// ID opened it from 1Password or the owner typed or pasted it
+///
+/// Anything else is refused in words that never hold the value
+fn current_code(value: WireSecret) -> Result<WireSecret, &'static str> {
+    let value = Zeroizing::new(value.into_inner());
+    let value = value.trim();
+    if is_code(value) {
+        return Ok(WireSecret::new(value.to_owned()));
     }
 
-    let seed = Zeroizing::new(opened);
-    let seed = seed.trim();
-    if is_code(seed) {
-        return Ok(WireSecret::new(seed.to_owned()));
-    }
-    let totp = Totp::parse(seed).map_err(|error| error.to_string())?;
+    // the parse error names what is wrong with a 1Password item, which a
+    // typed value is not, so one refusal covers both
+    let totp = Totp::parse(value).map_err(|_| {
+        "that is neither a 6 to 8 digit code nor a one-time password seed, so nothing was filled"
+    })?;
 
     Ok(WireSecret::new(totp.now()))
 }

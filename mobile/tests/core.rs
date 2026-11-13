@@ -2520,6 +2520,120 @@ async fn a_one_time_code_filled_on_a_machine_is_computed_on_the_phone() -> TestR
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_one_time_code_typed_on_a_machine_is_computed_on_the_phone() -> TestResult {
+    // the RFC 6238 SHA1 test seed, pasted bare and as an otpauth address
+    const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    const ADDRESS: &str =
+        "otpauth://totp/GitHub:praveenperera?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=GitHub";
+    // too many digits for a code, and 0, 1, 8 and 9 are not base32
+    const NOT_A_CODE: &str = "1234 5678 90";
+    let gateway = FakeGateway::start().await?;
+    let (app, _platform, recorder) = paired(&gateway).await?;
+    let (spoke, mut opened) = fake_spoke("ci").await?;
+
+    app.dispatch(AppAction::OpenTakeover {
+        session: "ci".to_owned(),
+        handoff: None,
+        host: SessionHost::Machine {
+            id: spoke.id.to_string(),
+            name: "code".to_owned(),
+        },
+    });
+    app.takeover(TakeoverInput::Resize {
+        width: 390,
+        height: 664,
+        scale: 3.0,
+    });
+    let (_listing, mut send, _receive) = gateway.next_takeover().await?;
+    let listed = GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: Vec::new(),
+        last_pages: Default::default(),
+        machines: vec![spoke.clone()],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+    let (_open, _link, mut send, mut receive) =
+        tokio::time::timeout(Duration::from_secs(10), opened.recv())
+            .await?
+            .ok_or("the spoke stopped")?;
+    let page = GatewayMessage::Page {
+        url: "https://github.com/sessions/two-factor".to_owned(),
+        title: "Two-factor authentication".to_owned(),
+        focus: Some(Focus {
+            field: Some(WireField::Code),
+            editable: true,
+            secure: false,
+            numeric: true,
+            origin: "https://github.com".to_owned(),
+            cross_site: false,
+        }),
+        offers: Vec::new(),
+    };
+    send.write_all(&encode_message(&page)?).await?;
+    until(&app, |state| {
+        state
+            .takeover
+            .as_ref()
+            .is_some_and(|takeover| takeover.page.is_some())
+    })
+    .await?;
+
+    // the owner pastes the seed into the code sheet rather than a code;
+    // the spoke gets only the current code, in both forms
+    let totp = Totp::parse(SEED)?;
+    for (typed, submit) in [(SEED, true), (ADDRESS, false)] {
+        app.takeover_fill(LoginField::Code, typed.to_owned(), submit);
+        let PhoneMessage::Fill {
+            field,
+            value,
+            submit: submitted,
+            site,
+        } = read_phone(&mut receive).await?
+        else {
+            return Err("the spoke got no fill".into());
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        // the code may have been computed in the period before this one
+        let current = [totp.at(now), totp.at(now.saturating_sub(30))];
+        assert_eq!(field, WireField::Code);
+        assert_eq!(value.expose().len(), 6);
+        assert!(current.iter().any(|code| code == value.expose()));
+        assert_eq!(submitted, submit);
+        assert_eq!(site, None);
+    }
+
+    // a value that is neither a code nor a seed is refused on the phone,
+    // in words that do not repeat it
+    app.takeover_fill(LoginField::Code, NOT_A_CODE.to_owned(), false);
+    let state = until(&app, |state| {
+        state
+            .takeover
+            .as_ref()
+            .is_some_and(|takeover| matches!(takeover.notice, Some(TakeoverNotice::Refused { .. })))
+    })
+    .await?;
+    let Some(TakeoverNotice::Refused { message }) =
+        state.takeover.and_then(|takeover| takeover.notice)
+    else {
+        return Err("no refusal".into());
+    };
+    assert_eq!(
+        message,
+        "that is neither a 6 to 8 digit code nor a one-time password seed, so nothing was filled"
+    );
+
+    // the spoke never got it: the next thing it reads is Done
+    app.takeover(TakeoverInput::Done);
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Done);
+    for typed in [SEED, ADDRESS, NOT_A_CODE] {
+        assert!(!format!("{:?}", app.state()).contains(typed));
+        assert!(!format!("{:?}", updates(&recorder)).contains(typed));
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn two_machines_of_one_name_are_kept_apart_by_id() -> TestResult {
     let gateway = FakeGateway::start().await?;
     let (app, _platform, _recorder) = paired(&gateway).await?;

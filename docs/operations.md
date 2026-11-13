@@ -821,7 +821,9 @@ the session live in the Companion app:
   `Fill op://… into github on ai5090`, checked as an agent's fill is, and only while the page is still on the
   site the copy is saved for; if the page moved while Face ID was up, nothing is filled. Without a sealed copy
   it opens a sheet with one field of that kind: pick the login from the AutoFill bar (or its key icon) and tap
-  Fill, and the value is filled into the page's focused field if it is still that kind.
+  Fill, and the value is filled into the page's focused field if it is still that kind. In the code sheet you
+  can enter the code or paste its seed or `otpauth://` address; the phone sends the page only the current
+  code, and refuses anything else.
 - The page is drawn at the phone's own scale (3x on most iPhones), so text stays sharp. When a takeover ends,
   the gateway's log line `takeover ended` gives the images sent, their size in `kb`, `first_ms` until the
   first, `per_sec`, and whether the link was `direct` or through a `relay` with its `rtt_ms`, which tells a
@@ -1148,7 +1150,8 @@ What changes for a spoke's sessions:
   never leaves it.
 - Handoffs: the push reads `Session github on ai5090`, and **Take over** dials the spoke.
 - **Fill from 1Password** in a takeover offers the hub's sealed copies, as on the hub. For a one-time code,
-  the phone sends the spoke the current code it computed, never the seed.
+  from 1Password or typed or pasted into the code sheet, the phone sends the spoke only the current code it
+  computed, never a seed.
 - The phone must reach the spoke: on the tailnet, at the address `browser_listen` fixes, or through n0's
   relays when `[secrets] discovery` is on. A spoke the phone cannot dial in 8 seconds shows as unreachable
   in its section, and the other machines still list.

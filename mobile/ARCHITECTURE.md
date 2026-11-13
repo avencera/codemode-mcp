@@ -115,8 +115,9 @@ App (supervisor)
   Its prompt names where the value goes, `OpenDestination::Page` with the session and its machine, so a fill on
   a spoke names the spoke, not the gateway that sealed it; a read's prompt names the gateway
   (`OpenDestination::Gateway`).
-  For a code offer the core sends the current code, computed from the opened seed with `companion_wire::totp`,
-  never the seed, so a spoke never holds it. A link that drops while the app is in the foreground is dialed again
+  Every fill, from an offer or the sheet, passes `send_secret`, which sends a code fill as the current code: a
+  6 to 8 digit code as is, or the code a seed (`otpauth://` or base32) gives now, computed with
+  `companion_wire::totp`, and refuses anything else without repeating it, so a spoke never holds a seed. A link that drops while the app is in the foreground is dialed again
   with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while
   the link is down goes right after the next `Open`. `Ended` stops the actor: Done and Cancel close the screen and
   remove their handoff's card, any other reason stays on screen until the owner closes it. Leaving
