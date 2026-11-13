@@ -16,7 +16,7 @@ use companion_wire::mobile::LoginField;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
-use super::page::SessionName;
+use super::SessionAt;
 
 /// How long values wait for their fill after the phone sent them
 pub const WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -26,7 +26,7 @@ struct Held {
     until: Instant,
 }
 
-type Waiting = Mutex<HashMap<(SessionName, String), Held>>;
+type Waiting = Mutex<HashMap<(SessionAt, String), Held>>;
 
 /// The values waiting, by session and site
 #[derive(Default)]
@@ -36,7 +36,7 @@ impl SignIns {
     /// Keeps `values` for `session` on `site`, replacing what was kept
     pub fn hold(
         &self,
-        session: &SessionName,
+        session: &SessionAt,
         site: &str,
         values: HashMap<LoginField, Zeroizing<String>>,
     ) {
@@ -69,7 +69,7 @@ impl SignIns {
     /// Takes `field`'s value for `session` on `site`, if one waits
     pub fn take(
         &self,
-        session: &SessionName,
+        session: &SessionAt,
         site: &str,
         field: LoginField,
     ) -> Option<Zeroizing<String>> {

@@ -16,14 +16,18 @@ use std::{
     time::Duration,
 };
 
+use companion_wire::takeover::FillOffer;
+use iroh::EndpointId;
 use reqwest::StatusCode;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{Notify, watch};
+use zeroize::Zeroizing;
 
 use super::{
-    API, CATALOG_HEADER, CATALOG_WAIT, CallAnswer, ConfigAnswer, ConfigRead, ForwardedCall,
-    GateAnswer, GateCall, HubCatalog, ProgramReadCall, Refusal, Register, Registration,
-    SPOKE_HEADER, WaitAnswer, WaitFor,
+    API, BrowserEndpoint, CATALOG_HEADER, CATALOG_WAIT, CallAnswer, ConfigAnswer, ConfigRead,
+    FillGrant, FillSource, FillValue, FillValueAnswer, ForwardedCall, GateAnswer, GateCall,
+    HandoffCall, HandoffReply, HubCatalog, OffersAnswer, OffersCall, ProgramReadCall, Refusal,
+    Register, Registration, SPOKE_HEADER, VouchedPhones, WaitAnswer, WaitFor,
 };
 use crate::{
     admin::{OpFindRequest, OpFindResponse, OpReadRequest, OpReadResponse},
@@ -56,6 +60,9 @@ const UNREACHABLE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// to trust this spoke before it fails; a failed read waits out the
 /// upstream's long retry for secrets
 const TRUST_WAIT: Duration = Duration::from_secs(10 * 60);
+/// How long a takeover waits for its page's fill offers, which it asks for
+/// between reads of the page
+const OFFERS_WAIT: Duration = Duration::from_secs(5);
 
 /// Resolves the hub's name to its IPv4 addresses when it has any, so every
 /// request leaves from this spoke's IPv4 tailnet address: the hub answers a
@@ -388,6 +395,72 @@ impl HubClient {
             )),
             ConfigAnswer::Error(reason) => Err(HubClientError::Refused(reason)),
         }
+    }
+
+    /// Waits until the hub trusts this spoke
+    pub async fn trusted(&self) {
+        let mut trusted = self.trusted.subscribe();
+        let _ = trusted.wait_for(|trusted| *trusted).await;
+    }
+
+    /// Reports where this spoke's browser sessions are taken over, and
+    /// answers the phones the hub vouches for
+    pub async fn report_browser(
+        &self,
+        endpoint: &BrowserEndpoint,
+    ) -> Result<VouchedPhones, HubClientError> {
+        self.post("/browser/endpoint", endpoint, QUICK).await
+    }
+
+    /// Where the value of a fill this spoke checked on its page comes from;
+    /// the hub may search 1Password for it, which can wait on the owner
+    pub async fn fill_source(&self, fill: &FillSource) -> Result<FillGrant, HubClientError> {
+        self.post("/browser/source", fill, PATIENT).await
+    }
+
+    /// The value of the fill the owner approved under `grant`, as it is
+    /// typed; it may wait on the owner's phone
+    pub async fn fill_value(&self, grant: &str) -> Result<Zeroizing<String>, String> {
+        let answer: FillValueAnswer = self
+            .post(
+                "/browser/value",
+                &FillValue {
+                    grant: grant.to_owned(),
+                },
+                PATIENT,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        match answer {
+            FillValueAnswer::Value(value) => Ok(Zeroizing::new(value)),
+            FillValueAnswer::Refused(reason) => Err(reason),
+        }
+    }
+
+    /// Offers a handoff of this spoke's session to the hub's phones, until
+    /// one answers on the offer or the handoff expires; dropping the future
+    /// takes the offer down
+    pub async fn offer_handoff(&self, call: &HandoffCall) -> Result<HandoffReply, HubClientError> {
+        let wait = Duration::from_millis(call.expires_in_ms) + QUICK;
+
+        self.post("/browser/handoff", call, wait).await
+    }
+
+    /// The fills `phone` could open on a page of `site`, sealed to it on
+    /// the hub
+    pub async fn fill_offers(
+        &self,
+        phone: EndpointId,
+        site: &str,
+    ) -> Result<Vec<FillOffer>, HubClientError> {
+        let call = OffersCall {
+            phone,
+            site: site.to_owned(),
+        };
+        let answer: OffersAnswer = self.post("/browser/offers", &call, OFFERS_WAIT).await?;
+
+        Ok(answer.offers)
     }
 
     /// Keeps this spoke registered and its view of the hub's catalog

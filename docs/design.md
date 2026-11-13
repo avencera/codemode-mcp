@@ -573,7 +573,9 @@ Goal: see whether agents use Code Mode well or get confused, and feed that back 
 - A trusted spoke can call the hub's servers under the hub's policy and ask for approvals and 1Password values,
   each of which the owner decides on the hub. It never holds the hub's tokens. A compromised spoke can ask, and
   word its client and thread as it likes, but the prompt names the spoke as the owner trusted it. `spokes
-  remove` ends it
+  remove` ends it. A spoke with its own `browser` server is sent a 1Password value for a fill the owner
+  approved in a prompt naming that spoke, and only for it; once there, it is as exposed as any value on the
+  spoke
 - Local same-user processes can still impersonate a client name and ride a live client grant (the fallback for
   calls without a valid session), because the name is self-asserted and loopback gives no identity. Session
   grants close this for agents that pass their session: the token is unguessable, and a caller that presents a
@@ -839,7 +841,9 @@ spokes as hub tools.
   `config init` needs `--hub`, since a hub needs the Mac's 1Password, Touch ID and Keychain
 - Transport: JSON over HTTP under `/hub/v1` on the hub's main listener, always spoke to hub; the hub never dials
   a spoke and nothing is discovered. Routes: `register`, `catalog`, `gate`, `call`, `approvals/wait`, `op/read`,
-  `op/find`, `op/config`. A spoke names itself in `x-codemode-spoke`, and every answer carries the hub's catalog
+  `op/find`, `op/config`, and for a spoke's own browser `browser/endpoint`, `browser/source`, `browser/value`,
+  `browser/handoff` and `browser/offers` (see Browser). The hub's phones do dial a spoke, at the takeover
+  endpoint the hub lists to them. A spoke names itself in `x-codemode-spoke`, and every answer carries the hub's catalog
   version in `x-codemode-catalog`
 - Who may call: the guard (`hub::server::guard`, a route layer, so other paths of the main listener are
   untouched) takes only Tailscale peers (100.64.0.0/10, fd7a:115c:a1e0::/48) and direct loopback connections
@@ -1160,7 +1164,59 @@ rather than a generated crate), so no secret passes through an agent-browser com
   stream, like a read, with a push (`kind=handoff`). Done or Cancel from a takeover naming the id, or Cancel on
   the offer stream, answers it. The call is marked `waits_on_owner`, so the executor pauses the script's
   budget, and the upstream timeout covers the 120-minute maximum.
-- Not exported to spokes: a spoke's call is gated on the hub without `prepare`.
+- Exported to spokes: a spoke calling the hub's `browser` tools drives the hub's sessions, checked by the
+  hub's `prepare` as its own (see Hub and spokes).
+- On a spoke (`companion/spoke.rs`, `hub/server/browser.rs`): a spoke with a `browser` server of its own runs
+  its sessions in its own agent-browser and Chrome (`--engine chrome`, which agent-browser finds on Linux as
+  on macOS), checks its own pages, and leaves values, approvals and phones to the hub (`Values::Hub`). The
+  phone dials the spoke directly, for the list and for takeovers, and the hub vouches both ways.
+  - Takeover endpoint: a second iroh endpoint on the spoke, taking `TAKEOVER_ALPN` only, with its key in
+    `<state_dir>/browser.key` (0600), since a spoke has no Keychain. `[hub] browser_listen` fixes its socket;
+    without it the port is random. Relays and discovery follow `[secrets] discovery`. Every 30 s the spoke
+    posts its id, relay and direct addresses (at most 16, with any socket bound to one address, such as
+    `browser_listen`, included even before the interfaces are known) to `browser/endpoint`. The hub keeps them
+    in memory and answers with its paired phones' endpoint ids and names, the only phones the spoke admits;
+    until that first answer it admits none. A phone the hub does not list is closed with `not paired`, and a
+    spoke `spokes remove` drops is forgotten at once. Why a separate endpoint: the spoke's companion links,
+    if any, are its own, and the phone needs one id and address set per machine that the hub can vouch for
+  - Why direct rather than through the hub: a relayed takeover would put every screencast image through the
+    hub twice and tie each takeover to the hub's link and load. The phone already trusts what the hub says
+    over its authenticated link, so the hub naming the spoke's endpoint id is enough to dial it
+  - Listing: the hub's `Sessions` answer carries `machines`, each spoke reported in the last 90 s (three
+    reports) with its id, relay and addresses. A hub without a `browser` server of its own still answers the
+    list, with no sessions of its own, so the machines show. The phone dials each machine on a link of its own,
+    in parallel, with an 8 s dial timeout, so a spoke that is down shows as unreachable in its own section
+    while the rest list; a newer listing round drops a slower one's answer. An `Open` for a machine the phone
+    has not listed yet, such as from a link, waits for a new listing of the gateway first
+  - Fill: `prepare` on the spoke checks the page as on the hub, then posts the session, field, kind, host,
+    site and item to `browser/source`. The hub checks the names, finds the source as for its own session
+    under a `SessionAt` whose machine is `Machine::Spoke { id, name }`, so the spoke's remembered sign-ins and
+    phone asks never mix with the hub's, and holds it in memory under a random grant (at most 32 per spoke,
+    for the approval timeout plus 60 s). The spoke's `fill` is gated on the hub as one of its own `ask` tools,
+    with `checked.source = {hub: {grant}}`. There the hub checks that the call's session, kind, site and host
+    are the grant's, replaces the spoke's summary with its own, makes the grant `per_call` whatever the
+    spoke's config says, and binds the grant to the request; a grant asked about once is refused a second
+    gate. `browser/value` answers once, only when that request is approved, its stored row names this spoke,
+    the server and the tool `fill`, and it has not expired; it removes the grant before reading. A one-time
+    code is computed from its seed on the hub, so the seed never leaves it. The spoke adds a password it is
+    sent to its own redactor, as for a value read there. Why bind the value to the gate request: a value
+    route answering any grant would let a spoke read a value under a harmless prompt; tying it to the request
+    the owner approved, in the hub's own words naming the spoke, means the prompt, the machine and the value
+    always match. A hub restart drops held grants, so the agent fills again
+  - Away: the phone is asked for the whole sign-in on the hub, as for the hub's own sessions, keyed by the
+    spoke's `SessionAt`, and the values not yet used wait on the hub, not the spoke
+  - Handoff: the spoke posts `browser/handoff` and the hub offers it to its phones as its own, with
+    `PhoneHandoff.machine` set and a push whose `machine` key names the spoke and whose subtitle reads
+    `Session S on <spoke>`. The request is held until a phone answers or the deadline (at most 120 minutes).
+    The hub refuses at once when the spoke's endpoint is not fresh or no phone is paired, since no phone
+    could take it over; if offering fails it waits out the deadline, as a gateway's own handoff does when no
+    phone takes it. A takeover on the spoke answering the handoff there ends the spoke's call, which drops
+    the request, and the hub withdraws the offer from the phones. On a network error the spoke offers it
+    again every 5 s, and a takeover can still answer it meanwhile
+  - Fill from 1Password: a takeover on the spoke asks `browser/offers` for the phone's offers on the page's
+    site, which the hub answers only for a phone it has paired. The sealed copies are the hub's, so the phone
+    opens them with the hub's record whichever machine it dialed
+  - Linux has no `~/.Trash`, so a spoke sets `browser_trash` for Remove from the phone
 
 ### Xcode
 
@@ -1351,6 +1407,10 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
 - Other machines use the hub over the tailnet rather than holding their own 1Password and sign-ins: one place
   approves, one set of tokens, and Touch ID or a passkey at the owner's hand for every machine. Spokes start
   every exchange, so the hub needs no inbound path to them and nothing is discovered
+- A spoke's own browser sessions run on the spoke, in full Chrome, and the phone dials the spoke directly for
+  them, both the list and takeovers. The hub vouches for each side to the other: it lists the spoke's
+  endpoint to its phones, and tells the spoke which phones it paired. Values stay on the hub until a fill the
+  owner approved naming the spoke
 - No tool returns `Any`; `Any`, `cast` and `type: ignore` in scripts are refused; the review decides whether to tighten or relax (see Type strictness)
 
 ## Known gaps
@@ -1371,6 +1431,9 @@ calls = [{ tool = "authenticate" }, { tool = "list_environments" }]
   is still asked, and an approved call of a hub tool stays unused until its deadline
 - A spoke's request for `op://` references in its config that was open when the hub restarted is withdrawn; the
   spoke asks again on its next attempt
+- A spoke's fill whose source the hub held when it restarted is refused; the agent fills again. A spoke's
+  takeover endpoint is listed only once the spoke reports it, up to 30 s after either machine starts, and a
+  phone that cannot reach the spoke's addresses or relay sees its section as unreachable
 
 ## Open questions
 

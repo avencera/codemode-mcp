@@ -22,7 +22,7 @@ use tokio::{
 
 use crate::{
     approvals::{Approvals, Gate, GateRequest, RemoteGate, Waiting, hex},
-    browser::{Browsers, page::AgentBrowser},
+    browser::{Browsers, Values, page::AgentBrowser, vault::Vault},
     budget::Budget,
     catalog::{Catalog, ServerSnapshot, ToolEntry, export_tools},
     companion::Companions,
@@ -274,6 +274,9 @@ pub struct Gateway {
     fill_check: FillCheck,
     /// The `browser` servers' shared state, when one is configured
     browsers: Option<Arc<Browsers>>,
+    /// Where fills' values come from, on the machine that holds 1Password;
+    /// a hub's spokes fill through it too
+    vault: Option<Arc<Vault>>,
     max_tool_result_bytes: usize,
     rebuild_task: RwLock<Option<JoinHandle<()>>>,
     /// The hub, on a spoke
@@ -463,19 +466,23 @@ impl Gateway {
             hub,
         } = access;
         let fill_check = FillCheck::new(secrets.onepassword.clone(), mac.clone());
+        // a spoke's fills are read on its hub; any other gateway reads its
+        // own, and its spokes' too
+        let values = match &hub {
+            Some(hub) => Values::Hub(Arc::clone(hub)),
+            None => Values::Here(Arc::new(Vault::new(
+                secrets.onepassword.clone(),
+                Arc::clone(&redactor),
+                Some(store.clone()),
+            ))),
+        };
+        let vault = values.vault().cloned();
         // only a configured browser server lets phones take a session over
         let browsers = config
             .servers
             .values()
             .any(|server| server.builtin == Some(Builtin::Browser))
-            .then(|| {
-                Browsers::new(
-                    secrets.onepassword.clone(),
-                    Arc::clone(&redactor),
-                    Some(store.clone()),
-                    agent_browser(&config),
-                )
-            });
+            .then(|| Browsers::new(values, Arc::clone(&redactor), agent_browser(&config)));
         let builtins = Builtins {
             mac,
             browsers: browsers.clone(),
@@ -496,6 +503,7 @@ impl Gateway {
             redactor,
             fill_check,
             browsers,
+            vault,
             max_tool_result_bytes: config.limits.max_tool_result_bytes,
             config,
             upstreams,
@@ -742,6 +750,16 @@ impl Gateway {
     /// The approval service
     pub fn approvals(&self) -> &Arc<Approvals> {
         &self.approvals
+    }
+
+    /// The `browser` servers' shared state, when one is configured
+    pub fn browsers(&self) -> Option<&Arc<Browsers>> {
+        self.browsers.as_ref()
+    }
+
+    /// Where fills' values come from; `None` on a spoke, whose hub has it
+    pub fn vault(&self) -> Option<&Arc<Vault>> {
+        self.vault.as_ref()
     }
 
     /// The companion Macs that can read references, and this gateway's

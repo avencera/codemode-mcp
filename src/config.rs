@@ -778,6 +778,12 @@ pub struct HubConfig {
     /// Hub servers kept off this spoke
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Fixed address for the endpoint the hub's phones dial to take this
+    /// spoke's browser sessions over, instead of a random port; set it
+    /// when a firewall lets only one port in. Used only with a `browser`
+    /// server
+    #[serde(default)]
+    pub browser_listen: Option<SocketAddr>,
 }
 
 impl HubConfig {

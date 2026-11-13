@@ -1871,6 +1871,7 @@ async fn a_handoff_offered_again_shows_once_and_cancel_answers_it() -> TestResul
         reason: Some("Approve the passkey prompt\nplease".to_owned()),
         url: Some("https://github.com/sessions/two-factor".to_owned()),
         expires_in_ms: 60_000,
+        machine: None,
     };
 
     let first = tokio::spawn({
@@ -1930,6 +1931,7 @@ async fn a_handoff_offered_again_shows_once_and_cancel_answers_it() -> TestResul
             reason: None,
             url: None,
             expires_in_ms: 60_000,
+            machine: None,
         },
     };
     send.write_all(&serde_json::to_vec(&request)?).await?;
@@ -2056,6 +2058,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
             "https://discord.com/channels/@me".to_owned(),
         )]
         .into(),
+        machines: Vec::new(),
     };
     send.write_all(&encode_message(&listed)?).await?;
     let state = until(&app, |state| {
@@ -2125,6 +2128,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
         running: Vec::new(),
         saved: vec!["discord".to_owned(), "github".to_owned()],
         last_pages: Default::default(),
+        machines: Vec::new(),
     };
     send.write_all(&encode_message(&listed)?).await?;
     let state = until(&app, |state| {
@@ -2157,6 +2161,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
         running: Vec::new(),
         saved: vec!["github".to_owned()],
         last_pages: Default::default(),
+        machines: Vec::new(),
     };
     send.write_all(&encode_message(&listed)?).await?;
     let state = until(&app, |state| names(state) == ["github"]).await?;

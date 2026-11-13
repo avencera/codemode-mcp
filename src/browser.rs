@@ -7,15 +7,22 @@
 //! the agent, agent-browser or a file. The gateway checks the page before
 //! asking the owner: `https` on the site the agent names, a field of that
 //! kind, and no frame from another site around it. Where the value comes
-//! from follows the owner: at this Mac, 1Password here finds the login
-//! saved for the site and reads it by reference, so a code is made fresh
-//! from its seed; away, the phone is asked at once, for the whole sign-in
-//! (see [`sign_in`]). Companion Macs report no presence, so they are asked
-//! as for any program read
+//! from follows the owner (see [`vault`]): at this Mac, 1Password here
+//! finds the login saved for the site and reads it by reference, so a code
+//! is made fresh from its seed; away, the phone is asked at once, for the
+//! whole sign-in (see [`sign_in`]). Companion Macs report no presence, so
+//! they are asked as for any program read
 //!
 //! `handoff` asks the owner to take the session over on their phone, for a
 //! passkey, a captcha or anything else that cannot be filled, and waits for
 //! their Done or Cancel. The takeover itself is in [`takeover`]
+//!
+//! On a spoke the sessions and the page checks are the spoke's own, and the
+//! rest is the hub's ([`Values::Hub`]): the hub finds the value's source
+//! and holds it under a grant, the owner approves the call naming the
+//! spoke on the hub, and only then does the hub send the value, once. Its
+//! phones are offered the spoke's handoffs and dial the spoke to take a
+//! session over (see [`crate::companion::spoke`])
 //!
 //! Anything that can drive the browser over CDP, the agent included, could
 //! also read a filled field or script the page before a fill; that is the
@@ -29,15 +36,17 @@ mod handoff;
 pub mod page;
 mod sign_in;
 pub mod takeover;
+pub mod vault;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use companion_wire::{
-    mobile::{HandoffAnswer, LoginField, SignIn},
-    takeover::{EndReason, FillOffer, GatewayFrame, GatewayMessage, PhoneMessage},
-    wire::{MAX_DESCRIPTION_CHARS, MAX_REASON_CHARS},
+    mobile::{HandoffAnswer, LoginField},
+    takeover::{EndReason, GatewayFrame, GatewayMessage, PhoneMessage},
+    wire::MAX_REASON_CHARS,
 };
+use iroh::EndpointId;
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
@@ -48,25 +57,23 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 use zeroize::Zeroizing;
 
 use crate::{
-    companion::{
-        Companions, HandoffOffer, ProgramAsk, ProgramRead, ProgramTarget, SessionList, SignInAsk,
-        TakeoverHost, TakeoverOpen,
-    },
-    config::{Builtin, PhonePeer, ServerConfig},
-    logins::{find_login, is_code, item_name, site_of, totp::Totp},
+    companion::{HandoffOffer, SessionList, TakeoverHost, TakeoverOpen, TakeoverPhone},
+    config::{Builtin, ServerConfig},
+    hub::{FillGrant, FillSource, HandoffCall, HandoffReply, client::HubClient},
+    logins::{is_code, site_of, totp::Totp},
     prompt,
-    secrets::{LoginPart, OnePassword, Redactor},
-    store::{Store, site_logins::SiteLogin},
+    secrets::Redactor,
 };
-use handoff::Handoffs;
+use handoff::{Handoff, Handoffs};
 use page::{AgentBrowser, PageError, SessionName};
-use sign_in::SignIns;
+use takeover::OffersFor;
+use vault::{FillAt, Vault};
 
-const INSTRUCTIONS: &str = "Signs in to websites in agent-browser sessions on this Mac without \
+const INSTRUCTIONS: &str = "Signs in to websites in agent-browser sessions on this machine without \
      showing you the username, password or one-time code, and hands a step to the user's phone \
      when only they can do it. For a login form: open the page in the session, click the field \
      so it has focus, then call fill with the session, the kind of field and the site, such as \
@@ -84,7 +91,7 @@ pub const CHECKED: &str = "checked";
 const HANDOFF_MINUTES: u64 = 30;
 
 /// Longest a handoff may wait
-const MAX_HANDOFF_MINUTES: u64 = 120;
+pub(crate) const MAX_HANDOFF_MINUTES: u64 = 120;
 
 /// Least time a `browser` server call is given: the longest handoff, and
 /// time to read the page after it
@@ -92,6 +99,10 @@ pub const BROWSER_CALL_TIMEOUT: Duration = Duration::from_secs(MAX_HANDOFF_MINUT
 
 /// What a fill the caller stopped waiting for answers; nothing was filled
 const CANCELLED: &str = "the call was cancelled before anything was filled";
+
+/// How long a spoke waits before offering a handoff to its hub again, after
+/// the hub could not be reached
+const HANDOFF_RETRY: Duration = Duration::from_secs(5);
 
 /// Which field of a login to fill
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -117,7 +128,7 @@ impl From<Kind> for LoginField {
 
 /// The site a `site` argument names: its registrable domain, from a host
 /// such as `github.com` or an address such as `https://github.com/login`
-fn site_named(text: &str) -> Result<String, String> {
+pub(crate) fn site_named(text: &str) -> Result<String, String> {
     let text = text.trim().to_ascii_lowercase();
     let host = match reqwest::Url::parse(&text) {
         Ok(url) if url.has_host() => url.host_str().unwrap_or_default().to_owned(),
@@ -196,6 +207,12 @@ pub enum Source {
     },
     /// The owner's phone, for the whole sign-in
     Phone,
+    /// The hub, which holds the source of a spoke's fill under `grant` and
+    /// sends the value once the owner approved the call naming it
+    Hub {
+        /// The grant's id
+        grant: String,
+    },
 }
 
 /// What the gateway found on the page before asking the owner, under
@@ -210,63 +227,103 @@ pub struct Checked {
     pub source: Source,
 }
 
+/// The machine a browser session runs on, as the machine that holds
+/// 1Password sees it
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Machine {
+    /// This one
+    Here,
+    /// A spoke, by the id the hub trusts it under
+    Spoke {
+        /// The spoke's id
+        id: String,
+        /// Its name, as the owner knows it
+        name: String,
+    },
+}
+
+/// A browser session on its machine
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionAt {
+    /// Where it runs
+    pub machine: Machine,
+    /// Its agent-browser name
+    pub session: SessionName,
+}
+
+impl SessionAt {
+    /// `session` on this machine
+    pub fn here(session: SessionName) -> Self {
+        Self {
+            machine: Machine::Here,
+            session,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionAt {
+    /// As the owner reads it, such as `browser session github on code`
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.machine {
+            Machine::Here => write!(formatter, "browser session {}", self.session),
+            Machine::Spoke { name, .. } => {
+                write!(formatter, "browser session {} on {name}", self.session)
+            }
+        }
+    }
+}
+
+/// Where a machine's `browser` servers get their values and reach the
+/// owner's phones
+pub enum Values {
+    /// This machine's own vault and phones: the hub, or a gateway with no
+    /// hub
+    Here(Arc<Vault>),
+    /// The hub's, for the fills the owner approves there: a spoke
+    Hub(Arc<HubClient>),
+}
+
+impl Values {
+    /// The vault, on the machine that holds 1Password
+    pub fn vault(&self) -> Option<&Arc<Vault>> {
+        match self {
+            Self::Here(vault) => Some(vault),
+            Self::Hub(_) => None,
+        }
+    }
+}
+
 /// The shared state of every `browser` server: the sign-ins and handoffs in
 /// progress and what they read values through; cheap to share
 pub struct Browsers {
     agent_browser: AgentBrowser,
     handoffs: Arc<Handoffs>,
-    sign_ins: SignIns,
-    onepassword: OnePassword,
+    values: Values,
     redactor: Arc<Redactor>,
-    store: Option<Store>,
     /// One fill at a time, so two never check and fill over each other
     turn: tokio::sync::Mutex<()>,
 }
 
 impl Browsers {
-    /// The state, reading values through `onepassword` and remembering each
-    /// site's login in `store`; it runs the takeovers the phones open
-    pub fn new(
-        onepassword: OnePassword,
-        redactor: Arc<Redactor>,
-        store: Option<Store>,
-        agent_browser: AgentBrowser,
-    ) -> Arc<Self> {
+    /// The state, reading values through `values`; on the machine that
+    /// holds 1Password it runs the takeovers the phones open, and a spoke
+    /// serves them on its own endpoint instead (see
+    /// [`crate::companion::spoke`])
+    pub fn new(values: Values, redactor: Arc<Redactor>, agent_browser: AgentBrowser) -> Arc<Self> {
         let browsers = Arc::new(Self {
             agent_browser,
             handoffs: Arc::default(),
-            sign_ins: SignIns::default(),
-            onepassword,
+            values,
             redactor,
-            store,
             turn: tokio::sync::Mutex::new(()),
         });
-        if let Some(companions) = browsers.onepassword.companions() {
+        let companions = browsers.values.vault().and_then(|vault| vault.companions());
+        if let Some(companions) = companions {
             let host: Arc<dyn TakeoverHost> = browsers.clone();
             companions.host_takeovers(Arc::downgrade(&host));
         }
 
         browsers
-    }
-
-    /// Whether 1Password on this Mac may be searched: the owner is at it, or
-    /// there is no Mac to find them at
-    async fn owner_here(&self) -> bool {
-        match self.onepassword.on_mac() {
-            Some(on_mac) => on_mac.mac.present(on_mac.config.idle()).await,
-            None => true,
-        }
-    }
-
-    fn phones(&self) -> Vec<PhonePeer> {
-        self.onepassword
-            .companions()
-            .map(|companions| companions.phones())
-            .unwrap_or_default()
-    }
-
-    fn site_login(&self, site: &str) -> Option<SiteLogin> {
-        self.store.as_ref()?.site_login(site).ok().flatten()
     }
 
     /// For a `fill` call of a `browser` server, checks the page, finds where
@@ -323,42 +380,36 @@ impl Browsers {
             .and_then(|state| state.check(field, &site))
             .map_err(|error| error.to_string())?;
 
-        let label = field.label();
-        let (source, summary) = if self.owner_here().await {
-            self.source_here(field, call.item.as_deref(), &host, &site)
-                .await
-                .map(|(source, item, warning)| {
-                    let mut summary =
-                        format!("{label} into {host} (browser session {session}) from {item}");
-                    if let Some(warning) = warning {
-                        summary.push_str("; ");
-                        summary.push_str(&warning);
-                    }
+        let (source, summary) = match &self.values {
+            Values::Here(vault) => {
+                let at = SessionAt::here(session);
+                let fill = FillAt {
+                    at: &at,
+                    field,
+                    item: call.item.as_deref(),
+                    host: &host,
+                    site: &site,
+                };
 
-                    (source, summary)
-                })?
-        } else {
-            if self.phones().is_empty() {
-                return Err(
-                    "the user is away from this Mac, so 1Password cannot be searched here, and \
-                     no phone is paired to pick the login on; wait for the user"
-                        .to_owned(),
-                );
+                vault.source(&fill).await?
             }
-            let known = self
-                .site_login(&site)
-                .map(|login| match login.account {
-                    Some(account) => format!(" ({} · {account})", login.item),
-                    None => format!(" ({})", login.item),
-                })
-                .unwrap_or_default();
-
-            (
-                Source::Phone,
-                format!(
-                    "{label} into {host} (browser session {session}), from the user's phone{known}"
-                ),
-            )
+            Values::Hub(hub) => {
+                let fill = FillSource {
+                    session: session.to_string(),
+                    field,
+                    host: host.clone(),
+                    site: site.clone(),
+                    item: call.item,
+                };
+                match hub
+                    .fill_source(&fill)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    FillGrant::Granted { grant, summary } => (Source::Hub { grant }, summary),
+                    FillGrant::Refused(reason) => return Err(reason),
+                }
+            }
         };
 
         let checked = Checked { host, site, source };
@@ -370,227 +421,107 @@ impl Browsers {
         Ok(Some(summary))
     }
 
-    /// The 1Password field for `field` on `host`, found on this Mac, with the
-    /// item's name and any warning; the site's login is remembered for when
-    /// the owner is away
-    async fn source_here(
-        &self,
-        field: LoginField,
-        item: Option<&str>,
-        host: &str,
-        site: &str,
-    ) -> Result<(Source, String, Option<String>), String> {
-        let (login, _, warning) = find_login(&self.onepassword, item, &[host.to_owned()])
-            .await
-            .map_err(|error| error.to_string())?;
-        let name = item_name(&login);
-        let [username, password, code] = self
-            .onepassword
-            .login_references(
-                &login,
-                [
-                    LoginPart::Username,
-                    LoginPart::Password,
-                    LoginPart::OneTimePassword,
-                ],
-            )
-            .await
-            .map_err(|error| format!("could not open {name}: {error}"))?;
-        let reference = match field {
-            LoginField::Username => username.clone(),
-            LoginField::Password => password.clone(),
-            LoginField::Code => code.clone(),
-        }
-        .filter(|reference| crate::secrets::is_reference(reference))
-        .ok_or_else(|| format!("{name} has no {}", field.label()))?;
-
-        // only an item saved for the site stands for it later
-        if warning.is_none()
-            && let Some(store) = &self.store
-        {
-            let remembered = SiteLogin {
-                site: site.to_owned(),
-                item: name.clone(),
-                account: login.account.clone(),
-                username,
-                password,
-                code,
-            };
-            if let Err(error) = store.put_site_login(&remembered) {
-                tracing::warn!(%error, site, "could not remember the site's login");
-            }
-        }
-
-        Ok((
-            Source::Item {
-                reference,
-                item: name.clone(),
-            },
-            name,
-            warning,
-        ))
-    }
-
-    /// The value for `field`, read by reference or asked of the phone
+    /// The value for `field`, read by reference or asked of the phone here,
+    /// or sent by the hub for the fill the owner approved there
     async fn value(
         &self,
         session: &SessionName,
         field: LoginField,
         checked: &Checked,
     ) -> Result<Zeroizing<String>, String> {
-        match &checked.source {
-            Source::Item { reference, .. } => self
-                .onepassword
-                .read_reference(reference)
-                .await
-                .map(Zeroizing::new)
-                .map_err(|error| error.to_string()),
-            Source::Phone => match self.sign_ins.take(session, &checked.site, field) {
-                Some(value) => Ok(value),
-                None => self.ask_phone(session, field, &checked.site).await,
-            },
-        }
-    }
+        match (&self.values, &checked.source) {
+            (Values::Here(vault), source) => {
+                let at = SessionAt::here(session.clone());
 
-    /// Asks the phone for the sign-in `field` belongs to: the username and
-    /// password together, with the code's seed when every phone holds a
-    /// sealed copy of it, or the code alone. Answers `field`'s value and
-    /// keeps the others for their fills
-    async fn ask_phone(
-        &self,
-        session: &SessionName,
-        field: LoginField,
-        site: &str,
-    ) -> Result<Zeroizing<String>, String> {
-        let known = self.site_login(site);
-        let reference = |field: LoginField| {
-            known.as_ref().and_then(|login| match field {
-                LoginField::Username => login.username.clone(),
-                LoginField::Password => login.password.clone(),
-                LoginField::Code => login.code.clone(),
-            })
-        };
-        let phones = self.phones();
-        // a code the owner enters now could expire before its page comes,
-        // so it is asked with the rest only when a seed opens instead
-        let sealed_seed = reference(LoginField::Code).is_some_and(|code| {
-            let companions = self.onepassword.companions();
-            !phones.is_empty()
-                && phones.iter().all(|phone| {
-                    companions
-                        .is_some_and(|companions| companions.phone_seal(phone, &code).is_some())
-                })
-        });
-        let fields: Vec<LoginField> = match field {
-            LoginField::Code => vec![LoginField::Code],
-            _ if sealed_seed => vec![LoginField::Username, LoginField::Password, LoginField::Code],
-            _ => vec![LoginField::Username, LoginField::Password],
-        };
-        let targets: Vec<ProgramTarget> = fields
-            .iter()
-            .map(|&field| match reference(field) {
-                Some(reference) => ProgramTarget::Reference(reference),
-                None => ProgramTarget::Describe(prompt::one_line(
-                    &format!("{} for {site}", field.label()),
-                    MAX_DESCRIPTION_CHARS,
-                )),
-            })
-            .collect();
-        // a Mac can read a reference but cannot enter a value
-        let phones_only = targets
-            .iter()
-            .any(|target| matches!(target, ProgramTarget::Describe(_)));
-        let ask = ProgramAsk {
-            targets,
-            reason: Some(prompt::one_line(
-                &format!("sign in to {site} in browser session {session}"),
-                MAX_REASON_CHARS,
-            )),
-            destination: Some(format!("the {site} sign-in in browser session {session}")),
-            keep: None,
-            phones_only,
-            keep_scope: None,
-            sign_in: Some(SignInAsk {
-                sign_in: SignIn {
-                    site: site.to_owned(),
-                    account: known.as_ref().and_then(|login| login.account.clone()),
-                    session: Some(session.to_string()),
-                },
-                fields: fields.clone(),
-            }),
-        };
-
-        let read = match self.onepassword.read_for_program(&ask).await {
-            Ok(ProgramRead::Values(read)) => read,
-            Ok(ProgramRead::Found(_)) => {
-                return Err("a Mac answered with items instead of the values".to_owned());
+                vault.value(&at, field, &checked.site, source).await
             }
-            Err(error) => return Err(error.to_string()),
+            (Values::Hub(hub), Source::Hub { grant }) => hub.fill_value(grant).await,
+            // a spoke never reads 1Password itself for a fill
+            (Values::Hub(_), _) => Err("this fill was not approved on the hub".to_owned()),
+        }
+    }
+
+    /// What a takeover by the phone `phone` offers to fill on a site
+    fn offers(&self, phone: EndpointId) -> OffersFor {
+        match &self.values {
+            Values::Here(vault) => {
+                let vault = Arc::clone(vault);
+                Box::new(move |site: String| {
+                    let offers = vault.offers_for(phone, &site);
+                    Box::pin(std::future::ready(offers))
+                })
+            }
+            Values::Hub(hub) => {
+                let hub = Arc::clone(hub);
+                Box::new(move |site: String| {
+                    let hub = Arc::clone(&hub);
+                    Box::pin(async move {
+                        hub.fill_offers(phone, &site).await.unwrap_or_else(|error| {
+                            tracing::debug!(%error, "the hub sent no fill offers");
+                            Vec::new()
+                        })
+                    })
+                })
+            }
+        }
+    }
+
+    /// Offers `handoff` to the owner's phones until one answers on the
+    /// offer; a phone that answers with a takeover instead is seen by the
+    /// caller, which then drops this. Fails only when it could not be
+    /// offered at all
+    async fn offer_handoff(
+        &self,
+        handoff: &Handoff,
+        url: Option<String>,
+        deadline: Instant,
+    ) -> Result<HandoffAnswer, String> {
+        let hub = match &self.values {
+            Values::Here(vault) => {
+                let Some(companions) = vault.companions() else {
+                    return std::future::pending().await;
+                };
+                let offer = HandoffOffer {
+                    id: handoff.id.clone(),
+                    session: handoff.session.to_string(),
+                    reason: handoff.reason.clone(),
+                    url,
+                    machine: None,
+                };
+
+                return match companions.offer_handoff(&offer, deadline).await {
+                    Ok(answer) => Ok(answer),
+                    // a phone too old for the request can still open the
+                    // takeover from the push, so keep waiting
+                    Err(error) => {
+                        tracing::warn!(%error, "no phone took the handoff request");
+                        std::future::pending().await
+                    }
+                };
+            }
+            Values::Hub(hub) => hub,
         };
-        let mut values: HashMap<LoginField, Zeroizing<String>> = HashMap::new();
-        for (field, value) in fields.into_iter().zip(read.values) {
-            let Some(text) = value.as_text() else {
-                continue;
+
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let call = HandoffCall {
+                id: handoff.id.clone(),
+                session: handoff.session.to_string(),
+                reason: handoff.reason.clone(),
+                url: url.clone(),
+                expires_in_ms: u64::try_from(left.as_millis()).unwrap_or(u64::MAX),
             };
-            values.insert(field, Zeroizing::new(text.to_owned()));
-            // the value's bytes are wiped as it drops
-            drop(Zeroizing::new(value.into_bytes()));
+            match hub.offer_handoff(&call).await {
+                Ok(HandoffReply::Answered(answer)) => return Ok(answer),
+                Ok(HandoffReply::Refused(reason)) => return Err(reason),
+                // the hub restarted or the link dropped; a takeover can
+                // still answer it here meanwhile
+                Err(error) => {
+                    tracing::warn!(%error, "could not offer the handoff through the hub");
+                    tokio::time::sleep(HANDOFF_RETRY).await;
+                }
+            }
         }
-        let wanted = values
-            .remove(&field)
-            .ok_or_else(|| format!("the phone sent no {}", field.label()))?;
-        self.sign_ins.hold(session, site, values);
-
-        Ok(wanted)
-    }
-
-    /// What a takeover offers to fill, owning what it reads from
-    fn offers(&self) -> Offers {
-        Offers {
-            store: self.store.clone(),
-            companions: self.onepassword.companions().cloned(),
-        }
-    }
-}
-
-/// What a takeover reads its fill offers from; cheap to clone
-#[derive(Clone)]
-struct Offers {
-    store: Option<Store>,
-    companions: Option<Arc<Companions>>,
-}
-
-impl Offers {
-    /// The fills `phone` could open on `site`: the remembered login's fields
-    /// that it holds sealed copies of
-    fn for_phone(&self, phone: &PhonePeer, site: &str) -> Vec<FillOffer> {
-        let login = self
-            .store
-            .as_ref()
-            .and_then(|store| store.site_login(site).ok().flatten());
-        let (Some(login), Some(companions)) = (login, &self.companions) else {
-            return Vec::new();
-        };
-        [
-            (LoginField::Username, &login.username),
-            (LoginField::Password, &login.password),
-            (LoginField::Code, &login.code),
-        ]
-        .into_iter()
-        .filter_map(|(field, reference)| {
-            let reference = reference.as_ref()?;
-            let sealed = companions.phone_seal(phone, reference)?;
-
-            Some(FillOffer {
-                field,
-                reference: reference.clone(),
-                sealed,
-                item: login.item.clone(),
-                account: login.account.clone(),
-                site: site.to_owned(),
-            })
-        })
-        .collect()
     }
 }
 
@@ -598,7 +529,7 @@ impl Offers {
 impl TakeoverHost for Browsers {
     async fn takeover(
         &self,
-        phone: PhonePeer,
+        phone: TakeoverPhone,
         open: TakeoverOpen,
         input: mpsc::Receiver<PhoneMessage>,
         output: mpsc::Sender<GatewayFrame>,
@@ -648,10 +579,8 @@ impl TakeoverHost for Browsers {
             }
         };
 
-        let offers = self.offers();
-        let offers_phone = phone.clone();
         let context = takeover::Context {
-            offers: Box::new(move |site: &str| offers.for_phone(&offers_phone, site)),
+            offers: self.offers(phone.id),
             handoff_over: handoff.as_ref().map(|handoff| handoff.over()),
             redactor: Arc::clone(&self.redactor),
         };
@@ -710,7 +639,7 @@ pub struct FillParams {
     #[serde(default)]
     pub submit: bool,
     /// The 1Password item to use, as `op://vault/item`, when the site has
-    /// several saved logins or none; only used while the user is at this Mac
+    /// several saved logins or none; only used while the user is at the Mac
     #[serde(default)]
     pub item: Option<String>,
     /// Set by the gateway, never the agent, so it stays out of the schema
@@ -865,10 +794,11 @@ impl BrowserServer {
         context: RequestContext<RoleServer>,
     ) -> Result<Json<HandedOff>, CallToolResult> {
         let session = SessionName::parse(&params.session).map_err(failed)?;
-        let Some(companions) = self.0.onepassword.companions().cloned() else {
-            return Err(failed("no phone is paired, so nobody can take over"));
-        };
-        if companions.phones().is_empty() {
+        // on the hub the phones are here to check; a spoke's hub refuses
+        // as soon as it is offered
+        if let Values::Here(vault) = &self.0.values
+            && vault.phones().is_empty()
+        {
             return Err(failed(
                 "no phone is paired, so nobody can take over (`codemode-mcp companion invite`)",
             ));
@@ -888,28 +818,12 @@ impl BrowserServer {
             (!reason.is_empty()).then(|| reason.clone()),
         );
         let handoff = Arc::clone(&open.handoff);
-        let offer = HandoffOffer {
-            id: handoff.id.clone(),
-            session: session.to_string(),
-            reason: handoff.reason.clone(),
-            url,
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(minutes * 60);
-        let offered = async {
-            match companions.offer_handoff(&offer, deadline).await {
-                Ok(answer) => answer,
-                // a phone too old for the request can still open the
-                // takeover from the push, so keep waiting
-                Err(error) => {
-                    tracing::warn!(%error, "no phone took the handoff request");
-                    std::future::pending().await
-                }
-            }
-        };
+        let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+        let offered = self.0.offer_handoff(&handoff, url, deadline);
 
         let answer = tokio::select! {
             answer = handoff.answered() => answer,
-            answer = offered => answer,
+            offered = offered => offered.map_err(failed)?,
             () = tokio::time::sleep_until(deadline) => {
                 return Err(failed(format!("the user did not finish within {minutes} minutes")));
             }

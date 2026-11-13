@@ -15,18 +15,29 @@
 //! answers as soon as its catalog changes. Each answer also carries the
 //! hub's catalog version in [`CATALOG_HEADER`], so a spoke of a hub that
 //! does not hold requests still refetches when it changes
+//!
+//! A spoke with its own `browser` builtin reports its takeover endpoint
+//! under `browser/`, which the hub lists for its phones, and puts the rest
+//! of the browser's work to the hub: where a fill's value comes from, the
+//! value itself once the owner approved that fill, its handoffs and a
+//! takeover's fill offers
 
 pub mod client;
 pub mod server;
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
+use companion_wire::{
+    mobile::{HandoffAnswer, LoginField, RequestId},
+    takeover::FillOffer,
+};
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
-    approvals::RemoteGate, catalog::ExportedTool, gateway::ToolCallError, policy::GrantMode,
-    usage::Caller,
+    approvals::RemoteGate, catalog::ExportedTool, companion::TakeoverPhone, gateway::ToolCallError,
+    policy::GrantMode, usage::Caller,
 };
 
 /// Prefix of every hub route
@@ -286,4 +297,137 @@ impl std::fmt::Debug for ConfigAnswer {
 pub struct Refusal {
     /// Why
     pub error: String,
+}
+
+/// Body of `POST /hub/v1/browser/endpoint`: where the spoke's browser
+/// sessions are taken over, sent every half minute
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserEndpoint {
+    /// The id of the spoke's takeover endpoint
+    pub id: EndpointId,
+    /// Where it can be dialed directly
+    #[serde(default)]
+    pub addrs: Vec<SocketAddr>,
+    /// The relay it can be reached through, as a URL
+    #[serde(default)]
+    pub relay: Option<String>,
+}
+
+/// Answer of `POST /hub/v1/browser/endpoint`: the hub's paired phones,
+/// which are the only ones the spoke lets take its sessions over
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VouchedPhones {
+    /// The phones
+    pub phones: Vec<TakeoverPhone>,
+}
+
+/// Body of `POST /hub/v1/browser/source`: a fill the spoke checked on its
+/// own page, for the hub to find the value's source
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillSource {
+    /// The agent-browser session
+    pub session: String,
+    /// The field the spoke found focused, of the kind the agent named
+    pub field: LoginField,
+    /// The page's host, as the spoke read it
+    pub host: String,
+    /// The page's site, which must be the host's
+    pub site: String,
+    /// The 1Password item the agent named, used only while the owner is at
+    /// the hub
+    #[serde(default)]
+    pub item: Option<String>,
+}
+
+/// Answer of `POST /hub/v1/browser/source`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillGrant {
+    /// The hub holds the source under `grant`. A gate call naming the grant
+    /// is asked of the owner with the hub's own `summary`, and its approval
+    /// lets the spoke read the value once
+    Granted {
+        /// The grant's id
+        grant: String,
+        /// What the owner is asked to approve, naming the spoke
+        summary: String,
+    },
+    /// Why there is no source, safe to show the script
+    Refused(String),
+}
+
+/// Body of `POST /hub/v1/browser/value`: the value of a fill the owner
+/// approved
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FillValue {
+    /// The grant the approved gate call named
+    pub grant: String,
+}
+
+/// Answer of `POST /hub/v1/browser/value`
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillValueAnswer {
+    /// The value as it is typed: a code, never its seed
+    Value(String),
+    /// Why there is none, safe to show the script
+    Refused(String),
+}
+
+impl std::fmt::Debug for FillValueAnswer {
+    // the value stays out of logs
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(_) => formatter.write_str("Value(..)"),
+            Self::Refused(reason) => formatter.debug_tuple("Refused").field(reason).finish(),
+        }
+    }
+}
+
+/// Body of `POST /hub/v1/browser/handoff`: a handoff of a spoke's session,
+/// which the hub offers to its phones. The hub holds the request until a
+/// phone answers on the offer or `expires_in_ms` passes; the spoke dropping
+/// it takes the offer down
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffCall {
+    /// The handoff's id on the spoke, which the phone's takeover names
+    pub id: RequestId,
+    /// The agent-browser session
+    pub session: String,
+    /// The agent's reason, one line
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The page the session shows
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Milliseconds until the spoke gives up on it
+    pub expires_in_ms: u64,
+}
+
+/// Answer of `POST /hub/v1/browser/handoff`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffReply {
+    /// A phone answered on the offer
+    Answered(HandoffAnswer),
+    /// Why it was not offered, or no phone took it, safe to show the script
+    Refused(String),
+}
+
+/// Body of `POST /hub/v1/browser/offers`: the fills a phone taking over a
+/// spoke's page on `site` could open
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OffersCall {
+    /// The phone
+    pub phone: EndpointId,
+    /// The page's site
+    pub site: String,
+}
+
+/// Answer of `POST /hub/v1/browser/offers`: copies sealed to the phone,
+/// which only it can open
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OffersAnswer {
+    /// The offers
+    pub offers: Vec<FillOffer>,
 }

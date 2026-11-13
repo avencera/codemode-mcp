@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (to_engine, input) = mpsc::channel(64);
     let (output, mut from_engine) = mpsc::channel(8);
     let context = Context {
-        offers: Box::new(|_| Vec::new()),
+        offers: Box::new(|_| Box::pin(std::future::ready(Vec::new()))),
         handoff_over: None,
         redactor: Arc::new(Redactor::default()),
     };

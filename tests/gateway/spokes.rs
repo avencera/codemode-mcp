@@ -33,7 +33,7 @@ use super::{
 const REFERENCE: &str = "op://Dev/fixture/credential";
 
 /// Waits until `function` is in `harness`'s catalog
-async fn wait_for_tool(harness: &Harness, function: &str) -> TestResult {
+pub(super) async fn wait_for_tool(harness: &Harness, function: &str) -> TestResult {
     for _ in 0..300 {
         if harness.app.gateway().catalog().get(function).is_some() {
             return Ok(());
@@ -46,7 +46,7 @@ async fn wait_for_tool(harness: &Harness, function: &str) -> TestResult {
 
 /// Posts `body` to the hub route `path` as the spoke `id`, from the
 /// address it was trusted at, and reads the answer
-async fn post_as_spoke<T: serde::de::DeserializeOwned>(
+pub(super) async fn post_as_spoke<T: serde::de::DeserializeOwned>(
     hub: &Harness,
     id: &str,
     path: &str,

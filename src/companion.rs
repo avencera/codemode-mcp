@@ -17,6 +17,7 @@ mod pair;
 mod phone;
 mod program;
 mod server;
+pub mod spoke;
 mod takeover;
 mod trust;
 
@@ -37,7 +38,9 @@ pub use program::{
     checked_query,
 };
 pub use server::{CompanionHandle, ServeError, serve};
-pub use takeover::{HandoffOffer, SessionList, TakeoverHost, TakeoverOpen};
+pub use takeover::{
+    BrowserMachines, HandoffOffer, SessionList, TakeoverHost, TakeoverOpen, TakeoverPhone,
+};
 pub use ticket::{
     AnyTicket, INVITE_PREFIX, InviteSecret, InviteTicket, TICKET_PREFIX, Ticket, TicketError,
 };

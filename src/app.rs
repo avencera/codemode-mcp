@@ -2,13 +2,13 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use crate::{
     admin::attach_action,
     approvals::{AdminAction, Approvals, NO_APPROVAL_PAGE, NO_NOTIFIER, Remote},
-    companion::DeviceTrust,
+    companion::{DeviceTrust, TakeoverHost, spoke::SpokeTakeovers},
     config::{Config, ConfigError},
     executions::Executions,
     executor::{Executor, ExecutorError},
@@ -112,6 +112,9 @@ pub struct App {
     log: UsageLog,
     /// What this machine shares with its spokes, unless it is one
     hub: Option<Arc<Hub>>,
+    /// On a spoke with a `browser` server, where the hub's phones take its
+    /// sessions over
+    takeovers: Option<Arc<SpokeTakeovers>>,
 }
 
 impl App {
@@ -267,6 +270,12 @@ impl App {
         // only the daemon answers spokes, and a spoke has no spokes of its own
         let hub = (role == Role::Daemon && config.hub.is_none())
             .then(|| Hub::new(Arc::clone(&gateway), store.clone(), Arc::clone(&config)));
+        let takeovers = match (role, gateway.hub(), gateway.browsers()) {
+            (Role::Daemon, Some(client), Some(browsers)) => {
+                Self::bind_takeovers(&config, &state_dir, client, browsers).await
+            }
+            _ => None,
+        };
         let executions = Arc::new(Executions::new(
             Arc::clone(&gateway),
             executor,
@@ -291,7 +300,33 @@ impl App {
             store: session_store,
             log,
             hub,
+            takeovers,
         })
+    }
+
+    /// Binds a spoke's takeover endpoint for `browsers` and keeps reporting
+    /// it to `client`'s hub; `None` when it cannot bind, which leaves the
+    /// sessions to agents alone rather than stopping the daemon
+    async fn bind_takeovers(
+        config: &Config,
+        state_dir: &Path,
+        client: &Arc<HubClient>,
+        browsers: &Arc<crate::browser::Browsers>,
+    ) -> Option<Arc<SpokeTakeovers>> {
+        let listen = config.hub.as_ref().and_then(|hub| hub.browser_listen);
+        let host: Weak<dyn TakeoverHost> = Arc::downgrade(browsers) as Weak<dyn TakeoverHost>;
+        let takeovers =
+            match SpokeTakeovers::bind(state_dir, config.secrets.discovery, listen, host).await {
+                Ok(takeovers) => takeovers,
+                Err(error) => {
+                    tracing::warn!(%error, "no takeovers of this spoke's browser sessions");
+
+                    return None;
+                }
+            };
+        tokio::spawn(Arc::clone(&takeovers).report_to(Arc::clone(client)));
+
+        Some(takeovers)
     }
 
     /// On a spoke, registers with the hub and takes its catalog in, waiting
@@ -427,6 +462,9 @@ impl App {
         // tells connected phones and frees `secrets.listen` for the next
         // process
         self.gateway.companions().close().await;
+        if let Some(takeovers) = &self.takeovers {
+            takeovers.close().await;
+        }
         self.log.flush().await;
     }
 

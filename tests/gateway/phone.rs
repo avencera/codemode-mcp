@@ -28,6 +28,8 @@ use base64::{
 };
 use codemode_mcp::{
     app::App,
+    approvals::RemoteGate,
+    browser::{Checked, Source},
     companion::{
         self, CompanionErrorCode, CompanionFault, CompanionResponse, InviteTicket, MOBILE_ALPN,
         PAIR_ALPN, PairCheck, PairRequest, PairResponse, ProgramValue, Registration, Role,
@@ -38,21 +40,25 @@ use codemode_mcp::{
         },
     },
     config::Config,
+    hub::{FillGrant, FillSource, FillValue, FillValueAnswer, GateAnswer, GateCall},
     logins::{FieldKind, FocusedField},
     mac::TouchId,
+    policy::GrantMode,
     secrets::PHONE_GRACE,
+    usage::Caller,
 };
 use companion_wire::{
     mobile::{LoginField, RequestId},
     seal::SoftwareKey,
     takeover::{
-        EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, Point, RunningSession,
-        Secret, TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
+        BrowserMachine, EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, Point,
+        RunningSession, Secret, TAKEOVER_ALPN, Viewport, decode_gateway, encode_message,
+        read_header,
     },
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, TransportAddr,
-    endpoint::{Connection, presets},
+    endpoint::{Connection, ConnectionError, presets},
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{Value, json};
@@ -64,6 +70,7 @@ use super::{
         FakeMac, Harness, Setup, Stop, TestResult, approval_id, execute, temp_state_dir, text_of,
     },
     secrets::{VALUE, fake_op, reads},
+    spokes::{post_as_spoke, wait_for_tool},
 };
 
 const REFERENCE: &str = "op://Dev/fixture/credential";
@@ -100,6 +107,8 @@ struct Seen {
     items: Vec<String>,
     /// A program read's reason
     reason: Option<String>,
+    /// A handoff's machine, when it is a spoke's session
+    machine: Option<String>,
 }
 
 /// One push as the fake APNs server received it
@@ -293,6 +302,16 @@ impl FakePhone {
         let address =
             EndpointAddr::from_parts(self.gateway, [TransportAddr::Ip(self.gateway_address)]);
 
+        self.dial_at(address, alpn).await
+    }
+
+    /// Dials `address` instead of the gateway, as a spoke the gateway
+    /// listed is dialed
+    async fn dial_at(
+        &self,
+        address: EndpointAddr,
+        alpn: &[u8],
+    ) -> Result<Connection, Box<dyn Error>> {
         Ok(self.endpoint.connect(address, alpn).await?)
     }
 
@@ -332,6 +351,7 @@ impl FakePhone {
                         withdrawn: false,
                         items: Vec::new(),
                         reason: request.handoff.reason,
+                        machine: request.handoff.machine.map(|machine| machine.name),
                     });
                 }
                 let _ = send.stopped().await;
@@ -359,6 +379,7 @@ impl FakePhone {
                     withdrawn: false,
                     items: Vec::new(),
                     reason: None,
+                    machine: None,
                 });
 
                 seen.len() - 1
@@ -445,6 +466,7 @@ impl FakePhone {
                 withdrawn: false,
                 items,
                 reason: read.reason.clone(),
+                machine: None,
             });
         }
         let answer = self.answer.lock().map_or(Answer::Deny, |answer| *answer);
@@ -1892,6 +1914,29 @@ impl Takeover {
         Ok(Self { send, receive })
     }
 
+    /// A link to the machine at `address`, with nothing sent on it yet
+    async fn dial_at(phone: &FakePhone, address: EndpointAddr) -> Result<Self, Box<dyn Error>> {
+        let connection = phone.dial_at(address, TAKEOVER_ALPN).await?;
+        let (send, receive) = connection.open_bi().await?;
+
+        Ok(Self { send, receive })
+    }
+
+    /// The sessions of the machine at `address`, as it listed them
+    async fn list_at(
+        phone: &FakePhone,
+        address: EndpointAddr,
+    ) -> Result<(Vec<RunningSession>, Vec<BrowserMachine>), Box<dyn Error>> {
+        let mut listing = Self::dial_at(phone, address).await?;
+        listing.send(&PhoneMessage::Sessions).await?;
+        match listing.next().await? {
+            GatewayFrame::Message(GatewayMessage::Sessions {
+                running, machines, ..
+            }) => Ok((running, machines)),
+            other => Err(format!("not a listing: {other:?}").into()),
+        }
+    }
+
     async fn open(
         phone: &FakePhone,
         session: &str,
@@ -2327,10 +2372,13 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
         running,
         saved,
         last_pages,
+        machines,
     }) = listing.next().await?
     else {
         return Err("no session list".into());
     };
+    // no spoke reported a browser
+    assert!(machines.is_empty());
     assert_eq!(
         last_pages.into_iter().collect::<Vec<_>>(),
         [(
@@ -2471,5 +2519,313 @@ async fn the_phone_lists_starts_and_closes_browser_sessions() -> TestResult {
         .count();
     assert_eq!(trashed, 1);
 
+    rig.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spokes_sessions_are_taken_over_handed_off_and_filled_through_the_hub() -> TestResult {
+    const ENTERED: &str = "entered-on-the-phone";
+    let hub_cdp = FakeCdp::start("https://example.com/").await?;
+    let spoke_cdp = FakeCdp::start("https://github.com/login").await?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(hub_cdp.program.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let mut passkey = rig.harness.enroll_passkey().await?;
+
+    // the spoke runs its own browser server beside the hub's, and the owner
+    // trusts it with Touch ID at the hub, then leaves
+    rig.gateway_mac.set_answer(Some(TouchId::Approved));
+    let hub_port = rig.harness.server.local_addr().port();
+    let browser_listen = SocketAddr::from(([127, 0, 0, 1], free_port()?));
+    let spoke_extra = format!(
+        "[hub]\nhost = \"127.0.0.1:{hub_port}\"\nexclude = [\"fixture\"]\n\
+         browser_listen = \"{browser_listen}\"\n\n\
+         [secrets]\ndiscovery = false\n\n\
+         [servers.code_browser]\nbuiltin = \"browser\"\npolicy = \"ask\"\n\
+         tools.fill.grant = \"per_call\"\ntools.handoff.policy = \"allow\"\n"
+    );
+    let spoke_top = format!("agent_browser_path = \"{}\"", spoke_cdp.program.display());
+    let Some(spoke) = Harness::with(Setup {
+        extra: &spoke_extra,
+        top: &spoke_top,
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    spoke.app.connect_hub(Duration::from_secs(5)).await?;
+    // the hub's own browser reaches the spoke once the hub trusts it
+    wait_for_tool(&spoke, "browser_fill").await?;
+    wait_for_tool(&spoke, "code_browser_fill").await?;
+    rig.gateway_mac.set_present(false);
+    let name = spoke
+        .app
+        .gateway()
+        .hub()
+        .ok_or("the spoke has no hub")?
+        .machine()
+        .name
+        .clone();
+    let spoke_id = rig
+        .harness
+        .app
+        .hub()
+        .ok_or("the hub has no spokes")?
+        .spokes()
+        .first()
+        .ok_or("no spoke is trusted")?
+        .id
+        .clone();
+
+    // the hub lists the spoke's browser to its phone, with where to dial it
+    let machines = rig.harness.app.gateway().companions().browser_machines();
+    let machine = eventually(|| machines.recent().into_iter().next()).await?;
+    assert_eq!(machine.name, name);
+    assert!(machine.addrs.contains(&browser_listen), "{machine:?}");
+    let hub_at = EndpointAddr::from_parts(
+        rig.phone.gateway,
+        [TransportAddr::Ip(rig.phone.gateway_address)],
+    );
+    let (_, listed) = Takeover::list_at(&rig.phone, hub_at).await?;
+    assert_eq!(listed, std::slice::from_ref(&machine));
+
+    // the spoke lets in the hub's phone, once the hub has vouched for it,
+    // and lists its own sessions, but no stranger
+    let spoke_at = EndpointAddr::from_parts(
+        machine.id,
+        machine.addrs.iter().copied().map(TransportAddr::Ip),
+    );
+    let mut listing = None;
+    for _ in 0..50 {
+        if let Ok(listed) = Takeover::list_at(&rig.phone, spoke_at.clone()).await {
+            listing = Some(listed);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (running, machines_there) = listing.ok_or("the spoke never let the phone in")?;
+    let names: Vec<&str> = running
+        .iter()
+        .map(|session| session.name.as_str())
+        .collect();
+    assert_eq!(names, ["test"]);
+    assert!(machines_there.is_empty());
+    let stranger = FakePhone::start(rig.phone.gateway, rig.phone.gateway_address).await?;
+    let refused = stranger.dial_at(spoke_at.clone(), TAKEOVER_ALPN).await?;
+    let closed = refused.closed().await;
+    assert!(
+        matches!(&closed, ConnectionError::ApplicationClosed(close)
+            if close.reason.as_ref() == b"not paired"),
+        "{closed:?}"
+    );
+
+    // a handoff of the spoke's session is offered through the hub, naming
+    // the spoke, and the phone answers it on the spoke's own takeover
+    let pending = spoke
+        .execute_body(r#"await code_browser_handoff(session="test", reason="approve the passkey")"#)
+        .await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let handoff = eventually(|| {
+        rig.phone
+            .seen()
+            .into_iter()
+            .find(|seen| seen.reference == "handoff test")
+    })
+    .await?;
+    assert_eq!(handoff.machine.as_deref(), Some(name.as_str()));
+    let push = rig
+        .apns
+        .pushes()
+        .into_iter()
+        .find(|push| push.body["kind"] == "handoff")
+        .ok_or("no handoff push")?;
+    assert_eq!(push.body["machine"], name.as_str(), "{}", push.body);
+    assert_eq!(
+        push.body["aps"]["alert"]["subtitle"],
+        format!("Session test on {name}"),
+        "{}",
+        push.body
+    );
+    let mut takeover = Takeover::dial_at(&rig.phone, spoke_at.clone()).await?;
+    takeover
+        .send(&PhoneMessage::Open {
+            session: "test".to_owned(),
+            handoff: Some(RequestId::try_from(handoff.id.clone())?),
+            viewport: Viewport {
+                width: 390,
+                height: 844,
+                scale: 3.0,
+            },
+            start: None,
+        })
+        .await?;
+    takeover
+        .until(|frame| {
+            matches!(frame, GatewayFrame::Message(GatewayMessage::Page { .. })).then_some(())
+        })
+        .await?;
+    takeover.send(&PhoneMessage::Done).await?;
+    let ended = takeover
+        .until(|frame| match frame {
+            GatewayFrame::Message(GatewayMessage::Ended { reason, .. }) => Some(*reason),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(ended, EndReason::Done);
+    let execution = pending["execution_id"].as_str().unwrap_or_default();
+    let done: Value = serde_json::from_str(&text_of(&spoke.wait_done(execution).await?))?;
+    assert_eq!(done["result"]["outcome"], "done", "{done}");
+
+    // with the owner away, the hub finds a fill's source as for its own
+    // fills and holds it for the spoke, naming the spoke
+    rig.phone.set_answer(Answer::Enter(ENTERED));
+    let source = FillSource {
+        session: "test".to_owned(),
+        field: LoginField::Username,
+        host: "github.com".to_owned(),
+        site: "github.com".to_owned(),
+        item: None,
+    };
+    let granted: FillGrant =
+        post_as_spoke(&rig.harness, &spoke_id, "/browser/source", &source).await?;
+    let FillGrant::Granted { grant, summary } = granted else {
+        return Err(format!("no grant: {granted:?}").into());
+    };
+    let named = format!("username into github.com (browser session test on {name})");
+    assert_eq!(summary, format!("{named}, from the user's phone"));
+    let read = async |grant: &str| -> Result<FillValueAnswer, Box<dyn Error>> {
+        let value = FillValue {
+            grant: grant.to_owned(),
+        };
+        post_as_spoke(&rig.harness, &spoke_id, "/browser/value", &value).await
+    };
+    // no value before the owner is asked
+    let refused = read(&grant).await?;
+    assert!(
+        matches!(&refused, FillValueAnswer::Refused(reason) if reason.contains("not asked")),
+        "{refused:?}"
+    );
+
+    // the spoke's gate call naming the grant is asked with the hub's own
+    // summary, whatever the spoke sent, once for this call
+    let checked = Checked {
+        host: "github.com".to_owned(),
+        site: "github.com".to_owned(),
+        source: Source::Hub {
+            grant: grant.clone(),
+        },
+    };
+    let arguments = json!({
+        "session": "test",
+        "kind": "username",
+        "site": "github.com",
+        "checked": checked,
+    });
+    let gate = GateCall {
+        caller: Caller::default(),
+        execution_id: "by-hand".to_owned(),
+        script: "await code_browser_fill(...)".to_owned(),
+        server: "code_browser".to_owned(),
+        tool: "fill".to_owned(),
+        arguments: arguments.as_object().cloned().unwrap_or_default(),
+        hub_tool: false,
+        grant_mode: GrantMode::Session,
+        sensitive: false,
+        summary: Some("a summary the spoke made up".to_owned()),
+    };
+    let gated: GateAnswer = post_as_spoke(&rig.harness, &spoke_id, "/gate", &gate).await?;
+    let GateAnswer::Gate(RemoteGate::Wait { id, .. }) = gated else {
+        return Err(format!("the hub did not ask: {gated:?}").into());
+    };
+    let page = rig
+        .harness
+        .http
+        .get(format!("{}/approve/{id}", rig.harness.base()))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(page.contains(&named), "{page}");
+    assert!(!page.contains("made up"), "{page}");
+    // a second gate call cannot name the same grant
+    let again: GateAnswer = post_as_spoke(&rig.harness, &spoke_id, "/gate", &gate).await?;
+    assert!(
+        matches!(&again, GateAnswer::Gate(RemoteGate::Closed { reason }) if reason.contains("asked about already")),
+        "{again:?}"
+    );
+    let waiting = read(&grant).await?;
+    assert!(
+        matches!(&waiting, FillValueAnswer::Refused(reason) if reason.contains("not approved")),
+        "{waiting:?}"
+    );
+
+    // approved, the value is read once, from the phone's sign-in
+    let (status, body) = rig
+        .harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let value = read(&grant).await?;
+    assert!(
+        matches!(&value, FillValueAnswer::Value(value) if value == ENTERED),
+        "{value:?}"
+    );
+    let twice = read(&grant).await?;
+    assert!(matches!(twice, FillValueAnswer::Refused(_)), "{twice:?}");
+    let asked: Vec<Seen> = rig
+        .phone
+        .seen()
+        .into_iter()
+        .filter(|seen| !seen.items.is_empty())
+        .collect();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        asked[0].reason.as_deref(),
+        Some(format!("sign in to github.com in browser session test on {name}").as_str())
+    );
+
+    // the spoke's own fill goes the same way: one approval on the hub that
+    // names the spoke, and the password the phone's sign-in brought
+    spoke_cdp.focus(Some(Field::PASSWORD));
+    let pending = spoke
+        .execute_body(
+            r#"await code_browser_fill(session="test", kind="password", site="github.com")"#,
+        )
+        .await?;
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let id = approval_id(&pending)?;
+    let page = rig
+        .harness
+        .http
+        .get(format!("{}/approve/{id}", rig.harness.base()))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(
+        page.contains(&format!(
+            "password into github.com (browser session test on {name}), from the user&#39;s phone"
+        )),
+        "{page}"
+    );
+    let (status, body) = rig
+        .harness
+        .approve_with_passkey(&mut passkey, &id, "once")
+        .await?;
+    assert_eq!(status, 200, "{body}");
+    let execution = pending["execution_id"].as_str().unwrap_or_default();
+    let done: Value = serde_json::from_str(&text_of(&spoke.wait_done(execution).await?))?;
+    assert_eq!(done["result"]["filled"], true, "{done}");
+    assert!(!done.to_string().contains(ENTERED), "{done}");
+    assert_eq!(spoke_cdp.typed(), ENTERED);
+    assert_eq!(hub_cdp.typed(), "");
+
+    spoke.stop().await?;
     rig.stop().await
 }

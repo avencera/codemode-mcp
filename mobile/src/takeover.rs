@@ -706,6 +706,7 @@ pub async fn list_sessions(
             running,
             saved,
             last_pages,
+            ..
         }) => Ok(Listing {
             running,
             saved,

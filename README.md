@@ -58,7 +58,8 @@ before the script sees them.
   Companion app, where you drive the session live
 - **Hub and spokes.** Your other machines, Linux included, run codemode-mcp as spokes of the Mac: their agents
   see the Mac's servers next to the machine's own, and every approval and 1Password value is decided on the
-  Mac, over Tailscale. Tokens and sign-ins never leave it
+  Mac, over Tailscale. Tokens and sign-ins never leave it. A spoke's own agent-browser sessions are signed in
+  from the Mac's 1Password and taken over in the Companion app, which reaches the spoke directly
 - **Usage review.** Per-client stats and a Markdown review of how agents use the gateway
 - **launchd service** with signed binaries, so macOS and 1Password permission grants survive updates
 

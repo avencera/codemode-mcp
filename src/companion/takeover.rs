@@ -5,11 +5,15 @@
 //! trusted phone, like the phone's own connection. It carries one stream of
 //! frames (see [`companion_wire::takeover`]); what the frames do to the
 //! browser is up to the [`TakeoverHost`] the daemon registers
+//!
+//! A hub also lists the spokes whose browser sessions the phones may take
+//! over ([`BrowserMachines`]), as each last reported its takeover endpoint;
+//! a spoke serves its own takeovers the same way (see [`super::spoke`])
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
-        Arc, OnceLock, PoisonError, Weak,
+        Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -19,16 +23,24 @@ use async_trait::async_trait;
 use companion_wire::{
     mobile::{HandoffAnswer, PhoneHandoff, PhoneHandoffRequest, RequestId, Sealed},
     takeover::{
-        EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage, RunningSession,
-        Viewport, decode_phone, encode_message, encode_screen, read_header,
+        BrowserMachine, EndReason, GatewayFrame, GatewayMessage, HEADER_BYTES, PhoneMessage,
+        RunningSession, Viewport, decode_phone, encode_message, encode_screen, read_header,
     },
 };
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::{
+    EndpointId,
+    endpoint::{Connection, RecvStream, SendStream},
+};
+use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinSet, time::Instant};
 use zeroize::Zeroizing;
 
 use super::{CompanionFailure, Companions, apns::Subject};
-use crate::config::PhonePeer;
+
+/// How long a spoke's report of its takeover endpoint stands; a spoke
+/// reports every [`super::spoke::REPORT_EVERY`], so one that missed two
+/// reports is taken to be gone
+const FRESH: Duration = Duration::from_secs(90);
 
 /// How long a phone may take to open its stream and say what it takes over
 const OPEN_WINDOW: Duration = Duration::from_secs(30);
@@ -39,6 +51,15 @@ const INPUT_BACKLOG: usize = 64;
 /// Frames waiting for the link to the phone; images are paced by the
 /// phone's acknowledgements, so few wait
 const OUTPUT_BACKLOG: usize = 16;
+
+/// The phone driving a takeover, as the machine it dialed knows it
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeoverPhone {
+    /// Its name in the hub's config, for logs
+    pub name: String,
+    /// Its iroh endpoint id, which only it can answer as
+    pub id: EndpointId,
+}
 
 /// What a phone opened a takeover with
 #[derive(Debug, Clone)]
@@ -88,7 +109,7 @@ pub trait TakeoverHost: Send + Sync {
     /// phone's link drops, and closing `output` ends the link
     async fn takeover(
         &self,
-        phone: PhonePeer,
+        phone: TakeoverPhone,
         open: TakeoverOpen,
         input: mpsc::Receiver<PhoneMessage>,
         output: mpsc::Sender<GatewayFrame>,
@@ -123,9 +144,69 @@ pub struct HandoffOffer {
     pub reason: Option<String>,
     /// The page the session shows
     pub url: Option<String>,
+    /// The spoke the session runs on, which the phone dials to take it
+    /// over; `None` for this gateway's own session
+    pub machine: Option<BrowserMachine>,
 }
 
-/// Reads one frame's kind and body, at most the protocol's limits
+struct Reported {
+    machine: BrowserMachine,
+    seen: Instant,
+}
+
+/// The spokes whose browser sessions the phones may take over, by spoke
+/// id, as each last reported its takeover endpoint; a hub lists the ones
+/// seen lately with its own sessions
+#[derive(Default)]
+pub struct BrowserMachines(Mutex<HashMap<String, Reported>>);
+
+impl BrowserMachines {
+    /// Records that spoke `spoke` answers takeovers as `machine` now
+    pub fn report(&self, spoke: &str, machine: BrowserMachine) {
+        let reported = Reported {
+            machine,
+            seen: Instant::now(),
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(spoke.to_owned(), reported);
+    }
+
+    /// Forgets spoke `spoke`, which is no longer trusted
+    pub fn forget(&self, spoke: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(spoke);
+    }
+
+    /// The spokes seen lately, by name
+    pub fn recent(&self) -> Vec<BrowserMachine> {
+        let mut machines: Vec<BrowserMachine> = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .filter(|reported| reported.seen.elapsed() < FRESH)
+            .map(|reported| reported.machine.clone())
+            .collect();
+        machines.sort_by(|one, other| one.name.cmp(&other.name));
+
+        machines
+    }
+
+    /// Spoke `spoke`'s endpoint, when it was seen lately
+    pub fn of(&self, spoke: &str) -> Option<BrowserMachine> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(spoke)
+            .filter(|reported| reported.seen.elapsed() < FRESH)
+            .map(|reported| reported.machine.clone())
+    }
+}
+
 /// One frame's kind and body; the body is wiped when dropped, since a
 /// phone's message may hold typed text or a login value
 async fn read_frame(receive: &mut RecvStream) -> Result<(u8, Zeroizing<Vec<u8>>), String> {
@@ -145,27 +226,35 @@ async fn read_frame(receive: &mut RecvStream) -> Result<(u8, Zeroizing<Vec<u8>>)
 }
 
 /// Answers a phone's [`PhoneMessage::Sessions`], or its change to a
-/// session once it is made, with the list, or with
-/// [`GatewayMessage::Ended`] saying why there is none
+/// session once it is made, with the list and the other `machines`, or
+/// with [`GatewayMessage::Ended`] saying why there is none. Without a
+/// `host` only the machines are listed
 async fn answer_sessions(
-    host: &dyn TakeoverHost,
+    host: Option<&dyn TakeoverHost>,
+    machines: Vec<BrowserMachine>,
     change: Option<SessionChange<'_>>,
     send: &mut SendStream,
 ) {
-    let changed = match change {
-        Some(SessionChange::Close(session)) => host.close_session(session).await,
-        Some(SessionChange::Remove(session)) => host.remove_session(session).await,
-        None => Ok(()),
-    };
-    let listed = match changed {
-        Ok(()) => host.sessions().await,
-        Err(message) => Err(message),
+    let listed = match host {
+        Some(host) => {
+            let changed = match change {
+                Some(SessionChange::Close(session)) => host.close_session(session).await,
+                Some(SessionChange::Remove(session)) => host.remove_session(session).await,
+                None => Ok(()),
+            };
+            match changed {
+                Ok(()) => host.sessions().await,
+                Err(message) => Err(message),
+            }
+        }
+        None => Ok(SessionList::default()),
     };
     let message = match listed {
         Ok(list) => GatewayMessage::Sessions {
             running: list.running,
             saved: list.saved,
             last_pages: list.last_pages,
+            machines,
         },
         Err(message) => GatewayMessage::Ended {
             reason: EndReason::BrowserGone,
@@ -179,6 +268,171 @@ async fn answer_sessions(
         let _ = send.finish();
         let _ = tokio::time::timeout(OPEN_WINDOW, send.stopped()).await;
     }
+}
+
+/// Serves a takeover connection from `phone`, which the caller has let in:
+/// one takeover on `host` until either side ends it, or one answer to a
+/// list or a change to a session. `machines` are the other machines a list
+/// names; a connection with neither a host nor machines is refused
+pub(crate) async fn serve_takeover(
+    connection: Connection,
+    phone: TakeoverPhone,
+    host: Option<Arc<dyn TakeoverHost>>,
+    machines: Vec<BrowserMachine>,
+) {
+    if host.is_none() && machines.is_empty() {
+        connection.close(1_u32.into(), b"no browser");
+
+        return;
+    }
+    let Ok(Ok((mut send, mut receive))) =
+        tokio::time::timeout(OPEN_WINDOW, connection.accept_bi()).await
+    else {
+        return;
+    };
+    let opened = tokio::time::timeout(OPEN_WINDOW, read_frame(&mut receive)).await;
+    let first = match opened {
+        Ok(Ok((kind, body))) => decode_phone(kind, &body).ok(),
+        _ => None,
+    };
+    let (open, host) = match (first, host) {
+        (Some(PhoneMessage::Sessions), host) => {
+            answer_sessions(host.as_deref(), machines, None, &mut send).await;
+            connection.close(0_u32.into(), b"listed");
+
+            return;
+        }
+        (Some(PhoneMessage::CloseSession { session }), Some(host)) => {
+            tracing::info!(phone = %phone.name, %session, "closing a session for a phone");
+            let change = SessionChange::Close(&session);
+            answer_sessions(Some(host.as_ref()), machines, Some(change), &mut send).await;
+            connection.close(0_u32.into(), b"listed");
+
+            return;
+        }
+        (Some(PhoneMessage::RemoveSession { session }), Some(host)) => {
+            tracing::info!(phone = %phone.name, %session, "removing a session for a phone");
+            let change = SessionChange::Remove(&session);
+            answer_sessions(Some(host.as_ref()), machines, Some(change), &mut send).await;
+            connection.close(0_u32.into(), b"listed");
+
+            return;
+        }
+        (
+            Some(PhoneMessage::Open {
+                session,
+                handoff,
+                viewport,
+                start,
+            }),
+            Some(host),
+        ) => (
+            TakeoverOpen {
+                session,
+                handoff,
+                viewport,
+                start,
+            },
+            host,
+        ),
+        // only spokes' sessions are listed here, and none of them is this
+        // machine's to open or change
+        (Some(PhoneMessage::Open { .. } | PhoneMessage::CloseSession { .. }), None)
+        | (Some(PhoneMessage::RemoveSession { .. }), None) => {
+            connection.close(1_u32.into(), b"no browser");
+
+            return;
+        }
+        _ => {
+            connection.close(1_u32.into(), b"expected open");
+
+            return;
+        }
+    };
+    tracing::info!(phone = %phone.name, session = %open.session, "takeover opened");
+
+    let (input, input_receiver) = mpsc::channel(INPUT_BACKLOG);
+    let (output, mut output_receiver) = mpsc::channel::<GatewayFrame>(OUTPUT_BACKLOG);
+    let mut tasks = JoinSet::new();
+    // the phone's messages, until it hangs up or sends something
+    // unreadable; dropping `input` tells the host
+    tasks.spawn(async move {
+        loop {
+            let message = match read_frame(&mut receive).await {
+                Ok((kind, body)) => decode_phone(kind, &body),
+                Err(_) => break,
+            };
+            let Ok(message) = message else {
+                break;
+            };
+            if input.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+    let sent = Arc::new(Traffic::default());
+    let counting = Arc::clone(&sent);
+    tasks.spawn(async move {
+        while let Some(frame) = output_receiver.recv().await {
+            let image = matches!(frame, GatewayFrame::Screen(_));
+            let bytes = match &frame {
+                GatewayFrame::Message(message) => encode_message(message),
+                GatewayFrame::Screen(screen) => encode_screen(screen),
+            };
+            let Ok(bytes) = bytes else {
+                continue;
+            };
+            if send.write_all(&bytes).await.is_err() {
+                return;
+            }
+            if image {
+                counting.image(bytes.len());
+            }
+        }
+        let _ = send.finish();
+        let _ = send.stopped().await;
+    });
+
+    let name = phone.name.clone();
+    let opened = Instant::now();
+    host.takeover(phone, open, input_receiver, output).await;
+    // the writer sends what is left, then the link closes
+    let _ = tokio::time::timeout(OPEN_WINDOW, async {
+        while let Some(finished) = tasks.join_next().await {
+            if finished.is_ok() {
+                tasks.abort_all();
+            }
+        }
+    })
+    .await;
+    // how the link carried it, to tell a slow path from a slow page
+    let path = connection
+        .paths()
+        .iter()
+        .find(|path| path.is_selected())
+        .map(|path| {
+            let kind = if path.is_relay() { "relay" } else { "direct" };
+            (kind, path.rtt().as_millis())
+        });
+    let (path, rtt_ms) = path.unwrap_or(("none", 0));
+    let images = sent.images.load(Ordering::Relaxed);
+    let kb = sent.bytes.load(Ordering::Relaxed) / 1024;
+    let first_ms = sent
+        .first
+        .get()
+        .map_or(0, |first| first.duration_since(opened).as_millis());
+    let secs = opened.elapsed().as_secs_f64();
+    connection.close(0_u32.into(), b"ended");
+    tracing::info!(
+        phone = %name,
+        images,
+        kb,
+        first_ms,
+        per_sec = format!("{:.1}", f64::from(images) / secs.max(0.001)),
+        path,
+        rtt_ms,
+        "takeover ended"
+    );
 }
 
 impl Companions {
@@ -198,11 +452,17 @@ impl Companions {
             .and_then(Weak::upgrade)
     }
 
-    /// The copy of `reference` sealed to `phone`, when the gateway has one
-    pub fn phone_seal(&self, phone: &PhonePeer, reference: &str) -> Option<Sealed> {
+    /// The copy of `reference` sealed to the phone `phone`, when the gateway
+    /// has one
+    pub fn phone_seal(&self, phone: EndpointId, reference: &str) -> Option<Sealed> {
         self.store
             .as_ref()
-            .and_then(|store| store.seal(&phone.id.to_string(), reference).ok().flatten())
+            .and_then(|store| store.seal(&phone.to_string(), reference).ok().flatten())
+    }
+
+    /// The spokes whose browser sessions the phones may take over
+    pub fn browser_machines(&self) -> &BrowserMachines {
+        &self.browser_machines
     }
 
     /// Serves a takeover connection a phone dialed: refused unless the phone
@@ -215,148 +475,18 @@ impl Companions {
 
             return;
         };
-        let Some(host) = self.takeover_host() else {
-            connection.close(1_u32.into(), b"no browser");
-
-            return;
+        let phone = TakeoverPhone {
+            name: phone.name,
+            id: phone.id,
         };
-        let Ok(Ok((mut send, mut receive))) =
-            tokio::time::timeout(OPEN_WINDOW, connection.accept_bi()).await
-        else {
-            return;
-        };
-        let opened = tokio::time::timeout(OPEN_WINDOW, read_frame(&mut receive)).await;
-        let open = match opened {
-            Ok(Ok((kind, body))) => match decode_phone(kind, &body) {
-                Ok(PhoneMessage::Open {
-                    session,
-                    handoff,
-                    viewport,
-                    start,
-                }) => TakeoverOpen {
-                    session,
-                    handoff,
-                    viewport,
-                    start,
-                },
-                Ok(PhoneMessage::Sessions) => {
-                    answer_sessions(host.as_ref(), None, &mut send).await;
-                    connection.close(0_u32.into(), b"listed");
 
-                    return;
-                }
-                Ok(PhoneMessage::CloseSession { session }) => {
-                    tracing::info!(phone = %phone.name, %session, "closing a session for a phone");
-                    let change = SessionChange::Close(&session);
-                    answer_sessions(host.as_ref(), Some(change), &mut send).await;
-                    connection.close(0_u32.into(), b"listed");
-
-                    return;
-                }
-                Ok(PhoneMessage::RemoveSession { session }) => {
-                    tracing::info!(phone = %phone.name, %session, "removing a session for a phone");
-                    let change = SessionChange::Remove(&session);
-                    answer_sessions(host.as_ref(), Some(change), &mut send).await;
-                    connection.close(0_u32.into(), b"listed");
-
-                    return;
-                }
-                _ => {
-                    connection.close(1_u32.into(), b"expected open");
-
-                    return;
-                }
-            },
-            _ => {
-                connection.close(1_u32.into(), b"expected open");
-
-                return;
-            }
-        };
-        tracing::info!(phone = %phone.name, session = %open.session, "takeover opened");
-
-        let (input, input_receiver) = mpsc::channel(INPUT_BACKLOG);
-        let (output, mut output_receiver) = mpsc::channel::<GatewayFrame>(OUTPUT_BACKLOG);
-        let mut tasks = JoinSet::new();
-        // the phone's messages, until it hangs up or sends something
-        // unreadable; dropping `input` tells the host
-        tasks.spawn(async move {
-            loop {
-                let message = match read_frame(&mut receive).await {
-                    Ok((kind, body)) => decode_phone(kind, &body),
-                    Err(_) => break,
-                };
-                let Ok(message) = message else {
-                    break;
-                };
-                if input.send(message).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let sent = Arc::new(Traffic::default());
-        let counting = Arc::clone(&sent);
-        tasks.spawn(async move {
-            while let Some(frame) = output_receiver.recv().await {
-                let image = matches!(frame, GatewayFrame::Screen(_));
-                let bytes = match &frame {
-                    GatewayFrame::Message(message) => encode_message(message),
-                    GatewayFrame::Screen(screen) => encode_screen(screen),
-                };
-                let Ok(bytes) = bytes else {
-                    continue;
-                };
-                if send.write_all(&bytes).await.is_err() {
-                    return;
-                }
-                if image {
-                    counting.image(bytes.len());
-                }
-            }
-            let _ = send.finish();
-            let _ = send.stopped().await;
-        });
-
-        let name = phone.name.clone();
-        let opened = Instant::now();
-        host.takeover(phone, open, input_receiver, output).await;
-        // the writer sends what is left, then the link closes
-        let _ = tokio::time::timeout(OPEN_WINDOW, async {
-            while let Some(finished) = tasks.join_next().await {
-                if finished.is_ok() {
-                    tasks.abort_all();
-                }
-            }
-        })
+        serve_takeover(
+            connection,
+            phone,
+            self.takeover_host(),
+            self.browser_machines.recent(),
+        )
         .await;
-        // how the link carried it, to tell a slow path from a slow page
-        let path = connection
-            .paths()
-            .iter()
-            .find(|path| path.is_selected())
-            .map(|path| {
-                let kind = if path.is_relay() { "relay" } else { "direct" };
-                (kind, path.rtt().as_millis())
-            });
-        let (path, rtt_ms) = path.unwrap_or(("none", 0));
-        let images = sent.images.load(Ordering::Relaxed);
-        let kb = sent.bytes.load(Ordering::Relaxed) / 1024;
-        let first_ms = sent
-            .first
-            .get()
-            .map_or(0, |first| first.duration_since(opened).as_millis());
-        let secs = opened.elapsed().as_secs_f64();
-        connection.close(0_u32.into(), b"ended");
-        tracing::info!(
-            phone = %name,
-            images,
-            kb,
-            first_ms,
-            per_sec = format!("{:.1}", f64::from(images) / secs.max(0.001)),
-            path,
-            rtt_ms,
-            "takeover ended"
-        );
     }
 
     /// Offers `handoff` to every phone, pushing to wake them, until one
@@ -385,6 +515,7 @@ impl Companions {
                         .reason
                         .clone()
                         .unwrap_or_else(|| "An agent needs you".to_owned()),
+                    machine: handoff.machine.as_ref().map(|machine| machine.name.clone()),
                 };
                 let encode = |expires_in_ms| {
                     serde_json::to_vec(&PhoneHandoffRequest {
@@ -394,6 +525,7 @@ impl Companions {
                             reason: handoff.reason.clone(),
                             url: handoff.url.clone(),
                             expires_in_ms,
+                            machine: handoff.machine.clone(),
                         },
                     })
                     .map_err(|error| error.to_string())

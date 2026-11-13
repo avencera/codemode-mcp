@@ -74,6 +74,8 @@ pub enum Subject {
         session: String,
         /// The agent's reason, one line
         reason: String,
+        /// The spoke the session runs on; `None` for the gateway's own
+        machine: Option<String>,
     },
 }
 
@@ -126,9 +128,16 @@ impl Apns {
                 format!("An agent on {}", alert.gateway),
                 site.clone(),
             ),
-            Subject::Handoff { session, reason } => (
+            Subject::Handoff {
+                session,
+                reason,
+                machine,
+            } => (
                 "Take over the browser",
-                format!("Session {session} on {}", alert.gateway),
+                format!(
+                    "Session {session} on {}",
+                    machine.as_deref().unwrap_or(&alert.gateway)
+                ),
                 reason.clone(),
             ),
         };
@@ -156,10 +165,17 @@ impl Apns {
                 body[push_keys::KIND] = json!(push_keys::PROGRAM);
                 body[push_keys::SUMMARY] = json!(summary);
             }
-            Subject::Handoff { session, reason } => {
+            Subject::Handoff {
+                session,
+                reason,
+                machine,
+            } => {
                 body[push_keys::KIND] = json!(push_keys::HANDOFF);
                 body[push_keys::SESSION] = json!(session);
                 body[push_keys::SUMMARY] = json!(reason);
+                if let Some(machine) = machine {
+                    body[push_keys::MACHINE] = json!(machine);
+                }
             }
         }
 

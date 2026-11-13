@@ -6,7 +6,10 @@
 //! [`PhoneMessage::Sessions`] to list the browser sessions instead, or
 //! [`PhoneMessage::CloseSession`] or [`PhoneMessage::RemoveSession`] to
 //! close or remove one, which the gateway answers with
-//! [`GatewayMessage::Sessions`] before closing the stream. After an Open the gateway sends the live page as [`Screen`]
+//! [`GatewayMessage::Sessions`] before closing the stream. A gateway with
+//! spokes lists their browser machines there too ([`BrowserMachine`]); the
+//! phone dials each the same way, as the same paired phone, and the spoke
+//! answers only the phones its gateway vouches for. After an Open the gateway sends the live page as [`Screen`]
 //! images and what changed on it as [`GatewayMessage`]s, and the phone sends
 //! the owner's taps, scrolls, keys and text. The gateway sends the next image only once the phone has
 //! acknowledged the last, so a slow link gets fewer images rather than a
@@ -27,8 +30,9 @@
 //! `Debug` never shows them; the gateway inserts them into the page and
 //! keeps nothing
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
+use iroh_base::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::mobile::{LoginField, RequestId, Sealed};
@@ -318,6 +322,23 @@ pub struct RunningSession {
     pub title: Option<String>,
 }
 
+/// A machine other than the gateway whose browser sessions the phone may
+/// take over: a spoke of the gateway, which vouches for it by listing it.
+/// The phone dials it directly on [`TAKEOVER_ALPN`]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserMachine {
+    /// Its short host name, as the gateway's prompts name it, such as `code`
+    pub name: String,
+    /// The endpoint id it answers takeovers on
+    pub id: EndpointId,
+    /// Where to dial it directly
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<SocketAddr>,
+    /// The relay it can be reached through, as a URL, when it uses one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
 /// What the gateway sends on a takeover besides the images
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -362,6 +383,10 @@ pub enum GatewayMessage {
         /// an address
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         last_pages: BTreeMap<String, String>,
+        /// The other machines whose sessions the phone may take over, which
+        /// it dials for their own lists; a spoke lists none
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        machines: Vec<BrowserMachine>,
     },
     /// The takeover is over, and the gateway closes the stream next
     Ended {
@@ -592,6 +617,45 @@ mod tests {
         assert_eq!(
             decode_phone(SCREEN, body),
             Err(FrameError::UnknownKind(SCREEN))
+        );
+    }
+
+    #[test]
+    fn a_list_from_a_gateway_without_spokes_still_reads() {
+        // as a gateway from before spokes had browsers sends it
+        let old = br#"{"sessions":{"running":[{"name":"github"}],"saved":["discord"]}}"#;
+        assert_eq!(
+            decode_gateway(MESSAGE, old).ok(),
+            Some(GatewayFrame::Message(GatewayMessage::Sessions {
+                running: vec![RunningSession {
+                    name: "github".to_owned(),
+                    url: None,
+                    title: None,
+                }],
+                saved: vec!["discord".to_owned()],
+                last_pages: BTreeMap::new(),
+                machines: Vec::new(),
+            }))
+        );
+
+        // and a list naming a spoke reads back with its address
+        let id = iroh_base::SecretKey::from_bytes(&[4; 32]).public();
+        let listed = GatewayMessage::Sessions {
+            running: Vec::new(),
+            saved: Vec::new(),
+            last_pages: BTreeMap::new(),
+            machines: vec![BrowserMachine {
+                name: "code".to_owned(),
+                id,
+                addrs: vec![SocketAddr::from(([192, 168, 1, 20], 7683))],
+                relay: Some("https://relay.example/".to_owned()),
+            }],
+        };
+        let written = encode_message(&listed).unwrap_or_default();
+        let (kind, body) = split(&written);
+        assert_eq!(
+            decode_gateway(kind, body).ok(),
+            Some(GatewayFrame::Message(listed))
         );
     }
 

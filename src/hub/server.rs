@@ -10,6 +10,10 @@
 //! its stored row when the held call is gone: the row must be a hub tool's
 //! request, for the same arguments, still in time. Each approval runs one
 //! call, which the store records, so a restart does not let it run twice
+//!
+//! The `browser/` routes serve a spoke's browser sessions (see
+//! [`browser`]): its takeover endpoint, which the phones dial, its fills,
+//! whose values the hub reads, and its handoffs, which the hub offers
 
 use std::{
     collections::HashMap,
@@ -32,9 +36,10 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    API, CATALOG_HEADER, CATALOG_WAIT, CallAnswer, ConfigAnswer, ConfigRead, ForwardedCall,
-    GateAnswer, GateCall, HubError, HubErrorKind, ProgramReadCall, Refusal, Register, Registration,
-    SPOKE_HEADER, WaitAnswer, WaitFor,
+    API, BrowserEndpoint, CATALOG_HEADER, CATALOG_WAIT, CallAnswer, ConfigAnswer, ConfigRead,
+    FillSource, FillValue, ForwardedCall, GateAnswer, GateCall, HandoffCall, HubError,
+    HubErrorKind, OffersCall, ProgramReadCall, Refusal, Register, Registration, SPOKE_HEADER,
+    WaitAnswer, WaitFor,
 };
 use crate::{
     admin::{OpFindRequest, op_find_response, op_read_response},
@@ -48,11 +53,14 @@ use crate::{
     durable::Sensitivity,
     gateway::{CallContext, Gateway, Plan, PreparedCall},
     host::{is_direct_local, is_tailnet_address},
+    policy::GrantMode,
     prompt::one_line,
     secrets::approved::Consumer,
     store::{Store, now_ms, spokes::StoredSpoke},
     usage::{Caller, Machine},
 };
+
+mod browser;
 
 /// How long a long poll for a verdict waits before answering "pending"
 const WAIT_POLL: Duration = Duration::from_secs(25);
@@ -82,6 +90,8 @@ struct HubState {
     trust_requests: HashMap<String, TrustRequest>,
     /// Requests spokes asked for, by request id
     held: HashMap<String, Held>,
+    /// Spokes' fills waiting on the owner, by grant
+    fills: browser::HeldFills,
 }
 
 struct TrustRequest {
@@ -192,6 +202,11 @@ impl Hub {
             .remove_spoke(&spoke.id)
             .map_err(|error| error.to_string())?;
         self.state().trusted.remove(&spoke.id);
+        // its phones stop listing its browser at once
+        self.gateway
+            .companions()
+            .browser_machines()
+            .forget(&spoke.id);
 
         Ok(spoke)
     }
@@ -461,6 +476,16 @@ impl Hub {
             // the spoke's own server, apart from a hub server of the same
             // name: in the prompt, in grants and in the stored request
             let server = format!("{}:{}", spoke.name, call.server);
+            // a fill whose source the hub holds is asked with the hub's
+            // summary, once per call, so the approval names this fill
+            let fill = match self.gated_fill(spoke, &call.tool, &call.arguments) {
+                Ok(fill) => fill,
+                Err(reason) => return GateAnswer::Gate(RemoteGate::Closed { reason }),
+            };
+            let (summary, grant_mode) = match &fill {
+                Some(fill) => (Some(fill.summary.as_str()), GrantMode::PerCall),
+                None => (call.summary.as_deref(), call.grant_mode),
+            };
             let script: Arc<str> = Arc::from(call.script.as_str());
             let execution_id = spoke_execution(spoke, &call.execution_id);
             let gate = self.approvals().gate_here(GateRequest {
@@ -470,10 +495,17 @@ impl Hub {
                 tool: &call.tool,
                 arguments: &call.arguments,
                 script: &script,
-                grant_mode: call.grant_mode,
+                grant_mode,
                 sensitivity,
-                summary: call.summary.as_deref(),
+                summary,
             });
+            if let Some(fill) = &fill {
+                match &gate {
+                    Gate::Open { approval_id } => self.bind_fill(&fill.grant, approval_id, &server),
+                    Gate::Wait(waiting) => self.bind_fill(&fill.grant, waiting.id(), &server),
+                    Gate::Closed { .. } | Gate::Unreachable(_) => self.drop_fill(&fill.grant),
+                }
+            }
 
             return GateAnswer::Gate(match gate {
                 Gate::Open { approval_id } => RemoteGate::Open { approval_id },
@@ -875,6 +907,11 @@ pub fn router(hub: Arc<Hub>, stopping: CancellationToken) -> Router {
         .route(&format!("{API}/op/read"), post(op_read))
         .route(&format!("{API}/op/find"), post(op_find))
         .route(&format!("{API}/op/config"), post(op_config))
+        .route(&format!("{API}/browser/endpoint"), post(browser_endpoint))
+        .route(&format!("{API}/browser/source"), post(browser_source))
+        .route(&format!("{API}/browser/value"), post(browser_value))
+        .route(&format!("{API}/browser/handoff"), post(browser_handoff))
+        .route(&format!("{API}/browser/offers"), post(browser_offers))
         // only the routes above: a `layer` would also wrap the fallback,
         // which the merge makes the main listener's
         .route_layer(from_fn_with_state(Arc::clone(&hub), guard))
@@ -1069,4 +1106,46 @@ async fn op_config(
     Json(read): Json<ConfigRead>,
 ) -> Response {
     Json(hub.read_config(&spoke, read).await).into_response()
+}
+
+async fn browser_endpoint(
+    State(hub): State<Arc<Hub>>,
+    Extension(spoke): Extension<StoredSpoke>,
+    Json(endpoint): Json<BrowserEndpoint>,
+) -> Response {
+    Json(hub.report_browser(&spoke, endpoint)).into_response()
+}
+
+async fn browser_source(
+    State(hub): State<Arc<Hub>>,
+    Extension(spoke): Extension<StoredSpoke>,
+    Json(fill): Json<FillSource>,
+) -> Response {
+    Json(hub.fill_source(&spoke, fill).await).into_response()
+}
+
+async fn browser_value(
+    State(hub): State<Arc<Hub>>,
+    Extension(spoke): Extension<StoredSpoke>,
+    Json(value): Json<FillValue>,
+) -> Response {
+    Json(hub.fill_value(&spoke, &value.grant).await).into_response()
+}
+
+/// Held until a phone answers or the spoke's deadline passes; the spoke
+/// dropping the request drops this future, which takes the offer down
+async fn browser_handoff(
+    State(hub): State<Arc<Hub>>,
+    Extension(spoke): Extension<StoredSpoke>,
+    Json(call): Json<HandoffCall>,
+) -> Response {
+    Json(hub.offer_handoff(&spoke, call).await).into_response()
+}
+
+async fn browser_offers(
+    State(hub): State<Arc<Hub>>,
+    Extension(spoke): Extension<StoredSpoke>,
+    Json(call): Json<OffersCall>,
+) -> Response {
+    Json(hub.fill_offers(&spoke, call)).into_response()
 }

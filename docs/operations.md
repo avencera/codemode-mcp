@@ -750,6 +750,7 @@ agent hands the session to your phone instead.
    the config for another place. A session started from the phone keeps its Chrome profile, and so its
    sign-ins, in `~/.agent-browser/<session>`; set `browser_profiles` at the top of the config for another
    directory. A session removed from the phone moves its profile to `~/.Trash`, or to `browser_trash`.
+   On a spoke, the server runs that machine's own sessions; see "Browser sessions on a spoke" below.
 2. If the Mac's display may be asleep while agents use the browser, as on a Mac mini left alone, tell
    agent-browser's Chrome to keep drawing pages then. Headless Chrome on macOS paces its frames by the display,
    so while it sleeps (about 30 seconds after the screen locks) `agent-browser screenshot` and anything else
@@ -827,18 +828,19 @@ the session live in the Companion app:
 - For a handoff, **Done** or **Cancel** ends it and the agent's call returns `done` or `cancelled`. **Sessions**
   leaves without answering, for the session list, where you can take it over again.
 
-The app's home screen lists the browser sessions on the gateway Mac under **Browser sessions**: handoffs waiting
-on you first, with the agent's reason, then each running session with its page, then the saved sessions that
-are not running. Tap one to take it over; a takeover without a handoff has no Done or Cancel to answer, and
-the agent keeps the session after you leave. **Sessions** on a handoff's card puts it aside for this list,
-until a new handoff or request comes. Swipe a running session left, or long-press it, to **Close** it: its
-browser quits, after you confirm, and an agent using it loses the page, but its saved profile stays, so it
-lists as saved and starts again signed in. Swipe or long-press a saved session to **Remove** it: its profile,
-with its sign-ins, moves to the gateway Mac's Trash as `agent-browser <session> <time>`, where Finder can put it
-back (rename it to the session's name in `~/.agent-browser`). A running session is closed first.
+The app's home screen lists the browser sessions on the gateway Mac under **Browser sessions**, and each spoke's
+under **Browser on <name>** (see "Browser sessions on a spoke"): handoffs waiting on you first, with the agent's
+reason, then each running session with its page, then the saved sessions that are not running. Tap one to take it
+over; a takeover without a handoff has no Done or Cancel to answer, and the agent keeps the session after you
+leave. **Sessions** on a handoff's card puts it aside for this list, until a new handoff or request comes. Swipe a
+running session left, or long-press it, to **Close** it: its browser quits, after you confirm, and an agent using
+it loses the page, but its saved profile stays, so it lists as saved and starts again signed in. Swipe or
+long-press a saved session to **Remove** it: its profile, with its sign-ins, moves to the Trash of the machine it
+runs on (a spoke's `browser_trash`) as `agent-browser <session> <time>`, where Finder can put it back on a Mac
+(rename it to the session's name in `~/.agent-browser`). A running session is closed first.
 
 **New session** asks for a name and an address, which must be `https` (`github.com/login` is read as
-`https://github.com/login`). A session that is not running launches with its saved profile, so a site it was
+`https://github.com/login`), and, when the gateway lists spokes with a browser, which machine it runs on. A session that is not running launches with its saved profile, so a site it was
 signed in to still is. A running session loads the address instead. Agents use a session you start like any
 other, by its name.
 
@@ -848,7 +850,8 @@ Tapping a saved session starts it at the page it was last on, which the gateway 
 Another Address** from its long-press menu, it asks for an address with the name filled in.
 
 A takeover runs over its own iroh connection from a paired, trusted phone, and only while the app is open. A
-phone can also open one with a `codemode-companion://takeover?session=NAME` link, without a handoff.
+phone can also open one with a `codemode-companion://takeover?session=NAME` link, without a handoff; add
+`&machine=SPOKE` for a session on a spoke.
 
 Limits:
 
@@ -1039,6 +1042,7 @@ What runs where:
 - Calendar, Reminders, Xcode and website sign-in stay on the hub Mac and reach spokes as hub tools, the
   `browser` server's `fill` and `handoff` included: a spoke's fill is checked against the hub's page and
   approved there like one made on the hub, and its script's time stops counting while a handoff waits on you.
+  A spoke can also run browser sessions of its own; see "Browser sessions on a spoke" below.
 - A browser session on the hub reaches spokes through agent-browser's own MCP server, one server per logged-in
   session, so an agent there drives only that profile:
 
@@ -1072,6 +1076,85 @@ What runs where:
   allowed `open` would let a spoke read any file on the hub through the page's text, and `read` fetches any
   http URL it is given from the hub, local network included. agent-browser's `allowedDomains` would narrow
   both but cannot be used with a profile.
+
+### Browser sessions on a spoke
+
+A spoke can run agent-browser sessions of its own, in full Chrome on that machine, and sign them in and hand
+them to your phone through the hub. 1Password, the approvals and the phones stay on the hub; the phone dials
+the spoke itself to list and take over its sessions, so screen images do not go through the hub.
+
+1. Install agent-browser and a Chrome it can launch on the spoke. Without root:
+
+   ```sh
+   npm install -g --prefix ~/.local agent-browser     # puts agent-browser in ~/.local/bin
+   agent-browser install            # downloads Chrome for Testing into ~/.agent-browser/browsers
+   ```
+
+   On Ubuntu 23.10 and later, AppArmor keeps Chrome from making the user namespaces its sandbox needs, and it
+   stops with `No usable sandbox!`. Give agent-browser's Chrome a profile that allows them, once, as root:
+
+   ```sh
+   sudo tee /etc/apparmor.d/agent-browser-chrome >/dev/null <<'EOF'
+   abi <abi/4.0>,
+   include <tunables/global>
+
+   profile agent-browser-chrome /home/*/.agent-browser/browsers/chrome-*/chrome flags=(unconfined) {
+     userns,
+
+     include if exists <local/agent-browser-chrome>
+   }
+   EOF
+   sudo apparmor_parser -r /etc/apparmor.d/agent-browser-chrome
+   ```
+
+   Don't pass `--no-sandbox` instead, which turns Chrome's sandbox off for every page. A missing `.so` file
+   when Chrome starts means system libraries are missing, which `agent-browser install --with-deps` installs,
+   also as root. Then check that a session starts and close it:
+
+   ```sh
+   agent-browser --session check open https://example.com --engine chrome && agent-browser --session check close
+   ```
+2. Add a `browser` server to the spoke's config, under a name no hub server uses, since the hub's `browser`
+   server reaches the spoke as `browser` already:
+
+   ```toml
+   agent_browser_path = "/home/you/.local/bin/agent-browser"
+   # Linux has no ~/.Trash, where Remove from the phone moves a profile otherwise;
+   # the directory is made on first use
+   browser_trash = "/home/you/.local/share/codemode-mcp/browser-trash"
+
+   [hub]
+   host = "mac-mini"
+   # optional: a fixed address for the phone to dial, such as the spoke's tailnet IP
+   browser_listen = "100.x.y.z:7682"
+
+   [servers.code_browser]
+   builtin = "browser"
+   policy = "ask"
+   tools.fill.grant = "per_call"
+   tools.handoff.policy = "allow"
+   ```
+
+   The top-level keys must come before `[hub]`. agent-browser is also found in `~/.local/bin` without
+   `agent_browser_path`, as on the hub.
+3. Restart the spoke's daemon. Once the hub trusts it, the spoke reports its browser to the hub every 30
+   seconds, and the app shows its sessions under **Browser on <name>** on the next refresh.
+
+What changes for a spoke's sessions:
+
+- Fills: the spoke checks its own page, then the hub finds the 1Password login as for its own sessions, while
+  you are at the Mac or from your phone while you are away. The approval is asked on the hub in the hub's
+  words, naming the spoke, such as `password into github.com (browser session github on ai5090) from
+  GitHub (Personal)`, and every fill asks, whatever the spoke's config says. Only after you approve does the
+  hub send the value to the spoke, once, for that fill; a one-time code is computed on the hub, so the seed
+  never leaves it.
+- Handoffs: the push reads `Session github on ai5090`, and **Take over** dials the spoke.
+- **Fill from 1Password** in a takeover offers the hub's sealed copies, as on the hub.
+- The phone must reach the spoke: on the tailnet, at the address `browser_listen` fixes, or through n0's
+  relays when `[secrets] discovery` is on. A spoke the phone cannot dial in 8 seconds shows as unreachable
+  in its section, and the other machines still list.
+- The spoke admits only the phones paired with the hub, which the hub tells it each time the spoke reports;
+  a phone paired on the hub is let in within 30 seconds.
 
 Manage spokes on the hub:
 

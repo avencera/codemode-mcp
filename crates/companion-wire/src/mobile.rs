@@ -347,6 +347,10 @@ pub struct PhoneHandoff {
     pub url: Option<String>,
     /// Milliseconds until the gateway gives up on this handoff
     pub expires_in_ms: u64,
+    /// The machine the session runs on, when it is not the gateway: a
+    /// spoke, which the phone dials to take the session over
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<crate::takeover::BrowserMachine>,
 }
 
 /// A phone's answer to a [`PhoneHandoffRequest`] on its stream
@@ -451,6 +455,9 @@ pub mod push_keys {
     pub const HANDOFF: &str = "handoff";
     /// The browser session a handoff takes over
     pub const SESSION: &str = "session";
+    /// The name of the machine a handoff's session runs on, when it is not
+    /// the gateway; absent for the gateway's own sessions
+    pub const MACHINE: &str = "machine";
 }
 
 mod base64_bytes {
@@ -470,7 +477,24 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestId, SealKey};
+    use super::{PhoneHandoffRequest, RequestId, SealKey};
+
+    #[test]
+    fn a_handoff_from_a_gateway_without_spokes_still_reads() {
+        // as a gateway from before spokes had browsers sends it
+        let id = RequestId::generate();
+        let old =
+            format!(r#"{{"handoff":{{"id":"{id}","session":"github","expires_in_ms":60000}}}}"#);
+        let read = serde_json::from_str::<PhoneHandoffRequest>(&old).ok();
+        assert_eq!(
+            read.as_ref().map(|read| (
+                read.handoff.id.clone(),
+                read.handoff.session.as_str(),
+                read.handoff.machine.is_none()
+            )),
+            Some((id, "github", true))
+        );
+    }
 
     #[test]
     fn request_ids_and_seal_keys_refuse_malformed_text() {

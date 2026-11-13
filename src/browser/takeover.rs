@@ -75,8 +75,10 @@ impl Outcome {
     }
 }
 
-/// The fills the phone could open on a site
-pub type OffersFor = Box<dyn Fn(&str) -> Vec<FillOffer> + Send + Sync>;
+/// The fills the phone could open on a site; on a spoke they come from the
+/// hub, so they are awaited
+pub type OffersFor =
+    Box<dyn Fn(String) -> crate::notify::BoxFuture<'static, Vec<FillOffer>> + Send + Sync>;
 
 /// What a takeover needs besides the page and the link
 pub struct Context {
@@ -638,7 +640,7 @@ impl Takeover<'_> {
         };
         if shown != self.shown {
             let offers = match &site {
-                Some(site) => (self.context.offers)(site),
+                Some(site) => (self.context.offers)(site.clone()).await,
                 None => Vec::new(),
             };
             let page = GatewayMessage::Page {

@@ -156,6 +156,8 @@ pub struct Companions {
     /// Runs the takeovers phones open; held weakly, since it reads values
     /// through the reader that holds these companions
     pub(super) takeovers: std::sync::RwLock<Option<std::sync::Weak<dyn super::TakeoverHost>>>,
+    /// The spokes whose browser sessions the phones may take over
+    pub(super) browser_machines: super::takeover::BrowserMachines,
 }
 
 impl Companions {
@@ -219,6 +221,7 @@ impl Companions {
             secret_key: Mutex::new(None),
             endpoint: OnceCell::new(),
             takeovers: std::sync::RwLock::new(None),
+            browser_machines: super::takeover::BrowserMachines::default(),
             invites: Invites::default(),
             registering: Mutex::new(()),
             accepting: OnceLock::new(),

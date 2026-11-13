@@ -7,6 +7,14 @@
 # first start asks on the hub to trust this machine. See docs/operations.md,
 # "Spokes"
 
+# For browser sessions on this machine (see `[servers.code_browser]` below).
+# Top-level keys come before `[hub]`. Where agent-browser is, when it is not
+# on the daemon's PATH or in ~/.local/bin
+# agent_browser_path = "{{HOME}}/.local/bin/agent-browser"
+# where Remove on the phone moves a session's profile, since Linux has no
+# ~/.Trash; made on first use
+# browser_trash = "{{HOME}}/.local/share/codemode-mcp/browser-trash"
+
 [hub]
 # the hub's MagicDNS name or tailnet IP, with :port when it is not 7681
 host = {{HUB}}
@@ -14,6 +22,9 @@ host = {{HUB}}
 # servers = ["linear", "github"]
 # or every hub server but these
 # exclude = ["xcode"]
+# the address the phone dials this machine's browser sessions at, such as its
+# tailnet IP; any free port when unset
+# browser_listen = "100.x.y.z:7682"
 
 # write_env and find_references on this machine: they write 1Password values
 # into files here, approved on the hub, and the agent sees only the names
@@ -25,3 +36,14 @@ builtin = "secrets"
 # [servers.files]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "{{HOME}}/code"]
+
+# Browser sessions on this machine, in its own Chrome (`agent-browser open
+# --engine chrome`), signed in from the hub's 1Password and handed to the
+# hub's phones, which dial this machine to take them over. The hub's own
+# `browser` server already shows here as `browser`, so this one needs another
+# name. `fill` must ask on every call
+# [servers.code_browser]
+# builtin = "browser"
+# policy = "ask"
+# tools.fill.grant = "per_call"
+# tools.handoff.policy = "allow"
