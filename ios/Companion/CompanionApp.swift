@@ -14,7 +14,7 @@ struct CompanionApp: App {
                 .environment(AppManager.shared)
                 .onOpenURL { url in
                     guard let takeover = TakeoverLink(url) else { return }
-                    AppManager.shared.dispatch(.openTakeover(session: takeover.session, handoff: takeover.request))
+                    AppManager.shared.dispatch(.openTakeover(session: takeover.session, handoff: takeover.request, host: takeover.host))
                 }
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
@@ -102,7 +102,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // takeover's Done or Cancel answers it
         if info["kind"] as? String == "handoff" {
             guard let session = info["session"] as? String else { return }
-            AppManager.shared.dispatch(.openTakeover(session: session, handoff: id))
+            // a session on a spoke names it; the gateway's own names none
+            let host = SessionHost(machine: info["machine"] as? String)
+            AppManager.shared.dispatch(.openTakeover(session: session, handoff: id, host: host))
             return
         }
 
@@ -140,13 +142,15 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     }
 }
 
-/// A `codemode-companion://takeover?session=<name>&request=<id>` link, which
-/// opens that browser session's takeover, for the handoff `request` if set
+/// A `codemode-companion://takeover?session=<name>&request=<id>&machine=<name>`
+/// link, which opens that browser session's takeover, for the handoff
+/// `request` if set, on the gateway's `machine` if set
 struct TakeoverLink {
     static let scheme = "codemode-companion"
 
     let session: String
     let request: String?
+    let host: SessionHost
 
     init?(_ url: URL) {
         guard url.scheme == Self.scheme, url.host() == "takeover",
@@ -155,5 +159,6 @@ struct TakeoverLink {
         else { return nil }
         self.session = session
         request = items.first(where: { $0.name == "request" })?.value
+        host = SessionHost(machine: items.first(where: { $0.name == "machine" })?.value)
     }
 }

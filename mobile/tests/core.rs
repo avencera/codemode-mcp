@@ -16,7 +16,8 @@ use companion_core::ffi::{
     AppAction, AppState, BrowserSession, ConnectionState, EnteredValue, FfiApp, HandoffStatus,
     LoginField, OpenBatch, OpenError, OpenRequest, PairingState, PendingRead, Platform,
     PlatformError, ProgramItem as ShownItem, PushEnvironment, ReadStatus, Reconciler, SavedSession,
-    ScreenImage, SessionsStatus, TakeoverInput, TakeoverNotice, TakeoverStatus, Update,
+    ScreenImage, SessionHost, SessionsStatus, TakeoverInput, TakeoverNotice, TakeoverStatus,
+    Update,
 };
 use companion_wire::{
     MAX_BODY_BYTES, MOBILE_ALPN, PAIR_ALPN,
@@ -27,8 +28,8 @@ use companion_wire::{
     },
     seal::{SoftwareKey, seal},
     takeover::{
-        EndReason, FillOffer, Focus, GatewayMessage, HEADER_BYTES, PhoneMessage, Point,
-        RunningSession, Screen, ScreenHeader, Secret as WireSecret, TAKEOVER_ALPN, Viewport,
+        BrowserMachine, EndReason, FillOffer, Focus, GatewayMessage, HEADER_BYTES, PhoneMessage,
+        Point, RunningSession, Screen, ScreenHeader, Secret as WireSecret, TAKEOVER_ALPN, Viewport,
         decode_phone, encode_message, encode_screen, read_header,
     },
     ticket::{InviteSecret, InviteTicket},
@@ -1670,6 +1671,7 @@ async fn a_takeover_shows_the_page_paces_its_images_and_sends_the_owners_input()
     app.dispatch(AppAction::OpenTakeover {
         session: "github".to_owned(),
         handoff: Some(handoff.to_string()),
+        host: SessionHost::Gateway,
     });
     let state = until(&app, |state| state.takeover.is_some()).await?;
     let takeover = state.takeover.ok_or("no takeover")?;
@@ -2039,7 +2041,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     assert_eq!(
         state.sessions.status,
         SessionsStatus::Failed {
-            message: "The gateway's codemode-mcp is too old to list sessions; update it".to_owned()
+            message: "mini's codemode-mcp is too old to list sessions; update it".to_owned()
         }
     );
 
@@ -2084,6 +2086,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     app.dispatch(AppAction::StartSession {
         session: "discord".to_owned(),
         url: "https://discord.com/login".to_owned(),
+        host: SessionHost::Gateway,
     });
     app.takeover(TakeoverInput::Resize {
         width: 390,
@@ -2116,6 +2119,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     // the browser, and lists the sessions as they are after
     app.dispatch(AppAction::CloseSession {
         session: "discord".to_owned(),
+        host: SessionHost::Gateway,
     });
     let (_closing, mut send, mut receive) = gateway.next_takeover().await?;
     assert_eq!(
@@ -2149,6 +2153,7 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     // removing a saved one is asked on a link of its own too
     app.dispatch(AppAction::RemoveSession {
         session: "discord".to_owned(),
+        host: SessionHost::Gateway,
     });
     let (_removing, mut send, mut receive) = gateway.next_takeover().await?;
     assert_eq!(
@@ -2166,6 +2171,191 @@ async fn the_sessions_are_listed_started_and_closed() -> TestResult {
     send.write_all(&encode_message(&listed)?).await?;
     let state = until(&app, |state| names(state) == ["github"]).await?;
     assert_eq!(state.sessions.status, SessionsStatus::Listed);
+
+    Ok(())
+}
+
+/// A takeover link the fake spoke took, held open by whoever holds it
+type SpokeLink = (PhoneMessage, Connection, SendStream, RecvStream);
+
+/// A spoke's takeover endpoint: lists `running` to every listing, and
+/// passes on each Open with its link, which stays up while it is held
+async fn fake_spoke(
+    running: &'static str,
+) -> Result<(BrowserMachine, mpsc::UnboundedReceiver<SpokeLink>), Box<dyn Error>> {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(iroh::SecretKey::generate())
+        .alpns(vec![TAKEOVER_ALPN.to_vec()])
+        .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))?
+        .bind()
+        .await?;
+    let address = endpoint
+        .bound_sockets()
+        .into_iter()
+        .find(SocketAddr::is_ipv4)
+        .ok_or("no IPv4 socket")?;
+    let machine = BrowserMachine {
+        name: "code".to_owned(),
+        id: endpoint.id(),
+        addrs: vec![address],
+        relay: None,
+    };
+    let (opens, opened) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let opens = opens.clone();
+            tokio::spawn(async move {
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                let Ok((mut send, mut receive)) = connection.accept_bi().await else {
+                    return;
+                };
+                let Ok(first) = read_phone(&mut receive).await else {
+                    return;
+                };
+                if first != PhoneMessage::Sessions {
+                    let _ = opens.send((first, connection, send, receive));
+
+                    return;
+                }
+                let listed = GatewayMessage::Sessions {
+                    running: vec![RunningSession {
+                        name: running.to_owned(),
+                        url: None,
+                        title: None,
+                    }],
+                    saved: Vec::new(),
+                    last_pages: Default::default(),
+                    machines: Vec::new(),
+                };
+                if let Ok(frame) = encode_message(&listed) {
+                    let _ = send.write_all(&frame).await;
+                }
+                let _ = connection.closed().await;
+            });
+        }
+    });
+
+    Ok((machine, opened))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gateways_machines_are_listed_and_dialed_on_their_own() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _platform, _recorder) = paired(&gateway).await?;
+    let (spoke, mut opened) = fake_spoke("ci").await?;
+    // a machine that is off: its port answers nothing
+    let off = BrowserMachine {
+        name: "attic".to_owned(),
+        id: iroh::SecretKey::generate().public(),
+        addrs: vec![SocketAddr::from(([127, 0, 0, 1], 9))],
+        relay: None,
+    };
+
+    // a takeover of a machine the phone has not heard of asks the gateway
+    // for a listing first, and dials the machine the listing names
+    app.dispatch(AppAction::OpenTakeover {
+        session: "ci".to_owned(),
+        handoff: None,
+        host: SessionHost::Machine {
+            name: "code".to_owned(),
+        },
+    });
+    app.takeover(TakeoverInput::Resize {
+        width: 390,
+        height: 664,
+        scale: 3.0,
+    });
+    let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    let listed = GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: vec!["github".to_owned()],
+        last_pages: Default::default(),
+        machines: vec![spoke.clone(), off.clone()],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+
+    let (open, _link, _send, _receive) =
+        tokio::time::timeout(Duration::from_secs(10), opened.recv())
+            .await?
+            .ok_or("the spoke stopped")?;
+    assert_eq!(
+        open,
+        PhoneMessage::Open {
+            session: "ci".to_owned(),
+            handoff: None,
+            viewport: Viewport {
+                width: 390,
+                height: 664,
+                scale: 3.0,
+            },
+            start: None,
+        }
+    );
+    assert_eq!(
+        app.state().takeover.map(|takeover| takeover.host),
+        Some(SessionHost::Machine {
+            name: "code".to_owned()
+        })
+    );
+
+    // each machine has its own section; the one that is off shows as
+    // unreachable, without holding up the others
+    let state = until(&app, |state| {
+        state
+            .sessions
+            .machines
+            .iter()
+            .all(|section| section.status != SessionsStatus::Loading)
+    })
+    .await?;
+    let names: Vec<&str> = state
+        .sessions
+        .machines
+        .iter()
+        .map(|section| section.name.as_str())
+        .collect();
+    assert_eq!(names, ["attic", "code"]);
+    assert!(matches!(
+        &state.sessions.machines[0].status,
+        SessionsStatus::Unreachable { message } if message.starts_with("attic is unreachable")
+    ));
+    assert_eq!(state.sessions.machines[1].status, SessionsStatus::Listed);
+    assert_eq!(
+        state.sessions.machines[1].running,
+        [BrowserSession {
+            name: "ci".to_owned(),
+            url: None,
+            title: None,
+        }]
+    );
+    assert_eq!(state.sessions.saved[0].name, "github");
+
+    // a handoff of a machine's session shows where it runs
+    let id = RequestId::generate();
+    let handoff = PhoneHandoff {
+        id: id.clone(),
+        session: "ci".to_owned(),
+        reason: None,
+        url: None,
+        expires_in_ms: 60_000,
+        machine: Some(spoke),
+    };
+    let answered = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.offer_handoff(handoff).await }
+    });
+    let state = until(&app, |state| !state.handoffs.is_empty()).await?;
+    assert_eq!(
+        state.handoffs[0].host,
+        SessionHost::Machine {
+            name: "code".to_owned()
+        }
+    );
+    app.dispatch(AppAction::CancelHandoff { id: id.to_string() });
+    assert_eq!(answered.await??, HandoffAnswer::Cancelled);
 
     Ok(())
 }

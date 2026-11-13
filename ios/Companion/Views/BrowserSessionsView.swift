@@ -1,27 +1,80 @@
 import CompanionCore
 import SwiftUI
 
-/// The gateway's browser sessions: the handoffs waiting on the owner, the
-/// sessions running, which any can take over or close, the saved ones to
-/// start again or remove, and New session
+/// The browser sessions: the gateway's, then a section for each machine the
+/// gateway vouches for, such as a Linux spoke, which the phone lists on a
+/// link of its own; New session starts one on any of them
 struct BrowserSessionsSection: View {
     @Environment(AppManager.self) private var manager
     let gatewayName: String
     /// The session New session starts, while its sheet is up; the list
     /// holds the sheet, since a section's own modifiers do not reliably run
     @Binding var starting: NewSession?
+
+    var body: some View {
+        let sessions = manager.state.sessions
+        let waiting = manager.state.handoffs.filter { !$0.status.isFinished }
+        HostSessionsSection(
+            host: .gateway,
+            place: gatewayName,
+            title: "Browser sessions",
+            status: sessions.status,
+            running: sessions.running,
+            saved: sessions.saved,
+            waiting: waiting.filter { $0.host == .gateway },
+            starting: $starting
+        ) {
+            Button {
+                starting = NewSession(name: "", host: .gateway, movable: true)
+            } label: {
+                Label("New session", systemImage: "plus")
+            }
+        }
+        ForEach(sessions.machines, id: \.name) { machine in
+            let host = SessionHost.machine(name: machine.name)
+            HostSessionsSection(
+                host: host,
+                place: machine.name,
+                title: "Browser on \(machine.name)",
+                status: machine.status,
+                running: machine.running,
+                saved: machine.saved,
+                waiting: waiting.filter { $0.host == host },
+                starting: $starting
+            ) {
+                EmptyView()
+            }
+        }
+    }
+}
+
+/// One machine's browser sessions: the handoffs waiting on the owner, the
+/// sessions running, which any can take over or close, and the saved ones
+/// to start again or remove
+private struct HostSessionsSection<Extra: View>: View {
+    @Environment(AppManager.self) private var manager
+    let host: SessionHost
+    /// The machine's name, as the owner knows it
+    let place: String
+    let title: String
+    let status: SessionsStatus
+    let running: [BrowserSession]
+    let saved: [SavedSession]
+    /// The handoffs waiting on this machine's sessions
+    let waiting: [PendingHandoff]
+    @Binding var starting: NewSession?
+    /// Rows after the sessions, such as New session
+    @ViewBuilder let extra: Extra
     /// The running session whose Close waits on the owner's confirmation
     @State private var closing: String?
     /// The saved session whose Remove waits on the owner's confirmation
     @State private var removing: String?
 
     var body: some View {
-        let sessions = manager.state.sessions
-        let waiting = manager.state.handoffs.filter { !$0.status.isFinished }
         Section {
             ForEach(waiting, id: \.id) { handoff in
                 Button {
-                    manager.dispatch(.openTakeover(session: handoff.session, handoff: handoff.id))
+                    manager.dispatch(.openTakeover(session: handoff.session, handoff: handoff.id, host: host))
                 } label: {
                     SessionRow(
                         name: handoff.session,
@@ -33,9 +86,9 @@ struct BrowserSessionsSection: View {
             }
             // a session with a waiting handoff shows once, as the handoff, so
             // Done there answers the agent
-            ForEach(sessions.running.filter { session in !waiting.contains { $0.session == session.name } }, id: \.name) { session in
+            ForEach(running.filter { session in !waiting.contains { $0.session == session.name } }, id: \.name) { session in
                 Button {
-                    manager.dispatch(.openTakeover(session: session.name, handoff: nil))
+                    manager.dispatch(.openTakeover(session: session.name, handoff: nil, host: host))
                 } label: {
                     SessionRow(name: session.name, detail: session.detail, icon: "safari", tint: .accentColor)
                 }
@@ -57,21 +110,21 @@ struct BrowserSessionsSection: View {
                     titleVisibility: .visible
                 ) {
                     Button("Close Session", role: .destructive) {
-                        manager.dispatch(.closeSession(session: session.name))
+                        manager.dispatch(.closeSession(session: session.name, host: host))
                     }
                 } message: {
-                    Text("Its browser on \(gatewayName) quits, and an agent using it loses the page. Its saved sign-ins stay, so it starts again signed in.")
+                    Text("Its browser on \(place) quits, and an agent using it loses the page. Its saved sign-ins stay, so it starts again signed in.")
                 }
             }
-            ForEach(sessions.saved, id: \.name) { saved in
+            ForEach(saved, id: \.name) { saved in
                 let name = saved.name
                 // starts where it left off; only a session whose last page
-                // the gateway does not know asks for an address
+                // the machine does not know asks for an address
                 Button {
                     if let page = saved.lastPage {
-                        manager.dispatch(.startSession(session: name, url: page))
+                        manager.dispatch(.startSession(session: name, url: page, host: host))
                     } else {
-                        starting = NewSession(name: name)
+                        starting = NewSession(name: name, host: host, movable: false)
                     }
                 } label: {
                     SessionRow(name: name, detail: saved.detail, icon: "moon.zzz", tint: .secondary)
@@ -82,7 +135,7 @@ struct BrowserSessionsSection: View {
                 }
                 .contextMenu {
                     Button("Start at Another Address", systemImage: "link") {
-                        starting = NewSession(name: name)
+                        starting = NewSession(name: name, host: host, movable: false)
                     }
                     Button("Remove Session", systemImage: "trash", role: .destructive) { removing = name }
                 }
@@ -95,24 +148,22 @@ struct BrowserSessionsSection: View {
                     titleVisibility: .visible
                 ) {
                     Button("Remove Session", role: .destructive) {
-                        manager.dispatch(.removeSession(session: name))
+                        manager.dispatch(.removeSession(session: name, host: host))
                     }
                 } message: {
-                    Text("Its saved sign-ins move to the Trash on \(gatewayName), and it leaves this list.")
+                    Text("Its saved sign-ins move to the Trash on \(place), and it leaves this list.")
                 }
             }
-            Button {
-                starting = NewSession(name: "")
-            } label: {
-                Label("New session", systemImage: "plus")
-            }
+            extra
         } header: {
             HStack {
-                Text("Browser sessions")
+                Text(title)
                 Spacer()
-                if sessions.status == .loading {
+                if status == .loading {
                     ProgressView().controlSize(.mini)
-                } else {
+                } else if host == .gateway {
+                    // lists the machines again too, since the gateway names
+                    // them
                     Button {
                         manager.dispatch(.refreshSessions)
                     } label: {
@@ -122,19 +173,64 @@ struct BrowserSessionsSection: View {
                 }
             }
         } footer: {
-            if case let .failed(message) = sessions.status {
+            switch status {
+            case let .failed(message):
                 Text(message).foregroundStyle(.red)
-            } else {
-                Text("Sessions of the browser on \(gatewayName). Take one over to use it here; agents keep using it after you leave. Swipe one to close or remove it.")
+            case let .unreachable(message):
+                Text(message).foregroundStyle(.orange)
+            case .idle, .loading, .listed:
+                Text(footer)
             }
+        }
+    }
+
+    private var footer: String {
+        switch host {
+        case .gateway:
+            "Sessions of the browser on \(place). Take one over to use it here; agents keep using it after you leave. Swipe one to close or remove it."
+        case .machine:
+            "Sessions of the browser on \(place), which this iPhone reaches directly. Take one over to use it here; swipe one to close or remove it."
         }
     }
 }
 
-/// The session New session starts, by name; empty for a new one
+/// The session New session starts, by name, and where; empty for a new one
 struct NewSession: Identifiable {
     let name: String
-    var id: String { name }
+    let host: SessionHost
+    /// Whether the owner may pick another machine; a saved session's
+    /// sign-ins live on its own
+    let movable: Bool
+    var id: String { "\(host.key)/\(name)" }
+}
+
+extension SessionHost {
+    /// The machine's name as the owner knows it, the gateway's own for the
+    /// gateway
+    func place(gatewayName: String) -> String {
+        switch self {
+        case .gateway: gatewayName
+        case let .machine(name): name
+        }
+    }
+
+    /// The machine a link or push names; a gateway that knows no machines
+    /// names none
+    init(machine: String?) {
+        guard let machine, !machine.isEmpty else {
+            self = .gateway
+            return
+        }
+        self = .machine(name: machine)
+    }
+
+    /// Tells hosts apart in an identity; a machine's name never has `/`
+    var key: String {
+        switch self {
+        case .gateway: ""
+        case let .machine(name): "machine:\(name)"
+        }
+    }
 }
 
 private struct SessionRow: View {
@@ -178,14 +274,20 @@ extension BrowserSession {
     }
 }
 
-/// Names a session and the https address it starts at. A saved session
-/// launches with its profile, so a site it signed in to before still is
+/// Names a session, the machine it runs on and the https address it starts
+/// at. A saved session launches with its profile, so a site it signed in to
+/// before still is
 struct NewSessionSheet: View {
     @Environment(\.dismiss) private var dismiss
     let gatewayName: String
-    let onStart: (String, String) -> Void
+    /// The machines besides the gateway New session can start on
+    let machines: [String]
+    /// Whether the owner may pick the machine
+    let movable: Bool
+    let onStart: (String, String, SessionHost) -> Void
 
     @State private var name: String
+    @State private var host: SessionHost
     @State private var address = ""
     @FocusState private var focused: Field?
 
@@ -193,15 +295,33 @@ struct NewSessionSheet: View {
         case name, address
     }
 
-    init(name: String, gatewayName: String, onStart: @escaping (String, String) -> Void) {
-        _name = State(initialValue: name)
+    init(
+        session: NewSession,
+        gatewayName: String,
+        machines: [String],
+        onStart: @escaping (String, String, SessionHost) -> Void
+    ) {
+        _name = State(initialValue: session.name)
+        _host = State(initialValue: session.host)
+        movable = session.movable
         self.gatewayName = gatewayName
+        self.machines = machines
         self.onStart = onStart
     }
 
     var body: some View {
         NavigationStack {
             Form {
+                if movable, !machines.isEmpty {
+                    Section {
+                        Picker("Runs on", selection: $host) {
+                            Text(gatewayName).tag(SessionHost.gateway)
+                            ForEach(machines, id: \.self) { machine in
+                                Text(machine).tag(SessionHost.machine(name: machine))
+                            }
+                        }
+                    }
+                }
                 Section {
                     TextField("Name, such as github", text: $name)
                         .focused($focused, equals: .name)
@@ -240,7 +360,7 @@ struct NewSessionSheet: View {
         if !name.isEmpty, !Self.valid(name: name) {
             return "A name is letters, digits, - and _."
         }
-        return "Opens in the browser on \(gatewayName), with the session's saved sign-ins when it has some."
+        return "Opens in the browser on \(host.place(gatewayName: gatewayName)), with the session's saved sign-ins when it has some."
     }
 
     /// The address as `https`, which is all a session starts at
@@ -256,7 +376,7 @@ struct NewSessionSheet: View {
 
     private func start() {
         guard Self.valid(name: name), let url else { return }
-        onStart(name, url)
+        onStart(name, url, host)
         dismiss()
     }
 }

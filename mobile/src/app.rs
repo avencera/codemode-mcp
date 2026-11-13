@@ -19,7 +19,7 @@ use companion_wire::{
         ProgramItem as WireProgramItem, PushEnvironment as WirePushEnvironment, PushToken,
         RequestId,
     },
-    takeover::PhoneMessage,
+    takeover::{BrowserMachine, PhoneMessage, RunningSession},
     wire::{
         CompanionErrorCode, CompanionFault, CompanionResponse, MAX_DESCRIPTION_CHARS,
         MAX_DESTINATION_CHARS, MAX_PROGRAM_ITEMS, MAX_REASON_CHARS, PairCheck,
@@ -33,17 +33,17 @@ use crate::{
     connection::{ConnArgs, ConnMsg, ConnectionActor},
     ffi::{
         AppAction, AppState, BrowserSession, BrowserSessions, ConnectionState, HandoffStatus,
-        PairingState, PendingHandoff, PendingRead, Platform, ProgramItem, ProgramRead,
-        PushEnvironment, ReadStatus, Reconciler, SavedSession, SessionsStatus, SignIn, TakeoverEnd,
-        TakeoverInput, TakeoverState, TakeoverStatus, Update,
+        MachineSessions, PairingState, PendingHandoff, PendingRead, Platform, ProgramItem,
+        ProgramRead, PushEnvironment, ReadStatus, Reconciler, SavedSession, SessionHost,
+        SessionsStatus, SignIn, TakeoverEnd, TakeoverInput, TakeoverState, TakeoverStatus, Update,
     },
     handoff::{Handoffs, Offer},
-    pairing,
+    net, pairing,
     record::{GatewayRecord, load_key},
     request::{Asked, Entered, RequestActor, RequestArgs, RequestMsg, Secret, keep_secs},
     takeover::{
-        Listing, SessionChange, TakeoverActor, TakeoverArgs, TakeoverEvent, TakeoverMsg,
-        list_sessions,
+        BrowserHost, ListAt, ListFailure, Listing, SessionChange, TakeoverActor, TakeoverArgs,
+        TakeoverEvent, TakeoverMsg, list_sessions,
     },
 };
 
@@ -65,6 +65,9 @@ const MAX_SUMMARY_CHARS: usize = 200;
 const MAX_NAME_CHARS: usize = 128;
 /// Longest page address a handoff's card shows
 const MAX_URL_CHARS: usize = 1024;
+/// How long dialing a machine the gateway lists may take before it shows
+/// as unreachable; short, so one that is off does not hold its section up
+const MACHINE_DIAL: Duration = Duration::from_secs(8);
 
 /// How a read's stream ended without an answer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,8 +165,18 @@ pub enum AppMsg {
     /// Lends the connection's endpoint to a takeover; `None` while there is
     /// no connection actor
     Endpoint(RpcReplyPort<Option<Endpoint>>),
-    /// A listing of the browser sessions finished
-    Sessions(Result<Listing, String>),
+    /// A listing of the gateway's browser sessions finished
+    Sessions(Result<Listing, ListFailure>),
+    /// A listing of a machine's browser sessions finished
+    MachineSessions {
+        /// The machine
+        name: String,
+        /// The round of listings it belongs to; one from an earlier round
+        /// is ignored
+        round: u64,
+        /// What it listed
+        listed: Result<Listing, ListFailure>,
+    },
     /// A read's or handoff's stream ended without an answer
     StreamEnded {
         /// The read
@@ -456,6 +469,12 @@ fn malformed(program: &PhoneProgramRead) -> Option<String> {
 
 /// A handoff as its card shows it
 fn handoff_card(handoff: &PhoneHandoff, gateway_name: &str) -> PendingHandoff {
+    let host = match &handoff.machine {
+        Some(machine) => SessionHost::Machine {
+            name: machine.name.clone(),
+        },
+        None => SessionHost::Gateway,
+    };
     let reason = handoff
         .reason
         .as_deref()
@@ -472,6 +491,7 @@ fn handoff_card(handoff: &PhoneHandoff, gateway_name: &str) -> PendingHandoff {
             .as_deref()
             .map(|url| one_line(url, MAX_URL_CHARS)),
         gateway_name: gateway_name.to_owned(),
+        host,
         expires_at_ms: now_ms() + i64::try_from(handoff.expires_in_ms).unwrap_or(i64::MAX),
         status: HandoffStatus::Waiting,
     }
@@ -488,6 +508,27 @@ fn session_name(session: &str) -> Option<String> {
             .any(|character| character.is_control() || character.is_whitespace());
 
     plain.then(|| session.to_owned())
+}
+
+/// A running session as the list shows it
+fn shown_session(session: RunningSession) -> BrowserSession {
+    BrowserSession {
+        name: session.name,
+        url: session.url,
+        title: session.title,
+    }
+}
+
+/// How a failed listing shows
+fn failed_status(failure: ListFailure) -> SessionsStatus {
+    match failure {
+        ListFailure::Unreachable(message) => SessionsStatus::Unreachable {
+            message: one_line(&message, MAX_REASON_CHARS),
+        },
+        ListFailure::Failed(message) => SessionsStatus::Failed {
+            message: one_line(&message, MAX_REASON_CHARS),
+        },
+    }
 }
 
 fn now_ms() -> i64 {
@@ -538,6 +579,27 @@ pub struct AppActorState {
     takeover: Option<ActorRef<TakeoverMsg>>,
     /// Counts takeovers, so the reports of one replaced are ignored
     takeover_generation: u64,
+    /// The machines with browser sessions the gateway vouched for, by name,
+    /// from its last listing or a handoff
+    machines: HashMap<String, BrowserMachine>,
+    /// Counts the gateway's listings, each of which lists its machines anew
+    machine_round: u64,
+    /// A takeover asked for on a machine not known yet, opened once a
+    /// listing names it
+    waiting_open: Option<TakeoverAsk>,
+}
+
+/// A takeover the owner asked for
+#[derive(Debug, Clone)]
+struct TakeoverAsk {
+    session: String,
+    handoff: Option<String>,
+    /// The address to start the session at
+    start: Option<String>,
+    host: SessionHost,
+    /// The image area the app gave while the takeover waited on a listing,
+    /// handed to it once it starts
+    resize: Option<TakeoverInput>,
 }
 
 pub struct App;
@@ -681,15 +743,33 @@ impl App {
                     state.shared.set_handoff(&id, status);
                 }
             }
-            AppAction::OpenTakeover { session, handoff } => {
-                Self::open_takeover(myself, state, &session, handoff.as_deref(), None).await;
+            AppAction::OpenTakeover {
+                session,
+                handoff,
+                host,
+            } => {
+                let ask = TakeoverAsk {
+                    session,
+                    handoff,
+                    start: None,
+                    host,
+                    resize: None,
+                };
+                Self::open_takeover(myself, state, ask).await;
             }
-            AppAction::StartSession { session, url } => {
-                Self::open_takeover(myself, state, &session, None, Some(url)).await;
+            AppAction::StartSession { session, url, host } => {
+                let ask = TakeoverAsk {
+                    session,
+                    handoff: None,
+                    start: Some(url),
+                    host,
+                    resize: None,
+                };
+                Self::open_takeover(myself, state, ask).await;
             }
             AppAction::CloseTakeover => Self::close_takeover(state),
             AppAction::RefreshSessions => Self::refresh_sessions(myself, state, None),
-            AppAction::CloseSession { session } => {
+            AppAction::CloseSession { session, host } => {
                 let Some(session) = session_name(&session) else {
                     tracing::warn!("a close was asked for a session name no gateway uses");
 
@@ -698,18 +778,20 @@ impl App {
                 // a takeover of it, put aside for the list, would only end
                 // with its browser
                 let shown = state.shared.state().takeover;
-                if shown.is_some_and(|takeover| takeover.session == session) {
+                if shown
+                    .is_some_and(|takeover| takeover.session == session && takeover.host == host)
+                {
                     Self::close_takeover(state);
                 }
-                Self::refresh_sessions(myself, state, Some(SessionChange::Close(session)));
+                Self::change_sessions(myself, state, host, SessionChange::Close(session));
             }
-            AppAction::RemoveSession { session } => {
+            AppAction::RemoveSession { session, host } => {
                 let Some(session) = session_name(&session) else {
                     tracing::warn!("a removal was asked for a session name no gateway uses");
 
                     return;
                 };
-                Self::refresh_sessions(myself, state, Some(SessionChange::Remove(session)));
+                Self::change_sessions(myself, state, host, SessionChange::Remove(session));
             }
             AppAction::Unpair => {
                 if state.record.is_none() {
@@ -830,39 +912,237 @@ impl App {
         state
             .shared
             .change_sessions(|sessions| sessions.status = SessionsStatus::Loading);
-        let address = record.endpoint_addr();
+        let at = ListAt {
+            address: record.endpoint_addr(),
+            name: record.name.clone(),
+            dial: net::DIAL_TIMEOUT,
+        };
         let myself = myself.clone();
         tokio::spawn(async move {
-            let listed = list_sessions(myself.clone(), address, change).await;
+            let listed = list_sessions(myself.clone(), at, change).await;
             let _ = myself.cast(AppMsg::Sessions(listed));
         });
     }
 
-    /// Opens a takeover of `session`, for `handoff` if set and starting it at
-    /// `start` if set, replacing any open one; a session or handoff id a link
-    /// made up is refused
-    async fn open_takeover(
+    /// Makes `change` to a session on `host`, then lists that machine's
+    /// sessions again
+    fn change_sessions(
         myself: &ActorRef<AppMsg>,
         state: &mut AppActorState,
-        session: &str,
-        handoff: Option<&str>,
-        start: Option<String>,
+        host: SessionHost,
+        change: SessionChange,
     ) {
+        match host {
+            SessionHost::Gateway => Self::refresh_sessions(myself, state, Some(change)),
+            SessionHost::Machine { name } => {
+                Self::list_machine(myself, state, &name, Some(change));
+            }
+        }
+    }
+
+    /// Asks machine `name` for its browser sessions, after making `change`
+    /// if set, on a link of its own, in a spawned task that reports back as
+    /// [`AppMsg::MachineSessions`]
+    fn list_machine(
+        myself: &ActorRef<AppMsg>,
+        state: &mut AppActorState,
+        name: &str,
+        change: Option<SessionChange>,
+    ) {
+        let (Some(record), Some(machine)) = (&state.record, state.machines.get(name)) else {
+            tracing::warn!("a listing was asked of a machine the gateway does not list");
+
+            return;
+        };
+        let at = ListAt {
+            address: BrowserHost::Machine(machine.clone()).endpoint_addr(record),
+            name: name.to_owned(),
+            dial: MACHINE_DIAL,
+        };
+        state.shared.change_sessions(|sessions| {
+            if let Some(section) = sessions
+                .machines
+                .iter_mut()
+                .find(|section| section.name == name)
+            {
+                section.status = SessionsStatus::Loading;
+            }
+        });
+        let round = state.machine_round;
+        let name = name.to_owned();
+        let myself = myself.clone();
+        tokio::spawn(async move {
+            let listed = list_sessions(myself.clone(), at, change).await;
+            let _ = myself.cast(AppMsg::MachineSessions {
+                name,
+                round,
+                listed,
+            });
+        });
+    }
+
+    /// Shows the gateway's listing, keeps the machines it names and lists
+    /// each of them anew, all at once, and opens a takeover that waited on
+    /// one of them
+    async fn gateway_listed(
+        myself: &ActorRef<AppMsg>,
+        state: &mut AppActorState,
+        listed: Result<Listing, ListFailure>,
+    ) {
+        let listing = match listed {
+            Ok(listing) => listing,
+            Err(failure) => {
+                state
+                    .shared
+                    .change_sessions(|sessions| sessions.status = failed_status(failure.clone()));
+                if let Some(ask) = state.waiting_open.take() {
+                    let message = failure.into_message();
+                    Self::takeover_ended(state, TakeoverEnd::Failed, Some(message));
+                    tracing::debug!(session = %ask.session, "a waiting takeover's listing failed");
+                }
+
+                return;
+            }
+        };
+
+        let Listing {
+            running,
+            saved,
+            mut last_pages,
+            machines,
+        } = listing;
+        state.machines = machines
+            .into_iter()
+            .map(|machine| (machine.name.clone(), machine))
+            .collect();
+        let mut names: Vec<String> = state.machines.keys().cloned().collect();
+        names.sort();
+        state.shared.change_sessions(|sessions| {
+            let before = std::mem::take(&mut sessions.machines);
+            *sessions = BrowserSessions {
+                status: SessionsStatus::Listed,
+                running: running.into_iter().map(shown_session).collect(),
+                saved: saved
+                    .into_iter()
+                    .map(|name| SavedSession {
+                        last_page: last_pages.remove(&name),
+                        name,
+                    })
+                    .collect(),
+                // each keeps its last listing while it is asked again
+                machines: names
+                    .iter()
+                    .map(|name| {
+                        let kept = before.iter().find(|section| section.name == *name);
+                        MachineSessions {
+                            name: name.clone(),
+                            status: SessionsStatus::Loading,
+                            running: kept.map(|kept| kept.running.clone()).unwrap_or_default(),
+                            saved: kept.map(|kept| kept.saved.clone()).unwrap_or_default(),
+                        }
+                    })
+                    .collect(),
+            };
+        });
+        state.machine_round = state.machine_round.wrapping_add(1);
+        for name in &names {
+            Self::list_machine(myself, state, name, None);
+        }
+
+        let Some(ask) = state.waiting_open.take() else {
+            return;
+        };
+        if let SessionHost::Machine { name } = &ask.host
+            && !state.machines.contains_key(name)
+        {
+            let gateway = state
+                .record
+                .as_ref()
+                .map(|record| record.name.clone())
+                .unwrap_or_default();
+            let message = format!("{gateway} lists no browser on {name} now");
+            Self::takeover_ended(state, TakeoverEnd::Failed, Some(message));
+
+            return;
+        }
+        Self::open_takeover(myself, state, ask).await;
+    }
+
+    /// Shows machine `name`'s listing, unless a newer round of listings
+    /// started since it was asked
+    fn machine_listed(
+        state: &mut AppActorState,
+        name: &str,
+        round: u64,
+        listed: Result<Listing, ListFailure>,
+    ) {
+        if round != state.machine_round {
+            return;
+        }
+        state.shared.change_sessions(|sessions| {
+            let Some(section) = sessions
+                .machines
+                .iter_mut()
+                .find(|section| section.name == name)
+            else {
+                return;
+            };
+            // a failure keeps the last listing showing
+            let Listing {
+                running,
+                saved,
+                mut last_pages,
+                ..
+            } = match listed {
+                Ok(listing) => listing,
+                Err(failure) => {
+                    section.status = failed_status(failure);
+
+                    return;
+                }
+            };
+            section.status = SessionsStatus::Listed;
+            section.running = running.into_iter().map(shown_session).collect();
+            section.saved = saved
+                .into_iter()
+                .map(|name| SavedSession {
+                    last_page: last_pages.remove(&name),
+                    name,
+                })
+                .collect();
+        });
+    }
+
+    /// Opens a takeover of `ask.session` on its machine, for its handoff if
+    /// set and starting it at its address if set, replacing any open one; a
+    /// session or handoff id a link made up is refused. A machine the phone
+    /// has not heard of yet is looked up in a new listing first
+    async fn open_takeover(myself: &ActorRef<AppMsg>, state: &mut AppActorState, ask: TakeoverAsk) {
         let Some(record) = state.record.clone() else {
             return;
         };
-        let Some(session) = session_name(session) else {
+        let Some(session) = session_name(&ask.session) else {
             tracing::warn!("a takeover was asked for a session name no gateway uses");
 
             return;
         };
-        let handoff = handoff.and_then(|id| RequestId::try_from(id.to_owned()).ok());
+        let handoff = ask
+            .handoff
+            .as_deref()
+            .and_then(|id| RequestId::try_from(id.to_owned()).ok());
+        let host = match &ask.host {
+            SessionHost::Gateway => Some(BrowserHost::Gateway),
+            SessionHost::Machine { name } => {
+                state.machines.get(name).cloned().map(BrowserHost::Machine)
+            }
+        };
 
         // the same takeover asked for again, such as a push tapped twice,
         // keeps its link
-        let open = start.is_none()
+        let open = ask.start.is_none()
             && state.shared.state().takeover.is_some_and(|shown| {
                 shown.session == session
+                    && shown.host == ask.host
                     && shown.handoff == handoff.as_ref().map(ToString::to_string)
                     && !matches!(shown.status, TakeoverStatus::Ended { .. })
             });
@@ -874,6 +1154,7 @@ impl App {
         state.takeover_generation = state.takeover_generation.wrapping_add(1);
         let shown = TakeoverState {
             session: session.clone(),
+            host: ask.host.clone(),
             handoff: handoff.as_ref().map(ToString::to_string),
             status: TakeoverStatus::Connecting,
             page: None,
@@ -891,18 +1172,38 @@ impl App {
             let _ = connection.cast(ConnMsg::Connect);
         }
 
+        // only the gateway can say where a machine it has not listed yet is
+        let Some(host) = host else {
+            state.waiting_open = Some(TakeoverAsk {
+                session,
+                handoff: ask.handoff,
+                start: ask.start,
+                host: ask.host,
+                resize: ask.resize,
+            });
+            Self::refresh_sessions(myself, state, None);
+
+            return;
+        };
+        state.waiting_open = None;
         let args = TakeoverArgs {
             session,
             handoff,
-            start,
+            start: ask.start,
             generation: state.takeover_generation,
             record,
+            host,
             platform: Arc::clone(&state.platform),
             app: myself.clone(),
             foreground: state.foreground,
         };
         match Actor::spawn_linked(None, TakeoverActor, args, myself.get_cell()).await {
-            Ok((takeover, _)) => state.takeover = Some(takeover),
+            Ok((takeover, _)) => {
+                if let Some(resize) = ask.resize {
+                    let _ = takeover.cast(TakeoverMsg::Input(resize));
+                }
+                state.takeover = Some(takeover);
+            }
             Err(error) => {
                 tracing::error!(%error, "cannot start a takeover");
                 Self::takeover_ended(state, TakeoverEnd::Failed, Some(error.to_string()));
@@ -1013,11 +1314,16 @@ impl App {
             return;
         };
         let id = handoff.id.to_string();
+        let card = handoff_card(&handoff, &record.name);
+        // the gateway vouches for the machine over its own link, so a
+        // takeover of the handoff can dial it before any listing
+        if let Some(machine) = handoff.machine.clone() {
+            state.machines.insert(machine.name.clone(), machine);
+        }
         if state.handoffs.offer(&id, seq, responder) == Offer::Again {
             return;
         }
 
-        let card = handoff_card(&handoff, &record.name);
         state.shared.change_handoffs(|handoffs| {
             match handoffs.iter_mut().find(|shown| shown.id == id) {
                 Some(shown) => *shown = card,
@@ -1260,6 +1566,9 @@ impl Actor for App {
             handoffs: Handoffs::default(),
             takeover: None,
             takeover_generation: 0,
+            machines: HashMap::new(),
+            machine_round: 0,
+            waiting_open: None,
         })
     }
 
@@ -1328,7 +1637,9 @@ impl Actor for App {
                     had
                 });
                 state.shared.set_pairing(PairingState::Idle);
-                // the sessions were the old gateway's
+                // the sessions and machines were the old gateway's
+                state.machines.clear();
+                state.waiting_open = None;
                 state
                     .shared
                     .change_sessions(|sessions| *sessions = BrowserSessions::default());
@@ -1369,6 +1680,10 @@ impl Actor for App {
             AppMsg::Takeover(input) => {
                 if let Some(takeover) = &state.takeover {
                     let _ = takeover.cast(TakeoverMsg::Input(input));
+                } else if let Some(waiting) = &mut state.waiting_open
+                    && matches!(input, TakeoverInput::Resize { .. })
+                {
+                    waiting.resize = Some(input);
                 }
             }
             AppMsg::TakeoverSend(message) => {
@@ -1383,37 +1698,13 @@ impl Actor for App {
             }
             // a listing that finishes after an unpair was of the old gateway
             AppMsg::Sessions(_) if state.record.is_none() => {}
-            AppMsg::Sessions(listed) => state.shared.change_sessions(|sessions| match listed {
-                Ok(Listing {
-                    running,
-                    saved,
-                    mut last_pages,
-                }) => {
-                    *sessions = BrowserSessions {
-                        status: SessionsStatus::Listed,
-                        running: running
-                            .into_iter()
-                            .map(|session| BrowserSession {
-                                name: session.name,
-                                url: session.url,
-                                title: session.title,
-                            })
-                            .collect(),
-                        saved: saved
-                            .into_iter()
-                            .map(|name| SavedSession {
-                                last_page: last_pages.remove(&name),
-                                name,
-                            })
-                            .collect(),
-                    };
-                }
-                Err(message) => {
-                    sessions.status = SessionsStatus::Failed {
-                        message: one_line(&message, MAX_REASON_CHARS),
-                    };
-                }
-            }),
+            AppMsg::Sessions(listed) => Self::gateway_listed(&myself, state, listed).await,
+            AppMsg::MachineSessions { .. } if state.record.is_none() => {}
+            AppMsg::MachineSessions {
+                name,
+                round,
+                listed,
+            } => Self::machine_listed(state, &name, round, listed),
             AppMsg::Endpoint(reply) => match &state.connection {
                 Some(connection) => {
                     let _ = connection.cast(ConnMsg::Endpoint(reply));

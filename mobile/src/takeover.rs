@@ -1,9 +1,12 @@
 //! The takeover actor: one live view of a browser session on the gateway
-//! Mac, from the owner's Take over (or a handoff's push or link) until Done,
-//! Cancel, leaving it, or the gateway ending it
+//! Mac or a machine it vouches for, from the owner's Take over (or a
+//! handoff's push or link) until Done, Cancel, leaving it, or the session's
+//! machine ending it
 //!
-//! It dials the gateway on [`TAKEOVER_ALPN`] as the paired phone, from the
-//! connection actor's endpoint, opens one stream and sends
+//! It dials the session's machine on [`TAKEOVER_ALPN`] as the paired phone,
+//! from the connection actor's endpoint: the gateway, or a spoke at the
+//! address the gateway listed it under (see [`BrowserHost`]), which lets in
+//! the phones the gateway paired. It opens one stream and sends
 //! [`PhoneMessage::Open`] once the app has said how big the image area is.
 //! Frames are read and written in spawned tasks that report back as
 //! messages, so a handler never waits on the network. Each image goes to the
@@ -12,18 +15,21 @@
 //! that drops while the app is in the foreground is dialed again with the
 //! connection's backoff, and the takeover opens anew on it
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use zeroize::Zeroizing;
 
 use companion_wire::{
     mobile::{LoginField as WireLoginField, RequestId, seal_info},
     takeover::{
-        EndReason, FillOffer as WireFillOffer, Focus, GatewayFrame, GatewayMessage, HEADER_BYTES,
-        Key, MAX_TEXT_CHARS, PhoneMessage, Point, RunningSession, Secret as WireSecret,
-        TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
+        BrowserMachine, EndReason, FillOffer as WireFillOffer, Focus, GatewayFrame, GatewayMessage,
+        HEADER_BYTES, Key, MAX_TEXT_CHARS, PhoneMessage, Point, RunningSession,
+        Secret as WireSecret, TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
     },
 };
-use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
+use iroh::{
+    EndpointAddr, RelayUrl, TransportAddr,
+    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
+};
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::sync::mpsc;
 
@@ -45,6 +51,43 @@ const MAX_PAGE_TEXT_CHARS: usize = 1024;
 /// Longest the endpoint lookup may take; the connection actor answers at
 /// once unless it is restarting
 const ENDPOINT_TIMEOUT_MS: u64 = 2_000;
+
+/// Where a browser session runs, as the phone dials it
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserHost {
+    /// The paired gateway, at its record's address
+    Gateway,
+    /// A machine the gateway vouches for, at the address it listed
+    Machine(BrowserMachine),
+}
+
+impl BrowserHost {
+    /// Where to dial it; a takeover's fill offers are still sealed by the
+    /// gateway, under `record`'s id
+    pub fn endpoint_addr(&self, record: &GatewayRecord) -> EndpointAddr {
+        let Self::Machine(machine) = self else {
+            return record.endpoint_addr();
+        };
+        let ips = machine.addrs.iter().copied().map(TransportAddr::Ip);
+        // a relay helps only an endpoint that uses relays, which the
+        // connection's does when the gateway has discovery on
+        let relay = machine
+            .relay
+            .as_deref()
+            .and_then(|relay| relay.parse::<RelayUrl>().ok())
+            .map(TransportAddr::Relay);
+
+        EndpointAddr::from_parts(machine.id, ips.chain(relay))
+    }
+
+    /// The name the owner knows it by, as messages use it
+    pub fn name<'a>(&'a self, record: &'a GatewayRecord) -> &'a str {
+        match self {
+            Self::Gateway => &record.name,
+            Self::Machine(machine) => &machine.name,
+        }
+    }
+}
 
 /// What the takeover tells the app, which keeps it in [`crate::ffi::AppState`]
 pub enum TakeoverEvent {
@@ -115,8 +158,10 @@ pub struct TakeoverArgs {
     pub start: Option<String>,
     /// Tells this takeover's reports apart from those of one it replaced
     pub generation: u64,
-    /// The gateway to dial
+    /// The paired gateway, which seals the fill offers
     pub record: GatewayRecord,
+    /// Where the session runs, which is dialed
+    pub host: BrowserHost,
     /// For Face ID
     pub platform: Arc<dyn Platform>,
     /// Where reports go, and the endpoint comes from
@@ -144,6 +189,7 @@ pub struct TakeoverState {
     start: Option<String>,
     generation: u64,
     record: GatewayRecord,
+    host: BrowserHost,
     platform: Arc<dyn Platform>,
     app: ActorRef<AppMsg>,
     /// The image area, once the app has said; nothing is dialed before
@@ -239,10 +285,16 @@ impl TakeoverActor {
         let mut first = vec![open];
         first.extend(state.ending.clone());
         let app = state.app.clone();
-        let address = state.record.endpoint_addr();
+        let address = state.host.endpoint_addr(&state.record);
+        let name = state.host.name(&state.record).to_owned();
         let myself = myself.clone();
         tokio::spawn(async move {
-            let dialed = connect(app, address, first).await;
+            let dialed = connect(app, address, first, net::DIAL_TIMEOUT)
+                .await
+                .map_err(|failure| match failure {
+                    ListFailure::Unreachable(why) => format!("{name} is unreachable: {why}"),
+                    ListFailure::Failed(why) => why,
+                });
             let _ = myself.cast(TakeoverMsg::Dialed(dialed));
         });
     }
@@ -429,6 +481,8 @@ impl TakeoverActor {
             id: state.open_id(),
             reference: offer.reference.clone(),
             gateway_name: state.record.name.clone(),
+            // the gateway sealed it, for a spoke's page too, since only the
+            // gateway reads 1Password
             info: seal_info(&state.record.id, &offer.reference),
             enc: offer.sealed.enc.clone(),
             ciphertext: offer.sealed.ciphertext.clone(),
@@ -500,6 +554,7 @@ impl Actor for TakeoverActor {
             start: args.start,
             generation: args.generation,
             record: args.record,
+            host: args.host,
             platform: args.platform,
             app: args.app,
             viewport: None,
@@ -601,32 +656,48 @@ impl Actor for TakeoverActor {
     }
 }
 
-/// Dials the gateway on the takeover ALPN from the connection actor's
-/// endpoint, opens the stream and sends `first`, the Open and anything
-/// waiting on it
+/// Why a session's machine could not be asked
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListFailure {
+    /// It could not be dialed in time
+    Unreachable(String),
+    /// It answered, but not with what was asked
+    Failed(String),
+}
+
+impl ListFailure {
+    /// Why, in the owner's words
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Unreachable(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+/// Dials `address` on the takeover ALPN from the connection actor's
+/// endpoint, giving up after `dial`, opens the stream and sends `first`,
+/// the Open and anything waiting on it
 async fn connect(
     app: ActorRef<AppMsg>,
-    address: iroh::EndpointAddr,
+    address: EndpointAddr,
     first: Vec<PhoneMessage>,
-) -> Result<Link, String> {
+    dial: Duration,
+) -> Result<Link, ListFailure> {
     let endpoint = ractor::call_t!(app, AppMsg::Endpoint, ENDPOINT_TIMEOUT_MS)
-        .map_err(|error| error.to_string())?
-        .ok_or("not paired with a gateway")?;
+        .map_err(|error| ListFailure::Failed(error.to_string()))?
+        .ok_or_else(|| ListFailure::Failed("not paired with a gateway".to_owned()))?;
 
-    let connection =
-        tokio::time::timeout(net::DIAL_TIMEOUT, endpoint.connect(address, TAKEOVER_ALPN))
-            .await
-            .map_err(|_| "the gateway did not answer in time".to_owned())?
-            .map_err(|error| error.to_string())?;
-    let (mut send, receive) = connection
-        .open_bi()
+    let connection = tokio::time::timeout(dial, endpoint.connect(address, TAKEOVER_ALPN))
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| ListFailure::Unreachable("it did not answer in time".to_owned()))?
+        .map_err(|error| ListFailure::Unreachable(error.to_string()))?;
+    let failed = |error: &dyn std::fmt::Display| ListFailure::Failed(error.to_string());
+    let (mut send, receive) = connection.open_bi().await.map_err(|error| failed(&error))?;
     for message in &first {
-        let frame = encode_message(message).map_err(|error| error.to_string())?;
+        let frame = encode_message(message).map_err(|error| failed(&error))?;
         send.write_all(&frame)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| failed(&error))?;
     }
 
     Ok(Link {
@@ -638,16 +709,16 @@ async fn connect(
 
 /// How long the gateway may take to list its sessions, which it caps at
 /// about 13 seconds
-const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the gateway may take to close a session, which it caps at 45
 /// seconds, before it lists them
-const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How long a link whose stream ended may take to say why it closed
-const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
-/// The gateway's browser sessions, as it listed them
+/// A machine's browser sessions, as it listed them
 #[derive(Debug, Clone)]
 pub struct Listing {
     /// The sessions running
@@ -656,26 +727,39 @@ pub struct Listing {
     pub saved: Vec<String>,
     /// The `https` page each saved session was last on, by name
     pub last_pages: std::collections::BTreeMap<String, String>,
+    /// The other machines with browser sessions, which only the gateway
+    /// lists
+    pub machines: Vec<BrowserMachine>,
 }
 
-/// What the phone asks of the gateway's sessions before they are listed
+/// What the phone asks of a machine's sessions before they are listed
 #[derive(Debug, Clone)]
 pub enum SessionChange {
     /// Quit a session's browser
     Close(String),
-    /// Move a saved session's profile to the gateway's Trash
+    /// Move a saved session's profile to the machine's Trash
     Remove(String),
 }
 
-/// The gateway's browser sessions, after making `change` if set: dials as a
-/// takeover does, asks with [`PhoneMessage::Sessions`],
+/// The machine to list the sessions of
+pub struct ListAt {
+    /// Where to dial it
+    pub address: EndpointAddr,
+    /// The name the owner knows it by
+    pub name: String,
+    /// How long the dial may take
+    pub dial: Duration,
+}
+
+/// The browser sessions of the machine `at`, after making `change` if set:
+/// dials as a takeover does, asks with [`PhoneMessage::Sessions`],
 /// [`PhoneMessage::CloseSession`] or [`PhoneMessage::RemoveSession`], and
 /// reads the one answer
 pub async fn list_sessions(
     app: ActorRef<AppMsg>,
-    address: iroh::EndpointAddr,
+    at: ListAt,
     change: Option<SessionChange>,
-) -> Result<Listing, String> {
+) -> Result<Listing, ListFailure> {
     let (first, timeout, asked) = match change {
         Some(SessionChange::Close(session)) => (
             PhoneMessage::CloseSession { session },
@@ -689,15 +773,32 @@ pub async fn list_sessions(
         ),
         None => (PhoneMessage::Sessions, LIST_TIMEOUT, "list sessions"),
     };
-    let mut link = connect(app, address, vec![first]).await?;
+    let ListAt {
+        address,
+        name,
+        dial,
+    } = at;
+    let mut link =
+        connect(app, address, vec![first], dial)
+            .await
+            .map_err(|failure| match failure {
+                ListFailure::Unreachable(why) => {
+                    ListFailure::Unreachable(format!("{name} is unreachable: {why}"))
+                }
+                failed => failed,
+            })?;
     let _ = link.send.finish();
     let answer = tokio::time::timeout(timeout, read_frame(&mut link.receive))
         .await
-        .map_err(|_| format!("the gateway did not {asked} in time"))?;
+        .map_err(|_| ListFailure::Failed(format!("{name} did not {asked} in time")))?;
     let answer = match answer {
         Ok(frame) => frame,
-        // a gateway that cannot answer closes the link, its reason the close's
-        Err(error) => return Err(refusal(&link.connection, asked).await.unwrap_or(error)),
+        // a machine that cannot answer closes the link, its reason the close's
+        Err(error) => {
+            let refused = refusal(&link.connection, &name, asked).await;
+
+            return Err(ListFailure::Failed(refused.unwrap_or(error)));
+        }
     };
     link.connection.close(0_u32.into(), b"listed");
 
@@ -706,25 +807,28 @@ pub async fn list_sessions(
             running,
             saved,
             last_pages,
-            ..
+            machines,
         }) => Ok(Listing {
             running,
             saved,
             last_pages,
+            machines,
         }),
         GatewayFrame::Message(GatewayMessage::Ended {
             message: Some(message),
             ..
-        }) => Err(message),
-        _ => Err("the gateway answered something else; update codemode-mcp on it".to_owned()),
+        }) => Err(ListFailure::Failed(message)),
+        _ => Err(ListFailure::Failed(format!(
+            "{name} answered something else; update codemode-mcp on it"
+        ))),
     }
 }
 
-/// Why the gateway closed `connection`, in the owner's words, when it closed
-/// it for a reason a listing can meet: an older gateway, which takes only an
-/// Open and could not do what was `asked`, or one without the `browser`
-/// server
-async fn refusal(connection: &Connection, asked: &str) -> Option<String> {
+/// Why machine `name` closed `connection`, in the owner's words, when it
+/// closed it for a reason a listing can meet: an older gateway, which takes
+/// only an Open and could not do what was `asked`, one without the
+/// `browser` server, or a spoke that has not heard of this phone yet
+async fn refusal(connection: &Connection, name: &str, asked: &str) -> Option<String> {
     let closed = tokio::time::timeout(CLOSE_WAIT, connection.closed())
         .await
         .ok()?;
@@ -734,9 +838,13 @@ async fn refusal(connection: &Connection, asked: &str) -> Option<String> {
 
     match close.reason.as_ref() {
         b"expected open" => Some(format!(
-            "The gateway's codemode-mcp is too old to {asked}; update it"
+            "{name}'s codemode-mcp is too old to {asked}; update it"
         )),
-        b"no browser" => Some("The gateway has no `browser` server configured".to_owned()),
+        b"no browser" => Some(format!("{name} has no `browser` server configured")),
+        // a spoke learns the gateway's phones every half minute
+        b"not paired" => Some(format!(
+            "{name} does not know this phone yet; try again in a minute"
+        )),
         _ => None,
     }
 }

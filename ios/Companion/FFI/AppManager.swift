@@ -123,7 +123,9 @@ final class AppManager: Reconciler, @unchecked Sendable {
             state.sessions = sessions
         case let .takeover(takeover):
             // a new takeover, or none, starts without the last one's image
-            if takeover?.session != state.takeover?.session || takeover?.handoff != state.takeover?.handoff {
+            if takeover?.session != state.takeover?.session || takeover?.handoff != state.takeover?.handoff
+                || takeover?.host != state.takeover?.host
+            {
                 screen = nil
             }
             state.takeover = takeover

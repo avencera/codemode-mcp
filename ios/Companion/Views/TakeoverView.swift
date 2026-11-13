@@ -2,7 +2,8 @@ import CompanionCore
 import SwiftUI
 import UIKit
 
-/// A browser session on the gateway Mac, live on this phone: the page as an
+/// A browser session on the gateway or a machine it vouches for, live on
+/// this phone: the page as an
 /// image the owner taps, scrolls and types into, a key bar, Fill from
 /// 1Password, and for a handoff Done or Cancel to hand the session back to
 /// the agent.
@@ -357,7 +358,11 @@ struct TakeoverView: View {
         case .cancelled: "Cancelled."
         case .handoffOver: "The handoff is over: another device answered, the agent stopped waiting, or it expired."
         case .browserGone: "The browser session closed or could not be reached."
-        case .shutdown: "The gateway is stopping."
+        case .shutdown:
+            switch takeover.host {
+            case .gateway: "The gateway is stopping."
+            case let .machine(name): "codemode-mcp on \(name) is stopping."
+            }
         case .failed: "This iPhone could not keep the takeover going."
         }
     }

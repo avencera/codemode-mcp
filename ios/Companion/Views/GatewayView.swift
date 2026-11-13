@@ -19,8 +19,12 @@ struct GatewayView: View {
                 BrowserSessionsSection(gatewayName: gateway.name, starting: $starting)
             }
             .sheet(item: $starting) { session in
-                NewSessionSheet(name: session.name, gatewayName: gateway.name) { name, url in
-                    manager.dispatch(.startSession(session: name, url: url))
+                NewSessionSheet(
+                    session: session,
+                    gatewayName: gateway.name,
+                    machines: manager.state.sessions.machines.map(\.name)
+                ) { name, url, host in
+                    manager.dispatch(.startSession(session: name, url: url, host: host))
                 }
             }
             // listed when the screen shows and each time the link comes back

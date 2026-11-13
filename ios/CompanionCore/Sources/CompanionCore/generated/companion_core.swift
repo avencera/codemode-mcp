@@ -938,7 +938,8 @@ public struct AppState: Equatable, Hashable {
      */
     public var takeover: TakeoverState?
     /**
-     * The gateway's browser sessions, as last listed
+     * The browser sessions of the gateway and of the machines it vouches
+     * for, as last listed
      */
     public var sessions: BrowserSessions
 
@@ -967,7 +968,8 @@ public struct AppState: Equatable, Hashable {
          * arrive as [`Update::Screen`] and are not kept here
          */takeover: TakeoverState?, 
         /**
-         * The gateway's browser sessions, as last listed
+         * The browser sessions of the gateway and of the machines it vouches
+         * for, as last listed
          */sessions: BrowserSessions) {
         self.gateway = gateway
         self.connection = connection
@@ -1111,39 +1113,50 @@ public func FfiConverterTypeBrowserSession_lower(_ value: BrowserSession) -> Rus
 
 
 /**
- * The gateway's browser sessions, which the owner takes over or starts
+ * The browser sessions the owner takes over or starts: the gateway's, and
+ * each machine's the gateway lists, which the phone dials itself
  */
 public struct BrowserSessions: Equatable, Hashable {
     /**
-     * Where the listing stands
+     * Where the gateway's listing stands
      */
     public var status: SessionsStatus
     /**
-     * The sessions running, by name, from the last listing
+     * The gateway's sessions running, by name, from the last listing
      */
     public var running: [BrowserSession]
     /**
-     * The sessions with a saved profile that are not running, which
-     * [`AppAction::StartSession`] launches signed in as before
+     * The gateway's sessions with a saved profile that are not running,
+     * which [`AppAction::StartSession`] launches signed in as before
      */
     public var saved: [SavedSession]
+    /**
+     * The other machines with browser sessions, by name, each listed on
+     * its own link; empty until the gateway lists them
+     */
+    public var machines: [MachineSessions]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
-         * Where the listing stands
+         * Where the gateway's listing stands
          */status: SessionsStatus, 
         /**
-         * The sessions running, by name, from the last listing
+         * The gateway's sessions running, by name, from the last listing
          */running: [BrowserSession], 
         /**
-         * The sessions with a saved profile that are not running, which
-         * [`AppAction::StartSession`] launches signed in as before
-         */saved: [SavedSession]) {
+         * The gateway's sessions with a saved profile that are not running,
+         * which [`AppAction::StartSession`] launches signed in as before
+         */saved: [SavedSession], 
+        /**
+         * The other machines with browser sessions, by name, each listed on
+         * its own link; empty until the gateway lists them
+         */machines: [MachineSessions]) {
         self.status = status
         self.running = running
         self.saved = saved
+        self.machines = machines
     }
 
     
@@ -1164,7 +1177,8 @@ public struct FfiConverterTypeBrowserSessions: FfiConverterRustBuffer {
             try BrowserSessions(
                 status: FfiConverterTypeSessionsStatus.read(from: &buf), 
                 running: FfiConverterSequenceTypeBrowserSession.read(from: &buf), 
-                saved: FfiConverterSequenceTypeSavedSession.read(from: &buf)
+                saved: FfiConverterSequenceTypeSavedSession.read(from: &buf), 
+                machines: FfiConverterSequenceTypeMachineSessions.read(from: &buf)
         )
     }
 
@@ -1172,6 +1186,7 @@ public struct FfiConverterTypeBrowserSessions: FfiConverterRustBuffer {
         FfiConverterTypeSessionsStatus.write(value.status, into: &buf)
         FfiConverterSequenceTypeBrowserSession.write(value.running, into: &buf)
         FfiConverterSequenceTypeSavedSession.write(value.saved, into: &buf)
+        FfiConverterSequenceTypeMachineSessions.write(value.machines, into: &buf)
     }
 }
 
@@ -1357,6 +1372,97 @@ public func FfiConverterTypeGatewayInfo_lift(_ buf: RustBuffer) throws -> Gatewa
 #endif
 public func FfiConverterTypeGatewayInfo_lower(_ value: GatewayInfo) -> RustBuffer {
     return FfiConverterTypeGatewayInfo.lower(value)
+}
+
+
+/**
+ * One machine's browser sessions, in a section of their own
+ */
+public struct MachineSessions: Equatable, Hashable {
+    /**
+     * The name the gateway lists it under, such as `code`
+     */
+    public var name: String
+    /**
+     * Where its listing stands; [`SessionsStatus::Unreachable`] when the
+     * phone could not dial it
+     */
+    public var status: SessionsStatus
+    /**
+     * Its sessions running, by name
+     */
+    public var running: [BrowserSession]
+    /**
+     * Its sessions with a saved profile that are not running
+     */
+    public var saved: [SavedSession]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The name the gateway lists it under, such as `code`
+         */name: String, 
+        /**
+         * Where its listing stands; [`SessionsStatus::Unreachable`] when the
+         * phone could not dial it
+         */status: SessionsStatus, 
+        /**
+         * Its sessions running, by name
+         */running: [BrowserSession], 
+        /**
+         * Its sessions with a saved profile that are not running
+         */saved: [SavedSession]) {
+        self.name = name
+        self.status = status
+        self.running = running
+        self.saved = saved
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MachineSessions: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMachineSessions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MachineSessions {
+        return
+            try MachineSessions(
+                name: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypeSessionsStatus.read(from: &buf), 
+                running: FfiConverterSequenceTypeBrowserSession.read(from: &buf), 
+                saved: FfiConverterSequenceTypeSavedSession.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MachineSessions, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterTypeSessionsStatus.write(value.status, into: &buf)
+        FfiConverterSequenceTypeBrowserSession.write(value.running, into: &buf)
+        FfiConverterSequenceTypeSavedSession.write(value.saved, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMachineSessions_lift(_ buf: RustBuffer) throws -> MachineSessions {
+    return try FfiConverterTypeMachineSessions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMachineSessions_lower(_ value: MachineSessions) -> RustBuffer {
+    return FfiConverterTypeMachineSessions.lower(value)
 }
 
 
@@ -1602,6 +1708,10 @@ public struct PendingHandoff: Equatable, Hashable {
      */
     public var gatewayName: String
     /**
+     * Where the session runs, which a takeover for it dials
+     */
+    public var host: SessionHost
+    /**
      * When the gateway gives up, in ms since the epoch on this phone's clock
      */
     public var expiresAtMs: Int64
@@ -1629,6 +1739,9 @@ public struct PendingHandoff: Equatable, Hashable {
          * The gateway Mac's short name
          */gatewayName: String, 
         /**
+         * Where the session runs, which a takeover for it dials
+         */host: SessionHost, 
+        /**
          * When the gateway gives up, in ms since the epoch on this phone's clock
          */expiresAtMs: Int64, 
         /**
@@ -1639,6 +1752,7 @@ public struct PendingHandoff: Equatable, Hashable {
         self.reason = reason
         self.url = url
         self.gatewayName = gatewayName
+        self.host = host
         self.expiresAtMs = expiresAtMs
         self.status = status
     }
@@ -1664,6 +1778,7 @@ public struct FfiConverterTypePendingHandoff: FfiConverterRustBuffer {
                 reason: FfiConverterOptionString.read(from: &buf), 
                 url: FfiConverterOptionString.read(from: &buf), 
                 gatewayName: FfiConverterString.read(from: &buf), 
+                host: FfiConverterTypeSessionHost.read(from: &buf), 
                 expiresAtMs: FfiConverterInt64.read(from: &buf), 
                 status: FfiConverterTypeHandoffStatus.read(from: &buf)
         )
@@ -1675,6 +1790,7 @@ public struct FfiConverterTypePendingHandoff: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.reason, into: &buf)
         FfiConverterOptionString.write(value.url, into: &buf)
         FfiConverterString.write(value.gatewayName, into: &buf)
+        FfiConverterTypeSessionHost.write(value.host, into: &buf)
         FfiConverterInt64.write(value.expiresAtMs, into: &buf)
         FfiConverterTypeHandoffStatus.write(value.status, into: &buf)
     }
@@ -2480,6 +2596,10 @@ public struct TakeoverState: Equatable, Hashable {
      */
     public var session: String
     /**
+     * Where it runs
+     */
+    public var host: SessionHost
+    /**
      * The handoff it answers, if it was opened for one
      */
     public var handoff: String?
@@ -2503,6 +2623,9 @@ public struct TakeoverState: Equatable, Hashable {
          * The browser session, such as `github`
          */session: String, 
         /**
+         * Where it runs
+         */host: SessionHost, 
+        /**
          * The handoff it answers, if it was opened for one
          */handoff: String?, 
         /**
@@ -2515,6 +2638,7 @@ public struct TakeoverState: Equatable, Hashable {
          * The last thing the gateway refused or filled, until the page changes
          */notice: TakeoverNotice?) {
         self.session = session
+        self.host = host
         self.handoff = handoff
         self.status = status
         self.page = page
@@ -2538,6 +2662,7 @@ public struct FfiConverterTypeTakeoverState: FfiConverterRustBuffer {
         return
             try TakeoverState(
                 session: FfiConverterString.read(from: &buf), 
+                host: FfiConverterTypeSessionHost.read(from: &buf), 
                 handoff: FfiConverterOptionString.read(from: &buf), 
                 status: FfiConverterTypeTakeoverStatus.read(from: &buf), 
                 page: FfiConverterOptionTypeTakeoverPage.read(from: &buf), 
@@ -2547,6 +2672,7 @@ public struct FfiConverterTypeTakeoverState: FfiConverterRustBuffer {
 
     public static func write(_ value: TakeoverState, into buf: inout [UInt8]) {
         FfiConverterString.write(value.session, into: &buf)
+        FfiConverterTypeSessionHost.write(value.host, into: &buf)
         FfiConverterOptionString.write(value.handoff, into: &buf)
         FfiConverterTypeTakeoverStatus.write(value.status, into: &buf)
         FfiConverterOptionTypeTakeoverPage.write(value.page, into: &buf)
@@ -2678,7 +2804,11 @@ public enum AppAction: Equatable, Hashable {
          */session: String, 
         /**
          * The handoff it answers
-         */handoff: String?
+         */handoff: String?, 
+        /**
+         * Where the session runs; a machine the phone has not heard of yet
+         * is looked up in a new listing first
+         */host: SessionHost
     )
     /**
      * Start browser `session` at `url`, an `https` address, and take it
@@ -2692,7 +2822,10 @@ public enum AppAction: Equatable, Hashable {
          */session: String, 
         /**
          * Where to start it
-         */url: String
+         */url: String, 
+        /**
+         * The machine to start it on
+         */host: SessionHost
     )
     /**
      * Leave the takeover without ending it or its handoff, which may be
@@ -2700,26 +2833,33 @@ public enum AppAction: Equatable, Hashable {
      */
     case closeTakeover
     /**
-     * Ask the gateway for its browser sessions
+     * Ask the gateway for its browser sessions, then each machine it lists
+     * for its own
      */
     case refreshSessions
     /**
-     * Quit browser `session` on the gateway, keeping its saved profile, then
-     * list the sessions again; a takeover of it is left
+     * Quit browser `session` on `host`, keeping its saved profile, then
+     * list that machine's sessions again; a takeover of it is left
      */
     case closeSession(
         /**
          * The browser session
-         */session: String
+         */session: String, 
+        /**
+         * Where it runs
+         */host: SessionHost
     )
     /**
      * Move the saved profile of browser `session`, which is not running,
-     * to the gateway's Trash, then list the sessions again
+     * to the Trash of `host`, then list that machine's sessions again
      */
     case removeSession(
         /**
          * The browser session
-         */session: String
+         */session: String, 
+        /**
+         * Where it runs
+         */host: SessionHost
     )
     /**
      * APNs gave this token, or `None` when notifications are off
@@ -2780,20 +2920,20 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
         case 10: return .cancelHandoff(id: try FfiConverterString.read(from: &buf)
         )
         
-        case 11: return .openTakeover(session: try FfiConverterString.read(from: &buf), handoff: try FfiConverterOptionString.read(from: &buf)
+        case 11: return .openTakeover(session: try FfiConverterString.read(from: &buf), handoff: try FfiConverterOptionString.read(from: &buf), host: try FfiConverterTypeSessionHost.read(from: &buf)
         )
         
-        case 12: return .startSession(session: try FfiConverterString.read(from: &buf), url: try FfiConverterString.read(from: &buf)
+        case 12: return .startSession(session: try FfiConverterString.read(from: &buf), url: try FfiConverterString.read(from: &buf), host: try FfiConverterTypeSessionHost.read(from: &buf)
         )
         
         case 13: return .closeTakeover
         
         case 14: return .refreshSessions
         
-        case 15: return .closeSession(session: try FfiConverterString.read(from: &buf)
+        case 15: return .closeSession(session: try FfiConverterString.read(from: &buf), host: try FfiConverterTypeSessionHost.read(from: &buf)
         )
         
-        case 16: return .removeSession(session: try FfiConverterString.read(from: &buf)
+        case 16: return .removeSession(session: try FfiConverterString.read(from: &buf), host: try FfiConverterTypeSessionHost.read(from: &buf)
         )
         
         case 17: return .pushToken(token: try FfiConverterOptionString.read(from: &buf), environment: try FfiConverterTypePushEnvironment.read(from: &buf)
@@ -2860,16 +3000,18 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             FfiConverterString.write(id, into: &buf)
             
         
-        case let .openTakeover(session,handoff):
+        case let .openTakeover(session,handoff,host):
             writeInt(&buf, Int32(11))
             FfiConverterString.write(session, into: &buf)
             FfiConverterOptionString.write(handoff, into: &buf)
+            FfiConverterTypeSessionHost.write(host, into: &buf)
             
         
-        case let .startSession(session,url):
+        case let .startSession(session,url,host):
             writeInt(&buf, Int32(12))
             FfiConverterString.write(session, into: &buf)
             FfiConverterString.write(url, into: &buf)
+            FfiConverterTypeSessionHost.write(host, into: &buf)
             
         
         case .closeTakeover:
@@ -2880,14 +3022,16 @@ public struct FfiConverterTypeAppAction: FfiConverterRustBuffer {
             writeInt(&buf, Int32(14))
         
         
-        case let .closeSession(session):
+        case let .closeSession(session,host):
             writeInt(&buf, Int32(15))
             FfiConverterString.write(session, into: &buf)
+            FfiConverterTypeSessionHost.write(host, into: &buf)
             
         
-        case let .removeSession(session):
+        case let .removeSession(session,host):
             writeInt(&buf, Int32(16))
             FfiConverterString.write(session, into: &buf)
+            FfiConverterTypeSessionHost.write(host, into: &buf)
             
         
         case let .pushToken(token,environment):
@@ -3907,6 +4051,87 @@ public func FfiConverterTypeReadStatus_lower(_ value: ReadStatus) -> RustBuffer 
 
 
 /**
+ * Where a browser session runs
+ */
+
+public enum SessionHost: Equatable, Hashable {
+    
+    /**
+     * The paired gateway
+     */
+    case gateway
+    /**
+     * A machine the gateway vouches for, such as a Linux spoke
+     */
+    case machine(
+        /**
+         * The name the gateway lists it under, such as `code`
+         */name: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SessionHost: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSessionHost: FfiConverterRustBuffer {
+    typealias SwiftType = SessionHost
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SessionHost {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .gateway
+        
+        case 2: return .machine(name: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SessionHost, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .gateway:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .machine(name):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(name, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionHost_lift(_ buf: RustBuffer) throws -> SessionHost {
+    return try FfiConverterTypeSessionHost.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSessionHost_lower(_ value: SessionHost) -> RustBuffer {
+    return FfiConverterTypeSessionHost.lower(value)
+}
+
+
+
+/**
  * Where a listing of the browser sessions stands
  */
 
@@ -3925,9 +4150,17 @@ public enum SessionsStatus: Equatable, Hashable {
      */
     case listed
     /**
-     * The gateway could not be asked or could not list them
+     * The machine answered but could not list them
      */
     case failed(
+        /**
+         * Why, one line
+         */message: String
+    )
+    /**
+     * The phone could not dial the machine in time
+     */
+    case unreachable(
         /**
          * Why, one line
          */message: String
@@ -3962,6 +4195,9 @@ public struct FfiConverterTypeSessionsStatus: FfiConverterRustBuffer {
         case 4: return .failed(message: try FfiConverterString.read(from: &buf)
         )
         
+        case 5: return .unreachable(message: try FfiConverterString.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -3984,6 +4220,11 @@ public struct FfiConverterTypeSessionsStatus: FfiConverterRustBuffer {
         
         case let .failed(message):
             writeInt(&buf, Int32(4))
+            FfiConverterString.write(message, into: &buf)
+            
+        
+        case let .unreachable(message):
+            writeInt(&buf, Int32(5))
             FfiConverterString.write(message, into: &buf)
             
         }
@@ -5728,6 +5969,31 @@ fileprivate struct FfiConverterSequenceTypeFillOffer: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFillOffer.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMachineSessions: FfiConverterRustBuffer {
+    typealias SwiftType = [MachineSessions]
+
+    public static func write(_ value: [MachineSessions], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMachineSessions.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MachineSessions] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MachineSessions]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMachineSessions.read(from: &buf))
         }
         return seq
     }

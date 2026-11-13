@@ -2,7 +2,8 @@
 
 The Rust core of the iPhone companion app (`companion-core`). It pairs with a codemode-mcp gateway, holds the
 connection to it, runs each read the gateway sends from arrival to answer, shows the handoffs agents ask for, and
-runs the live takeover of a browser session on the gateway Mac. The SwiftUI app in `ios/` draws
+runs the live takeover of a browser session on the gateway Mac or on a spoke the gateway vouches for. The SwiftUI
+app in `ios/` draws
 the state and does what only iOS can: the Keychain, the Secure Enclave, Face ID and push. How to use the app is
 in [docs/operations.md](../docs/operations.md#approve-from-an-iphone).
 
@@ -84,9 +85,16 @@ App (supervisor)
   answers `HandoffAnswer::Cancelled` on the stream, kept until it is delivered as a read's answer is. Take over
   opens a takeover with the handoff's id; its Done or Cancel ends the handoff on the takeover's connection, after
   which the gateway stops the handoff's stream. A stopped stream marks a handoff the owner did not answer here as
-  over, and its deadline (at most two hours) as expired.
+  over, and its deadline (at most two hours) as expired. A handoff for a spoke's session carries `machine`, the
+  spoke's name, endpoint id and addresses, which the app keeps with the other listed machines; it is trusted as
+  the gateway's word, since it arrives on the gateway's authenticated link. Its card's `host` is that machine.
 - **Takeover** dials the gateway on `TAKEOVER_ALPN` from the connection actor's endpoint (the app lends it through
-  `AppMsg::Endpoint`), so the gateway sees the paired phone's key. It waits for the app's first `Resize`, which
+  `AppMsg::Endpoint`), so the gateway sees the paired phone's key. A session on a spoke (`BrowserHost::Machine`)
+  is dialed the same way, at the endpoint id, relay and addresses the gateway listed for that machine; the spoke
+  admits only the phones the gateway tells it are paired. An `OpenTakeover` naming a machine the app has not
+  listed yet, such as from a link, shows Connecting, lists the gateway's sessions again and opens once the
+  machine is known (`waiting_open`, which also keeps the first `Resize`), or ends as failed if the gateway no
+  longer lists it. It waits for the app's first `Resize`, which
   gives the image area in points and its scale (at most 2), then opens one stream and sends `Open { session,
   handoff, viewport }`. Frames are read and written in spawned tasks that report back as messages. Each `Page`
   updates `AppState.takeover` (address, focus, fill offers without their sealed bytes); each `Screen` goes to
@@ -101,14 +109,19 @@ App (supervisor)
   offer opens a sheet with one visible field of the focused kind, for AutoFill, and sends its value as `Fill`.
   Fill from an offer
   opens its sealed copy with `Platform::open_sealed`, the seal's `info` binding the gateway and the offer's
-  reference, and sends the value as `Fill`. A link that drops while the app is in the foreground is dialed again
+  reference (the gateway's id on a spoke's page too, since only the gateway reads 1Password and seals), and sends the value as `Fill`. A link that drops while the app is in the foreground is dialed again
   with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while
   the link is down goes right after the next `Open`. `Ended` stops the actor: Done and Cancel close the screen and
   remove their handoff's card, any other reason stays on screen until the owner closes it. Leaving
   (`CloseTakeover`) hangs up without ending anything, so the handoff can be taken over again.
 - **Sessions** are listed on a takeover link of their own: `RefreshSessions` dials `TAKEOVER_ALPN` in a spawned
   task, sends `PhoneMessage::Sessions` and reads the one answer into `AppState.sessions` (running sessions
-  and saved profiles), which keeps the last listing while the next loads. `StartSession` opens a takeover whose
+  and saved profiles), which keeps the last listing while the next loads. The gateway's answer also names
+  `machines`, the spokes with a browser of their own; each gets a `MachineSessions` section, listed on a link
+  of its own to that spoke, all at once, with an 8 s dial timeout, so one spoke that is down shows
+  `SessionsStatus::Unreachable` while the rest list. Each gateway listing starts a new round, and a machine's
+  answer from an older round is dropped. Session actions carry a `SessionHost`, the gateway or a machine by
+  name, and go to that machine. `StartSession` opens a takeover whose
   `Open` carries `start`, the `https` address the gateway starts the session at; the takeover actor drops it
   once a link gets through, so a redial takes the session over as it is. `CloseSession` sends
   `PhoneMessage::CloseSession` on a listing link instead, leaving any takeover of that session first, and

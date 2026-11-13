@@ -2,7 +2,7 @@ import CompanionCore
 import SwiftUI
 
 /// One handoff: an agent asks the owner to do a step in a browser session on
-/// the gateway Mac, such as a passkey or a captcha. Take over opens the
+/// the gateway or a machine it vouches for, such as a passkey or a captcha. Take over opens the
 /// session live on this phone; Cancel tells the agent the owner will not
 struct HandoffView: View {
     @Environment(AppManager.self) private var manager
@@ -18,7 +18,7 @@ struct HandoffView: View {
                     .font(.system(size: 48))
                     .foregroundStyle(tint)
                 VStack(spacing: 8) {
-                    Text("An agent on \(handoff.gatewayName) needs you in its browser")
+                    Text("An agent on \(handoff.host.place(gatewayName: handoff.gatewayName)) needs you in its browser")
                         .font(.headline)
                         .multilineTextAlignment(.center)
                     Label(handoff.session, systemImage: "safari")
@@ -77,7 +77,7 @@ struct HandoffView: View {
         } else {
             VStack(spacing: 12) {
                 Button {
-                    manager.dispatch(.openTakeover(session: handoff.session, handoff: handoff.id))
+                    manager.dispatch(.openTakeover(session: handoff.session, handoff: handoff.id, host: handoff.host))
                 } label: {
                     Label("Take over", systemImage: "hand.tap")
                         .frame(maxWidth: .infinity)

@@ -41,19 +41,50 @@ pub struct AppState {
     /// The browser session the owner has taken over, if any; its images
     /// arrive as [`Update::Screen`] and are not kept here
     pub takeover: Option<TakeoverState>,
-    /// The gateway's browser sessions, as last listed
+    /// The browser sessions of the gateway and of the machines it vouches
+    /// for, as last listed
     pub sessions: BrowserSessions,
 }
 
-/// The gateway's browser sessions, which the owner takes over or starts
+/// The browser sessions the owner takes over or starts: the gateway's, and
+/// each machine's the gateway lists, which the phone dials itself
 #[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
 pub struct BrowserSessions {
-    /// Where the listing stands
+    /// Where the gateway's listing stands
     pub status: SessionsStatus,
-    /// The sessions running, by name, from the last listing
+    /// The gateway's sessions running, by name, from the last listing
     pub running: Vec<BrowserSession>,
-    /// The sessions with a saved profile that are not running, which
-    /// [`AppAction::StartSession`] launches signed in as before
+    /// The gateway's sessions with a saved profile that are not running,
+    /// which [`AppAction::StartSession`] launches signed in as before
+    pub saved: Vec<SavedSession>,
+    /// The other machines with browser sessions, by name, each listed on
+    /// its own link; empty until the gateway lists them
+    pub machines: Vec<MachineSessions>,
+}
+
+/// Where a browser session runs
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum SessionHost {
+    /// The paired gateway
+    Gateway,
+    /// A machine the gateway vouches for, such as a Linux spoke
+    Machine {
+        /// The name the gateway lists it under, such as `code`
+        name: String,
+    },
+}
+
+/// One machine's browser sessions, in a section of their own
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MachineSessions {
+    /// The name the gateway lists it under, such as `code`
+    pub name: String,
+    /// Where its listing stands; [`SessionsStatus::Unreachable`] when the
+    /// phone could not dial it
+    pub status: SessionsStatus,
+    /// Its sessions running, by name
+    pub running: Vec<BrowserSession>,
+    /// Its sessions with a saved profile that are not running
     pub saved: Vec<SavedSession>,
 }
 
@@ -67,8 +98,13 @@ pub enum SessionsStatus {
     Loading,
     /// Listed
     Listed,
-    /// The gateway could not be asked or could not list them
+    /// The machine answered but could not list them
     Failed {
+        /// Why, one line
+        message: String,
+    },
+    /// The phone could not dial the machine in time
+    Unreachable {
         /// Why, one line
         message: String,
     },
@@ -320,6 +356,8 @@ pub struct PendingHandoff {
     pub url: Option<String>,
     /// The gateway Mac's short name
     pub gateway_name: String,
+    /// Where the session runs, which a takeover for it dials
+    pub host: SessionHost,
     /// When the gateway gives up, in ms since the epoch on this phone's clock
     pub expires_at_ms: i64,
     /// Where it stands
@@ -352,6 +390,8 @@ impl HandoffStatus {
 pub struct TakeoverState {
     /// The browser session, such as `github`
     pub session: String,
+    /// Where it runs
+    pub host: SessionHost,
     /// The handoff it answers, if it was opened for one
     pub handoff: Option<String>,
     /// The link to the session
@@ -678,6 +718,9 @@ pub enum AppAction {
         session: String,
         /// The handoff it answers
         handoff: Option<String>,
+        /// Where the session runs; a machine the phone has not heard of yet
+        /// is looked up in a new listing first
+        host: SessionHost,
     },
     /// Start browser `session` at `url`, an `https` address, and take it
     /// over: the gateway launches the session with its saved profile when it
@@ -688,23 +731,30 @@ pub enum AppAction {
         session: String,
         /// Where to start it
         url: String,
+        /// The machine to start it on
+        host: SessionHost,
     },
     /// Leave the takeover without ending it or its handoff, which may be
     /// taken over again later; also closes one the gateway ended
     CloseTakeover,
-    /// Ask the gateway for its browser sessions
+    /// Ask the gateway for its browser sessions, then each machine it lists
+    /// for its own
     RefreshSessions,
-    /// Quit browser `session` on the gateway, keeping its saved profile, then
-    /// list the sessions again; a takeover of it is left
+    /// Quit browser `session` on `host`, keeping its saved profile, then
+    /// list that machine's sessions again; a takeover of it is left
     CloseSession {
         /// The browser session
         session: String,
+        /// Where it runs
+        host: SessionHost,
     },
     /// Move the saved profile of browser `session`, which is not running,
-    /// to the gateway's Trash, then list the sessions again
+    /// to the Trash of `host`, then list that machine's sessions again
     RemoveSession {
         /// The browser session
         session: String,
+        /// Where it runs
+        host: SessionHost,
     },
     /// APNs gave this token, or `None` when notifications are off
     PushToken {
