@@ -16,11 +16,12 @@
 //! types only on that host, and the tool answers with the host it filled
 //! on, never the value
 
-pub mod totp;
-
 use std::sync::Arc;
 
-use companion_wire::wire::MAX_DESCRIPTION_CHARS;
+use companion_wire::{
+    totp::{Totp, is_code},
+    wire::MAX_DESCRIPTION_CHARS,
+};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
@@ -39,7 +40,6 @@ use crate::{
     prompt,
     secrets::{LoginPart, OnePassword, Redactor, SavedLogin, is_reference},
 };
-use totp::Totp;
 
 const INSTRUCTIONS: &str = "Signs in to websites on this Mac with logins from 1Password, \
      without showing you the username, password or one-time code. Click the field first, so it \
@@ -834,12 +834,6 @@ impl FillCheck {
 
         Ok((Source::Phone, None))
     }
-}
-
-/// Whether `value` is a one-time code itself, as the owner enters one on
-/// the phone, rather than the seed 1Password holds
-pub fn is_code(value: &str) -> bool {
-    (6..=8).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// One fill at a time across every `logins` server and reconnect, so two

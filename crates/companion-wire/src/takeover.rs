@@ -235,8 +235,10 @@ pub enum PhoneMessage {
         /// The field it is for
         field: LoginField,
         /// The value: typed, from AutoFill, or a sealed copy the gateway
-        /// offered, opened with Face ID. For a code, a seed (`otpauth://` or base32)
-        /// is turned into the current code by the gateway
+        /// offered, opened with Face ID. For a code, the phone sends the
+        /// current code it computed from an opened seed, so the seed never
+        /// reaches a spoke; a seed (`otpauth://` or base32) an older phone
+        /// sends is still turned into the current code where it lands
         value: Secret,
         /// Press Return after it
         #[serde(default)]

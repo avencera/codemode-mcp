@@ -1145,7 +1145,8 @@ What changes for a spoke's sessions:
   hub send the value to the spoke, once, for that fill; a one-time code is computed on the hub, so the seed
   never leaves it.
 - Handoffs: the push reads `Session github on ai5090`, and **Take over** dials the spoke.
-- **Fill from 1Password** in a takeover offers the hub's sealed copies, as on the hub.
+- **Fill from 1Password** in a takeover offers the hub's sealed copies, as on the hub. For a one-time code,
+  the phone sends the spoke the current code it computed, never the seed.
 - The phone must reach the spoke: on the tailnet, at the address `browser_listen` fixes, or through n0's
   relays when `[secrets] discovery` is on. A spoke the phone cannot dial in 8 seconds shows as unreachable
   in its section, and the other machines still list.

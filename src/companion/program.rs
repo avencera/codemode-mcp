@@ -18,6 +18,7 @@ use std::{sync::Arc, time::Duration};
 
 use companion_wire::{
     mobile::{LoginField, PhoneProgramRead, PhoneProgramRequest, ProgramItem, RequestId, SignIn},
+    totp::is_code,
     wire::{
         MAX_DESCRIPTION_CHARS, MAX_DESTINATION_CHARS, MAX_FIND_QUERY_CHARS, MAX_KEEP_SECS,
         MAX_PROGRAM_ITEMS, MAX_REASON_CHARS,
@@ -593,9 +594,7 @@ impl OnePassword {
                     .as_ref()
                     .and_then(|sign_in| sign_in.fields.get(index))
                     .is_some_and(|field| *field == LoginField::Code);
-                let entered_code = value
-                    .as_text()
-                    .is_some_and(|text| crate::logins::is_code(text.trim()));
+                let entered_code = value.as_text().is_some_and(|text| is_code(text.trim()));
                 if code_field && entered_code {
                     continue;
                 }

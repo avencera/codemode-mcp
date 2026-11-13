@@ -10,6 +10,8 @@ pub mod mobile;
 pub mod seal;
 pub mod takeover;
 pub mod ticket;
+#[cfg(feature = "totp")]
+pub mod totp;
 pub mod wire;
 
 use std::time::Duration;

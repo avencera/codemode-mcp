@@ -260,7 +260,8 @@ pub enum LoginField {
     /// A password
     Password,
     /// A one-time code, such as a TOTP code; an item read by reference holds
-    /// the seed instead, which the gateway turns into the current code
+    /// the seed instead, which the gateway turns into the current code, as
+    /// the phone does for a sealed seed it fills in a takeover
     Code,
 }
 

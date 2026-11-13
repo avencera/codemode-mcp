@@ -110,7 +110,9 @@ App (supervisor)
   offer opens a sheet with one visible field of the focused kind, for AutoFill, and sends its value as `Fill`.
   Fill from an offer
   opens its sealed copy with `Platform::open_sealed`, the seal's `info` binding the gateway and the offer's
-  reference (the gateway's id on a spoke's page too, since only the gateway reads 1Password and seals), and sends the value as `Fill`. A link that drops while the app is in the foreground is dialed again
+  reference (the gateway's id on a spoke's page too, since only the gateway reads 1Password and seals), and sends the value as `Fill`.
+  For a code offer the core sends the current code, computed from the opened seed with `companion_wire::totp`,
+  never the seed, so a spoke never holds it. A link that drops while the app is in the foreground is dialed again
   with the connection's backoff and opens anew; going to the background hangs up, and Done or Cancel made while
   the link is down goes right after the next `Open`. `Ended` stops the actor: Done and Cancel close the screen and
   remove their handoff's card, any other reason stays on screen until the owner closes it. Leaving

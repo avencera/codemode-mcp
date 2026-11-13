@@ -1,5 +1,7 @@
-//! RFC 6238 one-time codes, computed in the daemon from the seed 1Password
-//! keeps for a login, so neither the seed nor the code reaches an agent
+//! RFC 6238 one-time codes, computed from the seed 1Password keeps for a
+//! login: by the gateway for its own fills, so neither the seed nor the
+//! code reaches an agent, and by the phone for a fill it opened for
+//! another machine's page, so the seed never leaves the phone for it
 //!
 //! 1Password answers a one-time-password field either as an
 //! `otpauth://totp/...` URI or as the bare base32 secret; both are read
@@ -55,8 +57,8 @@ impl Totp {
             return Self::new(text, Algorithm::Sha1, 6, 30);
         }
 
-        let url = reqwest::Url::parse(text)
-            .map_err(|_| TotpError("is not a valid otpauth:// address"))?;
+        let url =
+            url::Url::parse(text).map_err(|_| TotpError("is not a valid otpauth:// address"))?;
         if url.host_str().map(str::to_ascii_lowercase).as_deref() != Some("totp") {
             return Err(TotpError(
                 "is not time-based (otpauth://totp/), so no code can be computed from it",
@@ -165,6 +167,12 @@ impl Totp {
 
         format!("{code:0width$}", width = self.digits as usize)
     }
+}
+
+/// Whether `value` is a one-time code itself, as the owner enters one on
+/// the phone, rather than the seed 1Password holds
+pub fn is_code(value: &str) -> bool {
+    (6..=8).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn hmac<M: Mac + KeyInit>(key: &[u8], message: &[u8]) -> Vec<u8> {

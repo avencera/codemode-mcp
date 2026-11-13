@@ -1098,7 +1098,8 @@ from a header the agent's entry sets), dropped when idle, and excluded from the 
   password field is read itself (an `item` whose vault or title holds `?` is refused, and anything after the
   title is dropped, since `?attribute=` would cache a code); its value, an
   `otpauth://totp/` URI (SHA1, SHA256 or SHA512, 6 or 8 digits, any period) or a bare base32 secret, is turned
-  into the current RFC 6238 code in `src/logins/totp.rs` (`hmac`, `sha1` and `sha2` on the digest 0.11 line).
+  into the current RFC 6238 code in `companion_wire::totp` (feature `totp`, shared with the phone's core;
+  `hmac`, `sha1` and `sha2` on the digest 0.11 line).
   The seed's text is redacted with fragments and the whole value without, since its label is often an email
   address; neither the seed nor the code is returned. The code is typed into a plain text field, so an agent
   that reads the screen sees it, as it would a username; it expires within one period and is useless without
@@ -1224,7 +1225,9 @@ rather than a generated crate), so no secret passes through an agent-browser com
     again every 5 s, and a takeover can still answer it meanwhile
   - Fill from 1Password: a takeover on the spoke asks `browser/offers` for the phone's offers on the page's
     site, which the hub answers only for a phone it has paired. The sealed copies are the hub's, so the phone
-    opens them with the hub's record whichever machine it dialed
+    opens them with the hub's record whichever machine it dialed. For a one-time code the phone computes the
+    current code from the opened seed (`companion_wire::totp`, the gateway's own code) and sends only that,
+    so the seed never leaves the phone for the spoke; it does the same on the hub, which takes a code as is
   - Linux has no `~/.Trash`, so a spoke sets `browser_trash` for Remove from the phone
 
 ### Xcode

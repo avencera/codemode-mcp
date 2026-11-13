@@ -44,6 +44,7 @@ use async_trait::async_trait;
 use companion_wire::{
     mobile::{HandoffAnswer, LoginField},
     takeover::{EndReason, GatewayFrame, GatewayMessage, PhoneMessage},
+    totp::{Totp, is_code},
     wire::MAX_REASON_CHARS,
 };
 use iroh::EndpointId;
@@ -64,7 +65,7 @@ use crate::{
     companion::{HandoffOffer, SessionList, TakeoverHost, TakeoverOpen, TakeoverPhone},
     config::{Builtin, ServerConfig},
     hub::{FillGrant, FillSource, HandoffCall, HandoffReply, client::HubClient},
-    logins::{is_code, site_of, totp::Totp},
+    logins::site_of,
     prompt,
     secrets::Redactor,
 };

@@ -10,9 +10,10 @@ use std::{
 };
 
 use codemode_mcp::{
-    logins::{Exposure, FieldKind, FocusedField, Setting, totp::Totp},
+    logins::{Exposure, FieldKind, FocusedField, Setting},
     mac::TouchId,
 };
+use companion_wire::totp::Totp;
 use serde_json::{Value, json};
 
 use super::{

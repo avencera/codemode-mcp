@@ -33,6 +33,7 @@ use companion_wire::{
         decode_phone, encode_message, encode_screen, read_header,
     },
     ticket::{InviteSecret, InviteTicket},
+    totp::Totp,
     wire::{
         CompanionErrorCode, CompanionResponse, PairCheck, PairRequest, PairResponse, ProgramValue,
         Registered,
@@ -2356,6 +2357,100 @@ async fn the_gateways_machines_are_listed_and_dialed_on_their_own() -> TestResul
     );
     app.dispatch(AppAction::CancelHandoff { id: id.to_string() });
     assert_eq!(answered.await??, HandoffAnswer::Cancelled);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_time_code_filled_on_a_machine_is_computed_on_the_phone() -> TestResult {
+    // the RFC 6238 SHA1 test seed, as 1Password keeps it for a login
+    const SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    let reference = "op://Private/GitHub/one-time password";
+    let gateway = FakeGateway::start().await?;
+    let (app, platform, _recorder) = paired(&gateway).await?;
+    let (spoke, mut opened) = fake_spoke("ci").await?;
+
+    app.dispatch(AppAction::OpenTakeover {
+        session: "ci".to_owned(),
+        handoff: None,
+        host: SessionHost::Machine {
+            name: "code".to_owned(),
+        },
+    });
+    app.takeover(TakeoverInput::Resize {
+        width: 390,
+        height: 664,
+        scale: 3.0,
+    });
+    let (_listing, mut send, _receive) = gateway.next_takeover().await?;
+    let listed = GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: Vec::new(),
+        last_pages: Default::default(),
+        machines: vec![spoke],
+    };
+    send.write_all(&encode_message(&listed)?).await?;
+    let (_open, _link, mut send, mut receive) =
+        tokio::time::timeout(Duration::from_secs(10), opened.recv())
+            .await?
+            .ok_or("the spoke stopped")?;
+
+    // the gateway sealed the seed for the spoke's page, as it does every
+    // offer, and the spoke offers it for the code field
+    let page = GatewayMessage::Page {
+        url: "https://github.com/sessions/two-factor".to_owned(),
+        title: "Two-factor authentication".to_owned(),
+        focus: Some(Focus {
+            field: Some(WireField::Code),
+            editable: true,
+            secure: false,
+            numeric: true,
+            origin: "https://github.com".to_owned(),
+            cross_site: false,
+        }),
+        offers: vec![FillOffer {
+            field: WireField::Code,
+            reference: reference.to_owned(),
+            sealed: gateway.seal(reference, SEED)?,
+            item: "GitHub".to_owned(),
+            account: Some("praveenperera".to_owned()),
+            site: "github.com".to_owned(),
+        }],
+    };
+    send.write_all(&encode_message(&page)?).await?;
+    until(&app, |state| {
+        state
+            .takeover
+            .as_ref()
+            .and_then(|takeover| takeover.page.as_ref())
+            .is_some_and(|page| !page.offers.is_empty())
+    })
+    .await?;
+
+    // the spoke gets the current code, never the seed
+    app.takeover(TakeoverInput::FillOffer {
+        reference: reference.to_owned(),
+    });
+    let PhoneMessage::Fill {
+        field,
+        value,
+        submit,
+        site,
+    } = read_phone(&mut receive).await?
+    else {
+        return Err("the spoke got no fill".into());
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let totp = Totp::parse(SEED)?;
+    // the code may have been computed in the period before this one
+    let current = [totp.at(now), totp.at(now.saturating_sub(30))];
+    assert_eq!(field, WireField::Code);
+    assert_eq!(value.expose().len(), 6);
+    assert!(current.iter().any(|code| code == value.expose()));
+    assert!(!submit);
+    assert_eq!(site.as_deref(), Some("github.com"));
+    let prompted = platform.prompts().pop().map(|(prompted, _)| prompted);
+    assert_eq!(prompted.as_deref(), Some(reference));
 
     Ok(())
 }

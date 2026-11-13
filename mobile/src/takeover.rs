@@ -25,6 +25,7 @@ use companion_wire::{
         HEADER_BYTES, Key, MAX_TEXT_CHARS, PhoneMessage, Point, RunningSession,
         Secret as WireSecret, TAKEOVER_ALPN, Viewport, decode_gateway, encode_message, read_header,
     },
+    totp::{Totp, is_code},
 };
 use iroh::{
     EndpointAddr, RelayUrl, TransportAddr,
@@ -622,16 +623,18 @@ impl Actor for TakeoverActor {
                 opened,
             } => {
                 state.opening = false;
-                match opened {
-                    Ok(Secret(value)) => Self::send_secret(
+                let filled = opened.map(|Secret(value)| fill_value(field, value));
+                match filled {
+                    Ok(Ok(value)) => Self::send_secret(
                         state,
                         PhoneMessage::Fill {
                             field,
-                            value: WireSecret::new(value),
+                            value,
                             submit: false,
                             site: Some(site),
                         },
                     ),
+                    Ok(Err(message)) => state.refuse(&message),
                     // the owner said no; nothing to explain
                     Err(OpenError::Denied) => {}
                     Err(OpenError::Failed { message }) => state.refuse(&message),
@@ -654,6 +657,25 @@ impl Actor for TakeoverActor {
 
         Ok(())
     }
+}
+
+/// What an opened offer for `field` fills: for a one-time code, the
+/// current code, computed here from the seed 1Password holds, so the seed
+/// never leaves the phone for the machine the page is on; anything else
+/// as it was opened
+fn fill_value(field: WireLoginField, opened: String) -> Result<WireSecret, String> {
+    if field != WireLoginField::Code {
+        return Ok(WireSecret::new(opened));
+    }
+
+    let seed = Zeroizing::new(opened);
+    let seed = seed.trim();
+    if is_code(seed) {
+        return Ok(WireSecret::new(seed.to_owned()));
+    }
+    let totp = Totp::parse(seed).map_err(|error| error.to_string())?;
+
+    Ok(WireSecret::new(totp.now()))
 }
 
 /// Why a session's machine could not be asked
