@@ -166,14 +166,20 @@ pub enum AppMsg {
     /// no connection actor
     Endpoint(RpcReplyPort<Option<Endpoint>>),
     /// A listing of the gateway's browser sessions finished
-    Sessions(Result<Listing, ListFailure>),
+    Sessions {
+        /// Its number among the asks of the gateway's sessions; one a later
+        /// ask overtook is dropped
+        seq: u64,
+        /// What it listed
+        listed: Result<Listing, ListFailure>,
+    },
     /// A listing of a machine's browser sessions finished
     MachineSessions {
         /// The machine's endpoint id
         id: EndpointId,
-        /// The round of listings it belongs to; one from an earlier round
-        /// is ignored
-        round: u64,
+        /// Its number among the asks of this machine's sessions; one a
+        /// later ask overtook is dropped
+        seq: u64,
         /// What it listed
         listed: Result<Listing, ListFailure>,
     },
@@ -584,11 +590,62 @@ pub struct AppActorState {
     /// endpoint id, from its last listing or a handoff; never by name,
     /// which two machines may share
     machines: HashMap<EndpointId, BrowserMachine>,
-    /// Counts the gateway's listings, each of which lists its machines anew
-    machine_round: u64,
+    /// Numbers the listings and session changes asked of each place
+    session_asks: SessionAsks,
     /// A takeover asked for on a machine not known yet, opened once a
     /// listing names it
     waiting_open: Option<TakeoverAsk>,
+}
+
+/// Where sessions are listed or changed: the gateway, or a machine it
+/// vouches for, by endpoint id
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SessionsAt {
+    Gateway,
+    Machine(EndpointId),
+}
+
+/// Numbers each listing and session change by place, so an answer a later
+/// ask of the same place overtook is dropped rather than undoing it, as a
+/// background listing answered after a Close would bring the closed
+/// session back
+#[derive(Debug, Default)]
+struct SessionAsks {
+    /// The number the last ask took; never reused, so an answer from
+    /// before an unpair never matches
+    last: u64,
+    /// The latest ask of each place
+    latest: HashMap<SessionsAt, u64>,
+}
+
+impl SessionAsks {
+    /// Numbers a new listing or change of `at`, which overtakes any asked
+    /// before it
+    fn ask(&mut self, at: SessionsAt) -> u64 {
+        self.last = self.last.wrapping_add(1);
+        self.latest.insert(at, self.last);
+
+        self.last
+    }
+
+    /// Whether `seq` is still the latest ask of `at`
+    fn is_latest(&self, at: SessionsAt, seq: u64) -> bool {
+        self.latest.get(&at) == Some(&seq)
+    }
+
+    /// Drops the answer of every ask still under way
+    fn forget(&mut self) {
+        self.latest.clear();
+    }
+
+    /// Forgets the machines `listed` leaves out, whose answers no section
+    /// shows any more
+    fn keep(&mut self, listed: &HashMap<EndpointId, BrowserMachine>) {
+        self.latest.retain(|at, _| match at {
+            SessionsAt::Gateway => true,
+            SessionsAt::Machine(id) => listed.contains_key(id),
+        });
+    }
 }
 
 /// A takeover the owner asked for
@@ -919,10 +976,11 @@ impl App {
             name: record.name.clone(),
             dial: net::DIAL_TIMEOUT,
         };
+        let seq = state.session_asks.ask(SessionsAt::Gateway);
         let myself = myself.clone();
         tokio::spawn(async move {
             let listed = list_sessions(myself.clone(), at, change).await;
-            let _ = myself.cast(AppMsg::Sessions(listed));
+            let _ = myself.cast(AppMsg::Sessions { seq, listed });
         });
     }
 
@@ -972,11 +1030,11 @@ impl App {
                 section.status = SessionsStatus::Loading;
             }
         });
-        let round = state.machine_round;
+        let seq = state.session_asks.ask(SessionsAt::Machine(id));
         let myself = myself.clone();
         tokio::spawn(async move {
             let listed = list_sessions(myself.clone(), at, change).await;
-            let _ = myself.cast(AppMsg::MachineSessions { id, round, listed });
+            let _ = myself.cast(AppMsg::MachineSessions { id, seq, listed });
         });
     }
 
@@ -1014,6 +1072,7 @@ impl App {
             .into_iter()
             .map(|machine| (machine.id, machine))
             .collect();
+        state.session_asks.keep(&state.machines);
         // by name, and two of one name by id, so each keeps its place
         let mut listed: Vec<&BrowserMachine> = state.machines.values().collect();
         listed.sort_by(|one, other| (&one.name, one.id).cmp(&(&other.name, other.id)));
@@ -1050,7 +1109,6 @@ impl App {
                     .collect(),
             };
         });
-        state.machine_round = state.machine_round.wrapping_add(1);
         for id in ids {
             Self::list_machine(myself, state, id, None);
         }
@@ -1081,15 +1139,15 @@ impl App {
         state.machines.get(&id).cloned()
     }
 
-    /// Shows machine `id`'s listing, unless a newer round of listings
-    /// started since it was asked
+    /// Shows machine `id`'s listing, unless a later listing or change of
+    /// it was asked since
     fn machine_listed(
         state: &mut AppActorState,
         id: EndpointId,
-        round: u64,
+        seq: u64,
         listed: Result<Listing, ListFailure>,
     ) {
-        if round != state.machine_round {
+        if !state.session_asks.is_latest(SessionsAt::Machine(id), seq) {
             return;
         }
         let key = id.to_string();
@@ -1588,7 +1646,7 @@ impl Actor for App {
             takeover: None,
             takeover_generation: 0,
             machines: HashMap::new(),
-            machine_round: 0,
+            session_asks: SessionAsks::default(),
             waiting_open: None,
         })
     }
@@ -1660,6 +1718,7 @@ impl Actor for App {
                 state.shared.set_pairing(PairingState::Idle);
                 // the sessions and machines were the old gateway's
                 state.machines.clear();
+                state.session_asks.forget();
                 state.waiting_open = None;
                 state
                     .shared
@@ -1718,11 +1777,15 @@ impl Actor for App {
                 }
             }
             // a listing that finishes after an unpair was of the old gateway
-            AppMsg::Sessions(_) if state.record.is_none() => {}
-            AppMsg::Sessions(listed) => Self::gateway_listed(&myself, state, listed).await,
+            AppMsg::Sessions { .. } if state.record.is_none() => {}
+            // a later listing or change of the gateway's sessions answers
+            // for both
+            AppMsg::Sessions { seq, .. }
+                if !state.session_asks.is_latest(SessionsAt::Gateway, seq) => {}
+            AppMsg::Sessions { listed, .. } => Self::gateway_listed(&myself, state, listed).await,
             AppMsg::MachineSessions { .. } if state.record.is_none() => {}
-            AppMsg::MachineSessions { id, round, listed } => {
-                Self::machine_listed(state, id, round, listed);
+            AppMsg::MachineSessions { id, seq, listed } => {
+                Self::machine_listed(state, id, seq, listed);
             }
             AppMsg::Endpoint(reply) => match &state.connection {
                 Some(connection) => {
