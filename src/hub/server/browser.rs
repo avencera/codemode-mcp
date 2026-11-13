@@ -373,16 +373,21 @@ impl Hub {
             machine: Some(machine),
         };
 
-        match companions.offer_handoff(&offer, deadline).await {
-            Ok(answer) => HandoffReply::Answered(answer),
+        // a phone that never connects keeps its ask waiting, so the deadline
+        // is held here, whatever the spoke's request does
+        let offered =
+            tokio::time::timeout_at(deadline, companions.offer_handoff(&offer, deadline)).await;
+        match offered {
+            Ok(Ok(answer)) => HandoffReply::Answered(answer),
             // the push may still bring a phone to the spoke's takeover,
             // which answers there, so the offer stands until the deadline
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(%error, spoke = %spoke.name, "no phone took a spoke's handoff");
                 tokio::time::sleep_until(deadline).await;
 
                 HandoffReply::Refused(error.to_string())
             }
+            Err(_) => HandoffReply::Refused("no phone answered the handoff in time".to_owned()),
         }
     }
 
