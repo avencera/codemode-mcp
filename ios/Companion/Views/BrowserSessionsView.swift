@@ -343,6 +343,10 @@ struct NewSessionSheet: View {
                         .autocorrectionDisabled()
                         .submitLabel(.next)
                         .onSubmit { focused = .address }
+                        .onChange(of: name) { _, typed in
+                            let fixed = Self.sessionName(typed)
+                            if fixed != typed { name = fixed }
+                        }
                     TextField("Address, such as github.com/login", text: $address)
                         .focused($focused, equals: .address)
                         .keyboardType(.URL)
@@ -371,10 +375,7 @@ struct NewSessionSheet: View {
     }
 
     private var footer: String {
-        if !name.isEmpty, !Self.valid(name: name) {
-            return "A name is letters, digits, - and _."
-        }
-        return "Opens in the browser on \(host.place(gatewayName: gatewayName)), with the session's saved sign-ins when it has some."
+        "Opens in the browser on \(host.place(gatewayName: gatewayName)), with the session's saved sign-ins when it has some."
     }
 
     /// The address as `https`, which is all a session starts at
@@ -386,6 +387,18 @@ struct NewSessionSheet: View {
     private static func valid(name: String) -> Bool {
         (1 ... 64).contains(name.count)
             && name.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_") }
+    }
+
+    /// The typed name with each character a session name can't hold made
+    /// `-`, such as `github.com` to `github-com`, so Start never stays off
+    /// for a reason the field hides
+    private static func sessionName(_ typed: String) -> String {
+        let scalars = typed.unicodeScalars.prefix(64).map { scalar -> Character in
+            let allowed = scalar.isASCII
+                && (CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_")
+            return allowed ? Character(scalar) : "-"
+        }
+        return String(scalars)
     }
 
     private func start() {

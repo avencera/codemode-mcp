@@ -842,7 +842,8 @@ long-press a saved session to **Remove** it: its profile, with its sign-ins, mov
 runs on (a spoke's `browser_trash`) as `agent-browser <session> <time>`, where Finder can put it back on a Mac
 (rename it to the session's name in `~/.agent-browser`). A running session is closed first.
 
-**New session** asks for a name and an address, which must be `https` (`github.com/login` is read as
+**New session** asks for a name (letters, digits, `-` and `_`; any other character typed becomes `-`, so
+`github.com` becomes `github-com`) and an address, which must be `https` (`github.com/login` is read as
 `https://github.com/login`), and, when the gateway lists spokes with a browser, which machine it runs on. A session that is not running launches with its saved profile, so a site it was
 signed in to still is. A running session loads the address instead. Agents use a session you start like any
 other, by its name.
