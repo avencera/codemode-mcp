@@ -2588,10 +2588,11 @@ impl Spoke {
         // the owner trusts the spoke with Touch ID at the hub
         rig.gateway_mac.set_answer(Some(TouchId::Approved));
         let hub_port = rig.harness.server.local_addr().port();
-        let browser_listen = SocketAddr::from(([127, 0, 0, 1], free_port()?));
+        // any free port, taken as it binds, so no other test can take it
+        // first; the spoke reports the port it got
         let extra = format!(
             "[hub]\nhost = \"127.0.0.1:{hub_port}\"\nexclude = [\"fixture\"]\n\
-             browser_listen = \"{browser_listen}\"\nbrowser_report_secs = {report_secs}\n\n\
+             browser_listen = \"127.0.0.1:0\"\nbrowser_report_secs = {report_secs}\n\n\
              [secrets]\ndiscovery = false\n\n\
              [servers.code_browser]\nbuiltin = \"browser\"\npolicy = \"ask\"\n\
              tools.fill.grant = \"per_call\"\ntools.handoff.policy = \"allow\"\n"
@@ -2634,7 +2635,13 @@ impl Spoke {
         let machines = rig.harness.app.gateway().companions().browser_machines();
         let machine = eventually(|| machines.recent().into_iter().next()).await?;
         assert_eq!(machine.name, name);
-        assert!(machine.addrs.contains(&browser_listen), "{machine:?}");
+        assert!(
+            machine
+                .addrs
+                .iter()
+                .any(|addr| addr.ip().is_loopback() && addr.port() != 0),
+            "{machine:?}"
+        );
         let at = EndpointAddr::from_parts(
             machine.id,
             machine.addrs.iter().copied().map(TransportAddr::Ip),
