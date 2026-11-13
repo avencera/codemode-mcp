@@ -1195,9 +1195,11 @@ rather than a generated crate), so no secret passes through an agent-browser com
     reports) with its id, relay and addresses. A hub without a `browser` server of its own still answers the
     list, with no sessions of its own, so the machines show. The phone dials each machine on a link of its own,
     in parallel, with an 8 s dial timeout, so a spoke that is down shows as unreachable in its own section
-    while the rest list. Each listing and session change of a place (the gateway or one machine) is numbered,
-    and an answer a later one of the same place overtook is dropped, so a background listing answered after a
-    Close or Remove cannot bring the session back. The phone keys machines by
+    while the rest list. Each place (the gateway or one machine) has at most one listing or session change
+    under way, so every ask starts after the changes asked of it before were made. A listing asked meanwhile
+    is served by the answer under way; a Close or Remove goes ahead of a listing, whose answer is then
+    dropped, and after another change. So a background listing, asked before a Close or during it, cannot
+    bring the session back. The phone keys machines by
     endpoint id, in its map, its sections, handoffs, pushes and every action, and shows names only: the hub
     lets two spokes share a name, and a name key would send one's actions to the other. An `Open` for a
     machine the phone has not listed yet, such as from a link, waits for a new listing of the gateway first

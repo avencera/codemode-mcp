@@ -127,10 +127,12 @@ App (supervisor)
   and saved profiles), which keeps the last listing while the next loads. The gateway's answer also names
   `machines`, the spokes with a browser of their own; each gets a `MachineSessions` section, listed on a link
   of its own to that spoke, all at once, with an 8 s dial timeout, so one spoke that is down shows
-  `SessionsStatus::Unreachable` while the rest list. Every listing and session change is numbered per place
-  (`SessionAsks`, the gateway or one machine), and an answer is shown only while it is the latest asked of its
-  place, so a background listing answered after a Close or Remove of the same machine is dropped, not shown
-  over the change. Session actions carry a `SessionHost`, the gateway or a machine by
+  `SessionsStatus::Unreachable` while the rest list. Each place (the gateway or one machine) has at most one
+  listing or session change under way (`SessionAsks`), so every ask starts after the changes asked before it
+  were made: a listing asked meanwhile, such as the background one a gateway refresh starts, is served by the
+  answer under way, a Close or Remove goes ahead of a listing, whose answer is then dropped, and waits behind
+  another change. Only the answer of the ask under way shows, so neither an earlier listing nor one started
+  during a change can bring a closed session back. Session actions carry a `SessionHost`, the gateway or a machine by
   its endpoint id, and go to that machine. Machines are kept, listed and dialed by endpoint id, never by name,
   since the hub lets two spokes share one; the name only shows, and two sections of one name show the start
   of their ids. A handoff's push carries the id as `machine` and the name as `machine_name`, and a

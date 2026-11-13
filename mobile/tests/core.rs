@@ -2253,6 +2253,43 @@ async fn held(links: &mut mpsc::UnboundedReceiver<SpokeLink>) -> Result<SpokeLin
         .ok_or_else(|| "the spoke stopped".into())
 }
 
+/// A machine's answer to a listing or change: `running` and nothing saved
+fn spoke_lists(running: &[&str]) -> GatewayMessage {
+    GatewayMessage::Sessions {
+        running: running
+            .iter()
+            .map(|name| RunningSession {
+                name: (*name).to_owned(),
+                url: None,
+                title: None,
+            })
+            .collect(),
+        saved: Vec::new(),
+        last_pages: Default::default(),
+        machines: Vec::new(),
+    }
+}
+
+/// The gateway's answer to a listing: no sessions of its own, and
+/// `machines`
+fn gateway_lists(machines: Vec<BrowserMachine>) -> GatewayMessage {
+    GatewayMessage::Sessions {
+        running: Vec::new(),
+        saved: Vec::new(),
+        last_pages: Default::default(),
+        machines,
+    }
+}
+
+/// The sessions the first machine's section shows running, once it is
+/// listed
+fn shown_on_spoke(state: &AppState) -> Option<Vec<String>> {
+    let section = state.sessions.machines.first()?;
+    let names = section.running.iter().map(|session| session.name.clone());
+
+    (section.status == SessionsStatus::Listed).then(|| names.collect())
+}
+
 /// A spoke's takeover endpoint: lists `running` to every listing, and
 /// passes on each Open with its link, which stays up while it is held
 async fn fake_spoke(
@@ -2744,38 +2781,14 @@ async fn a_listing_answered_after_a_close_does_not_bring_the_session_back() -> T
         id: spoke.id.to_string(),
         name: spoke.name.clone(),
     };
-    let running = |names: &[&str]| GatewayMessage::Sessions {
-        running: names
-            .iter()
-            .map(|name| RunningSession {
-                name: (*name).to_owned(),
-                url: None,
-                title: None,
-            })
-            .collect(),
-        saved: Vec::new(),
-        last_pages: Default::default(),
-        machines: Vec::new(),
-    };
-    let shown = |state: &AppState| {
-        let section = state.sessions.machines.first()?;
-        let names = section.running.iter().map(|session| session.name.clone());
-
-        (section.status == SessionsStatus::Listed).then(|| names.collect::<Vec<_>>())
-    };
 
     // the gateway's listing names the spoke, which the phone then lists in
     // the background
     app.dispatch(AppAction::RefreshSessions);
     let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
     assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
-    let listed = GatewayMessage::Sessions {
-        running: Vec::new(),
-        saved: Vec::new(),
-        last_pages: Default::default(),
-        machines: vec![spoke],
-    };
-    send.write_all(&encode_message(&listed)?).await?;
+    send.write_all(&encode_message(&gateway_lists(vec![spoke]))?)
+        .await?;
     let (first, background, mut background_send, _background_receive) = held(&mut links).await?;
     assert_eq!(first, PhoneMessage::Sessions);
 
@@ -2793,22 +2806,180 @@ async fn a_listing_answered_after_a_close_does_not_bring_the_session_back() -> T
         }
     );
     closing_send
-        .write_all(&encode_message(&running(&["deploy"]))?)
+        .write_all(&encode_message(&spoke_lists(&["deploy"]))?)
         .await?;
     until(&app, |state| {
-        shown(state) == Some(vec!["deploy".to_owned()])
+        shown_on_spoke(state) == Some(vec!["deploy".to_owned()])
     })
     .await?;
 
     // the listing from before the close answers last, and is dropped
     background_send
-        .write_all(&encode_message(&running(&["ci", "deploy"]))?)
+        .write_all(&encode_message(&spoke_lists(&["ci", "deploy"]))?)
         .await?;
     tokio::time::timeout(Duration::from_secs(10), background.closed()).await?;
     for _ in 0..25 {
-        assert_eq!(shown(&app.state()), Some(vec!["deploy".to_owned()]));
+        assert_eq!(
+            shown_on_spoke(&app.state()),
+            Some(vec!["deploy".to_owned()])
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_during_a_close_does_not_bring_the_session_back() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _platform, _recorder) = paired(&gateway).await?;
+    let (spoke, mut links) = held_spoke().await?;
+    let on_spoke = SessionHost::Machine {
+        id: spoke.id.to_string(),
+        name: spoke.name.clone(),
+    };
+
+    // the gateway's listing names the spoke, whose own listing shows both
+    // sessions
+    app.dispatch(AppAction::RefreshSessions);
+    let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    send.write_all(&encode_message(&gateway_lists(vec![spoke.clone()]))?)
+        .await?;
+    let (first, _background, mut background_send, _background_receive) = held(&mut links).await?;
+    assert_eq!(first, PhoneMessage::Sessions);
+    background_send
+        .write_all(&encode_message(&spoke_lists(&["ci", "deploy"]))?)
+        .await?;
+    until(&app, |state| {
+        shown_on_spoke(state) == Some(vec!["ci".to_owned(), "deploy".to_owned()])
+    })
+    .await?;
+
+    // the owner closes one, and while the spoke is still closing it the
+    // gateway's sessions are refreshed, which names the spoke again
+    app.dispatch(AppAction::CloseSession {
+        session: "ci".to_owned(),
+        host: on_spoke,
+    });
+    let (first, _closing, mut closing_send, _closing_receive) = held(&mut links).await?;
+    assert_eq!(
+        first,
+        PhoneMessage::CloseSession {
+            session: "ci".to_owned()
+        }
+    );
+    app.dispatch(AppAction::RefreshSessions);
+    let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    send.write_all(&encode_message(&gateway_lists(vec![spoke]))?)
+        .await?;
+    until(&app, |state| {
+        state.sessions.status == SessionsStatus::Listed
+    })
+    .await?;
+
+    // a listing of the spoke started now would read it from before the
+    // close and could answer last; any the phone starts answers so
+    let lister = tokio::spawn(async move {
+        while let Some((first, _link, mut send, _receive)) = links.recv().await {
+            if first == PhoneMessage::Sessions {
+                let stale = encode_message(&spoke_lists(&["ci", "deploy"])).unwrap_or_default();
+                let _ = send.write_all(&stale).await;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // the close answers with the spoke's sessions after it, and the closed
+    // session stays gone
+    closing_send
+        .write_all(&encode_message(&spoke_lists(&["deploy"]))?)
+        .await?;
+    until(&app, |state| {
+        shown_on_spoke(state) == Some(vec!["deploy".to_owned()])
+    })
+    .await?;
+    for _ in 0..25 {
+        assert_eq!(
+            shown_on_spoke(&app.state()),
+            Some(vec!["deploy".to_owned()])
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    lister.abort();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_close_on_a_machine_waits_for_the_first() -> TestResult {
+    let gateway = FakeGateway::start().await?;
+    let (app, _platform, _recorder) = paired(&gateway).await?;
+    let (spoke, mut links) = held_spoke().await?;
+    let on_spoke = SessionHost::Machine {
+        id: spoke.id.to_string(),
+        name: spoke.name.clone(),
+    };
+
+    app.dispatch(AppAction::RefreshSessions);
+    let (_listing, mut send, mut receive) = gateway.next_takeover().await?;
+    assert_eq!(read_phone(&mut receive).await?, PhoneMessage::Sessions);
+    send.write_all(&encode_message(&gateway_lists(vec![spoke]))?)
+        .await?;
+    let (_first, _background, mut background_send, _background_receive) = held(&mut links).await?;
+    background_send
+        .write_all(&encode_message(&spoke_lists(&["ci", "deploy"]))?)
+        .await?;
+    until(&app, |state| {
+        shown_on_spoke(state) == Some(vec!["ci".to_owned(), "deploy".to_owned()])
+    })
+    .await?;
+
+    // the owner closes both; the second waits for the first, so it does not
+    // read the spoke while the first is still closing and answer last
+    for session in ["ci", "deploy"] {
+        app.dispatch(AppAction::CloseSession {
+            session: session.to_owned(),
+            host: on_spoke.clone(),
+        });
+    }
+    let (first, _closing, mut closing_send, _closing_receive) = held(&mut links).await?;
+    assert_eq!(
+        first,
+        PhoneMessage::CloseSession {
+            session: "ci".to_owned()
+        }
+    );
+    let early = tokio::time::timeout(Duration::from_millis(500), links.recv()).await;
+    assert!(
+        early.is_err(),
+        "the second close went before the first answered"
+    );
+    closing_send
+        .write_all(&encode_message(&spoke_lists(&["deploy"]))?)
+        .await?;
+
+    // the first's answer shows while the second is asked
+    let (first, _closing, mut closing_send, _closing_receive) = held(&mut links).await?;
+    assert_eq!(
+        first,
+        PhoneMessage::CloseSession {
+            session: "deploy".to_owned()
+        }
+    );
+    let state = app.state();
+    let section = state.sessions.machines.first().ok_or("no section")?;
+    let names: Vec<&str> = section
+        .running
+        .iter()
+        .map(|session| session.name.as_str())
+        .collect();
+    assert_eq!(names, ["deploy"]);
+    closing_send
+        .write_all(&encode_message(&spoke_lists(&[]))?)
+        .await?;
+    until(&app, |state| shown_on_spoke(state) == Some(Vec::new())).await?;
 
     Ok(())
 }

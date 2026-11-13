@@ -165,20 +165,13 @@ pub enum AppMsg {
     /// Lends the connection's endpoint to a takeover; `None` while there is
     /// no connection actor
     Endpoint(RpcReplyPort<Option<Endpoint>>),
-    /// A listing of the gateway's browser sessions finished
+    /// A listing of the browser sessions of the gateway or a machine
+    /// finished, after the change it made if any
     Sessions {
-        /// Its number among the asks of the gateway's sessions; one a later
-        /// ask overtook is dropped
-        seq: u64,
-        /// What it listed
-        listed: Result<Listing, ListFailure>,
-    },
-    /// A listing of a machine's browser sessions finished
-    MachineSessions {
-        /// The machine's endpoint id
-        id: EndpointId,
-        /// Its number among the asks of this machine's sessions; one a
-        /// later ask overtook is dropped
+        /// Whose sessions
+        at: SessionsAt,
+        /// Its number among the asks of that place; one no longer under way
+        /// there is dropped
         seq: u64,
         /// What it listed
         listed: Result<Listing, ListFailure>,
@@ -590,7 +583,8 @@ pub struct AppActorState {
     /// endpoint id, from its last listing or a handoff; never by name,
     /// which two machines may share
     machines: HashMap<EndpointId, BrowserMachine>,
-    /// Numbers the listings and session changes asked of each place
+    /// The listing or session change under way at each place, and the
+    /// changes waiting on it
     session_asks: SessionAsks,
     /// A takeover asked for on a machine not known yet, opened once a
     /// listing names it
@@ -600,48 +594,114 @@ pub struct AppActorState {
 /// Where sessions are listed or changed: the gateway, or a machine it
 /// vouches for, by endpoint id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum SessionsAt {
+pub enum SessionsAt {
     Gateway,
     Machine(EndpointId),
 }
 
-/// Numbers each listing and session change by place, so an answer a later
-/// ask of the same place overtook is dropped rather than undoing it, as a
-/// background listing answered after a Close would bring the closed
-/// session back
+/// The ask under way at one place, the only one whose answer shows there
+#[derive(Debug)]
+enum UnderWay {
+    /// A listing, numbered
+    Listing(u64),
+    /// A change, numbered, and the changes asked since, which wait on it
+    Change {
+        seq: u64,
+        waiting: VecDeque<SessionChange>,
+    },
+}
+
+impl UnderWay {
+    /// The ask's number
+    fn seq(&self) -> u64 {
+        match self {
+            Self::Listing(seq) | Self::Change { seq, .. } => *seq,
+        }
+    }
+}
+
+/// Keeps at most one listing or change under way at each place, so every
+/// ask starts after the changes asked before it were made and its answer
+/// shows them. An ask started during a change could read the sessions from
+/// before it and, answering last, undo it on screen, as a background
+/// listing would bring a closed session back
+///
+/// A listing asked while an ask is under way waits for that ask, whose
+/// answer, a listing too, serves for it. A change goes ahead of a listing
+/// under way, whose answer is then dropped, and after a change under way
 #[derive(Debug, Default)]
 struct SessionAsks {
     /// The number the last ask took; never reused, so an answer from
     /// before an unpair never matches
     last: u64,
-    /// The latest ask of each place
-    latest: HashMap<SessionsAt, u64>,
+    /// The ask under way at each place
+    under_way: HashMap<SessionsAt, UnderWay>,
+}
+
+/// What an answer is to the asks of its place
+#[derive(Debug)]
+enum Answered {
+    /// A later ask overtook it, or its place was forgotten; it is dropped
+    Overtaken,
+    /// It was the ask under way, so it shows; the changes that waited on
+    /// it are asked next, in order
+    Latest { waiting: VecDeque<SessionChange> },
 }
 
 impl SessionAsks {
-    /// Numbers a new listing or change of `at`, which overtakes any asked
-    /// before it
-    fn ask(&mut self, at: SessionsAt) -> u64 {
+    /// Numbers a listing, or `change` if set, of `at` to ask now, unless an
+    /// ask of `at` is under way: a listing then waits for it, and a change
+    /// waits for a change but goes ahead of a listing
+    fn ask(&mut self, at: SessionsAt, change: Option<SessionChange>) -> Option<u64> {
+        let asks_change = change.is_some();
+        match (self.under_way.get_mut(&at), change) {
+            (Some(UnderWay::Change { waiting, .. }), Some(change)) => {
+                waiting.push_back(change);
+
+                return None;
+            }
+            (Some(_), None) => return None,
+            (Some(UnderWay::Listing(_)) | None, _) => {}
+        }
+
         self.last = self.last.wrapping_add(1);
-        self.latest.insert(at, self.last);
+        let seq = self.last;
+        let asked = if asks_change {
+            UnderWay::Change {
+                seq,
+                waiting: VecDeque::new(),
+            }
+        } else {
+            UnderWay::Listing(seq)
+        };
+        self.under_way.insert(at, asked);
 
-        self.last
+        Some(seq)
     }
 
-    /// Whether `seq` is still the latest ask of `at`
-    fn is_latest(&self, at: SessionsAt, seq: u64) -> bool {
-        self.latest.get(&at) == Some(&seq)
+    /// Whether the answer to ask `seq` of `at` shows, and what waited on it
+    fn answered(&mut self, at: SessionsAt, seq: u64) -> Answered {
+        if self.under_way.get(&at).map(UnderWay::seq) != Some(seq) {
+            return Answered::Overtaken;
+        }
+
+        let waiting = match self.under_way.remove(&at) {
+            Some(UnderWay::Change { waiting, .. }) => waiting,
+            _ => VecDeque::new(),
+        };
+
+        Answered::Latest { waiting }
     }
 
-    /// Drops the answer of every ask still under way
+    /// Drops every ask under way, and the changes waiting on them
     fn forget(&mut self) {
-        self.latest.clear();
+        self.under_way.clear();
     }
 
     /// Forgets the machines `listed` leaves out, whose answers no section
     /// shows any more
     fn keep(&mut self, listed: &HashMap<EndpointId, BrowserMachine>) {
-        self.latest.retain(|at, _| match at {
+        self.under_way.retain(|at, _| match at {
             SessionsAt::Gateway => true,
             SessionsAt::Machine(id) => listed.contains_key(id),
         });
@@ -827,7 +887,9 @@ impl App {
                 Self::open_takeover(myself, state, ask).await;
             }
             AppAction::CloseTakeover => Self::close_takeover(state),
-            AppAction::RefreshSessions => Self::refresh_sessions(myself, state, None),
+            AppAction::RefreshSessions => {
+                Self::ask_sessions(myself, state, SessionsAt::Gateway, None);
+            }
             AppAction::CloseSession { session, host } => {
                 let Some(session) = session_name(&session) else {
                     tracing::warn!("a close was asked for a session name no gateway uses");
@@ -953,89 +1015,106 @@ impl App {
         }
     }
 
-    /// Asks the gateway for its browser sessions, after making `change` if
-    /// set, in a spawned task that reports back as [`AppMsg::Sessions`]; the
-    /// last listing shows meanwhile
-    fn refresh_sessions(
-        myself: &ActorRef<AppMsg>,
-        state: &mut AppActorState,
-        change: Option<SessionChange>,
-    ) {
-        let Some(record) = &state.record else {
-            return;
-        };
-        // a change goes ahead of a listing under way, whose answer it follows
-        if change.is_none() && state.shared.state().sessions.status == SessionsStatus::Loading {
-            return;
-        }
-        state
-            .shared
-            .change_sessions(|sessions| sessions.status = SessionsStatus::Loading);
-        let at = ListAt {
-            address: record.endpoint_addr(),
-            name: record.name.clone(),
-            dial: net::DIAL_TIMEOUT,
-        };
-        let seq = state.session_asks.ask(SessionsAt::Gateway);
-        let myself = myself.clone();
-        tokio::spawn(async move {
-            let listed = list_sessions(myself.clone(), at, change).await;
-            let _ = myself.cast(AppMsg::Sessions { seq, listed });
-        });
-    }
-
-    /// Makes `change` to a session on `host`, then lists that machine's
-    /// sessions again
+    /// Makes `change` to a session on `host`, then lists its sessions again
     fn change_sessions(
         myself: &ActorRef<AppMsg>,
         state: &mut AppActorState,
         host: SessionHost,
         change: SessionChange,
     ) {
-        match host {
-            SessionHost::Gateway => Self::refresh_sessions(myself, state, Some(change)),
+        let at = match host {
+            SessionHost::Gateway => SessionsAt::Gateway,
             SessionHost::Machine { id, .. } => match id.parse() {
-                Ok(id) => Self::list_machine(myself, state, id, Some(change)),
-                Err(_) => tracing::warn!("a session change named a machine id no endpoint has"),
+                Ok(id) => SessionsAt::Machine(id),
+                Err(_) => {
+                    tracing::warn!("a session change named a machine id no endpoint has");
+
+                    return;
+                }
             },
-        }
+        };
+
+        Self::ask_sessions(myself, state, at, Some(change));
     }
 
-    /// Asks machine `id` for its browser sessions, after making `change`
-    /// if set, on a link of its own, in a spawned task that reports back as
-    /// [`AppMsg::MachineSessions`]
-    fn list_machine(
+    /// Asks `at` for its browser sessions, after making `change` if set, on
+    /// a link of its own, in a spawned task that reports back as
+    /// [`AppMsg::Sessions`]; the last listing shows meanwhile. While an ask
+    /// of `at` is under way, a listing waits for its answer and a change
+    /// goes after it (see [`SessionAsks`])
+    fn ask_sessions(
         myself: &ActorRef<AppMsg>,
         state: &mut AppActorState,
-        id: EndpointId,
+        at: SessionsAt,
         change: Option<SessionChange>,
     ) {
-        let (Some(record), Some(machine)) = (&state.record, state.machines.get(&id)) else {
-            tracing::warn!("a listing was asked of a machine the gateway does not list");
-
+        let Some(record) = &state.record else {
             return;
         };
-        let at = ListAt {
-            address: BrowserHost::Machine(machine.clone()).endpoint_addr(record),
-            name: machine.name.clone(),
-            dial: MACHINE_DIAL,
+        let list_at = match at {
+            SessionsAt::Gateway => ListAt {
+                address: record.endpoint_addr(),
+                name: record.name.clone(),
+                dial: net::DIAL_TIMEOUT,
+            },
+            SessionsAt::Machine(id) => {
+                let Some(machine) = state.machines.get(&id) else {
+                    tracing::warn!("a listing was asked of a machine the gateway does not list");
+
+                    return;
+                };
+
+                ListAt {
+                    address: BrowserHost::Machine(machine.clone()).endpoint_addr(record),
+                    name: machine.name.clone(),
+                    dial: MACHINE_DIAL,
+                }
+            }
         };
-        let key = id.to_string();
-        state.shared.change_sessions(|sessions| {
-            if let Some(section) = sessions
-                .machines
-                .iter_mut()
-                .find(|section| section.id == key)
-            {
-                section.status = SessionsStatus::Loading;
+        let Some(seq) = state.session_asks.ask(at, change.clone()) else {
+            return;
+        };
+
+        state.shared.change_sessions(|sessions| match at {
+            SessionsAt::Gateway => sessions.status = SessionsStatus::Loading,
+            SessionsAt::Machine(id) => {
+                let key = id.to_string();
+                if let Some(section) = sessions
+                    .machines
+                    .iter_mut()
+                    .find(|section| section.id == key)
+                {
+                    section.status = SessionsStatus::Loading;
+                }
             }
         });
-        let seq = state.session_asks.ask(SessionsAt::Machine(id));
         let myself = myself.clone();
         tokio::spawn(async move {
-            let listed = list_sessions(myself.clone(), at, change).await;
-            let _ = myself.cast(AppMsg::MachineSessions { id, seq, listed });
+            let listed = list_sessions(myself.clone(), list_at, change).await;
+            let _ = myself.cast(AppMsg::Sessions { at, seq, listed });
         });
+    }
+
+    /// Shows the answer to ask `seq` of `at`, unless it was overtaken, then
+    /// asks the changes that waited on it
+    async fn sessions_answered(
+        myself: &ActorRef<AppMsg>,
+        state: &mut AppActorState,
+        at: SessionsAt,
+        seq: u64,
+        listed: Result<Listing, ListFailure>,
+    ) {
+        let Answered::Latest { waiting } = state.session_asks.answered(at, seq) else {
+            return;
+        };
+
+        match at {
+            SessionsAt::Gateway => Self::gateway_listed(myself, state, listed).await,
+            SessionsAt::Machine(id) => Self::machine_listed(state, id, listed),
+        }
+        for change in waiting {
+            Self::ask_sessions(myself, state, at, Some(change));
+        }
     }
 
     /// Shows the gateway's listing, keeps the machines it names and lists
@@ -1110,7 +1189,7 @@ impl App {
             };
         });
         for id in ids {
-            Self::list_machine(myself, state, id, None);
+            Self::ask_sessions(myself, state, SessionsAt::Machine(id), None);
         }
 
         let Some(ask) = state.waiting_open.take() else {
@@ -1139,17 +1218,12 @@ impl App {
         state.machines.get(&id).cloned()
     }
 
-    /// Shows machine `id`'s listing, unless a later listing or change of
-    /// it was asked since
+    /// Shows machine `id`'s listing
     fn machine_listed(
         state: &mut AppActorState,
         id: EndpointId,
-        seq: u64,
         listed: Result<Listing, ListFailure>,
     ) {
-        if !state.session_asks.is_latest(SessionsAt::Machine(id), seq) {
-            return;
-        }
         let key = id.to_string();
         state.shared.change_sessions(|sessions| {
             let Some(section) = sessions
@@ -1260,7 +1334,7 @@ impl App {
                 host: ask.host,
                 resize: ask.resize,
             });
-            Self::refresh_sessions(myself, state, None);
+            Self::ask_sessions(myself, state, SessionsAt::Gateway, None);
 
             return;
         };
@@ -1778,14 +1852,8 @@ impl Actor for App {
             }
             // a listing that finishes after an unpair was of the old gateway
             AppMsg::Sessions { .. } if state.record.is_none() => {}
-            // a later listing or change of the gateway's sessions answers
-            // for both
-            AppMsg::Sessions { seq, .. }
-                if !state.session_asks.is_latest(SessionsAt::Gateway, seq) => {}
-            AppMsg::Sessions { listed, .. } => Self::gateway_listed(&myself, state, listed).await,
-            AppMsg::MachineSessions { .. } if state.record.is_none() => {}
-            AppMsg::MachineSessions { id, seq, listed } => {
-                Self::machine_listed(state, id, seq, listed);
+            AppMsg::Sessions { at, seq, listed } => {
+                Self::sessions_answered(&myself, state, at, seq, listed).await;
             }
             AppMsg::Endpoint(reply) => match &state.connection {
                 Some(connection) => {
