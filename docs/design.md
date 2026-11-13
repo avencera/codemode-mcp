@@ -1215,10 +1215,11 @@ rather than a generated crate), so no secret passes through an agent-browser com
     spoke's `SessionAt`, and the values not yet used wait on the hub, not the spoke
   - Handoff: the spoke posts `browser/handoff` and the hub offers it to its phones as its own, with
     `PhoneHandoff.machine` set and a push whose `machine` key names the spoke and whose subtitle reads
-    `Session S on <spoke>`. The request is held until a phone answers or the deadline (at most 120 minutes).
-    The hub refuses at once when the spoke's endpoint is not fresh or no phone is paired, since no phone
-    could take it over; if offering fails it waits out the deadline, as a gateway's own handoff does when no
-    phone takes it. A takeover on the spoke answering the handoff there ends the spoke's call, which drops
+    `Session S on <spoke>`. The request is held until a phone answers or the deadline (at most 120 minutes),
+    which the hub enforces on the offer itself, since a phone that is never reached, or takes the offer and
+    never answers, would otherwise hold it whatever the spoke does. The hub refuses at once when the spoke's
+    endpoint is not fresh or no phone is paired, since no phone could take it over; if offering fails it
+    waits out the deadline, as a gateway's own handoff does when no phone takes it. A takeover on the spoke answering the handoff there ends the spoke's call, which drops
     the request, and the hub withdraws the offer from the phones. On a network error the spoke offers it
     again every 5 s, and a takeover can still answer it meanwhile
   - Fill from 1Password: a takeover on the spoke asks `browser/offers` for the phone's offers on the page's

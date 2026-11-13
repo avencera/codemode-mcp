@@ -40,7 +40,10 @@ use codemode_mcp::{
         },
     },
     config::Config,
-    hub::{FillGrant, FillSource, FillValue, FillValueAnswer, GateAnswer, GateCall},
+    hub::{
+        FillGrant, FillSource, FillValue, FillValueAnswer, GateAnswer, GateCall, HandoffCall,
+        HandoffReply,
+    },
     logins::{FieldKind, FocusedField},
     mac::TouchId,
     policy::GrantMode,
@@ -2991,4 +2994,50 @@ async fn a_spoke_lets_no_phone_in_once_the_hub_stops_answering() -> TestResult {
     not_paired(&again).await?;
 
     spoke.harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hub_gives_up_a_spokes_handoff_at_its_deadline() -> TestResult {
+    const DEADLINE: Duration = Duration::from_secs(3);
+    let hub_cdp = FakeCdp::start("https://example.com/").await?;
+    let spoke_cdp = FakeCdp::start("https://github.com/login").await?;
+    let Some(rig) = Rig::start(Options {
+        browser: Some(hub_cdp.program.clone()),
+        ..Options::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    let Some(spoke) = Spoke::start(&rig, &spoke_cdp.program, 30).await? else {
+        return Ok(());
+    };
+
+    // the phone takes the offer but never answers it, so only the
+    // deadline the spoke set ends the hub's wait
+    let call = HandoffCall {
+        id: RequestId::generate(),
+        session: "test".to_owned(),
+        reason: Some("approve the passkey".to_owned()),
+        url: None,
+        expires_in_ms: u64::try_from(DEADLINE.as_millis())?,
+    };
+    let started = tokio::time::Instant::now();
+    let offered = post_as_spoke(&rig.harness, &spoke.id, "/browser/handoff", &call);
+    let reply: HandoffReply = tokio::time::timeout(DEADLINE * 10, offered).await??;
+    assert!(
+        matches!(&reply, HandoffReply::Refused(reason) if reason.contains("in time")),
+        "{reply:?}"
+    );
+    assert!(started.elapsed() >= DEADLINE, "{:?}", started.elapsed());
+    let offer = rig
+        .phone
+        .seen()
+        .into_iter()
+        .find(|seen| seen.reference == "handoff test")
+        .ok_or("the phone never saw the offer")?;
+    assert_eq!(offer.machine.as_deref(), Some(spoke.name.as_str()));
+
+    spoke.harness.stop().await?;
+    rig.stop().await
 }
