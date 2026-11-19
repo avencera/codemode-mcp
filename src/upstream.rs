@@ -842,13 +842,7 @@ impl Upstream {
         }
 
         if inner.unlisted != unlisted {
-            if !unlisted.is_empty() {
-                tracing::warn!(
-                    server = %self.name,
-                    tools = %unlisted.join(", "),
-                    "settings name tools the server does not list; they fall back to the server defaults",
-                );
-            }
+            warn_unlisted(&self.name, &unlisted);
             inner.unlisted = unlisted;
         }
 
@@ -1425,6 +1419,20 @@ fn unlisted_settings(config: &ServerConfig, tools: &[Tool]) -> (Vec<String>, Vec
         .partition(|configured| config.tightens(configured))
 }
 
+/// Logs the configured tool names a server does not list whose settings
+/// were dropped, if any
+fn warn_unlisted(server: &str, unlisted: &[String]) {
+    if unlisted.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        server,
+        tools = %unlisted.join(", "),
+        "settings name tools the server does not list; they fall back to the server defaults",
+    );
+}
+
 /// Sends `notifications/cancelled` for a request unless disarmed, so a call
 /// abandoned by its caller does not keep running upstream
 struct CancelOnDrop {
@@ -1503,6 +1511,9 @@ impl Upstreams {
             } else {
                 unlisted_settings(config, &tools).1
             };
+            // a refresh logs only a change, so names the live list agrees
+            // with are logged here
+            warn_unlisted(name, &unlisted);
             let upstream = Arc::new(Upstream {
                 name: name.clone(),
                 config: config.clone(),
