@@ -447,8 +447,7 @@ return type is `Any`.
   win. `output` and `output_schema` cannot be combined. The starter config types the OpenAI docs search, list and
   endpoint tools and marks `fetch_openai_doc` as text. A key should be a tool the server lists, exactly as
   listed. A key the server does not list is handled by what losing its setting would do. A setting that tightens
-  the tool (a stricter `policy` than the server's, or `per_call` under a server `grant` of `session` for an `ask`
-  tool) refuses the server: it shows `unavailable` with `configuration` and none of its tools are served, so a
+  the tool, ordering `allow`, `ask` with `session`, `ask` with `per_call`, then `deny`, refuses the server: it shows `unavailable` with `configuration` and none of its tools are served, so a
   renamed tool cannot run without its `per_call` grant or policy. A setting that only loosens the tool or sets
   its output is dropped instead, since the renamed tool falls back to the stricter server defaults; the server
   stays up, the daemon logs a warning, `/healthz` counts them as `unlisted_tools`, and `codemode-mcp tools`

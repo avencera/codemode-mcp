@@ -1256,8 +1256,10 @@ The "Type strictness" section ends with a verdict line:
   renamed `ZohoMail_sendEmail` to `ZohoMail_send_mail`. Rename the setting and restart; until then none of its
   tools run. To stop a rename from taking the server down, set the server's `grant = "per_call"` and mark the
   reads `session` instead (see Add a server).
-- `/healthz` shows `unlisted_tools` for a connected server: settings that only loosen a tool name tools the
-  server no longer lists, so those tools ask every call. `codemode-mcp tools` names them; rename the settings.
+- `/healthz` shows `unlisted_tools` for a connected server: settings that only loosen a tool or set its output
+  name tools the server no longer lists, so the tools it lists under the new names use the server defaults (they
+  ask every call only when those are `ask` with `grant = "per_call"`). `codemode-mcp tools` names them; rename
+  the settings.
 - A Zoho (or other key-in-the-URL) server answers HTTP 400 or shows `configuration` with "is a whole URL": the
   value read for the key is the item's whole URL, usually pasted or AutoFilled on the phone, where AutoFill fills
   the item's password. The daemon drops it and asks again on the next attempt; paste only the key field.

@@ -1540,6 +1540,18 @@ pub enum Transport<'a> {
     Builtin(Builtin),
 }
 
+/// How strictly a call is held, loosest first: `allow`, `ask` with a
+/// `session` grant, `ask` with a `per_call` grant, then `deny`
+///
+/// The grant only counts under `ask`, so under `allow` or `deny` it cannot
+/// make one setting stricter than another
+fn strictness(policy: Policy, grant: GrantMode) -> (Policy, Option<GrantMode>) {
+    match policy {
+        Policy::Ask => (policy, Some(grant)),
+        Policy::Allow | Policy::Deny => (policy, None),
+    }
+}
+
 impl ServerConfig {
     /// The transport this server uses; validation guarantees exactly one
     pub fn transport(&self) -> Option<Transport<'_>> {
@@ -1585,7 +1597,7 @@ impl ServerConfig {
 
         let policy = setting.policy.unwrap_or(self.policy);
         let grant = setting.grant.unwrap_or(self.grant);
-        policy > self.policy || (policy == Policy::Ask && grant > self.grant)
+        strictness(policy, grant) > strictness(self.policy, self.grant)
     }
 
     /// Whether a call of `tool` waits on the owner rather than working, so
@@ -2024,6 +2036,16 @@ mod tests {
             url = "https://example.com/docs"
             tools.search = { policy = "ask", grant = "per_call" }
             tools.fetch.grant = "per_call"
+
+            [servers.locked]
+            url = "https://example.com/locked"
+            policy = "deny"
+            tools.read = { policy = "ask", grant = "per_call" }
+
+            [servers.shared]
+            url = "https://example.com/shared"
+            policy = "ask"
+            tools.write.grant = "per_call"
             "#,
         )?;
         let mail = &config.servers["mail"];
@@ -2041,6 +2063,11 @@ mod tests {
         let docs = &config.servers["docs"];
         assert!(docs.tightens("search"));
         assert!(!docs.tightens("fetch"));
+
+        // asking on every call is still looser than the `deny` it replaces,
+        // while `per_call` over a `session` server grant is stricter
+        assert!(!config.servers["locked"].tightens("read"));
+        assert!(config.servers["shared"].tightens("write"));
 
         Ok(())
     }
