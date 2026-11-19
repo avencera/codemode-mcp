@@ -224,6 +224,14 @@ pub struct PublicUpstreamReport {
     /// Coarse failure reason when unavailable
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorCategory>,
+    /// How many tool settings name a tool the server does not list; the
+    /// names stay in the local report
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unlisted_tools: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// Outcome of one warm-up call, safe to print
@@ -249,6 +257,10 @@ pub struct UpstreamReport {
     pub status: UpstreamStatus,
     /// Number of tools currently known
     pub tools: usize,
+    /// Tool settings naming a tool the server does not list, served without
+    /// those settings because they only loosen the tool or set its output
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unlisted_tools: Vec<String>,
 }
 
 /// The tool backend: owns the upstream connections and the current catalog
@@ -670,6 +682,7 @@ impl Gateway {
                 name: upstream.name().to_owned(),
                 status: upstream.status(),
                 tools: upstream.tools().len(),
+                unlisted_tools: upstream.unlisted(),
             })
             .collect()
     }
@@ -684,6 +697,7 @@ impl Gateway {
                 error: report.status.category(),
                 name: report.name,
                 tools: report.tools,
+                unlisted_tools: report.unlisted_tools.len(),
             })
             .collect()
     }

@@ -1381,6 +1381,11 @@ pub struct ServerConfig {
     /// Default policy for every tool of this server
     #[serde(default)]
     pub policy: Policy,
+    /// Default grant for every `ask` tool of this server; `per_call` makes a
+    /// tool the server renames or adds ask on every call until the config
+    /// names it, instead of falling back to a session grant
+    #[serde(default)]
+    pub grant: GrantMode,
     /// Whether usage logs keep only tool names and outcomes for this server;
     /// defaults to true when `policy` is `ask`
     #[serde(default)]
@@ -1438,7 +1443,7 @@ pub struct ToolOverride {
     /// Policy for this tool; the server policy when unset
     #[serde(default)]
     pub policy: Option<Policy>,
-    /// How far one approval of this tool reaches; `session` when unset
+    /// How far one approval of this tool reaches; the server's `grant` when unset
     #[serde(default)]
     pub grant: Option<GrantMode>,
     /// How the result reaches scripts; see [`OutputMode`]
@@ -1535,6 +1540,18 @@ pub enum Transport<'a> {
     Builtin(Builtin),
 }
 
+/// How strictly a call is held, loosest first: `allow`, `ask` with a
+/// `session` grant, `ask` with a `per_call` grant, then `deny`
+///
+/// The grant only counts under `ask`, so under `allow` or `deny` it cannot
+/// make one setting stricter than another
+fn strictness(policy: Policy, grant: GrantMode) -> (Policy, Option<GrantMode>) {
+    match policy {
+        Policy::Ask => (policy, Some(grant)),
+        Policy::Allow | Policy::Deny => (policy, None),
+    }
+}
+
 impl ServerConfig {
     /// The transport this server uses; validation guarantees exactly one
     pub fn transport(&self) -> Option<Transport<'_>> {
@@ -1564,7 +1581,23 @@ impl ServerConfig {
         self.tools
             .get(tool)
             .and_then(|tool| tool.grant)
-            .unwrap_or_default()
+            .unwrap_or(self.grant)
+    }
+
+    /// Whether the setting for `tool` makes it stricter than the server
+    /// defaults, so the tool would run with less protection without it
+    ///
+    /// A setting that only loosens a tool, or sets its output, is safe to
+    /// lose when the server renames the tool: the renamed tool falls back to
+    /// the stricter defaults
+    pub fn tightens(&self, tool: &str) -> bool {
+        let Some(setting) = self.tools.get(tool) else {
+            return false;
+        };
+
+        let policy = setting.policy.unwrap_or(self.policy);
+        let grant = setting.grant.unwrap_or(self.grant);
+        strictness(policy, grant) > strictness(self.policy, self.grant)
     }
 
     /// Whether a call of `tool` waits on the owner rather than working, so
@@ -1977,7 +2010,64 @@ mod tests {
         );
         assert_eq!(config.servers["op"].grant_for("list"), GrantMode::Session);
         assert!(config.servers["op"].is_sensitive());
+        assert!(config.servers["op"].tightens("delete_item"));
+        assert!(config.servers["op"].tightens("create_environment"));
+        assert!(!config.servers["op"].tightens("list"));
         assert!(!config.servers["docs"].is_sensitive());
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_server_grant_is_the_default_and_loosening_settings_do_not_tighten()
+    -> Result<(), ConfigError> {
+        let config = parse(
+            r#"
+            [servers.mail]
+            url = "https://example.com/mcp"
+            policy = "ask"
+            grant = "per_call"
+            tools.list_mails.grant = "session"
+            tools.get_mail = { policy = "allow" }
+            tools.delete_mail.policy = "deny"
+            tools.get_mail_html.output = "text"
+
+            [servers.docs]
+            url = "https://example.com/docs"
+            tools.search = { policy = "ask", grant = "per_call" }
+            tools.fetch.grant = "per_call"
+
+            [servers.locked]
+            url = "https://example.com/locked"
+            policy = "deny"
+            tools.read = { policy = "ask", grant = "per_call" }
+
+            [servers.shared]
+            url = "https://example.com/shared"
+            policy = "ask"
+            tools.write.grant = "per_call"
+            "#,
+        )?;
+        let mail = &config.servers["mail"];
+
+        // a tool the config does not name, such as one the server renamed,
+        // asks every call
+        assert_eq!(mail.grant_for("send_mail"), GrantMode::PerCall);
+        assert_eq!(mail.grant_for("list_mails"), GrantMode::Session);
+        assert!(!mail.tightens("list_mails"));
+        assert!(!mail.tightens("get_mail"));
+        assert!(!mail.tightens("get_mail_html"));
+        assert!(mail.tightens("delete_mail"));
+
+        // under `allow` a grant alone changes nothing, while asking does
+        let docs = &config.servers["docs"];
+        assert!(docs.tightens("search"));
+        assert!(!docs.tightens("fetch"));
+
+        // asking on every call is still looser than the `deny` it replaces,
+        // while `per_call` over a `session` server grant is stricter
+        assert!(!config.servers["locked"].tightens("read"));
+        assert!(config.servers["shared"].tightens("write"));
 
         Ok(())
     }

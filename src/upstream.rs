@@ -166,10 +166,12 @@ pub enum UpstreamError {
     /// The OAuth client could not be prepared (discovery or stored login)
     #[error("oauth: {0}")]
     OAuth(String),
-    /// The config has per-tool settings for tools the server does not list
+    /// The config tightens tools the server does not list, so a renamed
+    /// tool would run with less protection than the config asks for
     #[error(
-        "`servers.{server}.tools` names tools the server does not list: {}; \
-         fix the names and restart the service",
+        "`servers.{server}.tools` tightens tools the server does not list: {}; \
+         fix the names and restart the service, or set the server's `policy` or \
+         `grant` so tools it renames stay as strict",
         .tools.join(", ")
     )]
     UnlistedTools {
@@ -361,6 +363,10 @@ struct Inner {
     peer_epoch: u64,
     tools: Vec<Tool>,
     instructions: Option<String>,
+    /// Configured tool names the server does not list whose settings only
+    /// loosen the tool or set its output, so the server is served without
+    /// them; settings that tighten a tool refuse the server instead
+    unlisted: Vec<String>,
 }
 
 /// One upstream server with its supervisor task
@@ -453,6 +459,12 @@ impl Upstream {
     /// tool list while it is down
     pub fn instructions(&self) -> Option<String> {
         self.read().instructions.clone()
+    }
+
+    /// Configured tool names the server does not list, served without
+    /// their settings because those only loosen the tool
+    pub fn unlisted(&self) -> Vec<String> {
+        self.read().unlisted.clone()
     }
 
     /// Resolves once the first connection attempt has either succeeded or failed
@@ -812,15 +824,9 @@ impl Upstream {
         }
 
         let tools = peer.list_all_tools().await?;
-        let unlisted: Vec<String> = self
-            .config
-            .tools
-            .keys()
-            .filter(|configured| !tools.iter().any(|tool| tool.name == **configured))
-            .cloned()
-            .collect();
+        let (refused, unlisted) = unlisted_settings(&self.config, &tools);
         let mut inner = self.write();
-        if !unlisted.is_empty() {
+        if !refused.is_empty() {
             if !inner.tools.is_empty() {
                 inner.tools.clear();
                 self.changed.notify_one();
@@ -831,8 +837,13 @@ impl Upstream {
 
             return Err(UpstreamError::UnlistedTools {
                 server: self.name.clone(),
-                tools: unlisted,
+                tools: refused,
             });
+        }
+
+        if inner.unlisted != unlisted {
+            warn_unlisted(&self.name, &unlisted);
+            inner.unlisted = unlisted;
         }
 
         let changed = inner.tools != tools;
@@ -1396,6 +1407,32 @@ impl ClientHandler for UpstreamHandler {
     }
 }
 
+/// Configured tool names `tools` does not list, split into those whose
+/// settings tighten the tool, which refuse the server, and the rest, which
+/// are dropped so the tool falls back to the server defaults
+fn unlisted_settings(config: &ServerConfig, tools: &[Tool]) -> (Vec<String>, Vec<String>) {
+    config
+        .tools
+        .keys()
+        .filter(|configured| !tools.iter().any(|tool| tool.name == **configured))
+        .cloned()
+        .partition(|configured| config.tightens(configured))
+}
+
+/// Logs the configured tool names a server does not list whose settings
+/// were dropped, if any
+fn warn_unlisted(server: &str, unlisted: &[String]) {
+    if unlisted.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        server,
+        tools = %unlisted.join(", "),
+        "settings name tools the server does not list; they fall back to the server defaults",
+    );
+}
+
 /// Sends `notifications/cancelled` for a request unless disarmed, so a call
 /// abandoned by its caller does not keep running upstream
 struct CancelOnDrop {
@@ -1466,6 +1503,17 @@ impl Upstreams {
             // a server that stays down shows these, unavailable, until it
             // connects and lists its tools again
             let tools = Upstream::cached_tools(store, name);
+            // a lazy server may serve the saved list for hours before it
+            // connects, so its stale settings are reported from that list;
+            // with no list yet there is nothing to compare against
+            let unlisted = if tools.is_empty() {
+                Vec::new()
+            } else {
+                unlisted_settings(config, &tools).1
+            };
+            // a refresh logs only a change, so names the live list agrees
+            // with are logged here
+            warn_unlisted(name, &unlisted);
             let upstream = Arc::new(Upstream {
                 name: name.clone(),
                 config: config.clone(),
@@ -1486,6 +1534,7 @@ impl Upstreams {
                     peer_epoch: 0,
                     tools,
                     instructions: None,
+                    unlisted,
                 }),
                 status,
                 changed: Arc::clone(&changed),

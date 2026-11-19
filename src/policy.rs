@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 /// What the gateway does when a script calls a tool
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+///
+/// Ordered from loosest to strictest, so `a > b` reads as "a is stricter"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
     /// Run the call immediately
@@ -16,7 +18,9 @@ pub enum Policy {
 }
 
 /// How far one approval of an `ask` tool reaches
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+///
+/// Ordered from loosest to strictest, so `a > b` reads as "a is stricter"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantMode {
     /// An approval may cover every `session` tool of the server for every

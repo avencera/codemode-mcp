@@ -524,7 +524,9 @@ async fn healthz_reports_categories_not_raw_errors() -> TestResult {
 async fn a_setting_for_an_unlisted_tool_keeps_the_server_out() -> TestResult {
     // the shape of a Zoho rename: the grant names a tool the server lists
     // under another name, so serving the rest would drop it silently
-    let Some(harness) = Harness::start("", "tools.addition.grant = \"per_call\"").await? else {
+    let Some(harness) =
+        Harness::start("", "policy = \"ask\"\ntools.addition.grant = \"per_call\"").await?
+    else {
         return Ok(());
     };
 
@@ -559,6 +561,59 @@ async fn a_setting_for_an_unlisted_tool_keeps_the_server_out() -> TestResult {
         .await?,
     );
     assert!(!found.contains("fixture_add"), "{found}");
+
+    harness.stop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loosening_setting_for_an_unlisted_tool_leaves_the_server_up() -> TestResult {
+    // with `per_call` as the server default, a renamed read tool loses only
+    // its session grant and asks every call, so the server keeps serving
+    let Some(harness) = Harness::start(
+        "",
+        "policy = \"ask\"\ngrant = \"per_call\"\ntools.addition.grant = \"session\"",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let health: Value = harness
+        .http
+        .get(format!("{}/healthz", harness.base()))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let fixture = health["upstreams"]
+        .as_array()
+        .and_then(|upstreams| {
+            upstreams
+                .iter()
+                .find(|upstream| upstream["name"] == "fixture")
+        })
+        .ok_or("fixture missing from /healthz")?;
+    assert_eq!(fixture["state"], "connected", "{health}");
+    assert_eq!(fixture["unlisted_tools"], 1, "{health}");
+    assert!(!health.to_string().contains("addition"), "{health}");
+
+    let report = serde_json::to_value(harness.app.gateway().report())?;
+    let unlisted = report
+        .as_array()
+        .and_then(|reports| reports.iter().find(|report| report["name"] == "fixture"))
+        .map(|report| report["unlisted_tools"].clone())
+        .ok_or("fixture missing from the report")?;
+    assert_eq!(unlisted, json!(["addition"]), "{report}");
+
+    let found = text_of(
+        &call(
+            &harness.client,
+            "search_tools",
+            json!({ "query": "add two integers" }),
+        )
+        .await?,
+    );
+    assert!(found.contains("fixture_add"), "{found}");
 
     harness.stop().await
 }

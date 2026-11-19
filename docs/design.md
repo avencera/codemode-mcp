@@ -103,7 +103,10 @@ idempotent. `tools/list_changed` refreshes the catalog
 ### Approvals
 
 - Policy per tool: `allow`, `ask`, or `deny`, with server-level defaults (1Password: `ask`)
-- Grant mode per `ask` tool: `session` (default, name kept for existing configs) or `per_call`. A session grant
+- Grant mode per `ask` tool: `session` (default, name kept for existing configs) or `per_call`, with a
+  server-level default (`grant` under `[servers.<s>]`). A server whose tools change without notice, such as Zoho,
+  should default to `per_call` and list its reads as `session`, so a tool it renames or adds asks on every call
+  instead of running under a session grant. A session grant
   (15 or 60 min) is keyed by (app session hash, server), see App sessions. It covers every `session`-grant tool
   of that server for later calls that carry the same session, and also answers that session's other pending
   requests for such tools. It is allowed for any caller, local or proxied, because the unguessable token is the
@@ -442,9 +445,13 @@ return type is `Any`.
   upstream schema; an upstream-declared schema wins over `output_schema`, so a schema written for a server that
   later documents its own stops applying without an edit; `force_output_schema = true` makes the configured schema
   win. `output` and `output_schema` cannot be combined. The starter config types the OpenAI docs search, list and
-  endpoint tools and marks `fetch_openai_doc` as text. A key must be a tool the server lists, exactly as
-  listed: a list missing one is refused, the server shows `unavailable` with `configuration`, and none of its
-  tools are served, so a renamed tool cannot run without its `per_call` grant or policy
+  endpoint tools and marks `fetch_openai_doc` as text. A key should be a tool the server lists, exactly as
+  listed. A key the server does not list is handled by what losing its setting would do. A setting that tightens
+  the tool, ordering `allow`, `ask` with `session`, `ask` with `per_call`, then `deny`, refuses the server: it shows `unavailable` with `configuration` and none of its tools are served, so a
+  renamed tool cannot run without its `per_call` grant or policy. A setting that only loosens the tool or sets
+  its output is dropped instead, since the renamed tool falls back to the stricter server defaults; the server
+  stays up, the daemon logs a warning, `/healthz` counts them as `unlisted_tools`, and `codemode-mcp tools`
+  names them
 - Server-level helpers (`[servers.<s>]`): `arguments` is a table the gateway passes to every tool that declares
   one of its keys, and those parameters are dropped from the stubs, so a script cannot guess them (1Password's
   `accountId`); a value a script passes anyway is replaced, so a server can be pinned, such as to one
