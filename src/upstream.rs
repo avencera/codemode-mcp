@@ -166,10 +166,12 @@ pub enum UpstreamError {
     /// The OAuth client could not be prepared (discovery or stored login)
     #[error("oauth: {0}")]
     OAuth(String),
-    /// The config has per-tool settings for tools the server does not list
+    /// The config tightens tools the server does not list, so a renamed
+    /// tool would run with less protection than the config asks for
     #[error(
-        "`servers.{server}.tools` names tools the server does not list: {}; \
-         fix the names and restart the service",
+        "`servers.{server}.tools` tightens tools the server does not list: {}; \
+         fix the names and restart the service, or set the server's `policy` or \
+         `grant` so tools it renames stay as strict",
         .tools.join(", ")
     )]
     UnlistedTools {
@@ -361,6 +363,10 @@ struct Inner {
     peer_epoch: u64,
     tools: Vec<Tool>,
     instructions: Option<String>,
+    /// Configured tool names the server does not list whose settings only
+    /// loosen the tool or set its output, so the server is served without
+    /// them; settings that tighten a tool refuse the server instead
+    unlisted: Vec<String>,
 }
 
 /// One upstream server with its supervisor task
@@ -453,6 +459,12 @@ impl Upstream {
     /// tool list while it is down
     pub fn instructions(&self) -> Option<String> {
         self.read().instructions.clone()
+    }
+
+    /// Configured tool names the server does not list, served without
+    /// their settings because those only loosen the tool
+    pub fn unlisted(&self) -> Vec<String> {
+        self.read().unlisted.clone()
     }
 
     /// Resolves once the first connection attempt has either succeeded or failed
@@ -812,15 +824,15 @@ impl Upstream {
         }
 
         let tools = peer.list_all_tools().await?;
-        let unlisted: Vec<String> = self
+        let (refused, unlisted): (Vec<String>, Vec<String>) = self
             .config
             .tools
             .keys()
             .filter(|configured| !tools.iter().any(|tool| tool.name == **configured))
             .cloned()
-            .collect();
+            .partition(|configured| self.config.tightens(configured));
         let mut inner = self.write();
-        if !unlisted.is_empty() {
+        if !refused.is_empty() {
             if !inner.tools.is_empty() {
                 inner.tools.clear();
                 self.changed.notify_one();
@@ -831,8 +843,19 @@ impl Upstream {
 
             return Err(UpstreamError::UnlistedTools {
                 server: self.name.clone(),
-                tools: unlisted,
+                tools: refused,
             });
+        }
+
+        if inner.unlisted != unlisted {
+            if !unlisted.is_empty() {
+                tracing::warn!(
+                    server = %self.name,
+                    tools = %unlisted.join(", "),
+                    "settings name tools the server does not list; they fall back to the server defaults",
+                );
+            }
+            inner.unlisted = unlisted;
         }
 
         let changed = inner.tools != tools;
@@ -1486,6 +1509,7 @@ impl Upstreams {
                     peer_epoch: 0,
                     tools,
                     instructions: None,
+                    unlisted: Vec::new(),
                 }),
                 status,
                 changed: Arc::clone(&changed),

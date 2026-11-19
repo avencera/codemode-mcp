@@ -2030,6 +2030,12 @@ async fn tools_command(config: Config, stubs: bool) -> Result<()> {
     for report in app.gateway().report() {
         let detail = serde_json::to_string(&report.status)?;
         eprintln!("server {}: {detail} ({} tools)", report.name, report.tools);
+        if !report.unlisted_tools.is_empty() {
+            eprintln!(
+                "  settings name tools it does not list, which use the server defaults: {}",
+                report.unlisted_tools.join(", ")
+            );
+        }
     }
 
     let catalog = app.gateway().catalog();
