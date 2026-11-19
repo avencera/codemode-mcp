@@ -824,13 +824,7 @@ impl Upstream {
         }
 
         let tools = peer.list_all_tools().await?;
-        let (refused, unlisted): (Vec<String>, Vec<String>) = self
-            .config
-            .tools
-            .keys()
-            .filter(|configured| !tools.iter().any(|tool| tool.name == **configured))
-            .cloned()
-            .partition(|configured| self.config.tightens(configured));
+        let (refused, unlisted) = unlisted_settings(&self.config, &tools);
         let mut inner = self.write();
         if !refused.is_empty() {
             if !inner.tools.is_empty() {
@@ -1419,6 +1413,18 @@ impl ClientHandler for UpstreamHandler {
     }
 }
 
+/// Configured tool names `tools` does not list, split into those whose
+/// settings tighten the tool, which refuse the server, and the rest, which
+/// are dropped so the tool falls back to the server defaults
+fn unlisted_settings(config: &ServerConfig, tools: &[Tool]) -> (Vec<String>, Vec<String>) {
+    config
+        .tools
+        .keys()
+        .filter(|configured| !tools.iter().any(|tool| tool.name == **configured))
+        .cloned()
+        .partition(|configured| config.tightens(configured))
+}
+
 /// Sends `notifications/cancelled` for a request unless disarmed, so a call
 /// abandoned by its caller does not keep running upstream
 struct CancelOnDrop {
@@ -1489,6 +1495,14 @@ impl Upstreams {
             // a server that stays down shows these, unavailable, until it
             // connects and lists its tools again
             let tools = Upstream::cached_tools(store, name);
+            // a lazy server may serve the saved list for hours before it
+            // connects, so its stale settings are reported from that list;
+            // with no list yet there is nothing to compare against
+            let unlisted = if tools.is_empty() {
+                Vec::new()
+            } else {
+                unlisted_settings(config, &tools).1
+            };
             let upstream = Arc::new(Upstream {
                 name: name.clone(),
                 config: config.clone(),
@@ -1509,7 +1523,7 @@ impl Upstreams {
                     peer_epoch: 0,
                     tools,
                     instructions: None,
-                    unlisted: Vec::new(),
+                    unlisted,
                 }),
                 status,
                 changed: Arc::clone(&changed),

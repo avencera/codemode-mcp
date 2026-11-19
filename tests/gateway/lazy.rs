@@ -142,3 +142,31 @@ async fn lazy_servers_start_on_a_call_and_stop_when_idle() -> TestResult {
 
     harness.stop().await
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lazy_server_reports_stale_settings_from_its_cached_tools() -> TestResult {
+    let Some(harness) = Harness::with(Setup {
+        server: "lazy = true\nidle_secs = 1\npolicy = \"ask\"\ngrant = \"per_call\"\n\
+                 tools.addition.grant = \"session\"",
+        ..Setup::default()
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+    wait_for_state(&harness, "fixture", "idle").await?;
+
+    // the restarted server stays idle on its cached list, which already
+    // shows the setting naming a tool the server does not list
+    let harness = harness.restart(Stop::Drain).await?;
+    assert_eq!(state(&harness, "fixture").await?, "idle");
+    let report = serde_json::to_value(harness.app.gateway().report())?;
+    let unlisted = report
+        .as_array()
+        .and_then(|reports| reports.iter().find(|report| report["name"] == "fixture"))
+        .map(|report| report["unlisted_tools"].clone())
+        .ok_or("fixture missing from the report")?;
+    assert_eq!(unlisted, serde_json::json!(["addition"]), "{report}");
+
+    harness.stop().await
+}
